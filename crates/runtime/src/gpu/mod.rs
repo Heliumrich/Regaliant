@@ -30,7 +30,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 165] = [
+    static ALL: [Tunable; 166] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -196,6 +196,7 @@ pub mod tune {
         Tunable { name: "wb_probe", env: "DS_WB_PROBE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "wb_probe_site", env: "DS_WB_PROBE_SITE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "unb_bound", env: "DS_UNB_BOUND", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "kco", env: "DS_KCO", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1695,6 +1696,13 @@ pub mod tune {
         get(164) != 0
     }
 
+    /// The GPU arena's coherence passes as a census (`gpu::kco`): a helper
+    /// takes the arena's CPU-written scope after each title submission and
+    /// records the age of the pages it finds written (nothing consumes them).
+    pub fn kco() -> bool {
+        get(165) != 0
+    }
+
     /// Pixel programs that write no memory run their depth and stencil
     /// tests before the shader where the draw's state lets them (no kill,
     /// coverage or depth export, or no depth and stencil writes:
@@ -1859,6 +1867,7 @@ pub mod par;
 pub mod prio;
 pub mod precache;
 pub mod fe2;
+pub mod kco;
 pub mod fe2census;
 pub mod precompile;
 pub mod pipeuse;
@@ -2814,6 +2823,7 @@ pub fn submit(queue_id: u32, buffers: Vec<(u64, u32)>) {
     if pm4_census_on() {
         pm4_census(queue_id, &buffers);
     }
+    kco::trigger();
     // A frame replay holds the title at the start and end of the frame it
     // records.
     replay::hold();
@@ -3014,6 +3024,7 @@ pub fn reset_profile() {
     exec::replay_census_reset();
     pm4_census_reset();
     fe3_probe::reset();
+    kco::reset();
     if let Some(m) = PROFILE.lock().as_mut() {
         m.clear();
     }

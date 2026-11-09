@@ -382,6 +382,18 @@ const FIXES: &[Fix] = &[
         why: "the port counts the engine heaps' blocks by their call site (census)",
         only_with: Some("DS_HEAP_CENSUS"),
     },
+    // The end of the Agc library's command-buffer init (eboot+0x1d0a4fb,
+    // `mov dword ptr [rax+30h],0`: rax the buffer object, rsi its begin, rdx
+    // its end; a leaf function without branches).
+    Fix {
+        name: "engine map (command buffers)",
+        offset: 0x1d0a4fb,
+        from: &[0xc7, 0x40, 0x30, 0x00, 0x00, 0x00, 0x00],
+        change: Change::Hook { at: 0, handler: crate::engine::cb_init_hook },
+        kind: "engine map (read only)",
+        why: "the port learns the command buffers' extents (front end 3's knowledge coherence)",
+        only_with: None,
+    },
 ];
 
 /// Whether the fix of this name was applied.

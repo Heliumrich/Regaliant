@@ -16832,6 +16832,7 @@ pub fn status() -> String {
         + &super::resident::status()
         + &super::fe2::status()
         + &replay_census_line()
+        + &super::kco::status()
         + &import_sites_line()
         + &in_place_line()
         + &sync_why_status()

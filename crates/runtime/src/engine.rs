@@ -709,6 +709,11 @@ fn alloc_table_init() {
     }
 }
 
+/// The table entry of MiB `m` (`ALLOC`), for the coherence census.
+pub fn alloc_entry_of(m: u64) -> u64 {
+    alloc_entry(m)
+}
+
 /// The table entry of MiB `m` (`ALLOC`).
 #[inline]
 fn alloc_entry(m: u64) -> u64 {
@@ -1396,4 +1401,160 @@ fn heap_census_reset() {
             *t = [0; 2];
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Command buffers and the knowledge coherence's scope (`gpu::kco`;
+// FRONTEND3.md "Knowledge coherence"). The engine's Agc library initializes
+// every command buffer at eboot+0x1d0a4d0: [cb] its begin, [cb+8] its end,
+// [cb+0x10] the command cursor (growing up), [cb+0x18] the top-down cursor
+// (data the library embeds for the GPU, from the end down; the space for
+// commands ends there); a render context submits [begin, command cursor).
+// The GPU reads only the embedded data: our command processors read the
+// commands on the CPU. So a coherence of the GPU arena per epoch can leave
+// the MiBs a command buffer covers whole out, except for their embedded data.
+// ---------------------------------------------------------------------------
+
+/// In an allocation-table entry (`ALLOC`): a command buffer covers the MiB
+/// whole. Cleared by any allocation placed in the MiB and by a tag free
+/// (both rewrite the entry without it).
+const CMD_FLAG: u64 = 1 << 31;
+
+/// Command buffers by begin: (the command buffer object, end).
+static CBS: parking_lot::RwLock<std::collections::BTreeMap<u64, (u64, u64)>> = parking_lot::RwLock::new(std::collections::BTreeMap::new());
+
+/// [command buffers initialized, MiBs marked as covered whole by one,
+/// buffers dropped as stale, embedded ranges added to a scope].
+pub static CB_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// At the end of the library's command-buffer init (eboot+0x1d0a4fb, `mov
+/// dword ptr [rax+30h],0`: rax the object, rsi its begin, rdx its end).
+pub extern "sysv64" fn cb_init_hook(regs: *const u64, _arg: u32) {
+    let (cb, begin, end) = unsafe { (*regs.add(0), *regs.add(6), *regs.add(2)) };
+    if end <= begin || end - begin > 1 << 30 {
+        return;
+    }
+    // (Only buffers in the GPU arena's allocations: the library also builds
+    // packets in 1 KiB buffers on the stack and copies them into a buffer,
+    // eboot+0x1d18c80, ~2,200 a flip.)
+    if alloc_entry(begin >> 20) & 0x1F_FFFF == 0 {
+        return;
+    }
+    CB_STATS[0].fetch_add(1, Ordering::Relaxed);
+    {
+        let mut g = CBS.write();
+        // (Memory used again: the buffers it overlaps are gone; live ones
+        // never overlap.)
+        let gone: Vec<u64> = g.range(..end).rev().take_while(|(_, v)| v.1 > begin).map(|(&b, _)| b).collect();
+        for b in gone {
+            g.remove(&b);
+        }
+        if g.len() >= 4096 {
+            g.clear();
+        }
+        g.insert(begin, (cb, end));
+    }
+    let t = ALLOC.load(Ordering::Relaxed);
+    if t.is_null() {
+        return;
+    }
+    // Its whole MiBs that the arena's table holds as allocated to the end
+    // (the buffer's own allocation, placed just before).
+    for m in begin.div_ceil(1 << 20)..(end >> 20).min(MIB_ENTRIES) {
+        let p = unsafe { &*(t.add(m as usize) as *const AtomicU64) };
+        if p.load(Ordering::Relaxed) & 0x1F_FFFF == 1 << 20 {
+            p.fetch_or(CMD_FLAG, Ordering::Relaxed);
+            CB_STATS[1].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The GPU arena's MiBs (from the engine map, refreshed every 2 s).
+static ARENA_MIBS: parking_lot::Mutex<(Option<std::time::Instant>, Vec<u64>)> = parking_lot::Mutex::new((None, Vec::new()));
+
+/// What the CPU may have written for the GPU in the GPU arena, as sorted,
+/// merged runs: each MiB's allocated bytes of the current generation except
+/// MiBs a command buffer covers whole, plus the embedded data of the live
+/// command buffers lying in such MiBs. Empty until the arena is known.
+pub fn coherence_runs(out: &mut Vec<(u64, u64)>) {
+    out.clear();
+    let arena = arena_owner();
+    if arena == 0 || ALLOC.load(Ordering::Relaxed).is_null() {
+        return;
+    }
+    let mibs = {
+        let mut g = ARENA_MIBS.lock();
+        if g.0.is_none_or(|t| t.elapsed().as_secs() >= 2) {
+            let (lo, hi) = census().into_iter().find(|x| x.0 == arena).map_or((0, 0), |x| (x.2, x.3));
+            let v: Vec<u64> = ((lo >> 20)..(hi >> 20)).filter(|&m| owner(m << 20) == arena).collect();
+            *g = (Some(std::time::Instant::now()), v);
+        }
+        g.1.clone()
+    };
+    for m in mibs {
+        let e = alloc_entry(m);
+        let h = e & 0x1F_FFFF;
+        if h == 0 || e & CMD_FLAG != 0 {
+            continue;
+        }
+        let (s, x) = (m << 20, (m << 20) + h.min(1 << 20));
+        // (Across a gap of unallocated bytes up to 512 KiB: a take costs
+        // ~2 us a call and ~2-3 ns a page.)
+        match out.last_mut() {
+            Some(l) if l.1 + (512 << 10) >= s => l.1 = x,
+            _ => out.push((s, x)),
+        }
+    }
+    // The embedded data of command buffers in MiBs left out (read now: a
+    // buffer whose object no longer agrees is dropped).
+    let mut extra: Vec<(u64, u64)> = Vec::new();
+    let mut stale: Vec<u64> = Vec::new();
+    {
+        let g = CBS.read();
+        for (&b, &(cb, end)) in g.iter() {
+            let (Some(b0), Some(e0), Some(down)) = (rd64(cb), rd64(cb + 8), rd64(cb + 0x18)) else {
+                stale.push(b);
+                continue;
+            };
+            if b0 != b || e0 != end || down < b || down > end {
+                stale.push(b);
+                continue;
+            }
+            let mut x = down & !0xFFF;
+            while x < end {
+                let m = x >> 20;
+                let me = ((m + 1) << 20).min(end);
+                if alloc_entry(m) & CMD_FLAG != 0 {
+                    extra.push((x, me.next_multiple_of(0x1000)));
+                }
+                x = me;
+            }
+        }
+    }
+    if !stale.is_empty() {
+        let mut g = CBS.write();
+        for b in &stale {
+            g.remove(b);
+        }
+        CB_STATS[2].fetch_add(stale.len() as u64, Ordering::Relaxed);
+    }
+    if !extra.is_empty() {
+        CB_STATS[3].fetch_add(extra.len() as u64, Ordering::Relaxed);
+        out.extend(extra);
+        out.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(out.len());
+        for &(a, b) in out.iter() {
+            match merged.last_mut() {
+                Some(l) if l.1 >= a => l.1 = l.1.max(b),
+                _ => merged.push((a, b)),
+            }
+        }
+        *out = merged;
+    }
+}
+
+/// The command buffers' line for the knowledge coherence's status.
+pub fn cb_line() -> String {
+    let s: Vec<u64> = CB_STATS.iter().map(|x| x.load(Ordering::Relaxed)).collect();
+    format!("command buffers: {} initialized ({} live), {} MiBs covered whole marked, {} dropped as stale, {} embedded ranges outside the scanned MiBs", s[0], CBS.read().len(), s[1], s[2], s[3])
 }
