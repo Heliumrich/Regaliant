@@ -494,6 +494,17 @@ pub fn with_cache<T>(kind: char, key: u64, create: impl FnOnce(vk::PipelineCache
     r
 }
 
+/// Whether the store holds what makes the pipeline of `key` without a
+/// compile in this session's mode: its binaries with pipeline binaries on,
+/// else its cache file.
+pub fn stored_cheap(kind: char, key: u64) -> bool {
+    if ctx().pbin.is_some() {
+        BIN_DIR.get().is_some_and(|dir| dir.join(format!("{kind}{key:016x}.pb")).exists())
+    } else {
+        DIR.get().is_some_and(|dir| dir.join(format!("{kind}{key:016x}.bin")).exists())
+    }
+}
+
 /// Whether the store holds the pipeline of `key` (its creation then takes
 /// milliseconds, not the seconds of a first compile).
 pub fn stored(kind: char, key: u64) -> bool {

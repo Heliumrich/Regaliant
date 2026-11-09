@@ -316,16 +316,155 @@ fn spans_write() -> parking_lot::RwLockWriteGuard<'static, Vec<Span>> {
     g
 }
 
+/// `DS_WATCH_WRITES=<hex lo>:<hex hi>` (diagnosis): every writer of a guest
+/// range overlapping [lo, hi) is logged with the flip, the first 600 (from
+/// flip `DS_WATCH_FROM` on)
+/// (`watch_note`): shaders' written bindings, CP DMA, fills, the CP writes
+/// the GPU performs, front end 2's uploads into the mirror (CPU-written
+/// pages carried to the GPU) and the guest words there when a guarded
+/// indirect draw's record is read (`Cp::checked_index_args`).
+pub fn watch_range() -> Option<(u64, u64)> {
+    static W: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        let v = std::env::var("DS_WATCH_WRITES").ok()?;
+        let (a, b) = v.split_once(':')?;
+        let p = |x: &str| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok();
+        Some((p(a)?, p(b)?))
+    })
+}
+
+/// A write (or upload) of guest [base, base+size) for `watch_range`.
+pub fn watch_note(what: impl FnOnce() -> String, base: u64, size: u64) {
+    let Some((lo, hi)) = watch_range() else { return };
+    if base >= hi || base.saturating_add(size) <= lo {
+        return;
+    }
+    // (`DS_WATCH_FROM=<flip>`: from that flip on, past a boot's loads.)
+    static FROM: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    if (super::FRAMES.load(Ordering::Relaxed) as u64) < *FROM.get_or_init(|| std::env::var("DS_WATCH_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(0)) {
+        return;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    static PER: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
+    let what = what();
+    // (At most 12 a writer logged at once: the key is its text up to its
+    // first parenthesis.)
+    let key = what.split(" (").next().unwrap_or(&what).to_string();
+    watch_ring_push(&key, format!("  flip {} {} {what} writes {base:#x}+{size:#x}", super::FRAMES.load(Ordering::Relaxed), crate::log::thread_name()));
+    {
+        let mut g = PER.lock();
+        let c = g.get_or_insert_with(HashMap::new).entry(key).or_insert(0);
+        *c += 1;
+        if *c > 12 {
+            return;
+        }
+    }
+    if N.fetch_add(1, Ordering::Relaxed) < 1500 {
+        crate::info!("watch: {what} writes {base:#x}+{size:#x} at flip {} on {}", super::FRAMES.load(Ordering::Relaxed), crate::log::thread_name());
+    }
+}
+
+/// The last watch notes of each writer (the 24 latest a writer, also those
+/// past its cap), dumped once when a guarded draw record is read
+/// (`watch_dump`).
+static WATCH_RING: Mutex<Option<HashMap<String, std::collections::VecDeque<String>>>> = Mutex::new(None);
+
+fn watch_ring_push(key: &str, line: String) {
+    let mut g = WATCH_RING.lock();
+    let r = g.get_or_insert_with(HashMap::new).entry(key.to_string()).or_default();
+    if r.len() >= 24 {
+        r.pop_front();
+    }
+    r.push_back(line);
+}
+
+/// Logs the watch notes kept (`WATCH_RING`), the first time it is called.
+pub fn watch_dump(why: &str) {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if watch_range().is_none() || DONE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let lines: Vec<String> = WATCH_RING.lock().as_ref().map(|m| m.values().flat_map(|r| r.iter().cloned()).collect()).unwrap_or_default();
+    // (Each resource a line names, as guest memory holds it now.)
+    let now = |line: &str| -> String {
+        let mut out = Vec::new();
+        for part in line.split("; ").flat_map(|x| x.split('{')) {
+            let mut it = part.split_whitespace();
+            let (Some(r), Some(a)) = (it.next(), it.next()) else { continue };
+            if !(r.starts_with('r') && r[1..].parse::<u32>().is_ok()) {
+                continue;
+            }
+            let Ok(base) = u64::from_str_radix(a.trim_start_matches("0x"), 16) else { continue };
+            let words: Vec<String> = (0..6u64).filter(|k| super::cp::guest_readable(base + 4 * k, 4)).map(|k| format!("{:08x}", unsafe { std::ptr::read_volatile((base + 4 * k) as *const u32) })).collect();
+            out.push(format!("{r} [{}]", words.join(" ")));
+        }
+        if out.is_empty() {
+            String::new()
+        } else {
+            format!(" | now: {}", out.join("; "))
+        }
+    };
+    let lines: Vec<String> = lines.iter().map(|l| format!("{l}{}", now(l))).collect();
+    crate::info!("watch: the last {} notes before {why}:\n{}", lines.len(), lines.join("\n"));
+}
+
+thread_local! {
+    /// (`DS_WATCH_WRITES`) This thread's latest front end 2 placements:
+    /// (base, size, bytes its check uploaded into the batch's prologue, from
+    /// the batch's placement memo).
+    static WATCH_PLACES: std::cell::RefCell<Vec<(u64, u64, u64, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A placement for `watch_resources` (only with `DS_WATCH_WRITES`).
+fn watch_place(base: u64, size: u64, uploaded: u64, memo: bool) {
+    WATCH_PLACES.with(|v| {
+        let mut v = v.borrow_mut();
+        if v.len() >= 64 {
+            v.drain(..32);
+        }
+        v.push((base, size, uploaded, memo));
+    });
+}
+
+fn watch_placed(base: u64) -> String {
+    WATCH_PLACES.with(|v| match v.borrow().iter().rev().find(|e| e.0 == base) {
+        Some(&(_, _, _, true)) => " placed from the memo".to_string(),
+        Some(&(_, _, 0, false)) => " placed current".to_string(),
+        Some(&(_, _, n, false)) => format!(" placed with {n:#x} bytes uploaded"),
+        None => " not placed".to_string(),
+    })
+}
+
+/// A stage's buffer resources for a watch line: each base and its first
+/// six guest words (the pattern copy's source and count block).
+pub(super) fn watch_resources(p: &Prepared) -> String {
+    let mut out = Vec::new();
+    for (i, r) in p.found.resources.iter().enumerate().take(4) {
+        if let Resolved::Buffer(v) = r {
+            let words: Vec<String> = (0..6u64).filter(|k| super::cp::guest_readable(v.base + 4 * k, 4)).map(|k| format!("{:08x}", unsafe { std::ptr::read_volatile((v.base + 4 * k) as *const u32) })).collect();
+            out.push(format!("r{i} {:#x} stride {} records {} [{}]{}", v.base, v.stride, v.num_records, words.join(" "), watch_placed(v.base)));
+        }
+    }
+    out.join("; ")
+}
+
 /// GPU execution enabled (`DS_GPU=1`) and Vulkan available.
 /// `DS_TRACE_WRITES=<hex bytes>`: logs once each shader (and CP DMA) that
 /// writes a guest range at least that large (who fills a large buffer).
 pub fn trace_writes(what: impl FnOnce() -> String, base: u64, size: u64) {
     static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let min = *MIN.get_or_init(|| std::env::var("DS_TRACE_WRITES").ok().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()).unwrap_or(0));
-    if min == 0 || size < min {
+    let watched = watch_range().is_some_and(|(lo, hi)| base < hi && base.saturating_add(size) > lo);
+    if !watched && (min == 0 || size < min) {
         return;
     }
     let what = what();
+    if watched {
+        watch_note(|| what.clone(), base, size);
+    }
+    if min == 0 || size < min {
+        return;
+    }
     static SEEN: Mutex<Option<HashSet<(String, u64, u64)>>> = Mutex::new(None);
     if SEEN.lock().get_or_insert_with(HashSet::new).insert((what.clone(), base, size)) {
         crate::info!("writes: {what} writes {base:#x}+{size:#x} (flip {})", super::FRAMES.load(Ordering::Relaxed));
@@ -2147,10 +2286,15 @@ pub fn inflight_stats() -> (u64, u64, u64) {
     (PIPE_FLIGHT_WAITS[0].load(Ordering::Relaxed), PIPE_FLIGHT_WAITS[1].load(Ordering::Relaxed), PIPE_FLIGHT_WAITS[2].load(Ordering::Relaxed))
 }
 
-/// The compute pipeline of a prepared shader if it exists.
+/// The compute pipeline of a prepared shader if it exists (a dispatch's: its
+/// use noted, `pipeuse`).
 fn cached_compute_pipe(p: &Prepared) -> Option<Pipe> {
     let key = push_key(p.tr.key, push_fits(&[p]));
-    PIPES.lock().as_ref().and_then(|m| m.get(&key)).copied()
+    let r = PIPES.lock().as_ref().and_then(|m| m.get(&key)).copied();
+    if r.is_some() {
+        super::pipeuse::note(key);
+    }
+    r
 }
 
 /// Background compiles of particle programs' pipelines (`tune
@@ -2367,9 +2511,43 @@ pub(crate) fn compile_trace_on() -> bool {
 
 /// The compute pipeline of a prepared shader (created on first use, outside
 /// the map's lock; a pipeline another queue created meanwhile wins; one in
-/// flight on another thread is waited for).
+/// flight on another thread is waited for; a dispatch's: its use noted).
 fn compute_pipe(p: &Prepared) -> Result<Pipe, String> {
-    compute_pipe_with(&p.tr, p.addr, &std::cell::Cell::new(false))
+    let r = compute_pipe_with(&p.tr, p.addr, &std::cell::Cell::new(false));
+    if r.is_ok() {
+        super::pipeuse::note(push_key(p.tr.key, push_fits_tr(&p.tr)));
+    }
+    r
+}
+
+/// What the precompile did with the pipelines it was given: [compute kept
+/// alive, compute made for the store only, compute left to their first use,
+/// the same for graphics].
+pub(crate) static PRECOMPILE_LIVE: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+pub(crate) fn precompile_live() -> [u64; 6] {
+    std::array::from_fn(|k| PRECOMPILE_LIVE[k].load(Ordering::Relaxed))
+}
+
+/// The precompile's compute pipeline: made and kept (`precompile_translation`)
+/// when a recent session used it (`pipeuse`); else, when the store has no
+/// binaries (or cache data) for it, made through the store and let go (a
+/// first use then takes milliseconds, not a compile); else left to its first
+/// use. A pipeline costs the driver ~2.6 MiB of host memory while it lives
+/// (FINDINGS.md 2026-11-09): every learned spec kept alive made ~15,000 a
+/// boot, ~2,000 of them used.
+pub(crate) fn precompile_or_warm(tr: &super::shaders::Translated, addr: u64) -> Option<bool> {
+    let key = push_key(tr.key, push_fits_tr(tr));
+    if super::pipeuse::recent(key) {
+        PRECOMPILE_LIVE[0].fetch_add(1, Ordering::Relaxed);
+        return precompile_translation(tr, addr);
+    }
+    if PIPES.lock().as_ref().is_some_and(|m| m.contains_key(&key)) || PIPE_FLIGHTS.lock().as_ref().is_some_and(|m| m.contains_key(&key)) || super::pcache::stored_cheap('c', key) {
+        PRECOMPILE_LIVE[2].fetch_add(1, Ordering::Relaxed);
+        return Some(false);
+    }
+    PRECOMPILE_LIVE[1].fetch_add(1, Ordering::Relaxed);
+    store_compute_pipeline(tr).ok().map(|_| true)
 }
 
 /// Whether a compute pipeline of this translation gets a push descriptor
@@ -2538,6 +2716,25 @@ pub(super) fn bench_compute_pipeline(tr: &super::shaders::Translated) -> Result<
         dev.destroy_descriptor_set_layout(pipe.set_layout, None);
     }
     Ok(d)
+}
+
+/// A compute pipeline made through the pipeline store under the key its
+/// dispatches look up and handed to the caller (`--compile-bench` with
+/// `DS_CB_MEMTEST`): pipeline, layout and set layout.
+pub(super) fn store_compute_pipeline_parts(tr: &super::shaders::Translated) -> Result<(vk::Pipeline, vk::PipelineLayout, vk::DescriptorSetLayout), String> {
+    let push_mode = push_fits_tr(tr);
+    let pipe = compute_pipeline(&tr.out, push_mode, Some(push_key(tr.key, push_mode)))?;
+    Ok((pipe.pipeline, pipe.layout, pipe.set_layout))
+}
+
+/// Destroys what `store_compute_pipeline_parts` made.
+pub(super) fn destroy_pipeline_parts(p: (vk::Pipeline, vk::PipelineLayout, vk::DescriptorSetLayout)) {
+    unsafe {
+        let dev = &ctx().device;
+        dev.destroy_pipeline(p.0, None);
+        dev.destroy_pipeline_layout(p.1, None);
+        dev.destroy_descriptor_set_layout(p.2, None);
+    }
 }
 
 /// Makes the compute pipeline of a translation through the pipeline store
@@ -10633,6 +10830,9 @@ impl Exec {
                     self.fe2_marked = true;
                 }
                 place_memo_count(true);
+                if watch_range().is_some() {
+                    watch_place(base, size, 0, true);
+                }
                 return Some(m.result);
             }
             place_memo_count(false);
@@ -10779,6 +10979,9 @@ impl Exec {
             }
         }
         let t3 = tsc();
+        if watch_range().is_some() {
+            watch_place(base, size, up[first..].iter().map(|&(a, b)| b - a).sum(), false);
+        }
         let mut mine = mine;
         for &(a, b) in &up[first..] {
             let mut p = a;
@@ -11001,6 +11204,16 @@ impl Exec {
     /// for this batch only: CPU writes after it are not in it; nor shared with
     /// the run's later parts, `fe2_share`).
     fn fe2_upload(&mut self, mbuf: vk::Buffer, a: u64, b: u64, up: &mut Vec<(u64, u64)>) -> bool {
+        watch_note(
+            || {
+                let (lo, hi) = watch_range().unwrap_or((a, b));
+                let (x, y) = (a.max(lo) & !3, b.min(hi));
+                let words: Vec<String> = (0..((y.saturating_sub(x)) / 4).min(6)).map(|k| format!("{:08x}", unsafe { std::ptr::read_volatile((x + 4 * k) as *const u32) })).collect();
+                format!("{} front end 2's upload into the mirror (guest words at {x:#x} now: {})", self.name, words.join(" "))
+            },
+            a,
+            b - a,
+        );
         use super::resident::{MIRROR_BASE, PAGE};
         // (Only into a batch being recorded: `fe2_place` begins one.)
         if !self.recording {
@@ -11709,6 +11922,7 @@ impl Exec {
     /// of the range; None: all of it): the mirror is filled over the whole
     /// range (`tune fill_partial`).
     fn fill_in_place_parts(&mut self, base: u64, len: u64, v: u32, guest: Option<&[(u64, u64)]>) -> Result<bool, String> {
+        watch_note(|| format!("{} fill in place with {v:#x}", self.name), base, len);
         if len == 0 || base % 4 != 0 || len % 4 != 0 || DEVICE_LOST.load(Ordering::Relaxed) || super::homes::overlaps(base, len) {
             return Ok(false);
         }
@@ -12729,6 +12943,7 @@ impl Exec {
     /// queue). `label`: a value other queues may wait for (promised when the
     /// batch is submitted). False: not possible here.
     pub fn gpu_cp_write(&mut self, a: u64, data: &[u32], label: Option<(u64, u8)>, end_of_pipe: bool) -> bool {
+        watch_note(|| format!("{} CP write {:x?}", self.name, &data[..data.len().min(8)]), a, 4 * data.len() as u64);
         let bytes = 4 * data.len() as u64;
         if bytes == 0 || bytes > 65536 || a % 4 != 0 || DEVICE_LOST.load(Ordering::Relaxed) || super::homes::overlaps(a, bytes) {
             return false;
@@ -14355,7 +14570,7 @@ impl Exec {
                             info = vk::DescriptorBufferInfo { buffer: hbuf, offset: off, range: (bias + size).next_multiple_of(4).min(bias + avail) };
                             bound_size = size;
                             if found.tr.plan.resources[i].written {
-                                trace_writes(|| format!("{:?} shader {:#x}{}", p.stage, p.addr, super::shaders::program_hash(p.addr).ok().and_then(super::particles::origin).map(|d| format!(" (from {d})")).unwrap_or_default()), base, size);
+                                trace_writes(|| format!("{:?} shader {:#x}{} {{{}}}", p.stage, p.addr, super::shaders::program_hash(p.addr).ok().and_then(super::particles::origin).map(|d| format!(" (from {d})")).unwrap_or_default(), if watch_range().is_some() { watch_resources(p) } else { String::new() }), base, size);
                                 bound.writes.push((base, size));
                                 if super::xwait::on() {
                                     super::xwait::note_write(&self.name, base, size);
@@ -14402,7 +14617,7 @@ impl Exec {
                                         self.submit_after = self.submit_after.max(s);
                                     }
                                     if found.tr.plan.resources[i].written {
-                                        trace_writes(|| format!("{:?} shader {:#x}{}", p.stage, p.addr, super::shaders::program_hash(p.addr).ok().and_then(super::particles::origin).map(|d| format!(" (from {d})")).unwrap_or_default()), base, size);
+                                        trace_writes(|| format!("{:?} shader {:#x}{} {{{}}}", p.stage, p.addr, super::shaders::program_hash(p.addr).ok().and_then(super::particles::origin).map(|d| format!(" (from {d})")).unwrap_or_default(), if watch_range().is_some() { watch_resources(p) } else { String::new() }), base, size);
                                         bound.writes.push((base, size));
                                         if super::xwait::on() {
                                             super::xwait::note_write(&self.name, base, size);

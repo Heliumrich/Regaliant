@@ -4808,6 +4808,8 @@ impl Cp {
         if !self.index_args_past(&w) {
             return Some(w);
         }
+        super::exec::watch_note(|| format!("{} (a guarded draw record read: {w:?})", self.name), a, 20);
+        super::exec::watch_dump(&format!("the guarded record at {a:#x}"));
         let t0 = Instant::now();
         let mut now = w;
         while t0.elapsed() < std::time::Duration::from_millis(2) {

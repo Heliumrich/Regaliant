@@ -10,6 +10,7 @@ mod exception;
 mod gpu;
 mod guestprof;
 mod heap;
+mod heapsites;
 mod hosted;
 mod hostcensus;
 mod placement;
@@ -96,22 +97,40 @@ unsafe impl std::alloc::GlobalAlloc for GuardedAlloc {
         if l.size() > HUGE_ALLOC {
             report_huge_alloc(l.size());
         }
-        unsafe { heap::HostAlloc.alloc(l) }
+        let p = unsafe { heap::HostAlloc.alloc(l) };
+        if heapsites::tracked(l.size()) {
+            heapsites::note_alloc(p, l.size());
+        }
+        p
     }
     unsafe fn alloc_zeroed(&self, l: std::alloc::Layout) -> *mut u8 {
         if l.size() > HUGE_ALLOC {
             report_huge_alloc(l.size());
         }
-        unsafe { heap::HostAlloc.alloc_zeroed(l) }
+        let p = unsafe { heap::HostAlloc.alloc_zeroed(l) };
+        if heapsites::tracked(l.size()) {
+            heapsites::note_alloc(p, l.size());
+        }
+        p
     }
     unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        if heapsites::tracked(l.size()) {
+            heapsites::note_free(p);
+        }
         unsafe { heap::HostAlloc.dealloc(p, l) }
     }
     unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, new_size: usize) -> *mut u8 {
         if new_size > HUGE_ALLOC {
             report_huge_alloc(new_size);
         }
-        unsafe { heap::HostAlloc.realloc(p, l, new_size) }
+        if heapsites::tracked(l.size()) {
+            heapsites::note_free(p);
+        }
+        let q = unsafe { heap::HostAlloc.realloc(p, l, new_size) };
+        if heapsites::tracked(new_size) {
+            heapsites::note_alloc(q, new_size);
+        }
+        q
     }
 }
 
@@ -1321,6 +1340,7 @@ fn main() {
     hle::LENIENT_IMPORTS.store(cfg.lenient, std::sync::atomic::Ordering::Relaxed);
     info!("dsport {} | run dir {} | TLS slot {} | host heap: {} | guest write watch: {}", env!("CARGO_PKG_VERSION"), cfg.run_dir.display(), slot, heap::name(), mem::write_watch_state());
     exception::install();
+    heapsites::start();
     hosted::init();
     hosted::self_test_maybe();
     if cfg.dispatch_bench {

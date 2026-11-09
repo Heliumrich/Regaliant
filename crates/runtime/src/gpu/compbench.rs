@@ -323,16 +323,83 @@ pub fn precompile_all(app: &std::path::Path, threads: usize) -> i32 {
     0
 }
 
+/// The process's committed private bytes.
+fn private_bytes() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut c: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+    c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+    let ok = unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut c as *mut PROCESS_MEMORY_COUNTERS_EX as *mut PROCESS_MEMORY_COUNTERS, c.cb) };
+    if ok == 0 { 0 } else { c.PrivateUsage as u64 }
+}
+
+/// `DS_CB_MEMTEST=<n>` (with `--compile-bench`): the host memory a pipeline
+/// made through the pipeline store holds while it lives and after it is
+/// destroyed: up to n learned compute pipelines (keyed as the precompile
+/// keys them) made and kept, all destroyed, then made and destroyed one at
+/// a time; the process's committed bytes after each phase.
+fn memtest(n: usize) -> i32 {
+    if let Err(e) = super::vk::init() {
+        crate::error!("memtest: Vulkan: {e}");
+        return 2;
+    }
+    // The translations first (their memory apart from the pipelines').
+    let mut trs = Vec::new();
+    'progs: for (h, code, _) in super::precompile::learned_compute() {
+        for spec in super::precompile::keyed_learned_specs(h, &code) {
+            match super::shaders::translate_code_for_spec(&code, h, spec) {
+                Ok(tr) => trs.push(tr),
+                Err(_) => continue,
+            }
+            if trs.len() >= n {
+                break 'progs;
+            }
+        }
+    }
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    let c0 = private_bytes();
+    crate::info!("memtest: {} translations ready; committed {:.3} GiB", trs.len(), gib(c0));
+    let t = Instant::now();
+    let mut kept = Vec::new();
+    for tr in &trs {
+        match super::exec::store_compute_pipeline_parts(tr) {
+            Ok(p) => kept.push(p),
+            Err(e) => crate::warn!("memtest: {e}"),
+        }
+    }
+    let c1 = private_bytes();
+    crate::info!("memtest: {} pipelines made and kept in {:.1} s: committed {:.3} GiB (+{:.2} MiB a pipeline)", kept.len(), t.elapsed().as_secs_f64(), gib(c1), (c1 as f64 - c0 as f64) / (1u64 << 20) as f64 / kept.len().max(1) as f64);
+    let made = kept.len();
+    for p in kept.drain(..) {
+        super::exec::destroy_pipeline_parts(p);
+    }
+    let c2 = private_bytes();
+    crate::info!("memtest: all destroyed: committed {:.3} GiB ({:+.2} MiB a pipeline against before)", gib(c2), (c2 as f64 - c0 as f64) / (1u64 << 20) as f64 / made.max(1) as f64);
+    let t = Instant::now();
+    for tr in &trs {
+        if let Ok(p) = super::exec::store_compute_pipeline_parts(tr) {
+            super::exec::destroy_pipeline_parts(p);
+        }
+    }
+    let c3 = private_bytes();
+    crate::info!("memtest: made and destroyed one at a time again in {:.1} s: committed {:.3} GiB ({:+.2} MiB a pipeline against before)", t.elapsed().as_secs_f64(), gib(c3), (c3 as f64 - c2 as f64) / (1u64 << 20) as f64 / made.max(1) as f64);
+    0
+}
+
 pub fn run(args: &[String], app: &std::path::Path) -> i32 {
     if std::env::var("DS_CB_GUESS").ok().as_deref() == Some("1") {
         return guess_report(app);
+    }
+    if let Some(n) = std::env::var("DS_CB_MEMTEST").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0) {
+        return memtest(n);
     }
     let min_insts: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(2000);
     let max: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(40);
     let mut only: Vec<u64> = std::env::var("DS_CB_HASHES").map(|v| v.split(',').filter_map(|h| u64::from_str_radix(h.trim().trim_start_matches("0x"), 16).ok()).collect()).unwrap_or_default();
     // DS_CB_BINS=<file,...>: programs saved by a run (`shaders/<address>.bin`),
-    // found in the store by their code hash.
-    for f in std::env::var("DS_CB_BINS").map(|v| v.split(',').map(str::to_string).collect::<Vec<_>>()).unwrap_or_default() {
+    // found in the store by their code hash (';' separates them too: the
+    // run scripts split their variables at commas).
+    for f in std::env::var("DS_CB_BINS").map(|v| v.split([',', ';']).filter(|f| !f.is_empty()).map(str::to_string).collect::<Vec<_>>()).unwrap_or_default() {
         let Ok(bytes) = std::fs::read(&f) else {
             crate::warn!("compile bench: cannot read {f}");
             continue;
@@ -397,6 +464,11 @@ pub fn run(args: &[String], app: &std::path::Path) -> i32 {
         // DS_CB_SG_WAVES=1: as subgroup waves (`Spec::sg_waves`).
         if std::env::var("DS_CB_SG_WAVES").ok().as_deref() == Some("1") {
             spec.sg_waves = true;
+        }
+        // DS_CB_NO_GUARDS=1: VGPR writes without their lane guards
+        // (`Spec::lane_guards`; sizing only: wrong under a partial EXEC).
+        if std::env::var("DS_CB_NO_GUARDS").ok().as_deref() == Some("1") {
+            spec.lane_guards = false;
         }
         // (Learned specs as a preparation keys them now; `DS_CB_FORMATS=1`
         // keeps the formats the learned dispatches had instead of the

@@ -620,6 +620,28 @@ pub(crate) fn precompile_gfx_translations(vs: StageTr, ps: Option<StageTr>, stat
     if gfx_known(hkey) {
         return Some(false);
     }
+    // (Kept alive only when a recent session used it; else made through the
+    // store and let go when the store lacks it: `precompile_or_warm`.)
+    if !super::super::pipeuse::recent(hkey) {
+        if crate::gpu::pcache::stored_cheap('g', hkey) {
+            super::PRECOMPILE_LIVE[5].fetch_add(1, Ordering::Relaxed);
+            return Some(false);
+        }
+        super::PRECOMPILE_LIVE[4].fetch_add(1, Ordering::Relaxed);
+        return match graphics_pipeline(&key, hkey, vs, ps, push_mode) {
+            Ok(p) => {
+                unsafe {
+                    let d = &ctx().device;
+                    d.destroy_pipeline(p.pipeline, None);
+                    d.destroy_pipeline_layout(p.layout, None);
+                    d.destroy_descriptor_set_layout(p.set_layout, None);
+                }
+                Some(true)
+            }
+            Err(_) => None,
+        };
+    }
+    super::PRECOMPILE_LIVE[3].fetch_add(1, Ordering::Relaxed);
     let created = std::cell::Cell::new(false);
     gfx_pipe_with(&key, hkey, vs, ps, push_mode, &created).ok().map(|_| created.get())
 }
@@ -1640,6 +1662,7 @@ impl Exec {
                         p
                     }
                 };
+                super::super::pipeuse::note(hkey);
                 let t_pipe = since(t0);
                 lap.mark(7);
                 // Profile: the step's parts by draw kind ([draws, grow ns, check

@@ -207,6 +207,7 @@ pub fn set_store(path: std::path::PathBuf) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
+    super::pipeuse::set_path(&path);
     let _ = STORE.set(path);
 }
 
@@ -783,7 +784,7 @@ fn run(addr: u64) {
     }
     for spec in specs {
         let t = std::time::Instant::now();
-        let r = super::shaders::translate_for_spec(addr, spec).and_then(|tr| super::exec::precompile_translation(&tr, addr).ok_or_else(|| "pipeline creation failed".to_string()));
+        let r = super::shaders::translate_for_spec(addr, spec).and_then(|tr| super::exec::precompile_or_warm(&tr, addr).ok_or_else(|| "pipeline creation failed".to_string()));
         match r {
             Ok(true) => {
                 DONE[0].fetch_add(1, Ordering::Relaxed);
@@ -799,6 +800,34 @@ fn run(addr: u64) {
             }
         }
     }
+}
+
+/// A program's learned compute specs keyed as `run_code` keys them
+/// (`--compile-bench` with `DS_CB_MEMTEST`).
+pub(crate) fn keyed_learned_specs(h: u64, code: &[u32]) -> Vec<Spec> {
+    let seen = learned(|m| m.get(&h).map(|e| e.1.clone())).unwrap_or_default();
+    let Ok(insts) = rdna::decode_program(code) else { return Vec::new() };
+    let mut plans: Vec<(u16, rdna::analysis::Plan)> = Vec::new();
+    super::shaders::seed_formats(h, &seen.iter().map(|s| s.resources.as_slice()).collect::<Vec<_>>());
+    let mut done: Vec<Spec> = Vec::new();
+    for mut s in seen {
+        let user_sgprs = ((s.rsrc2 >> 1) & 0x1F).min(16) as u16;
+        let k = match plans.iter().position(|(u, _)| *u == user_sgprs) {
+            Some(k) => k,
+            None => {
+                plans.push((user_sgprs, rdna::analysis::analyze_opts(&insts, user_sgprs, 0, false)));
+                plans.len() - 1
+            }
+        };
+        super::shaders::key_learned(h, &insts, &plans[k].1, &mut s.resources);
+        let spec = super::shaders::compute_spec(0, h, s.rsrc2, s.local, s.wave64, s.resources, s.batched);
+        for spec in super::shaders::dispatch_variants(spec) {
+            if !done.contains(&spec) {
+                done.push(spec);
+            }
+        }
+    }
+    done
 }
 
 /// Makes the learned compute pipelines of a program from its kept code.
@@ -834,7 +863,7 @@ fn run_code(h: u64) {
             // its learned spec: `DS_CB_HASHES` / `DS_CB_SPEC` of the compile
             // bench.)
             let _g = super::vk::creating(|| format!("cs {h:#018x} learned spec {n}"));
-            let r = super::shaders::translate_code_for_spec(&code, h, spec).and_then(|tr| super::exec::precompile_translation(&tr, 0).ok_or_else(|| "pipeline creation failed".to_string()));
+            let r = super::shaders::translate_code_for_spec(&code, h, spec).and_then(|tr| super::exec::precompile_or_warm(&tr, 0).ok_or_else(|| "pipeline creation failed".to_string()));
             match r {
                 Ok(true) => {
                     DONE[0].fetch_add(1, Ordering::Relaxed);
@@ -1188,6 +1217,21 @@ pub fn status() -> String {
             g[4],
             URGENT[0].load(Ordering::Relaxed),
             URGENT[1].load(Ordering::Relaxed)
+        )
+    } else {
+        made
+    };
+    let made = if super::tune::precompile() >= 2 {
+        let l = super::exec::precompile_live();
+        format!(
+            "{made}; kept alive (used in a recent session) {} compute, {} graphics; made for the store only {} compute, {} graphics; left to their first use (stored) {} compute, {} graphics; {}",
+            l[0],
+            l[3],
+            l[1],
+            l[4],
+            l[2],
+            l[5],
+            super::pipeuse::line()
         )
     } else {
         made

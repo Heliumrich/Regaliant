@@ -1827,6 +1827,7 @@ pub mod precache;
 pub mod fe2;
 pub mod fe2census;
 pub mod precompile;
+pub mod pipeuse;
 pub mod lockstat;
 pub mod exec;
 
