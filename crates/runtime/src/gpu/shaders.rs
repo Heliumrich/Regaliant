@@ -1068,6 +1068,7 @@ fn mark_now(addr: u64) {
     use std::sync::atomic::Ordering;
     for a in &BATCHABLE {
         if a.compare_exchange(0, addr, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            BATCH_GEN.fetch_add(1, Ordering::AcqRel);
             // (Its code hash: the learned store's and the compile bench's
             // name for it, `DS_CB_HASHES`.)
             let code = program_hash(addr).map(|h| format!(", code {h:#x}")).unwrap_or_default();
@@ -1599,17 +1600,157 @@ pub fn prep_parts_line() -> String {
 }
 
 pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prepared, String> {
+    if super::tune::r2() && super::tune::gpu_chains() == 0 && !PROBE_ON.load(std::sync::atomic::Ordering::Relaxed) && FORCE_BATCHED.with(|f| f.get()) == 0 {
+        return prepare_compute_r2(cp, wave64);
+    }
     prep_warm(|| prepare_compute(cp, wave64));
     prep_lap_begin(if prep_laps_on() && PREP_INDIRECT.with(|c| c.get()) { 3 } else { 2 });
     let sh = |i: u32| cp.sh(i);
     let addr = ((sh(CS_PGM_LO) as u64) | ((sh(CS_PGM_LO + 1) as u64 & 0xFF) << 32)) << 8;
     let rsrc2 = sh(CS_RSRC2);
-    let user_sgprs = ((rsrc2 >> 1) & 0x1F).min(16) as u16;
     let user: [u32; 16] = std::array::from_fn(|i| sh(CS_USER_DATA + i as u32));
     let local = [sh(CS_NUM_THREAD) & 0xFFFF, sh(CS_NUM_THREAD + 1) & 0xFFFF, sh(CS_NUM_THREAD + 2) & 0xFFFF];
     prep_lap(0);
     let (insts, code_hash) = program_local(addr)?;
     prep_lap(1);
+    let mut spec = cs_spec(addr, rsrc2, local, wave64, code_hash);
+    prep_lap(2);
+    let r = prepare(addr, insts, code_hash, &user, &mut spec);
+    spec_vecs_back(spec);
+    r
+}
+
+/// `DS_R2_CHECK=1` (diagnosis): R2's templates checked at every hit against
+/// the spec built anew (`r2_check_spec`; mismatches logged, the first 40,
+/// and counted in `R2_CHECKS`).
+pub fn r2_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_R2_CHECK").ok().as_deref() == Some("1"))
+}
+
+/// [template hits checked, mismatches] (`DS_R2_CHECK=1`).
+pub static R2_CHECKS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Compares a template's spec (`got`, its pixel inputs filled, no
+/// resources) with the one built anew (`fresh`), whose vectors go back to
+/// the pool.
+fn r2_check_spec(kind: &str, addr: u64, got: &Spec, fresh: Spec) {
+    use std::sync::atomic::Ordering;
+    R2_CHECKS[0].fetch_add(1, Ordering::Relaxed);
+    let mut a = got.clone();
+    a.resources.clear();
+    let same = a == fresh;
+    if !same {
+        let n = R2_CHECKS[1].fetch_add(1, Ordering::Relaxed);
+        if n < 40 {
+            crate::info!("r2 check: {kind} {addr:#x}: the template's spec differs from the spec built now: template {a:?}; now {fresh:?}");
+        }
+    }
+    spec_vecs_back(fresh);
+}
+
+/// R2 (`tune r2`): a compute stage's program and specialization template
+/// (`cs_spec` without resources), kept per thread by what they derive from:
+/// the program's address and registers, the shader registrations, the
+/// switches' generation, the batchable programs' generation and the LOD
+/// measuring flag (probes, forced batching and GPU-resolved chains take the
+/// full path). The spec is then cloned instead of built (~25 switch reads,
+/// two 64-entry batchable scans and four program-list scans a stage).
+struct CsTmpl {
+    addr: u64,
+    rsrc2: u32,
+    local: [u32; 3],
+    wave64: bool,
+    lod_measure: bool,
+    tune_gen: u64,
+    batch_gen: u64,
+    regs: u64,
+    insts: Option<Arc<Local<Vec<rdna::Inst>>>>,
+    code_hash: u64,
+    spec: Option<Spec>,
+}
+
+const CS_TMPL_SLOTS: usize = 512;
+
+thread_local! {
+    static CS_TMPLS: std::cell::RefCell<Vec<CsTmpl>> = std::cell::RefCell::new(Vec::new());
+}
+
+/// Bumped when a program is marked batchable (`mark_now`): R2's compute
+/// templates made before are made again (`CsTmpl`).
+static BATCH_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn prepare_compute_r2<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prepared, String> {
+    use std::sync::atomic::Ordering;
+    prep_warm(|| prepare_compute(cp, wave64));
+    prep_lap_begin(if prep_laps_on() && PREP_INDIRECT.with(|c| c.get()) { 3 } else { 2 });
+    let sh = |i: u32| cp.sh(i);
+    let addr = ((sh(CS_PGM_LO) as u64) | ((sh(CS_PGM_LO + 1) as u64 & 0xFF) << 32)) << 8;
+    let rsrc2 = sh(CS_RSRC2);
+    let user: [u32; 16] = std::array::from_fn(|i| sh(CS_USER_DATA + i as u32));
+    let local = [sh(CS_NUM_THREAD) & 0xFFFF, sh(CS_NUM_THREAD + 1) & 0xFFFF, sh(CS_NUM_THREAD + 2) & 0xFFFF];
+    prep_lap(0);
+    let lod_measure = LOD_MEASURE.with(|c| c.get());
+    let tune_gen = super::tune::generation();
+    let batch_gen = BATCH_GEN.load(Ordering::Acquire);
+    let regs = crate::hle::libs::agc::shader_registrations();
+    let slot = ((addr >> 8) ^ (addr >> 19)) as usize & (CS_TMPL_SLOTS - 1);
+    let hit = CS_TMPLS.with(|t| {
+        let t = t.borrow();
+        let e = t.get(slot)?;
+        if e.addr == addr && e.rsrc2 == rsrc2 && e.local == local && e.wave64 == wave64 && e.lod_measure == lod_measure && e.tune_gen == tune_gen && e.batch_gen == batch_gen && e.regs == regs {
+            Some((e.insts.clone()?, e.code_hash, e.spec.clone()?))
+        } else {
+            None
+        }
+    });
+    let (insts, code_hash, mut spec) = match hit {
+        Some((insts, code_hash, mut spec)) => {
+            prep_lap(1);
+            if r2_check() {
+                r2_check_spec("cs", addr, &spec, cs_spec(addr, rsrc2, local, wave64, code_hash));
+            }
+            let (ps_inputs, resources) = spec_vecs();
+            spec.ps_inputs = ps_inputs;
+            spec.resources = resources;
+            (insts, code_hash, spec)
+        }
+        None => {
+            let (insts, code_hash) = program_local(addr)?;
+            prep_lap(1);
+            let spec = cs_spec(addr, rsrc2, local, wave64, code_hash);
+            // (The template: the switches, batchable programs and shader
+            // registrations as they were before the spec read them. Only for
+            // a program from a shader object, which `program_local` keeps
+            // until another registration: others are checked by hashing
+            // their code at every preparation.)
+            let registered = LOCAL_PROGRAMS.with(|c| c.borrow().contains_key(&addr));
+            CS_TMPLS.with(|t| {
+                if !registered {
+                    return;
+                }
+                let mut t = t.borrow_mut();
+                if t.is_empty() {
+                    t.resize_with(CS_TMPL_SLOTS, || CsTmpl { addr: 0, rsrc2: 0, local: [0; 3], wave64: false, lod_measure: false, tune_gen: 0, batch_gen: 0, regs: 0, insts: None, code_hash: 0, spec: None });
+                }
+                let mut tmpl = spec.clone();
+                tmpl.ps_inputs = Vec::new();
+                tmpl.resources = Vec::new();
+                t[slot] = CsTmpl { addr, rsrc2, local, wave64, lod_measure, tune_gen, batch_gen, regs, insts: Some(insts.clone()), code_hash, spec: Some(tmpl) };
+            });
+            (insts, code_hash, spec)
+        }
+    };
+    prep_lap(2);
+    let r = prepare(addr, insts, code_hash, &user, &mut spec);
+    spec_vecs_back(spec);
+    r
+}
+
+/// The specialization of compute program `addr` (code hash `code_hash`)
+/// for its registers, before its resources (`prepare` adds them).
+fn cs_spec(addr: u64, rsrc2: u32, local: [u32; 3], wave64: bool, code_hash: u64) -> Spec {
+    let user_sgprs = ((rsrc2 >> 1) & 0x1F).min(16) as u16;
     let (ps_inputs, resources) = spec_vecs();
     let mut spec = Spec {
         stage: Stage::Compute,
@@ -1685,10 +1826,7 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
             spec.pt_linear = super::fe2::on();
         }
     }
-    prep_lap(2);
-    let r = prepare(addr, insts, code_hash, &user, &mut spec);
-    spec_vecs_back(spec);
-    r
+    spec
 }
 
 /// Compute programs translated per lane (`Spec::per_lane`), by FNV-1a of
@@ -1928,22 +2066,29 @@ fn touch_test_wanted() -> bool {
 }
 
 /// Resolves and translates the pixel shader bound on `cp`.
+/// `DS_MRTZ_CENSUS=1` (diagnosis; `prepare_ps`).
+fn mrtz_census() -> bool {
+    static MRTZ_CENSUS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MRTZ_CENSUS.get_or_init(|| std::env::var("DS_MRTZ_CENSUS").ok().as_deref() == Some("1"))
+}
+
 pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
+    if super::tune::r2() && !PROBE_ON.load(std::sync::atomic::Ordering::Relaxed) && !super::exec::profiling_on() && !mrtz_census() && GPU_DRAW_MASKS.with(|c| c.get()).is_none() {
+        return prepare_ps_r2(cp);
+    }
     prep_warm(|| prepare_ps(cp));
     prep_lap_begin(1);
     let sh = |i: u32| cp.sh(i);
     let ctx = |a: u32| cp.ctx(a);
     let addr = ((sh(PS_PGM_LO) as u64) | ((sh(PS_PGM_LO + 1) as u64 & 0xFF) << 32)) << 8;
     let rsrc2 = sh(PS_RSRC2);
-    let user_sgprs = user_count(rsrc2);
     let user: [u32; 32] = std::array::from_fn(|i| sh(PS_USER_DATA + i as u32));
     prep_lap(0);
     let (insts, code_hash) = program_local(addr)?;
     prep_lap(1);
     // `DS_MRTZ_CENSUS=1` (diagnosis): pixel programs exporting stencil, a sample mask or alpha
     // through MRTZ, channels the translator leaves out, each logged once with the draw's state.
-    static MRTZ_CENSUS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *MRTZ_CENSUS.get_or_init(|| std::env::var("DS_MRTZ_CENSUS").ok().as_deref() == Some("1")) {
+    if mrtz_census() {
         let mz = insts.iter().filter(|i| i.enc == rdna::Enc::Exp && i.exp_target() == 8).fold(0, |m, i| m | i.exp_en());
         static SEEN: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
         if mz & 0xE != 0 && SEEN.lock().get_or_insert_with(Default::default).insert(addr) {
@@ -1959,6 +2104,153 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
             let _ = super::capture::save_program(addr);
         }
     }
+    let mut spec = ps_spec(addr, rsrc2, &ctx);
+    // Profile (`DS_PROFILE_GPU=1`): when the draw's depth tests run.
+    if super::exec::profiling_on() {
+        let class = if spec.early_tests {
+            0
+        } else if translate::writes_memory(&insts) {
+            3
+        } else if spec.early_ok {
+            1
+        } else if spec.lod_stats {
+            // After the shader with the LOD statistics' atomics: no early
+            // rejection either (the driver runs it for every fragment).
+            4
+        } else {
+            2
+        };
+        super::exec::note_ps_tests(addr, class);
+    }
+    prep_lap(2);
+    let r = prepare(addr, insts, code_hash, &user, &mut spec);
+    spec_vecs_back(spec);
+    r
+}
+
+/// The pixel stage's registers its specialization depends on (`ps_spec`), in
+/// a fixed order (R2's template key): SPI_PS_IN_CONTROL, its inputs'
+/// SPI_PS_INPUT_CNTL_n, SPI_SHADER_COL_FORMAT, the CB_COLORn_INFO number
+/// types, SPI_PS_INPUT_ADDR and `early_ok`'s depth and stencil state.
+const PS_KEY_MAX: usize = 52;
+
+fn ps_key<R: RegRead + ?Sized>(cp: &R, k: &mut [u32; PS_KEY_MAX]) -> usize {
+    let in_control = cp.ctx(SPI_PS_IN_CONTROL);
+    k[0] = in_control;
+    let ni = (in_control & 0x3F).min(32) as usize;
+    for i in 0..ni {
+        k[1 + i] = cp.ctx(SPI_PS_INPUT_CNTL_0 + 4 * i as u32);
+    }
+    let mut n = 1 + ni;
+    k[n] = cp.ctx(SPI_SHADER_COL_FORMAT);
+    n += 1;
+    for m in 0..8u32 {
+        k[n] = cp.ctx(CB_COLOR0_INFO + 0x3C * m) & (7 << 8);
+        n += 1;
+    }
+    for a in [SPI_PS_INPUT_ADDR, DB_SHADER_CONTROL, DB_DEPTH_CONTROL, DB_STENCILREFMASK, DB_STENCILREFMASK_BF, DB_STENCIL_CONTROL, DB_ALPHA_TO_MASK] {
+        k[n] = cp.ctx(a);
+        n += 1;
+    }
+    n
+}
+
+/// R2: a pixel stage's program and specialization template (`ps_spec`, its
+/// inputs included, no resources), kept per thread by the program's
+/// address and RSRC2, the registers `ps_key` lists, the switches'
+/// generation, the shader registrations and the batched and LOD-measuring
+/// flags (probes, profiles, the MRTZ census and GPU-resolved draws take the
+/// full path).
+struct PsTmpl {
+    addr: u64,
+    rsrc2: u32,
+    n: u8,
+    batched: bool,
+    lod_measure: bool,
+    key: [u32; PS_KEY_MAX],
+    tune_gen: u64,
+    regs: u64,
+    insts: Option<Arc<Local<Vec<rdna::Inst>>>>,
+    code_hash: u64,
+    /// The spec's pixel inputs (the template spec's vectors stay empty).
+    inputs: Vec<PsInput>,
+    spec: Option<Spec>,
+}
+
+const PS_TMPL_SLOTS: usize = 256;
+
+thread_local! {
+    static PS_TMPLS: std::cell::RefCell<Vec<PsTmpl>> = std::cell::RefCell::new(Vec::new());
+}
+
+fn prepare_ps_r2<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
+    prep_warm(|| prepare_ps(cp));
+    prep_lap_begin(1);
+    let sh = |i: u32| cp.sh(i);
+    let addr = ((sh(PS_PGM_LO) as u64) | ((sh(PS_PGM_LO + 1) as u64 & 0xFF) << 32)) << 8;
+    let rsrc2 = sh(PS_RSRC2);
+    let user: [u32; 32] = std::array::from_fn(|i| sh(PS_USER_DATA + i as u32));
+    prep_lap(0);
+    let mut key = [0u32; PS_KEY_MAX];
+    let n = ps_key(cp, &mut key);
+    let batched = batched_draw_now();
+    let lod_measure = LOD_MEASURE.with(|c| c.get());
+    let tune_gen = super::tune::generation();
+    let regs = crate::hle::libs::agc::shader_registrations();
+    let slot = ((addr >> 8) ^ (addr >> 19)) as usize & (PS_TMPL_SLOTS - 1);
+    let hit = PS_TMPLS.with(|t| {
+        let t = t.borrow();
+        let e = t.get(slot)?;
+        if e.addr == addr && e.rsrc2 == rsrc2 && e.n as usize == n && e.batched == batched && e.lod_measure == lod_measure && e.tune_gen == tune_gen && e.regs == regs && e.key[..n] == key[..n] {
+            // (The template's vectors are empty: its clone allocates nothing.)
+            let mut spec = e.spec.as_ref()?.clone();
+            let (mut ps_inputs, resources) = spec_vecs();
+            ps_inputs.extend_from_slice(&e.inputs);
+            spec.ps_inputs = ps_inputs;
+            spec.resources = resources;
+            Some((e.insts.clone()?, e.code_hash, spec))
+        } else {
+            None
+        }
+    });
+    let (insts, code_hash, mut spec) = match hit {
+        Some(h) => {
+            prep_lap(1);
+            if r2_check() {
+                r2_check_spec("ps", addr, &h.2, ps_spec(addr, rsrc2, &|a: u32| cp.ctx(a)));
+            }
+            h
+        }
+        None => {
+            let (insts, code_hash) = program_local(addr)?;
+            prep_lap(1);
+            let spec = ps_spec(addr, rsrc2, &|a: u32| cp.ctx(a));
+            let registered = LOCAL_PROGRAMS.with(|c| c.borrow().contains_key(&addr));
+            if registered {
+                PS_TMPLS.with(|t| {
+                    let mut t = t.borrow_mut();
+                    if t.is_empty() {
+                        t.resize_with(PS_TMPL_SLOTS, || PsTmpl { addr: 0, rsrc2: 0, n: 0, batched: false, lod_measure: false, key: [0; PS_KEY_MAX], tune_gen: 0, regs: 0, insts: None, code_hash: 0, inputs: Vec::new(), spec: None });
+                    }
+                    let mut tmpl = spec.clone();
+                    let inputs = std::mem::take(&mut tmpl.ps_inputs);
+                    tmpl.resources = Vec::new();
+                    t[slot] = PsTmpl { addr, rsrc2, n: n as u8, batched, lod_measure, key, tune_gen, regs, insts: Some(insts.clone()), code_hash, inputs, spec: Some(tmpl) };
+                });
+            }
+            (insts, code_hash, spec)
+        }
+    };
+    prep_lap(2);
+    let r = prepare(addr, insts, code_hash, &user, &mut spec);
+    spec_vecs_back(spec);
+    r
+}
+
+/// The specialization of pixel program `addr` for the draw's registers
+/// (`ctx` by byte address), before its resources (`prepare` adds them).
+fn ps_spec(addr: u64, rsrc2: u32, ctx: &dyn Fn(u32) -> u32) -> Spec {
+    let user_sgprs = user_count(rsrc2);
     let in_control = ctx(SPI_PS_IN_CONTROL);
     let (mut ps_inputs, resources) = spec_vecs();
     for n in 0..(in_control & 0x3F).min(32) {
@@ -2001,7 +2293,7 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         lod_stats: matches!(super::tune::lod_stats(), 3 | 4),
         lod_lean: super::tune::lod_stats() == 4,
         early_tests: ctx(DB_SHADER_CONTROL) & (1 << 12) != 0,
-        early_ok: early_ok(&ctx),
+        early_ok: early_ok(ctx),
         per_lane: false,
         lane_votes: false,
         lockstep_off: false,
@@ -2039,27 +2331,7 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         spec.lod_stats = false;
         spec.lod_lean = false;
     }
-    // Profile (`DS_PROFILE_GPU=1`): when the draw's depth tests run.
-    if super::exec::profiling_on() {
-        let class = if spec.early_tests {
-            0
-        } else if translate::writes_memory(&insts) {
-            3
-        } else if spec.early_ok {
-            1
-        } else if spec.lod_stats {
-            // After the shader with the LOD statistics' atomics: no early
-            // rejection either (the driver runs it for every fragment).
-            4
-        } else {
-            2
-        };
-        super::exec::note_ps_tests(addr, class);
-    }
-    prep_lap(2);
-    let r = prepare(addr, insts, code_hash, &user, &mut spec);
-    spec_vecs_back(spec);
-    r
+    spec
 }
 
 /// `DS_PROBE=<shader address>:<pc>:<vgpr>` (hex address and pc, decimal
@@ -2168,17 +2440,119 @@ const VGT_SHADER_STAGES_EN: u32 = 0x28B54;
 
 /// Resolves and translates the NGG (vertex) shader bound on `cp`.
 pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
+    if super::tune::r2() && GPU_DRAW_MASKS.with(|c| c.get()).is_none() {
+        let addr = ngg_addr_of(cp);
+        if super::capture::vs_dump_for(addr).is_none() {
+            return prepare_ngg_r2(cp);
+        }
+    }
     prep_warm(|| prepare_ngg(cp));
     prep_lap_begin(0);
     let sh = |i: u32| cp.sh(i);
     let stages = cp.ctx(VGT_SHADER_STAGES_EN);
     let addr = ((sh(ES_PGM_LO) as u64) | ((sh(ES_PGM_LO + 1) as u64 & 0xFF) << 32)) << 8;
     let rsrc2 = sh(GS_RSRC2);
-    let user_sgprs = user_count(rsrc2);
     let user: [u32; 32] = std::array::from_fn(|i| sh(GS_USER_DATA + i as u32));
     prep_lap(0);
     let (insts, code_hash) = program_local(addr)?;
     prep_lap(1);
+    let mut spec = ngg_spec(addr, rsrc2, stages, &insts);
+    prep_lap(2);
+    let r = prepare(addr, insts, code_hash, &user, &mut spec);
+    spec_vecs_back(spec);
+    r
+}
+
+/// R2: a vertex (NGG) stage's program and specialization template
+/// (`ngg_spec` without resources), kept per thread by the program's address,
+/// RSRC2, VGT_SHADER_STAGES_EN's wave size, the start-instance slot, the
+/// batched flag, the switches' generation and the shader registrations
+/// (GPU-resolved draws and vertex dumps take the full path).
+struct NggTmpl {
+    addr: u64,
+    rsrc2: u32,
+    wave: u32,
+    base_instance: Option<u16>,
+    batched: bool,
+    tune_gen: u64,
+    regs: u64,
+    insts: Option<Arc<Local<Vec<rdna::Inst>>>>,
+    code_hash: u64,
+    spec: Option<Spec>,
+}
+
+const NGG_TMPL_SLOTS: usize = 256;
+
+thread_local! {
+    static NGG_TMPLS: std::cell::RefCell<Vec<NggTmpl>> = std::cell::RefCell::new(Vec::new());
+}
+
+fn prepare_ngg_r2<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
+    prep_warm(|| prepare_ngg(cp));
+    prep_lap_begin(0);
+    let sh = |i: u32| cp.sh(i);
+    let stages = cp.ctx(VGT_SHADER_STAGES_EN);
+    let addr = ((sh(ES_PGM_LO) as u64) | ((sh(ES_PGM_LO + 1) as u64 & 0xFF) << 32)) << 8;
+    let rsrc2 = sh(GS_RSRC2);
+    let user: [u32; 32] = std::array::from_fn(|i| sh(GS_USER_DATA + i as u32));
+    prep_lap(0);
+    let wave = (stages >> 22) & 1;
+    let base_instance = BASE_INSTANCE.with(|c| c.get());
+    let batched = batched_draw_now();
+    let tune_gen = super::tune::generation();
+    let regs = crate::hle::libs::agc::shader_registrations();
+    let slot = ((addr >> 8) ^ (addr >> 19)) as usize & (NGG_TMPL_SLOTS - 1);
+    let hit = NGG_TMPLS.with(|t| {
+        let t = t.borrow();
+        let e = t.get(slot)?;
+        if e.addr == addr && e.rsrc2 == rsrc2 && e.wave == wave && e.base_instance == base_instance && e.batched == batched && e.tune_gen == tune_gen && e.regs == regs {
+            let mut spec = e.spec.as_ref()?.clone();
+            let (ps_inputs, resources) = spec_vecs();
+            spec.ps_inputs = ps_inputs;
+            spec.resources = resources;
+            Some((e.insts.clone()?, e.code_hash, spec))
+        } else {
+            None
+        }
+    });
+    let (insts, code_hash, mut spec) = match hit {
+        Some(h) => {
+            prep_lap(1);
+            if r2_check() {
+                r2_check_spec("vs", addr, &h.2, ngg_spec(addr, rsrc2, stages, &h.0));
+            }
+            h
+        }
+        None => {
+            let (insts, code_hash) = program_local(addr)?;
+            prep_lap(1);
+            let spec = ngg_spec(addr, rsrc2, stages, &insts);
+            let registered = LOCAL_PROGRAMS.with(|c| c.borrow().contains_key(&addr));
+            if registered {
+                NGG_TMPLS.with(|t| {
+                    let mut t = t.borrow_mut();
+                    if t.is_empty() {
+                        t.resize_with(NGG_TMPL_SLOTS, || NggTmpl { addr: 0, rsrc2: 0, wave: 0, base_instance: None, batched: false, tune_gen: 0, regs: 0, insts: None, code_hash: 0, spec: None });
+                    }
+                    let mut tmpl = spec.clone();
+                    tmpl.ps_inputs = Vec::new();
+                    tmpl.resources = Vec::new();
+                    t[slot] = NggTmpl { addr, rsrc2, wave, base_instance, batched, tune_gen, regs, insts: Some(insts.clone()), code_hash, spec: Some(tmpl) };
+                });
+            }
+            (insts, code_hash, spec)
+        }
+    };
+    prep_lap(2);
+    let r = prepare(addr, insts, code_hash, &user, &mut spec);
+    spec_vecs_back(spec);
+    r
+}
+
+/// The specialization of vertex (NGG) program `addr` for the draw's
+/// registers, before its resources (`prepare` adds them).
+fn ngg_spec(addr: u64, rsrc2: u32, stages: u32, insts: &[rdna::Inst]) -> Spec {
+    let user_sgprs = user_count(rsrc2);
     let (ps_inputs, resources) = spec_vecs();
     let mut spec = Spec {
         stage: Stage::Vertex,
@@ -2197,7 +2571,7 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         probe: None,
         dump: super::capture::vs_dump_for(addr).and_then(|(first, inst, count)| {
             let at = super::capture::vs_dump_pc().filter(|pc| insts.iter().any(|i| i.pc == *pc));
-            at.or_else(|| pos_export(&insts).map(|i| i.pc)).map(|pc| (pc, [first, inst, count]))
+            at.or_else(|| pos_export(insts).map(|i| i.pc)).map(|pc| (pc, [first, inst, count]))
         }),
         force_dispatcher: super::tune::block_chain() == 0,
         dispatcher_for_loops: super::tune::block_chain() == 2,
@@ -2238,10 +2612,7 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
             spec.pt_linear = super::fe2::on();
         }
     }
-    prep_lap(2);
-    let r = prepare(addr, insts, code_hash, &user, &mut spec);
-    spec_vecs_back(spec);
-    r
+    spec
 }
 
 /// Program address of the pixel shader in a register view.
@@ -3218,6 +3589,86 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
     spec.sg_appends = append_program(code_hash);
     spec
 }
+/// R2 (`tune r2`): what `prepare` looks up per plan (its analysis, the
+/// reader's sizes, the format, store-format, 3D-or-2D and compared-image
+/// masks, the latest translation), kept per thread in one direct-mapped
+/// record (seven map lookups a stage before). Every field is fixed per plan
+/// key except the latest translation and the sizes, which only this
+/// thread's preparations change; a record evicted by another plan is made
+/// again from the maps.
+#[derive(Default)]
+struct PlanRec {
+    key: u64,
+    plan: Option<std::rc::Rc<Arc<Plan>>>,
+    hints: [u32; 3],
+    hints_known: bool,
+    fmt: Option<u64>,
+    store_fmt: Option<u64>,
+    dim3: Option<u64>,
+    cmp: Option<u64>,
+    last_tr: Option<Arc<Local<Translated>>>,
+}
+
+const PLAN_REC_SLOTS: usize = 2048;
+
+thread_local! {
+    static PLAN_RECS: std::cell::RefCell<Vec<PlanRec>> = std::cell::RefCell::new(Vec::new());
+}
+
+fn plan_rec_slot(key: u64) -> usize {
+    ((key ^ (key >> 23) ^ (key >> 41)) as usize) & (PLAN_REC_SLOTS - 1)
+}
+
+/// A plan's record taken out of its slot for one preparation and put back
+/// when dropped (early returns included).
+struct PlanRecGuard(Option<PlanRec>);
+
+impl PlanRecGuard {
+    fn take(on: bool, key: u64) -> PlanRecGuard {
+        if !on {
+            return PlanRecGuard(None);
+        }
+        let r = PLAN_RECS.with(|t| {
+            let mut t = t.borrow_mut();
+            if t.is_empty() {
+                t.resize_with(PLAN_REC_SLOTS, PlanRec::default);
+            }
+            let slot = &mut t[plan_rec_slot(key)];
+            if slot.key == key && slot.plan.is_some() {
+                std::mem::take(slot)
+            } else {
+                PlanRec { key, ..PlanRec::default() }
+            }
+        });
+        PlanRecGuard(Some(r))
+    }
+
+    fn get(&self) -> Option<&PlanRec> {
+        self.0.as_ref()
+    }
+
+    fn get_mut(&mut self) -> Option<&mut PlanRec> {
+        self.0.as_mut()
+    }
+}
+
+impl Drop for PlanRecGuard {
+    fn drop(&mut self) {
+        if let Some(r) = self.0.take() {
+            if r.plan.is_some() {
+                PLAN_RECS.with(|t| {
+                    if let Ok(mut t) = t.try_borrow_mut() {
+                        if !t.is_empty() {
+                            let k = plan_rec_slot(r.key);
+                            t[k] = r;
+                        }
+                    }
+                });
+            }
+        }
+    }
+}
+
 fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: &[u32], spec: &mut Spec) -> Result<Prepared, String> {
     // Diagnostics (DS_PROFILE_GPU with DS_PROFILE_REPEATS=1: hashing every
     // word read and a global set per preparation inflate the prepare times
@@ -3237,7 +3688,9 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
     // The plan depends only on the program and the user-data layout (data
     // loads read by the CPU).
     let plan_key = code_hash ^ (spec.user_sgprs as u64) << 48 ^ (spec.user_base as u64) << 56;
-    let cached = LOCAL_PLANS.with(|c| c.borrow().get(&plan_key).cloned()).or_else(|| {
+    // R2: this plan's per-thread record (`PlanRec`), put back on return.
+    let mut rec = PlanRecGuard::take(super::tune::r2(), plan_key);
+    let cached = rec.get().and_then(|r| r.plan.clone()).or_else(|| LOCAL_PLANS.with(|c| c.borrow().get(&plan_key).cloned())).or_else(|| {
         let p = std::rc::Rc::new(PLANS.lock().as_ref().and_then(|m| m.get(&plan_key).cloned())?);
         LOCAL_PLANS.with(|c| c.borrow_mut().insert(plan_key, p.clone()));
         Some(p)
@@ -3257,6 +3710,11 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
             p
         }
     };
+    if let Some(r) = rec.get_mut() {
+        if r.plan.is_none() {
+            r.plan = Some(plan.clone());
+        }
+    }
     if !plan.errors.is_empty() {
         return Err(format!("{:?} shader {addr:#x}: {}", spec.stage, plan.errors.join("; ")));
     }
@@ -3264,13 +3722,23 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
     prep_lap(4);
     let map_gen = crate::mem::MAP_GEN.load(std::sync::atomic::Ordering::Acquire);
     let images_gen = super::images::GPU_IMAGES_GEN.load(std::sync::atomic::Ordering::Acquire);
-    let sizes = READ_HINTS.with(|h| h.borrow().get(&plan_key).copied().unwrap_or([0; 3]));
+    let sizes = match rec.get() {
+        Some(r) if r.hints_known => r.hints,
+        _ => READ_HINTS.with(|h| h.borrow().get(&plan_key).copied().unwrap_or([0; 3])),
+    };
     let mut rd = Reader::with_sizes(addr, sizes);
     let mut resources = pool::resolved(plan.resources.len());
     let mut res_addrs = pool::addrs(plan.resources.len());
     spec.resources.clear();
     spec.resources.reserve(plan.resources.len());
-    let fmt_mask = if plan.resources.iter().any(|r| r.kind == ResKind::Buffer) { LOCAL_FORMATS.with(|c| *c.borrow_mut().entry(plan_key).or_insert_with(|| shared_scan(1, plan_key, || format_resources(&insts, &plan)))) } else { 0 };
+    let fmt_mask = if plan.resources.iter().any(|r| r.kind == ResKind::Buffer) {
+        match rec.get_mut() {
+            Some(r) => *r.fmt.get_or_insert_with(|| LOCAL_FORMATS.with(|c| *c.borrow_mut().entry(plan_key).or_insert_with(|| shared_scan(1, plan_key, || format_resources(&insts, &plan))))),
+            None => LOCAL_FORMATS.with(|c| *c.borrow_mut().entry(plan_key).or_insert_with(|| shared_scan(1, plan_key, || format_resources(&insts, &plan)))),
+        }
+    } else {
+        0
+    };
     // Buffers specialized to their one format (a bit per resource):
     // `fmt_run_time` while their translation is missing.
     let mut specialized = 0u64;
@@ -3300,7 +3768,14 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
                 // 2026-11-02 late afternoon.)
                 let (format, dst_sel) = if fmt_mask & (1 << i.min(63)) == 0 {
                     (0, 0)
-                } else if spec.stage == Stage::Compute && translate::rt_format_entry(v.format as u16) != 0 && LOCAL_STORE_FORMATS.with(|c| *c.borrow_mut().entry(plan_key).or_insert_with(|| format_store_resources(&insts, &plan))) & (1 << i.min(63)) == 0 {
+                } else if spec.stage == Stage::Compute
+                    && translate::rt_format_entry(v.format as u16) != 0
+                    && match rec.get_mut() {
+                        Some(r) => *r.store_fmt.get_or_insert_with(|| LOCAL_STORE_FORMATS.with(|c| *c.borrow_mut().entry(plan_key).or_insert_with(|| format_store_resources(&insts, &plan)))),
+                        None => LOCAL_STORE_FORMATS.with(|c| *c.borrow_mut().entry(plan_key).or_insert_with(|| format_store_resources(&insts, &plan))),
+                    } & (1 << i.min(63))
+                        == 0
+                {
                     if fmt_census_on() {
                         fmt_census_note(code_hash, addr, i, v.format as u16, v.dst_sel as u16);
                     }
@@ -3331,7 +3806,15 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
                 // (Compute: addressed as 3D by its instructions, sampled, a
                 // 2D or 3D texture: one translation for both, FINDINGS.md
                 // 2026-11-02 evening.)
-                let dim = if spec.stage == Stage::Compute && matches!(t.ty, 9 | 10) && !res.written && LOCAL_DIM3.with(|c| *c.borrow_mut().entry(plan_key).or_insert_with(|| d3_resources(&insts, &plan))) & (1 << i.min(63)) != 0 {
+                let dim = if spec.stage == Stage::Compute
+                    && matches!(t.ty, 9 | 10)
+                    && !res.written
+                    && match rec.get_mut() {
+                        Some(r) => *r.dim3.get_or_insert_with(|| LOCAL_DIM3.with(|c| *c.borrow_mut().entry(plan_key).or_insert_with(|| d3_resources(&insts, &plan)))),
+                        None => LOCAL_DIM3.with(|c| *c.borrow_mut().entry(plan_key).or_insert_with(|| d3_resources(&insts, &plan))),
+                    } & (1 << i.min(63))
+                        != 0
+                {
                     ImageDim::D3OrD2
                 } else {
                     dim
@@ -3396,7 +3879,10 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
     let mut cmp_images = 0u64;
     let mut cmp_depth = 0u64;
     if super::tune::cmp_emulate() && resources.iter().any(|r| matches!(r, Resolved::Image(_))) {
-        cmp_images = compare_images(plan_key, &insts, &plan);
+        cmp_images = match rec.get_mut() {
+            Some(r) => *r.cmp.get_or_insert_with(|| compare_images(plan_key, &insts, &plan)),
+            None => compare_images(plan_key, &insts, &plan),
+        };
         for (r, s) in resources.iter().zip(spec.resources.iter_mut()) {
             if let (Resolved::Image(_), ResSpec::Image { depth, .. }) = (r, s) {
                 *depth = false;
@@ -3427,7 +3913,10 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
     if !by_address {
         spec.code_base = 0;
     }
-    let last_hit = LAST_TRANSLATIONS.with(|c| c.borrow().get(&plan_key).filter(|t| t.spec == *spec).cloned());
+    let last_hit = match rec.get() {
+        Some(r) => r.last_tr.as_ref().filter(|t| t.spec == *spec).cloned(),
+        None => LAST_TRANSLATIONS.with(|c| c.borrow().get(&plan_key).filter(|t| t.spec == *spec).cloned()),
+    };
     let from_last = last_hit.is_some();
     let (fast, fast_hit) = match last_hit {
         Some(t) => (0, Some(t)),
@@ -3506,7 +3995,12 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
         t
     };
     if !from_last {
-        LAST_TRANSLATIONS.with(|c| c.borrow_mut().insert(plan_key, tr.clone()));
+        match rec.get_mut() {
+            Some(r) => r.last_tr = Some(tr.clone()),
+            None => {
+                LAST_TRANSLATIONS.with(|c| c.borrow_mut().insert(plan_key, tr.clone()));
+            }
+        }
     }
     prep_lap(7);
     // Scalar-load data, resolved now.
@@ -3559,8 +4053,15 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
     }
     // The reader's references into the translation's plan end here.
     let used = [rd.reads.len() as u32, rd.words.len() as u32, rd.ptrs.len() as u32];
-    if used != sizes {
-        READ_HINTS.with(|h| h.borrow_mut().insert(plan_key, used));
+    match rec.get_mut() {
+        Some(r) => {
+            r.hints = used;
+            r.hints_known = true;
+        }
+        None if used != sizes => {
+            READ_HINTS.with(|h| h.borrow_mut().insert(plan_key, used));
+        }
+        None => {}
     }
     let Reader { reads, words, unread, chain_vals, .. } = rd;
     pool::put_addrs(chain_vals);

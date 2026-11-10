@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 164] = [
+    static ALL: [Tunable; 165] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -196,6 +196,7 @@ pub mod tune {
         Tunable { name: "wb_probe_site", env: "DS_WB_PROBE_SITE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "unb_bound", env: "DS_UNB_BOUND", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "kco", env: "DS_KCO", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "r2", env: "DS_R2", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1684,6 +1685,23 @@ pub mod tune {
         get(163) != 0
     }
 
+    /// The recording path rebuilt (R2, ROUTE60.md 2026-11-10 afternoon):
+    /// per-thread program and plan records, leaner preparation, binding and
+    /// synchronization, each producing what the earlier path produces.
+    #[inline(always)]
+    pub fn r2() -> bool {
+        get(164) != 0
+    }
+
+    /// Bumped by every switch change after boot (`set`, `set_default`):
+    /// per-thread records of switch-derived state hold while it is unchanged.
+    static GEN: AtomicU64 = AtomicU64::new(0);
+
+    #[inline(always)]
+    pub fn generation() -> u64 {
+        GEN.load(Ordering::Acquire)
+    }
+
 
     /// Pixel programs that write no memory run their depth and stencil
     /// tests before the shader where the draw's state lets them (no kill,
@@ -1812,6 +1830,7 @@ pub mod tune {
         match ALL.iter().find(|t| t.name == name) {
             Some(t) => {
                 t.value.store(v, Ordering::Relaxed);
+                GEN.fetch_add(1, Ordering::AcqRel);
                 true
             }
             None => false,
@@ -1826,6 +1845,7 @@ pub mod tune {
             Some(t) => {
                 if std::env::var_os(t.env).is_none() {
                     t.value.store(v, Ordering::Relaxed);
+                    GEN.fetch_add(1, Ordering::AcqRel);
                 }
                 true
             }
@@ -2955,6 +2975,11 @@ pub fn start_profiler() {
                     let is_ours = |f: &str| (f.starts_with("dsport::") || f.starts_with("rdna::")) && !f.contains("parking_lot");
                     let at = fns.iter().position(|f| is_ours(f));
                     let ours = at.map_or("(none)", |i| fns[i]);
+                    // (A thread whose innermost function of ours is its entry
+                    // runs none of our work: a worker idle in an unnamed
+                    // system wait, ~92% of the workers' samples counted as
+                    // busy before.)
+                    let waiting = waiting || ours == "dsport::thread::spawn_host::proc_";
                     if !waiting {
                         if let Some(m) = PROFILE_BUSY.lock().as_mut() {
                             *m.entry((kind, ours.to_string())).or_default() += 1;
@@ -3083,6 +3108,11 @@ pub fn profile_report() -> String {
     }
     s.push_str(&exec::push_line());
     s.push_str(&slotcensus::line());
+    if shaders::r2_check() {
+        let c: Vec<u64> = shaders::R2_CHECKS.iter().map(|x| x.load(Ordering::Relaxed)).collect();
+        s.push_str(&format!("    R2 checks (`DS_R2_CHECK`): {} template hits checked, {} mismatches
+", c[0], c[1]));
+    }
     s.push_str(&exec::async_line());
     s.push_str(&shaders::fmt_line());
     s.push_str(&exec::import_window_line());
@@ -3142,7 +3172,9 @@ fn profile_summary() -> String {
             }
         }
     }
-    for (table, what, n) in [(&PROFILE_CALLS, "by callee of our innermost function", 40), (&PROFILE_LEAF, "by innermost frame", 25), (&PROFILE_LINES, "by source line of our innermost function", 50)] {
+    // (`DS_PROFILE_LINES_TOP`: how many source lines, default 50.)
+    let lines_top = std::env::var("DS_PROFILE_LINES_TOP").ok().and_then(|x| x.parse().ok()).unwrap_or(50);
+    for (table, what, n) in [(&PROFILE_CALLS, "by callee of our innermost function", 40), (&PROFILE_LEAF, "by innermost frame", 25), (&PROFILE_LINES, "by source line of our innermost function", lines_top)] {
         if let Some(m) = table.lock().as_ref() {
             for kind in PROFILE_KINDS {
                 let mut v: Vec<(&String, &u64)> = m.iter().filter(|((k, _), _)| *k == kind).map(|((_, f), n)| (f, n)).collect();
