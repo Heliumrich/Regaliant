@@ -378,8 +378,9 @@ pub struct Reader<'a> {
     pub unread: Vec<(u64, u64)>,
     /// The mappings of recent reads (no memory-map lookup inside them; a
     /// stage reads its user data, descriptor tables and constants from a few
-    /// mappings in turn), replaced round robin.
-    spans: [(u64, u64); 4],
+    /// mappings in turn), replaced round robin. (R2: eight, kept per thread
+    /// across preparations while the mappings are unchanged: `load_spans`.)
+    spans: [(u64, u64); 8],
     next_span: usize,
     /// Pointers loaded from memory so far, by the plan's chain (each resource
     /// dword names its pointer chain again; kept by reference, not cloned:
@@ -396,6 +397,26 @@ pub struct Reader<'a> {
     /// them without hashing or comparing chains (`ptr_hash` was 7.8% of the
     /// compute queues' busy samples, run 20261014-145828).
     chain_vals: Vec<Option<u64>>,
+    /// `mem::MAP_GEN` when the spans were loaded (`load_spans`; u64::MAX:
+    /// not kept).
+    span_gen: u64,
+}
+
+thread_local! {
+    /// R2: this thread's reader spans (`Reader::load_spans`) and the
+    /// mapping generation they hold for.
+    static R2_SPANS: std::cell::Cell<(u64, [(u64, u64); 8], usize)> = const { std::cell::Cell::new((u64::MAX, [(0, 0); 8], 0)) };
+    /// R2: the next stage template's number (`CsTmpl::id` etc.; 0 is none).
+    static TMPL_IDS: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+}
+
+/// A new stage template's number on this thread (never 0).
+fn next_tmpl_id() -> u64 {
+    TMPL_IDS.with(|c| {
+        let v = c.get();
+        c.set(v + 1);
+        v
+    })
 }
 
 impl<'a> Reader<'a> {
@@ -410,12 +431,33 @@ impl<'a> Reader<'a> {
             reads: pool::pairs(sizes[0] as usize),
             words: pool::words(sizes[1] as usize),
             unread: pool::pairs(0),
-            spans: [(0, 0); 4],
+            spans: [(0, 0); 8],
             next_span: 0,
             ptrs: Vec::with_capacity(sizes[2] as usize),
             code_base,
             chain_vals: pool::addrs(0),
+            span_gen: u64::MAX,
         }
+    }
+
+    /// R2: this thread's spans from its earlier preparations, while the
+    /// mappings are unchanged (`mem::MAP_GEN`; `readable_span` answers the
+    /// same then).
+    fn load_spans(&mut self) {
+        let generation = crate::mem::MAP_GEN.load(std::sync::atomic::Ordering::Acquire);
+        R2_SPANS.with(|c| {
+            let (g, spans, next) = c.get();
+            if g == generation {
+                self.spans = spans;
+                self.next_span = next;
+            }
+        });
+        self.span_gen = generation;
+    }
+
+    /// R2: the spans kept for this thread's next preparation.
+    fn save_spans(&self) {
+        R2_SPANS.with(|c| c.set((self.span_gen, self.spans, self.next_span)));
     }
 
     /// `ptr` of the chain numbered `id` in its plan (u32::MAX: unnumbered).
@@ -457,6 +499,12 @@ impl<'a> Reader<'a> {
         }
         if !super::cp::valid(addr, n) {
             return false;
+        }
+        // R2: the readability map's "readable" stands without the table's
+        // lock (other answers go the table's way: a mapping in progress is
+        // waited for there).
+        if self.span_gen != u64::MAX && crate::mem::rg_readable(addr, n) == Some(true) {
+            return true;
         }
         match crate::mem::readable_span(addr) {
             Some((s, e)) if end <= e => {
@@ -1615,7 +1663,7 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
     prep_lap(1);
     let mut spec = cs_spec(addr, rsrc2, local, wave64, code_hash);
     prep_lap(2);
-    let r = prepare(addr, insts, code_hash, &user, &mut spec);
+    let r = prepare(addr, insts, code_hash, &user, &mut spec, 0);
     spec_vecs_back(spec);
     r
 }
@@ -1657,6 +1705,7 @@ fn r2_check_spec(kind: &str, addr: u64, got: &Spec, fresh: Spec) {
 /// full path). The spec is then cloned instead of built (~25 switch reads,
 /// two 64-entry batchable scans and four program-list scans a stage).
 struct CsTmpl {
+    id: u64,
     addr: u64,
     rsrc2: u32,
     local: [u32; 3],
@@ -1699,13 +1748,13 @@ fn prepare_compute_r2<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prepa
         let t = t.borrow();
         let e = t.get(slot)?;
         if e.addr == addr && e.rsrc2 == rsrc2 && e.local == local && e.wave64 == wave64 && e.lod_measure == lod_measure && e.tune_gen == tune_gen && e.batch_gen == batch_gen && e.regs == regs {
-            Some((e.insts.clone()?, e.code_hash, e.spec.clone()?))
+            Some((e.insts.clone()?, e.code_hash, e.spec.clone()?, e.id))
         } else {
             None
         }
     });
-    let (insts, code_hash, mut spec) = match hit {
-        Some((insts, code_hash, mut spec)) => {
+    let (insts, code_hash, mut spec, id) = match hit {
+        Some((insts, code_hash, mut spec, id)) => {
             prep_lap(1);
             if r2_check() {
                 r2_check_spec("cs", addr, &spec, cs_spec(addr, rsrc2, local, wave64, code_hash));
@@ -1713,12 +1762,13 @@ fn prepare_compute_r2<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prepa
             let (ps_inputs, resources) = spec_vecs();
             spec.ps_inputs = ps_inputs;
             spec.resources = resources;
-            (insts, code_hash, spec)
+            (insts, code_hash, spec, id)
         }
         None => {
             let (insts, code_hash) = program_local(addr)?;
             prep_lap(1);
             let spec = cs_spec(addr, rsrc2, local, wave64, code_hash);
+            let id = next_tmpl_id();
             // (The template: the switches, batchable programs and shader
             // registrations as they were before the spec read them. Only for
             // a program from a shader object, which `program_local` keeps
@@ -1731,18 +1781,18 @@ fn prepare_compute_r2<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prepa
                 }
                 let mut t = t.borrow_mut();
                 if t.is_empty() {
-                    t.resize_with(CS_TMPL_SLOTS, || CsTmpl { addr: 0, rsrc2: 0, local: [0; 3], wave64: false, lod_measure: false, tune_gen: 0, batch_gen: 0, regs: 0, insts: None, code_hash: 0, spec: None });
+                    t.resize_with(CS_TMPL_SLOTS, || CsTmpl { id: 0, addr: 0, rsrc2: 0, local: [0; 3], wave64: false, lod_measure: false, tune_gen: 0, batch_gen: 0, regs: 0, insts: None, code_hash: 0, spec: None });
                 }
                 let mut tmpl = spec.clone();
                 tmpl.ps_inputs = Vec::new();
                 tmpl.resources = Vec::new();
-                t[slot] = CsTmpl { addr, rsrc2, local, wave64, lod_measure, tune_gen, batch_gen, regs, insts: Some(insts.clone()), code_hash, spec: Some(tmpl) };
+                t[slot] = CsTmpl { id, addr, rsrc2, local, wave64, lod_measure, tune_gen, batch_gen, regs, insts: Some(insts.clone()), code_hash, spec: Some(tmpl) };
             });
-            (insts, code_hash, spec)
+            (insts, code_hash, spec, id)
         }
     };
     prep_lap(2);
-    let r = prepare(addr, insts, code_hash, &user, &mut spec);
+    let r = prepare(addr, insts, code_hash, &user, &mut spec, id);
     spec_vecs_back(spec);
     r
 }
@@ -2123,7 +2173,7 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         super::exec::note_ps_tests(addr, class);
     }
     prep_lap(2);
-    let r = prepare(addr, insts, code_hash, &user, &mut spec);
+    let r = prepare(addr, insts, code_hash, &user, &mut spec, 0);
     spec_vecs_back(spec);
     r
 }
@@ -2162,6 +2212,7 @@ fn ps_key<R: RegRead + ?Sized>(cp: &R, k: &mut [u32; PS_KEY_MAX]) -> usize {
 /// flags (probes, profiles, the MRTZ census and GPU-resolved draws take the
 /// full path).
 struct PsTmpl {
+    id: u64,
     addr: u64,
     rsrc2: u32,
     n: u8,
@@ -2208,12 +2259,12 @@ fn prepare_ps_r2<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
             ps_inputs.extend_from_slice(&e.inputs);
             spec.ps_inputs = ps_inputs;
             spec.resources = resources;
-            Some((e.insts.clone()?, e.code_hash, spec))
+            Some((e.insts.clone()?, e.code_hash, spec, e.id))
         } else {
             None
         }
     });
-    let (insts, code_hash, mut spec) = match hit {
+    let (insts, code_hash, mut spec, id) = match hit {
         Some(h) => {
             prep_lap(1);
             if r2_check() {
@@ -2225,24 +2276,25 @@ fn prepare_ps_r2<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
             let (insts, code_hash) = program_local(addr)?;
             prep_lap(1);
             let spec = ps_spec(addr, rsrc2, &|a: u32| cp.ctx(a));
+            let id = next_tmpl_id();
             let registered = LOCAL_PROGRAMS.with(|c| c.borrow().contains_key(&addr));
             if registered {
                 PS_TMPLS.with(|t| {
                     let mut t = t.borrow_mut();
                     if t.is_empty() {
-                        t.resize_with(PS_TMPL_SLOTS, || PsTmpl { addr: 0, rsrc2: 0, n: 0, batched: false, lod_measure: false, key: [0; PS_KEY_MAX], tune_gen: 0, regs: 0, insts: None, code_hash: 0, inputs: Vec::new(), spec: None });
+                        t.resize_with(PS_TMPL_SLOTS, || PsTmpl { id: 0, addr: 0, rsrc2: 0, n: 0, batched: false, lod_measure: false, key: [0; PS_KEY_MAX], tune_gen: 0, regs: 0, insts: None, code_hash: 0, inputs: Vec::new(), spec: None });
                     }
                     let mut tmpl = spec.clone();
                     let inputs = std::mem::take(&mut tmpl.ps_inputs);
                     tmpl.resources = Vec::new();
-                    t[slot] = PsTmpl { addr, rsrc2, n: n as u8, batched, lod_measure, key, tune_gen, regs, insts: Some(insts.clone()), code_hash, inputs, spec: Some(tmpl) };
+                    t[slot] = PsTmpl { id, addr, rsrc2, n: n as u8, batched, lod_measure, key, tune_gen, regs, insts: Some(insts.clone()), code_hash, inputs, spec: Some(tmpl) };
                 });
             }
-            (insts, code_hash, spec)
+            (insts, code_hash, spec, id)
         }
     };
     prep_lap(2);
-    let r = prepare(addr, insts, code_hash, &user, &mut spec);
+    let r = prepare(addr, insts, code_hash, &user, &mut spec, id);
     spec_vecs_back(spec);
     r
 }
@@ -2458,7 +2510,7 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
     prep_lap(1);
     let mut spec = ngg_spec(addr, rsrc2, stages, &insts);
     prep_lap(2);
-    let r = prepare(addr, insts, code_hash, &user, &mut spec);
+    let r = prepare(addr, insts, code_hash, &user, &mut spec, 0);
     spec_vecs_back(spec);
     r
 }
@@ -2469,6 +2521,7 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
 /// batched flag, the switches' generation and the shader registrations
 /// (GPU-resolved draws and vertex dumps take the full path).
 struct NggTmpl {
+    id: u64,
     addr: u64,
     rsrc2: u32,
     wave: u32,
@@ -2510,12 +2563,12 @@ fn prepare_ngg_r2<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
             let (ps_inputs, resources) = spec_vecs();
             spec.ps_inputs = ps_inputs;
             spec.resources = resources;
-            Some((e.insts.clone()?, e.code_hash, spec))
+            Some((e.insts.clone()?, e.code_hash, spec, e.id))
         } else {
             None
         }
     });
-    let (insts, code_hash, mut spec) = match hit {
+    let (insts, code_hash, mut spec, id) = match hit {
         Some(h) => {
             prep_lap(1);
             if r2_check() {
@@ -2527,24 +2580,25 @@ fn prepare_ngg_r2<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
             let (insts, code_hash) = program_local(addr)?;
             prep_lap(1);
             let spec = ngg_spec(addr, rsrc2, stages, &insts);
+            let id = next_tmpl_id();
             let registered = LOCAL_PROGRAMS.with(|c| c.borrow().contains_key(&addr));
             if registered {
                 NGG_TMPLS.with(|t| {
                     let mut t = t.borrow_mut();
                     if t.is_empty() {
-                        t.resize_with(NGG_TMPL_SLOTS, || NggTmpl { addr: 0, rsrc2: 0, wave: 0, base_instance: None, batched: false, tune_gen: 0, regs: 0, insts: None, code_hash: 0, spec: None });
+                        t.resize_with(NGG_TMPL_SLOTS, || NggTmpl { id: 0, addr: 0, rsrc2: 0, wave: 0, base_instance: None, batched: false, tune_gen: 0, regs: 0, insts: None, code_hash: 0, spec: None });
                     }
                     let mut tmpl = spec.clone();
                     tmpl.ps_inputs = Vec::new();
                     tmpl.resources = Vec::new();
-                    t[slot] = NggTmpl { addr, rsrc2, wave, base_instance, batched, tune_gen, regs, insts: Some(insts.clone()), code_hash, spec: Some(tmpl) };
+                    t[slot] = NggTmpl { id, addr, rsrc2, wave, base_instance, batched, tune_gen, regs, insts: Some(insts.clone()), code_hash, spec: Some(tmpl) };
                 });
             }
-            (insts, code_hash, spec)
+            (insts, code_hash, spec, id)
         }
     };
     prep_lap(2);
-    let r = prepare(addr, insts, code_hash, &user, &mut spec);
+    let r = prepare(addr, insts, code_hash, &user, &mut spec, id);
     spec_vecs_back(spec);
     r
 }
@@ -3607,6 +3661,8 @@ struct PlanRec {
     dim3: Option<u64>,
     cmp: Option<u64>,
     last_tr: Option<Arc<Local<Translated>>>,
+    /// The stage template number `last_tr`'s spec came from (0: unknown).
+    last_tmpl: u64,
 }
 
 const PLAN_REC_SLOTS: usize = 2048;
@@ -3669,7 +3725,9 @@ impl Drop for PlanRecGuard {
     }
 }
 
-fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: &[u32], spec: &mut Spec) -> Result<Prepared, String> {
+/// `tmpl`: R2's number of the stage template `spec` comes from (0: none),
+/// which the plan's latest translation is checked against (`PlanRec`).
+fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: &[u32], spec: &mut Spec, tmpl: u64) -> Result<Prepared, String> {
     // Diagnostics (DS_PROFILE_GPU with DS_PROFILE_REPEATS=1: hashing every
     // word read and a global set per preparation inflate the prepare times
     // the profile reports): the inputs that would key a cached preparation.
@@ -3727,6 +3785,9 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
         _ => READ_HINTS.with(|h| h.borrow().get(&plan_key).copied().unwrap_or([0; 3])),
     };
     let mut rd = Reader::with_sizes(addr, sizes);
+    if rec.get().is_some() {
+        rd.load_spans();
+    }
     let mut resources = pool::resolved(plan.resources.len());
     let mut res_addrs = pool::addrs(plan.resources.len());
     spec.resources.clear();
@@ -3913,8 +3974,27 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
     if !by_address {
         spec.code_base = 0;
     }
+    // (Under R2 a spec from the template the latest translation's spec came
+    // from equals it but for its resources: those alone are compared.)
     let last_hit = match rec.get() {
-        Some(r) => r.last_tr.as_ref().filter(|t| t.spec == *spec).cloned(),
+        Some(r) => r
+            .last_tr
+            .as_ref()
+            .filter(|t| {
+                if tmpl != 0 && r.last_tmpl == tmpl {
+                    let same = t.spec.resources == spec.resources;
+                    if r2_check() {
+                        R2_CHECKS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if same != (t.spec == *spec) && R2_CHECKS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
+                            crate::info!("r2 check: {:?} {addr:#x}: the translation found by the template's number ({same}) differs from the full comparison", spec.stage);
+                        }
+                    }
+                    same
+                } else {
+                    t.spec == *spec
+                }
+            })
+            .cloned(),
         None => LAST_TRANSLATIONS.with(|c| c.borrow().get(&plan_key).filter(|t| t.spec == *spec).cloned()),
     };
     let from_last = last_hit.is_some();
@@ -3994,6 +4074,10 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
         }
         t
     };
+    if let Some(r) = rec.get_mut() {
+        // (Whole specs compared equal: the template's number holds for it.)
+        r.last_tmpl = tmpl;
+    }
     if !from_last {
         match rec.get_mut() {
             Some(r) => r.last_tr = Some(tr.clone()),
@@ -4062,6 +4146,9 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
             READ_HINTS.with(|h| h.borrow_mut().insert(plan_key, used));
         }
         None => {}
+    }
+    if rd.span_gen != u64::MAX {
+        rd.save_spans();
     }
     let Reader { reads, words, unread, chain_vals, .. } = rd;
     pool::put_addrs(chain_vals);

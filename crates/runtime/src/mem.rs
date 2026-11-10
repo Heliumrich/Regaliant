@@ -468,6 +468,239 @@ fn share_run(run: (u64, u64, bool), generation: u64) {
     sh.1.insert(i, run);
 }
 
+// ---------------------------------------------------------------------------
+// Readability of guest memory per 64 KiB granule (R2): kept under the MEM
+// lock at every change of the mapping table (`MemState::rg_update`) and read
+// without it (`rg_readable`). A granule's `ok` bit: it lies in one usable
+// mapping (not reserved, some protection: `readable_span`'s rule); `mixed`:
+// part of it is usable, or several mappings share it. Nearly every mapping is 64 KiB aligned, so the
+// recording threads' readability checks need no lock, cache or walk of the
+// table; mixed granules go the earlier way. (The title's texture streaming
+// remaps 64 KiB pieces ~250 times a second in a walk: every change dropped
+// the threads' cached runs, and each miss walked up to 64 mappings either
+// side under the lock the title's allocator holds: 7.5% of the parallel
+// workers' busy samples in the 1-1 walk, FINDINGS.md 2026-11-10 evening.)
+// ---------------------------------------------------------------------------
+
+const RG_SHIFT: u32 = 16;
+const RG_GRAN: u64 = 1 << RG_SHIFT;
+const RG_LEAF_SHIFT: u32 = 30;
+const RG_LEAF_GRANULES: usize = 1 << (RG_LEAF_SHIFT - RG_SHIFT);
+const RG_LEAF_WORDS: usize = RG_LEAF_GRANULES / 64;
+const RG_LEAVES: usize = (GUEST_END >> RG_LEAF_SHIFT) as usize;
+
+struct RgLeaf {
+    ok: [std::sync::atomic::AtomicU64; RG_LEAF_WORDS],
+    mixed: [std::sync::atomic::AtomicU64; RG_LEAF_WORDS],
+}
+
+static RG: [std::sync::atomic::AtomicPtr<RgLeaf>; RG_LEAVES] = [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; RG_LEAVES];
+
+/// Sets granules [g0, g1) to (`ok`, `mixed`) (under the MEM lock). Leaves are
+/// made only to hold set bits: a missing leaf reads as nothing usable.
+fn rg_set_range(g0: u64, g1: u64, ok: bool, mixed: bool) {
+    use std::sync::atomic::Ordering;
+    let per = RG_LEAF_GRANULES as u64;
+    let mut g = g0;
+    while g < g1 {
+        let li = (g / per) as usize;
+        let lend = ((g / per + 1) * per).min(g1);
+        if li >= RG_LEAVES {
+            return;
+        }
+        let mut p = RG[li].load(Ordering::Acquire);
+        if p.is_null() {
+            if !ok && !mixed {
+                g = lend;
+                continue;
+            }
+            let leaf = Box::new(RgLeaf { ok: [const { std::sync::atomic::AtomicU64::new(0) }; RG_LEAF_WORDS], mixed: [const { std::sync::atomic::AtomicU64::new(0) }; RG_LEAF_WORDS] });
+            p = Box::into_raw(leaf);
+            RG[li].store(p, Ordering::Release);
+        }
+        let leaf = unsafe { &*p };
+        let mut i = (g % per) as usize;
+        let iend = (lend - (g / per) * per) as usize;
+        while i < iend {
+            let w = i / 64;
+            let b0 = i % 64;
+            let n = (iend - i).min(64 - b0);
+            let m = if n == 64 { u64::MAX } else { ((1u64 << n) - 1) << b0 };
+            if ok {
+                leaf.ok[w].fetch_or(m, Ordering::AcqRel);
+            } else {
+                leaf.ok[w].fetch_and(!m, Ordering::AcqRel);
+            }
+            if mixed {
+                leaf.mixed[w].fetch_or(m, Ordering::AcqRel);
+            } else {
+                leaf.mixed[w].fetch_and(!m, Ordering::AcqRel);
+            }
+            i += n;
+        }
+        g = lend;
+    }
+}
+
+/// Usable granules over [start, end) made mixed at once (before an
+/// unmapping or a protection change: readers go the earlier way, through the
+/// table's lock, until the update after the change sets what holds then; a
+/// change that fails between leaves them so).
+fn rg_clear(start: u64, end: u64) {
+    use std::sync::atomic::Ordering;
+    if end <= start {
+        return;
+    }
+    let per = RG_LEAF_GRANULES as u64;
+    let (g0, g1) = (start >> RG_SHIFT, end.saturating_add(RG_GRAN - 1) >> RG_SHIFT);
+    let mut g = g0;
+    while g < g1 {
+        let li = (g / per) as usize;
+        let lend = ((g / per + 1) * per).min(g1);
+        if li >= RG_LEAVES {
+            return;
+        }
+        let p = RG[li].load(Ordering::Acquire);
+        if !p.is_null() {
+            let leaf = unsafe { &*p };
+            let mut i = (g % per) as usize;
+            let iend = (lend - (g / per) * per) as usize;
+            while i < iend {
+                let w = i / 64;
+                let b0 = i % 64;
+                let n = (iend - i).min(64 - b0);
+                let m = if n == 64 { u64::MAX } else { ((1u64 << n) - 1) << b0 };
+                let ok = leaf.ok[w].load(Ordering::Acquire) & m;
+                if ok != 0 {
+                    leaf.mixed[w].fetch_or(ok, Ordering::AcqRel);
+                    leaf.ok[w].fetch_and(!ok, Ordering::AcqRel);
+                }
+                i += n;
+            }
+        }
+        g = lend;
+    }
+}
+
+/// Whether guest [a, a + len) is accessible by the readability map: Some
+/// when it decides (every granule usable, or one with nothing usable), None
+/// when a granule is mixed or the range lies outside the guest span (then
+/// `readable_span` decides).
+#[inline]
+pub fn rg_readable(a: u64, len: u64) -> Option<bool> {
+    use std::sync::atomic::Ordering;
+    let end = a.checked_add(len.max(1))?;
+    if a < GUEST_BASE || end > GUEST_END {
+        return None;
+    }
+    let (g0, g1) = (a >> RG_SHIFT, (end - 1) >> RG_SHIFT);
+    let mut mixed = false;
+    let per = RG_LEAF_GRANULES as u64;
+    let mut g = g0;
+    while g <= g1 {
+        let p = RG[(g / per) as usize].load(Ordering::Acquire);
+        if p.is_null() {
+            return rg_checked(a, len, end, false);
+        }
+        let leaf = unsafe { &*p };
+        let i = (g % per) as usize;
+        let (w, b) = (i / 64, 1u64 << (i % 64));
+        if leaf.ok[w].load(Ordering::Acquire) & b == 0 {
+            if leaf.mixed[w].load(Ordering::Acquire) & b == 0 {
+                return rg_checked(a, len, end, false);
+            }
+            mixed = true;
+        }
+        g += 1;
+    }
+    if mixed {
+        None
+    } else {
+        rg_checked(a, len, end, true)
+    }
+}
+
+/// `rg_readable`'s decided answer `b` (`DS_R2_CHECK=1`: checked against the
+/// table's: `readable_span`, else `mapped`).
+fn rg_checked(a: u64, len: u64, end: u64, b: bool) -> Option<bool> {
+    // (Only "readable" is used: `readable`, `Reader::readable`.)
+    if b && crate::gpu::shaders::r2_check() {
+        use std::sync::atomic::Ordering;
+        let old = match readable_span(a) {
+            Some((_, e)) if end <= e => true,
+            Some(_) => mapped(a, len),
+            None => false,
+        };
+        crate::gpu::shaders::R2_CHECKS[0].fetch_add(1, Ordering::Relaxed);
+        if old != b && crate::gpu::shaders::R2_CHECKS[1].fetch_add(1, Ordering::Relaxed) < 40 {
+            crate::info!("r2 check: readability map says {b} for {a:#x}+{len:#x}, the table {old}");
+        }
+    }
+    Some(b)
+}
+
+impl MemState {
+    /// The readability map's granules over [start, end) made again from the
+    /// table (under the MEM lock, after a change).
+    fn rg_update(&self, start: u64, end: u64) {
+        if end <= start {
+            return;
+        }
+        let usable = |v: &Vma| v.kind != VmaKind::Reserved && v.prot != 0;
+        let g1 = end.saturating_add(RG_GRAN - 1) >> RG_SHIFT;
+        let mut g = start >> RG_SHIFT;
+        while g < g1 {
+            let gs = g << RG_SHIFT;
+            let ge = gs + RG_GRAN;
+            match self.find(gs) {
+                // Granules wholly inside one mapping: by its kind.
+                Some(v) if v.end() >= ge => {
+                    let last = (v.end() >> RG_SHIFT).min(g1).max(g + 1);
+                    rg_set_range(g, last, usable(v), false);
+                    g = last;
+                    continue;
+                }
+                // Granules wholly inside a gap: nothing usable.
+                None => {
+                    let next = self.vmas.range(gs..).next().map(|(&k, _)| k).unwrap_or(u64::MAX);
+                    if next >= ge {
+                        let last = (next >> RG_SHIFT).min(g1).max(g + 1);
+                        rg_set_range(g, last, false, false);
+                        g = last;
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            // A granule shared by several mappings or a gap: mixed when any
+            // piece is usable (`ok` is one usable mapping over the whole
+            // granule: k such granules hold at most k mappings, which
+            // `fe2_place_inner`'s run ends rely on).
+            let (mut any_ok, mut any_bad) = (false, false);
+            let mut p = gs;
+            while p < ge {
+                match self.find(p) {
+                    Some(v) => {
+                        if usable(v) {
+                            any_ok = true;
+                        } else {
+                            any_bad = true;
+                        }
+                        p = v.end();
+                    }
+                    None => {
+                        any_bad = true;
+                        p = self.vmas.range(p..).next().map(|(&k, _)| k).unwrap_or(ge).max(p + 1);
+                    }
+                }
+            }
+            let _ = any_bad;
+            rg_set_range(g, g + 1, false, any_ok);
+            g += 1;
+        }
+    }
+}
+
 thread_local! {
     /// This thread's recently confirmed runs: [start, end) and whether they
     /// are readable (unmapped gaps are kept too: descriptors of unbound
@@ -570,6 +803,11 @@ pub fn readable_span(a: u64) -> Option<(u64, u64)> {
 
 /// Whether guest [a, a+len) is accessible (`readable_span`, else `mapped`).
 pub fn readable(a: u64, len: u64) -> bool {
+    // (R2: the map's "readable" stands; any other answer goes the table's
+    // way, which waits for a change in progress.)
+    if crate::gpu::tune::r2() && rg_readable(a, len) == Some(true) {
+        return true;
+    }
     let end = a.saturating_add(len.max(1));
     match readable_span(a) {
         Some((_, e)) if end <= e => true,
@@ -2354,6 +2592,7 @@ impl MemState {
     fn unmap_range_for(&mut self, start: u64, end: u64, why: usize) {
         trace_map("unmap", start, end, format_args!(""));
         note_unmap(self, "unmap", start, end);
+        rg_clear(start, end);
         bump_gen(start, end);
         self.split_at(start, why);
         self.split_at(end, why);
@@ -2384,6 +2623,7 @@ impl MemState {
                 self.flexible_used = self.flexible_used.saturating_sub(v.size);
             }
         }
+        self.rg_update(start, end);
     }
 
     /// Maps [addr, addr+size). For fixed mappings any existing mapping there is replaced.
@@ -2505,6 +2745,7 @@ impl MemState {
             self.flexible_used += size;
         }
         self.vmas.insert(addr, Vma { start: addr, size, kind, prot, phys, mtype, name: name.to_string(), slots, off, born: crate::gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed) });
+        self.rg_update(addr, addr + size);
         bump_gen(addr, addr + size);
         trace_map("map", addr, addr + size, format_args!("{kind:?} prot {prot:#x} phys {phys:#x} '{name}'"));
         Ok(addr)
@@ -2532,6 +2773,7 @@ impl MemState {
         }
         self.split_at(start, crate::sections::SPLIT_PROTECT);
         self.split_at(end, crate::sections::SPLIT_PROTECT);
+        rg_clear(start, end);
         // Before the pages change too: a bulk reader that checked the table
         // before taking `GUEST_READERS` sees the generation move
         // (`table_view_held`).
@@ -2545,6 +2787,7 @@ impl MemState {
             v.prot = prot;
             host_protect(v.start, v.size, prot)?;
         }
+        self.rg_update(start, end);
         bump_gen(start, end);
         Ok(())
     }

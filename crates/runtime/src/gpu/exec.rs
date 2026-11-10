@@ -11301,9 +11301,25 @@ impl Exec {
             return None;
         }
         let lo = base & !(PAGE - 1);
-        // (The run of mappings around `base`, from this thread's cache.)
-        let (_, mapped_end) = crate::mem::readable_span(base)?;
-        let hi = end.next_multiple_of(PAGE).min(mapped_end.next_multiple_of(PAGE));
+        // (The run of mappings around `base`, from this thread's cache. R2:
+        // a range over at most 65 granules the readability map has each in
+        // one usable mapping lies inside the run `readable_span` gives (it
+        // reaches 64 mappings past the one holding `base`): its end, without
+        // the table's lock.)
+        let hi = if super::tune::r2() && (end - 1) >> 16 <= (base >> 16) + 64 && crate::mem::rg_readable(base, size) == Some(true) {
+            let hi = end.next_multiple_of(PAGE);
+            if super::shaders::r2_check() {
+                let old = crate::mem::readable_span(base).map(|(_, e)| end.next_multiple_of(PAGE).min(e.next_multiple_of(PAGE)));
+                super::shaders::R2_CHECKS[0].fetch_add(1, Ordering::Relaxed);
+                if old != Some(hi) && super::shaders::R2_CHECKS[1].fetch_add(1, Ordering::Relaxed) < 40 {
+                    crate::info!("r2 check: a placement's end by the readability map {hi:#x} for {base:#x}+{size:#x}, by the table {old:x?}");
+                }
+            }
+            hi
+        } else {
+            let (_, mapped_end) = crate::mem::readable_span(base)?;
+            end.next_multiple_of(PAGE).min(mapped_end.next_multiple_of(PAGE))
+        };
         if hi <= base {
             return None;
         }

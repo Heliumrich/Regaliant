@@ -22,6 +22,10 @@ pub struct Ranges {
     by_start: BTreeMap<u64, u64>,
     filter: [u64; 16],
     big: Vec<(u64, u64)>,
+    /// R2: a range of the union as the last insert left it (ranges only
+    /// merge until a removal or clear, which empty this): an insert inside
+    /// it adds nothing (the culls note their output buffers every dispatch).
+    last: (u64, u64),
 }
 
 const FILTER_SHIFT: u32 = 16;
@@ -33,7 +37,7 @@ fn filter_bit(page: u64) -> usize {
 
 impl Ranges {
     pub const fn new() -> Ranges {
-        Ranges { by_start: BTreeMap::new(), filter: [0; 16], big: Vec::new() }
+        Ranges { by_start: BTreeMap::new(), filter: [0; 16], big: Vec::new(), last: (0, 0) }
     }
 
     fn filter_add(&mut self, a: u64, n: u64) {
@@ -85,6 +89,10 @@ impl Ranges {
         if n == 0 {
             return;
         }
+        let r2 = super::tune::r2();
+        if r2 && a >= self.last.0 && a.saturating_add(n) <= self.last.1 {
+            return;
+        }
         self.filter_add(a, n);
         let mut start = a;
         let mut end = a.saturating_add(n);
@@ -92,6 +100,9 @@ impl Ranges {
         if let Some((&s, &e)) = self.by_start.range(..=start).next_back() {
             if e >= start {
                 if e >= end {
+                    if r2 {
+                        self.last = (s, e);
+                    }
                     return;
                 }
                 start = s;
@@ -104,6 +115,9 @@ impl Ranges {
             self.by_start.remove(&s);
         }
         self.by_start.insert(start, end);
+        if r2 {
+            self.last = (start, end);
+        }
     }
 
     /// Whether the union holds all of [a, a + n) (touching ranges are
@@ -138,6 +152,7 @@ impl Ranges {
         self.by_start.clear();
         self.filter = [0; 16];
         self.big.clear();
+        self.last = (0, 0);
     }
 
     /// Number of disjoint ranges.
@@ -161,6 +176,7 @@ impl Ranges {
         if n == 0 {
             return;
         }
+        self.last = (0, 0);
         let end = a.saturating_add(n);
         let hit: Vec<(u64, u64)> = self.by_start.range(..end).rev().take_while(|&(_, &e)| e > a).map(|(&s, &e)| (s, e)).collect();
         for (s, e) in hit {
