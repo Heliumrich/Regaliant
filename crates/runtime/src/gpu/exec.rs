@@ -4754,7 +4754,6 @@ static GPU_INDIRECT: AtomicU64 = AtomicU64::new(0);
 pub(super) static ARGS_WAR_BARRIERS: AtomicU64 = AtomicU64::new(0);
 /// CP memory writes performed by the GPU (`Exec::gpu_cp_write`).
 static GPU_CP_WRITES: AtomicU64 = AtomicU64::new(0);
-static GPU_TIMESTAMPS: AtomicU64 = AtomicU64::new(0);
 /// Batch begins (DS_PROFILE_GPU): [count, ns including slot waits, of them
 /// draws' resident-shadow checks of their indices: count, ns].
 static BEGIN_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
@@ -4831,31 +4830,6 @@ fn begin_stats_line() -> String {
         format!("    submission steps (us each): {}; of the {} before parallel runs: {}\n", steps.join(", "), runs, before.join(", "))
     }
 }
-/// The first GPU timestamp writes (batch, guest address), compared with the
-/// title's clock once their batch completed (logged; a check of the clock
-/// conversion).
-static TS_CHECKS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
-static TS_CHECKED: AtomicU64 = AtomicU64::new(0);
-
-fn check_timestamps(done: u64) {
-    if TS_CHECKED.load(Ordering::Relaxed) >= 8 {
-        return;
-    }
-    let mut g = TS_CHECKS.lock();
-    if g.is_empty() {
-        return;
-    }
-    let now = super::cp::gpu_clock();
-    g.retain(|&(seq, a)| {
-        if seq > done {
-            return true;
-        }
-        let v = unsafe { std::ptr::read_volatile(a as *const u64) };
-        TS_CHECKED.fetch_add(1, Ordering::Relaxed);
-        crate::info!("gpu: timestamp written by the GPU at {a:#x} (batch {seq}): {v:#x}, the title's clock {now:#x} at completion ({} us later)", (now as i64 - v as i64) / 100);
-        false
-    });
-}
 /// CP writes `tune gpu_cp_writes` left to the CPU path: [nothing to order
 /// behind (performed now), (unused), memory the GPU cannot write here
 /// (video-memory home, not importable, too large)].
@@ -4901,10 +4875,6 @@ fn cpw_fences(k: usize) -> String {
     let v: Vec<String> = CPW_FENCES[k].iter().enumerate().filter(|(_, c)| c.load(Ordering::Relaxed) > 0).map(|(i, c)| if i == 64 { format!("ACQUIRE_MEM {}", c.load(Ordering::Relaxed)) } else { format!("event {i:#x} {}", c.load(Ordering::Relaxed)) }).collect();
     v.join(", ")
 }
-/// Dispatches storing deferred timestamps (`Exec::resolve_timestamps`), and
-/// deferred timestamps a later one of the same resolve overwrote.
-static TS_DISPATCHES: AtomicU64 = AtomicU64::new(0);
-static TS_REPEATS: AtomicU64 = AtomicU64::new(0);
 /// Copies in from shared copies counted for DS_SHADOW_SHARE_CHECK sampling.
 static SHARE_CHECKED: AtomicU64 = AtomicU64::new(0);
 static RESIDENT_READS: AtomicU64 = AtomicU64::new(0);
@@ -5369,24 +5339,6 @@ fn wait_released(s: &Slot, max: Option<std::time::Duration>) -> bool {
 }
 
 unsafe impl Send for Batch {}
-
-/// Copies `n` timestamp queries from `first` into `buf` at `off` (8 bytes
-/// each), once the work before them completed: by a full barrier (`tune
-/// ts_nowait`; a copy that waits for availability is the only operation of
-/// a batch that can stall the GPU indefinitely) or by the copy's own wait.
-unsafe fn copy_timestamps(cmd: vk::CommandBuffer, pool: vk::QueryPool, first: u32, n: u32, buf: vk::Buffer, off: u64) {
-    let c = ctx();
-    unsafe {
-        if super::tune::ts_nowait() {
-            if super::tune::skip_barriers() & 8 == 0 {
-                global_barrier(cmd);
-            }
-            c.device.cmd_copy_query_pool_results(cmd, pool, first, n, buf, off, 8, vk::QueryResultFlags::TYPE_64);
-        } else {
-            c.device.cmd_copy_query_pool_results(cmd, pool, first, n, buf, off, 8, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT);
-        }
-    }
-}
 
 /// A batch's GPU operations besides its draws and dispatches, counted while
 /// it is recorded (`Exec::ops`).
@@ -6594,7 +6546,6 @@ fn completion_thread() {
         after_completion();
         check_races(b.seq);
         super::forward::completed(b.seq);
-        check_timestamps(b.seq);
     }
 }
 
@@ -6790,9 +6741,6 @@ struct Slot {
     homes: Vec<std::sync::Arc<super::homes::HomeBuf>>,
     /// Shared copy chunks the slot's batch binds (kept until it completes).
     keep: Vec<std::sync::Arc<super::precache::Chunk>>,
-    /// Timestamp queries and their copied results for CP timestamp writes
-    /// the GPU performs (`Exec::gpu_timestamp`; made on first use).
-    ts: Option<(vk::QueryPool, vk::Buffer)>,
     /// Staging for the batch's uploads into the residency mirror
     /// (STAGE_SEG of host memory, made on first use).
     stage: Option<(vk::Buffer, *mut u8)>,
@@ -6938,7 +6886,6 @@ impl Slot {
                 xpre,
                 homes: Vec::new(),
                 keep: Vec::new(),
-                ts: None,
                 cpool: pool,
                 xcpool: xpool,
                 ccpool: cpool,
@@ -6947,101 +6894,6 @@ impl Slot {
             })
         }
     }
-}
-
-/// CP timestamp writes the GPU performs per batch (`Exec::gpu_timestamp`).
-const TS_PER_BATCH: u32 = 512;
-
-/// The timestamp store kernel (`rdna::kernels::timestamp_store`).
-struct TsPipe {
-    pipeline: vk::Pipeline,
-    layout: vk::PipelineLayout,
-    set_layout: vk::DescriptorSetLayout,
-}
-
-/// A deferred end-of-pipe timestamp: its query, the guest memory buffer and
-/// byte offset it is stored at, the clock offset (`title_clock_k`).
-#[derive(Clone, Copy)]
-struct TsEntry {
-    q: u32,
-    buffer: vk::Buffer,
-    off: u64,
-    k: u64,
-}
-
-/// The pipeline storing up to `rdna::kernels::TS_MANY` timestamps per
-/// dispatch (`Exec::resolve_timestamps`).
-fn ts_many_pipe() -> Result<&'static TsPipe, String> {
-    static PIPE: std::sync::OnceLock<Result<TsPipe, String>> = std::sync::OnceLock::new();
-    PIPE.get_or_init(|| {
-        let c = ctx();
-        unsafe {
-            let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..2)
-                .map(|b| vk::DescriptorSetLayoutBinding::default().binding(b).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE))
-                .collect();
-            let set_layout = c.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).map_err(|e| format!("timestamp set layout: {e}"))?;
-            let layouts = [set_layout];
-            let ranges = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 4 * (4 + 2 * rdna::kernels::TS_MANY) }];
-            let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(&ranges), None).map_err(|e| format!("timestamp layout: {e}"))?;
-            let code = rdna::kernels::timestamp_store_many();
-            let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).map_err(|e| format!("timestamp module: {e}"))?;
-            let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
-            let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout);
-            let pipeline = super::pcache::with_cache('i', 3, |cache| c.device.create_compute_pipelines(cache, &[ci], None)).map_err(|(_, e)| format!("timestamp pipeline: {e}"));
-            c.device.destroy_shader_module(module, None);
-            Ok(TsPipe { pipeline: pipeline?[0], layout, set_layout })
-        }
-    })
-    .as_ref()
-    .map_err(|e| e.clone())
-}
-
-fn ts_pipe() -> Result<&'static TsPipe, String> {
-    static PIPE: std::sync::OnceLock<Result<TsPipe, String>> = std::sync::OnceLock::new();
-    PIPE.get_or_init(|| {
-        let c = ctx();
-        unsafe {
-            let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..2)
-                .map(|b| vk::DescriptorSetLayoutBinding::default().binding(b).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE))
-                .collect();
-            let set_layout = c.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).map_err(|e| format!("timestamp set layout: {e}"))?;
-            let layouts = [set_layout];
-            let ranges = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 16 }];
-            let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(&ranges), None).map_err(|e| format!("timestamp layout: {e}"))?;
-            let code = rdna::kernels::timestamp_store();
-            let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).map_err(|e| format!("timestamp module: {e}"))?;
-            let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
-            let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout);
-            let pipeline = super::pcache::with_cache('i', 2, |cache| c.device.create_compute_pipelines(cache, &[ci], None)).map_err(|(_, e)| format!("timestamp pipeline: {e}"));
-            c.device.destroy_shader_module(module, None);
-            Ok(TsPipe { pipeline: pipeline?[0], layout, set_layout })
-        }
-    })
-    .as_ref()
-    .map_err(|e| e.clone())
-}
-
-/// The offset `k` that turns a GPU timestamp t (nanoseconds) into the
-/// title's GPU clock as (t + k) / 10 (`cp::gpu_clock`, 100 MHz), from a
-/// calibrated GPU timestamp (VK_EXT_calibrated_timestamps) renewed every
-/// second. None: no calibration, or GPU ticks that are not nanoseconds.
-fn title_clock_k() -> Option<u64> {
-    static K: Mutex<Option<(std::time::Instant, u64)>> = Mutex::new(None);
-    let mut g = K.lock();
-    if let Some((at, k)) = *g {
-        if at.elapsed() < std::time::Duration::from_secs(1) {
-            return Some(k);
-        }
-    }
-    let c = ctx();
-    if (c.limits.timestamp_period - 1.0).abs() > 1e-6 {
-        return None;
-    }
-    let (gpu, _) = c.calibrate()?;
-    let title = super::cp::gpu_clock();
-    let k = title.wrapping_mul(10).wrapping_sub(gpu);
-    *g = Some((std::time::Instant::now(), k));
-    Some(k)
 }
 
 const MAX_TIMED: u32 = 4096;
@@ -9092,19 +8944,10 @@ pub struct Exec {
     /// The next submission waits for this sequence (deferred CP writes that
     /// later GPU work may read).
     submit_after: u64,
-    /// CP timestamp writes the GPU performs in the recording batch.
-    ts_used: u32,
-    /// The recording batch reset its timestamp pool whole (`gpu_timestamp`).
-    ts_pool_reset: bool,
-    /// End-of-pipe timestamps of the batch whose readback and store wait for
-    /// its end (light end-of-pipe writes, `Exec::gpu_cp_write`).
-    ts_deferred: Vec<TsEntry>,
     /// An end-of-pipe label write in the batch that later work is not
     /// ordered after (light end-of-pipe writes, `Exec::gpu_cp_write`): a wait passing on it orders it
     /// (`order_after_open_writes`).
     eop_unordered: bool,
-    /// Of them, those to compare with the clock once the batch completed.
-    ts_check: Vec<u64>,
     /// The recording batch holds CP writes performed by the GPU
     /// (`gpu_cp_write`); the last submitted batch that does.
     gpu_writes_open: bool,
@@ -10083,11 +9926,7 @@ impl Exec {
                 last_seq: 0,
                 last_action_seq: 0,
                 submit_after: 0,
-                ts_used: 0,
-                ts_pool_reset: false,
-                ts_deferred: Vec::new(),
                 eop_unordered: false,
-                ts_check: Vec::new(),
                 gpu_writes_open: false,
                 last_gpu_write_seq: 0,
                 cpu_action_seq: 0,
@@ -10544,10 +10383,7 @@ impl Exec {
         self.begun_mark = super::timeline::mark();
         self.begun_cycles = if self.begun_mark.is_some() { super::threadcpu::own_cycles() } else { 0 };
         self.pool_use = [0; 6];
-        self.ts_used = 0;
-        self.ts_pool_reset = false;
         self.ops = [0; OPS];
-        self.ts_deferred.clear();
         self.effect_writes = Default::default();
         self.eop_unordered = false;
         note_seg_use(self.deferred, self.compute_cp, self.shadow_used, 0);
@@ -10640,7 +10476,6 @@ impl Exec {
         }
         self.end_rendering();
         st.mark(1);
-        self.resolve_timestamps();
         st.mark(2);
         // Front end 2: what the batch's work wrote into the mirror goes to
         // guest memory before the batch completes; the checks its bindings
@@ -10802,9 +10637,6 @@ impl Exec {
         st.mark(5);
         if std::mem::take(&mut self.gpu_writes_open) {
             self.last_gpu_write_seq = seq;
-        }
-        if !self.ts_check.is_empty() {
-            TS_CHECKS.lock().extend(self.ts_check.drain(..).map(|a| (seq, a)));
         }
         (self.xq_dep, self.xq_why, self.xq_img) = (0, 0, false);
         self.slots[i].seq = seq;
@@ -13644,7 +13476,7 @@ impl Exec {
             self.label(&l);
         }
         let full = !end_of_pipe && super::tune::skip_barriers() & 4 == 0;
-        if full && self.ts_deferred.is_empty() {
+        if full {
             self.end_rendering_before_barrier();
         } else {
             self.end_rendering();
@@ -13671,7 +13503,6 @@ impl Exec {
         // (Their guest-memory copies left for the batch's close, `tune
         // fe2_cpw_defer`, were level at the vista and in a wider form
         // deadlocked boots: FINDINGS.md 2026-10-30 morning and 2026-10-31.)
-        self.resolve_timestamps();
         // Front end 2: what earlier work wrote into the mirror reaches guest
         // memory before this write does (a title thread that sees it reads
         // that there), and the write goes into the mirror too (later work
@@ -13786,13 +13617,6 @@ impl Exec {
         true
     }
 
-    /// An end-of-pipe timestamp write (RELEASE_MEM DATA_SEL 3/4) performed by
-    /// the GPU in order with this queue's work: the GPU clock when the work
-    /// before it completed (vkCmdWriteTimestamp at the bottom of the pipe),
-    /// stored in the title's clock by `rdna::kernels::timestamp_store`. The
-    /// CPU took the time when the completion thread reached the batch, which
-    /// ended every batch at such a write (~400 per courtyard frame). False:
-    /// the CPU path (no calibration, memory the GPU cannot write here).
     /// A CP write the GPU performs in the recording batch follows the CP
     /// writes the CPU performs after batch `cpu` completed (its deferred
     /// effects: the graphics CP's GetLodStats once a frame): the batch waits
@@ -13806,171 +13630,6 @@ impl Exec {
             self.cpu_wait = self.cpu_wait.max(cpu);
         } else {
             self.submit_after = self.submit_after.max(cpu);
-        }
-    }
-
-    pub fn gpu_timestamp(&mut self, a: u64) -> bool {
-        // (Front end 4: a timestamp's page is never held; its store reaches
-        // guest memory alone.)
-        super::fe2::c4_cp_target(a, 8);
-        if (self.deferred && !self.held && !self.par_worker) || a % 4 != 0 || DEVICE_LOST.load(Ordering::Relaxed) || super::homes::overlaps(a, 8) {
-            return false;
-        }
-        let Some(k) = title_clock_k() else { return false };
-        // (Their stores to guest memory: `resolve_timestamps`.)
-        if ts_pipe().is_err() {
-            return false;
-        }
-        let Some((buffer, start, _)) = span(a, 8) else { return false };
-        if !self.actions.is_empty() {
-            self.submit_for("effect order");
-        }
-        let cpu = self.cpu_action_seq.max(self.cpu_dep_seq);
-        if cpu > done_seq() {
-            self.order_after_cpu(cpu);
-        }
-        self.begin();
-        // A descriptor set with two buffers per write (see `reserve`).
-        if self.ts_used >= TS_PER_BATCH || self.pool_use[0] + 1 > POOL_LIMITS[0] || self.pool_use[1] + 2 > POOL_LIMITS[1] {
-            self.submit_for("timestamps");
-            self.begin();
-        }
-        if !self.recording {
-            return false;
-        }
-        let c = ctx();
-        if self.slots[self.cur].ts.is_none() {
-            let pool = unsafe { c.device.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(TS_PER_BATCH), None) };
-            let buf = c.device_buffer(TS_PER_BATCH as u64 * 8, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST);
-            match (pool, buf) {
-                (Ok(p), Ok((b, _mem))) => self.slots[self.cur].ts = Some((p, b)),
-                _ => return false,
-            }
-        }
-        let Some((pool, _)) = self.slots[self.cur].ts else { return false };
-        // Their descriptor sets come when they are resolved
-        // (`resolve_timestamps`; the space stays reserved here).
-        self.pool_use[0] += 1;
-        self.pool_use[1] += 2;
-        self.gpu_writes_open = true;
-        // (Inside a rendering instance once the batch's pool is reset: a
-        // timestamp write may come there, a query reset may not.)
-        if !self.ts_pool_reset {
-            self.end_rendering();
-        }
-        let q = self.ts_used;
-        self.ts_used += 1;
-        let off = a - start;
-        let cmd = self.cmd();
-        // Taken when the work before it completed, without holding later
-        // work back; read and stored to guest memory at the batch's end
-        // (`resolve_timestamps`; the CPU reads it after completion, and a
-        // command-processor read of it waits for the batch). The batch's
-        // first resets every query of the pool, so the later ones need not
-        // end the rendering instance they come in (~400 a frame at the
-        // courtyard, each a restart of rendering for the next draw).
-        unsafe {
-            if !self.ts_pool_reset {
-                c.device.cmd_reset_query_pool(cmd, pool, 0, TS_PER_BATCH);
-                self.ts_pool_reset = true;
-            }
-            c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, q);
-        }
-        self.ts_deferred.push(TsEntry { q, buffer, off, k });
-        EOP_LIGHT[1].fetch_add(1, Ordering::Relaxed);
-        self.taint_resident(a, 8);
-        self.effect_writes.insert(a, 8);
-        self.note_write(a, 8);
-        self.ops[OP_TIMESTAMPS] += 1;
-        if GPU_TIMESTAMPS.fetch_add(1, Ordering::Relaxed) < 8 {
-            self.ts_check.push(a);
-        }
-        true
-    }
-
-    /// The batch's deferred end-of-pipe timestamps (`gpu_timestamp`): their
-    /// queries read at once and each stored to guest memory, at the batch's
-    /// end or before a later CP write of the batch (each query holds when the
-    /// work before it completed).
-    fn resolve_timestamps(&mut self) {
-        if self.ts_deferred.is_empty() {
-            return;
-        }
-        // (Its stores into guest memory after a CP write left open.)
-        if !self.cpw_open.is_empty() {
-            self.end_rendering_then_barrier();
-        }
-        if super::vk::labels_on() {
-            let l = format!("{} timestamp stores", self.name);
-            self.label(&l);
-        }
-        let mut deferred = std::mem::take(&mut self.ts_deferred);
-        // A slot written twice in the batch keeps the later value (stored in
-        // order, one dispatch each, the later store won; stores of one
-        // dispatch run unordered).
-        let before = deferred.len();
-        let mut seen: Vec<(vk::Buffer, u64)> = Vec::with_capacity(before);
-        for i in (0..deferred.len()).rev() {
-            let key = (deferred[i].buffer, deferred[i].off);
-            if seen.contains(&key) {
-                deferred.remove(i);
-            } else {
-                seen.push(key);
-            }
-        }
-        TS_REPEATS.fetch_add((before - deferred.len()) as u64, Ordering::Relaxed);
-        let (Some((pool, tbuf)), Ok(tp)) = (self.slots[self.cur].ts, ts_many_pipe()) else { return };
-        let c = ctx();
-        let cmd = self.cmd();
-        unsafe {
-            copy_timestamps(cmd, pool, 0, self.ts_used, tbuf, 0);
-            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
-            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
-            c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, tp.pipeline);
-        }
-        self.dyncache.cs_pipeline = tp.pipeline;
-        // Up to TS_MANY per dispatch (`tune ts_batch`), those of one buffer
-        // and clock offset in order, the binding over the bytes they store.
-        let per = (super::tune::ts_batch() as usize).clamp(1, rdna::kernels::TS_MANY as usize);
-        let align = c.limits.min_storage_buffer_offset_alignment.max(4);
-        let mut i = 0;
-        while i < deferred.len() {
-            let first = deferred[i];
-            let mut j = i + 1;
-            while j < deferred.len() && j - i < per && deferred[j].buffer == first.buffer && deferred[j].k == first.k {
-                j += 1;
-            }
-            let group = &deferred[i..j];
-            let lo = group.iter().map(|e| e.off).min().unwrap_or(0) / align * align;
-            let hi = group.iter().map(|e| e.off + 8).max().unwrap_or(8);
-            let Ok(set) = self.alloc_set(tp.set_layout) else { return };
-            // Diagnosis (`tune skip_copies` 512, timing only): stored into
-            // video memory instead of guest memory.
-            let dst = match scratch_buffer() {
-                Some(sb) if super::tune::skip_copies() & 512 != 0 => (sb, 0),
-                _ => (first.buffer, lo),
-            };
-            let infos = [vk::DescriptorBufferInfo { buffer: tbuf, offset: 0, range: TS_PER_BATCH as u64 * 8 }, vk::DescriptorBufferInfo { buffer: dst.0, offset: dst.1, range: hi - lo }];
-            let writes: Vec<vk::WriteDescriptorSet> = infos
-                .iter()
-                .enumerate()
-                .map(|(b, info)| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(b as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(info)))
-                .collect();
-            let mut pc: Vec<u32> = vec![first.k as u32, (first.k >> 32) as u32, group.len() as u32, 0];
-            for e in group {
-                pc.push(e.q);
-                pc.push(((e.off - lo) / 4) as u32);
-            }
-            pc.resize(4 + 2 * rdna::kernels::TS_MANY as usize, 0);
-            let bytes: Vec<u8> = pc.iter().flat_map(|x| x.to_le_bytes()).collect();
-            unsafe {
-                c.device.update_descriptor_sets(&writes, &[]);
-                c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, tp.layout, 0, &[set], &[]);
-                c.device.cmd_push_constants(cmd, tp.layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
-                c.device.cmd_dispatch(cmd, 1, 1, 1);
-            }
-            TS_DISPATCHES.fetch_add(1, Ordering::Relaxed);
-            i = j;
         }
     }
 
@@ -16902,7 +16561,7 @@ impl Drop for Exec {
 /// One status line for hang reports.
 pub fn status() -> String {
     format!(
-        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them from a resident shadow, {} of them behind a barrier of their own; {} render passes ended into the next full barrier; draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU ({} timestamps), left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges ({} before an in-place use), {} skipped; {} draws executed ({} reading their arguments on the GPU, {} repeating the draw before (chains ended by opcode: {}), {} barriers before a dispatch rewrote them), {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait), {} fill-kernel dispatches recorded as buffer fills ({} of them only clearing the GPU-written images they cover, {} MiB not stored), {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
+        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them from a resident shadow, {} of them behind a barrier of their own; {} render passes ended into the next full barrier; draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU, {} title timestamps written by the CPU, left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges ({} before an in-place use), {} skipped; {} draws executed ({} reading their arguments on the GPU, {} repeating the draw before (chains ended by opcode: {}), {} barriers before a dispatch rewrote them), {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait), {} fill-kernel dispatches recorded as buffer fills ({} of them only clearing the GPU-written images they cover, {} MiB not stored), {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
         EXECUTED.load(Ordering::Relaxed),
         GPU_INDIRECT.load(Ordering::Relaxed),
         SHADOW_ARGS.load(Ordering::Relaxed),
@@ -16917,7 +16576,7 @@ pub fn status() -> String {
             v.iter().take(6).map(|(a, n)| format!("{a:#x} {n}")).collect::<Vec<String>>().join(", ")
         },
         GPU_CP_WRITES.load(Ordering::Relaxed),
-        GPU_TIMESTAMPS.load(Ordering::Relaxed),
+        super::cp::TS_CPU.load(Ordering::Relaxed),
         GPU_CP_REFUSED.iter().map(|c| c.load(Ordering::Relaxed)).collect::<Vec<u64>>(),
         SHADOWED.load(Ordering::Relaxed),
         SHADOW_FULL.load(Ordering::Relaxed),
@@ -16981,11 +16640,8 @@ pub fn status() -> String {
             COALESCED[1].load(Ordering::Relaxed)
         )
         + &format!(
-            "    end-of-pipe writes without a full barrier: {} labels, {} timestamps (stored by {} dispatches, {} overwritten in their batch); {} waits ordered the work after them; {} CP writes right after front end 2's write-back with no barrier before them; CP writes without end of pipe the GPU performed, graphics / compute queues, by (neither, after a flush or acquire, held past a label wait, both): {:?} / {:?}; after a flush by what asked for it: graphics {}; compute queues {}\n",
+            "    end-of-pipe writes without a full barrier: {} labels; {} waits ordered the work after them; {} CP writes right after front end 2's write-back with no barrier before them; CP writes without end of pipe the GPU performed, graphics / compute queues, by (neither, after a flush or acquire, held past a label wait, both): {:?} / {:?}; after a flush by what asked for it: graphics {}; compute queues {}\n",
             EOP_LIGHT[0].load(Ordering::Relaxed),
-            EOP_LIGHT[1].load(Ordering::Relaxed),
-            TS_DISPATCHES.load(Ordering::Relaxed),
-            TS_REPEATS.load(Ordering::Relaxed),
             EOP_LIGHT[2].load(Ordering::Relaxed),
             EOP_LIGHT[3].load(Ordering::Relaxed),
             CPW_KINDS[0].iter().map(|c| c.load(Ordering::Relaxed)).collect::<Vec<u64>>(),

@@ -910,6 +910,20 @@ fn trace_cs_list() -> &'static [u64] {
     L.get_or_init(|| std::env::var("DS_TRACE_CS").map(|v| v.split(',').filter_map(|a| u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()).collect()).unwrap_or_default())
 }
 
+/// The title's timestamp at `a` written now by the CPU (its page never
+/// held by front end 4; the store is a CPU write front end 2's takes find).
+fn cpu_timestamp(a: u64) {
+    if !valid(a, 8) {
+        return;
+    }
+    super::fe2::c4_cp_target(a, 8);
+    unsafe { wr64(a, gpu_clock()) };
+    TS_CPU.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The title's timestamps written (`cpu_timestamp`).
+pub static TS_CPU: AtomicU64 = AtomicU64::new(0);
+
 /// GPU timestamp (100 MHz, like the console's GPU clock counter).
 pub fn gpu_clock() -> u64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -2341,8 +2355,8 @@ impl Cp {
     /// A packet the graphics queue's runs hold although it is neither state
     /// nor a command (this queue's main command processor, planning; since
     /// 2026-11-07 evening: the vista +3.7%): `RUN_PASS_TS` the title's GPU
-    /// timestamp (RELEASE_MEM of the GPU clock without an interrupt: a chunk
-    /// records it in its own batch, `Exec::gpu_timestamp`), `RUN_PASS_WAIT` a
+    /// timestamp (RELEASE_MEM of the GPU clock without an interrupt: written
+    /// by the planner, `cpu_timestamp`), `RUN_PASS_WAIT` a
     /// label wait that holds in guest memory now (the work that wrote the
     /// label is done; the planner gives the run the view the wait would, a
     /// worker orders its batch after the label's writer, `Exec::xq_label`).
@@ -2350,6 +2364,14 @@ impl Cp {
     /// hardware, so no dependency inside the run comes with them. A census of
     /// a vista frame: these ended a third of its serial runs.
     fn run_pass(&mut self, opc: u32, p: &dyn Fn(u64) -> u32) -> Option<u8> {
+        // (A run's timestamp is written now, by its planner, in stream
+        // order: its values stay monotonic; its chunk passes it.)
+        if opc == op::RELEASE_MEM && !self.compute && self.main_gfx {
+            let c = p(1);
+            if (c >> 29) & 7 == 3 && matches!((c >> 24) & 7, 0 | 3) {
+                cpu_timestamp(addr64(p(2) & !3, p(3)));
+            }
+        }
         if matches!(opc, op::WAIT_REG_MEM | op::WAIT_REG_MEM64) && !self.compute && self.main_gfx {
             // (Read as `wait` reads it.)
             let a = addr64(p(1), p(2));
@@ -2404,12 +2426,9 @@ impl Cp {
             if (c >> 29) & 7 != 3 || !matches!((c >> 24) & 7, 0 | 3) {
                 return false;
             }
-            let a = addr64(p(2) & !3, p(3));
+            // (Its planner wrote it: `run_pass`.)
             let Some(e) = self.exec.as_mut() else { return false };
             e.note_sync();
-            if !e.gpu_timestamp(a) {
-                return false;
-            }
             self.fence_pending = false;
             RUN_PASSED[2].fetch_add(1, Ordering::Relaxed);
             return true;
@@ -6174,14 +6193,15 @@ impl Cp {
         if !write && (int_sel == 0 || int_sel == 3) {
             return;
         }
+        // The title's GPU timestamps (the GPU clock without an interrupt):
+        // written now, in the clock `gpu_clock` gives, by the command
+        // processor that meets them (FINDINGS.md 2026-11-10 late morning: the
+        // swamp x1.037, the vista x1.026 against bottom-of-pipe queries stored
+        // by a kernel; the title does not react to the values, 2026-11-04).
         if matches!(data_sel, 3 | 4) && (int_sel == 0 || int_sel == 3) {
-            let held = self.held.is_some();
-            if let Some(e) = self.exec.as_mut() {
-                if (e.busy() || held) && e.gpu_timestamp(a) {
-                    self.fence_pending = false;
-                    return;
-                }
-            }
+            cpu_timestamp(a);
+            self.fence_pending = false;
+            return;
         }
         let seq = self.effect(
             true,
