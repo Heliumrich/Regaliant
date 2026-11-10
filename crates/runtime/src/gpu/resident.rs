@@ -1455,6 +1455,12 @@ const _: () = assert!(MIRROR_BASE == rdna::translate::PT_BASE && MIRROR_END == r
 /// turning residency on (none of its placements run). Ok: what was made.
 pub fn make_for_fe2() -> Result<String, String> {
     if MIRROR.get().is_none() {
+        if std::env::var("DS_SPARSE_HOST_TEST").is_ok_and(|v| v == "1") {
+            match sparse_host_test() {
+                Ok(s) => crate::info!("sparse host test: {s}"),
+                Err(e) => crate::warn!("sparse host test failed: {e}"),
+            }
+        }
         let m = make_mirror()?;
         let _ = MIRROR.set(m);
     }
@@ -1634,6 +1640,153 @@ fn zero_mark_pages(sm: &SparseMarks, pages: &[u64]) -> Result<(), String> {
 }
 
 static MIRROR: std::sync::OnceLock<Mirror> = std::sync::OnceLock::new();
+
+/// Boot self-test (`DS_SPARSE_HOST_TEST=1`; front end 3's residency
+/// question): whether a sparse buffer made for host allocations can have
+/// imported host memory bound to its pages, so that the GPU reads and writes
+/// that host memory through the buffer; and what unbound pages read. A 16
+/// MiB sparse buffer: [0, 4 MiB) bound to 4 MiB of host memory, [8, 9 MiB)
+/// to device memory, the rest unbound. Ok: a summary of what held.
+fn sparse_host_test() -> Result<String, String> {
+    use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+    let c = ctx();
+    let ext = c.ext_host.as_ref().ok_or("no VK_EXT_external_memory_host")?;
+    const SIZE: u64 = 16 << 20;
+    const HOST: u64 = 4 << 20;
+    let ht = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
+    let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
+    let mut out = Vec::new();
+    unsafe {
+        let mut ebi = vk::ExternalMemoryBufferCreateInfo::default().handle_types(ht);
+        let bi = vk::BufferCreateInfo::default().size(SIZE).usage(c.addressable(usage)).flags(vk::BufferCreateFlags::SPARSE_BINDING | vk::BufferCreateFlags::SPARSE_RESIDENCY).push_next(&mut ebi);
+        let buf = c.device.create_buffer(&bi, None).map_err(|e| format!("vkCreateBuffer (sparse, host allocations): {e}"))?;
+        let req = c.device.get_buffer_memory_requirements(buf);
+        out.push(format!("sparse buffer: alignment {} KiB, memory types {:#x}", req.alignment >> 10, req.memory_type_bits));
+        let host = VirtualAlloc(std::ptr::null(), HOST as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as *mut u32;
+        if host.is_null() {
+            c.device.destroy_buffer(buf, None);
+            return Err("VirtualAlloc".into());
+        }
+        for i in 0..(HOST / 4) as usize {
+            *host.add(i) = (i as u32).wrapping_mul(2654435761) ^ 0x5a5a_0000;
+        }
+        let mut props = vk::MemoryHostPointerPropertiesEXT::default();
+        let r = (ext.fp().get_memory_host_pointer_properties_ext)(c.device.handle(), ht, host as *const std::ffi::c_void, &mut props);
+        let cleanup = |buf: vk::Buffer, mems: &[vk::DeviceMemory]| {
+            c.device.destroy_buffer(buf, None);
+            for &m in mems {
+                c.device.free_memory(m, None);
+            }
+            VirtualFree(host as *mut std::ffi::c_void, 0, MEM_RELEASE);
+        };
+        if r != vk::Result::SUCCESS {
+            cleanup(buf, &[]);
+            return Err(format!("vkGetMemoryHostPointerPropertiesEXT: {r}"));
+        }
+        let bits = req.memory_type_bits & props.memory_type_bits;
+        out.push(format!("host pointer memory types {:#x}, common {bits:#x}", props.memory_type_bits));
+        let hv = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let Some(ty) = c.memory_type(bits, hv | vk::MemoryPropertyFlags::HOST_CACHED).or_else(|| c.memory_type(bits, hv)).or_else(|| c.memory_type(bits, vk::MemoryPropertyFlags::empty())) else {
+            cleanup(buf, &[]);
+            return Ok(format!("{}; no common memory type: host memory cannot back the buffer", out.join("; ")));
+        };
+        let mut imp = vk::ImportMemoryHostPointerInfoEXT::default().handle_type(ht).host_pointer(host as *mut std::ffi::c_void);
+        let ai = vk::MemoryAllocateInfo::default().allocation_size(HOST).memory_type_index(ty).push_next(&mut imp);
+        let hmem = match c.device.allocate_memory(&ai, None) {
+            Ok(m) => m,
+            Err(e) => {
+                cleanup(buf, &[]);
+                return Err(format!("{}; import of host memory (type {ty}): {e}", out.join("; ")));
+            }
+        };
+        let Some(dty) = c.memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL) else {
+            cleanup(buf, &[hmem]);
+            return Err("no device-local type".into());
+        };
+        let dmem = match c.device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(1 << 20).memory_type_index(dty), None) {
+            Ok(m) => m,
+            Err(e) => {
+                cleanup(buf, &[hmem]);
+                return Err(format!("device memory: {e}"));
+            }
+        };
+        let binds = [
+            vk::SparseMemoryBind::default().resource_offset(0).size(HOST).memory(hmem).memory_offset(0),
+            vk::SparseMemoryBind::default().resource_offset(8 << 20).size(1 << 20).memory(dmem).memory_offset(0),
+        ];
+        let bufs = [vk::SparseBufferMemoryBindInfo::default().buffer(buf).binds(&binds)];
+        let info = vk::BindSparseInfo::default().buffer_binds(&bufs);
+        let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(|e| format!("fence: {e}"))?;
+        let t = std::time::Instant::now();
+        let r = {
+            let q = c.queue.lock();
+            c.device.queue_bind_sparse(*q, &[info], fence)
+        };
+        let r = r.map_err(|e| format!("vkQueueBindSparse: {e}")).and_then(|_| c.device.wait_for_fences(&[fence], true, u64::MAX).map_err(|e| format!("bind fence: {e}")));
+        c.device.destroy_fence(fence, None);
+        if let Err(e) = r {
+            cleanup(buf, &[hmem, dmem]);
+            return Err(format!("{}; {e}", out.join("; ")));
+        }
+        out.push(format!("bound host memory (type {ty}) and device memory (type {dty}) in {} us", t.elapsed().as_micros()));
+        // GPU: read the host part and an unbound part into a readback
+        // buffer; fill 64 KiB at 1 MiB (host) and copy the device part's
+        // first 64 KiB after filling it.
+        let (rb, rbmem, rbptr) = match c.host_buffer(HOST + (1 << 20), vk::BufferUsageFlags::TRANSFER_DST) {
+            Ok(x) => x,
+            Err(e) => {
+                cleanup(buf, &[hmem, dmem]);
+                return Err(e);
+            }
+        };
+        let r = one_off(|cmd| {
+            c.device.cmd_copy_buffer(cmd, buf, rb, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: HOST }]);
+            c.device.cmd_copy_buffer(cmd, buf, rb, &[vk::BufferCopy { src_offset: 12 << 20, dst_offset: HOST, size: 64 << 10 }]);
+            let b = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::TRANSFER_READ);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[b], &[], &[]);
+            c.device.cmd_fill_buffer(cmd, buf, 1 << 20, 64 << 10, 0xabcd_ef01);
+            c.device.cmd_fill_buffer(cmd, buf, 8 << 20, 64 << 10, 0x1234_5678);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[b], &[], &[]);
+            c.device.cmd_copy_buffer(cmd, buf, rb, &[vk::BufferCopy { src_offset: 8 << 20, dst_offset: HOST + (64 << 10), size: 64 << 10 }]);
+        });
+        let mut ok_read = 0u64;
+        let mut ok_zero = 0u64;
+        let mut ok_fill = 0u64;
+        let mut ok_dev = 0u64;
+        if r.is_ok() {
+            let rbw = rbptr as *const u32;
+            for i in 0..(HOST / 4) as usize {
+                // (The fill came after the copy: the copy saw the pattern.)
+                if *rbw.add(i) == (i as u32).wrapping_mul(2654435761) ^ 0x5a5a_0000 {
+                    ok_read += 1;
+                }
+            }
+            for i in 0..(64 << 10) / 4 {
+                if *rbw.add((HOST / 4) as usize + i) == 0 {
+                    ok_zero += 1;
+                }
+                if *host.add((1 << 20) / 4 + i) == 0xabcd_ef01 {
+                    ok_fill += 1;
+                }
+                if *rbw.add(((HOST + (64 << 10)) / 4) as usize + i) == 0x1234_5678 {
+                    ok_dev += 1;
+                }
+            }
+        }
+        out.push(format!(
+            "GPU copy of the host part read {ok_read} of {} dwords as the CPU wrote them; unbound part read {ok_zero} of 16384 dwords as zero; a GPU fill through the buffer reached host memory in {ok_fill} of 16384 dwords; the device part {ok_dev} of 16384{}",
+            HOST / 4,
+            match &r {
+                Ok(()) => String::new(),
+                Err(e) => format!(" (GPU work failed: {e})"),
+            }
+        ));
+        c.device.destroy_buffer(rb, None);
+        c.device.free_memory(rbmem, None);
+        cleanup(buf, &[hmem, dmem]);
+    }
+    Ok(out.join("; "))
+}
 
 fn make_mirror() -> Result<Mirror, String> {
     let c = ctx();
@@ -1999,9 +2152,11 @@ fn unback_cold(flips: u32, max_words: usize) -> Result<(), String> {
     let ready: Vec<usize> = g.draining.iter().filter(|&(_, &(_, _, f))| now.wrapping_sub(f) >= DRAIN_FLIPS).map(|(&w, _)| w).collect();
     // (Front end 4's held pages: the mirror holds their newest words, never
     // unbound.)
+    // (Front end 3's C6 resident set too: shaders read it without a
+    // placement.)
     let held = |w: usize| {
         let lo = MIRROR_BASE + w as u64 * 64 * m.page;
-        super::fe2::c4_any_held(lo, lo + 64 * m.page)
+        super::fe2::c4_any_held(lo, lo + 64 * m.page) || super::c6::any_resident(lo, 64 * m.page)
     };
     for w in ready {
         let (bits, u, _) = g.draining.remove(&w).unwrap();

@@ -254,6 +254,8 @@ pub static MIP_VIEW_BINDINGS: AtomicU64 = AtomicU64::new(0);
 /// and how many were dropped because their pages were remapped.
 static IMPORTS: AtomicU64 = AtomicU64::new(0);
 static IMPORT_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Stages bound with front end 3's C6 (`Spec::c6`).
+pub static C6_STAGES: AtomicU64 = AtomicU64::new(0);
 static IMPORTS_MULTI: AtomicU64 = AtomicU64::new(0);
 static IMPORTS_STALE: AtomicU64 = AtomicU64::new(0);
 /// The profile window's imports (`import_window_line`): [imports, bytes,
@@ -2010,6 +2012,12 @@ fn span_cache_put(generation: u64, st: u64, e: u64, b: vk::Buffer) {
 
 /// Imported buffer covering guest [base, base+size): (buffer, window start, window end).
 #[track_caller]
+/// Whether one import window holds guest [base, base+size) (front end 3's
+/// C6: the resident set's copies come from it).
+pub(super) fn import_covers(base: u64, size: u64) -> bool {
+    span(base, size).is_some()
+}
+
 fn span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
     revalidate_spans();
     let generation = CACHE_GEN.load(Ordering::Acquire);
@@ -2139,7 +2147,7 @@ fn import_narrow(base: u64, size: u64) -> bool {
 /// `fe2_settled_over` again under the arm lock, and an import holds its
 /// pages unarmed from before its driver call until it is listed
 /// (`fe2::hold`).
-fn fe2_armable(a: u64, b: u64, arm: &mut dyn FnMut(u64, u64)) -> bool {
+pub(super) fn fe2_armable(a: u64, b: u64, arm: &mut dyn FnMut(u64, u64)) -> bool {
     let Some(parts) = settled_parts(a, b) else { return false };
     for (p, q) in parts {
         arm(p, q);
@@ -2310,7 +2318,7 @@ fn import_log() -> bool {
 /// writing meanwhile, every thread's lookups waited (282 waits, 959 ms,
 /// against 296 ms of imports in a stream-in window, 2026-10-28 night); an
 /// import over the same window waits for the one in progress instead.
-fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
+pub(super) fn import_span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
     import_span_win(base, size, 0)
 }
 
@@ -2973,6 +2981,22 @@ fn keep_pipe(map: &Mutex<Option<HashMap<u64, PipeEntry>>>, key: u64, pipe: Pipe)
 /// to this session, so the driver's shader cache serves nothing it compiled
 /// in an earlier one.
 pub(super) fn module_code(spirv: &[u32]) -> std::borrow::Cow<'_, [u32]> {
+    // (`DS_SPV_DUMP=<dir>`: every module written there before the driver
+    // compiles it, by its content's hash: a module that crashes the
+    // driver's compiler is among the last written.)
+    static DUMP: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    if let Some(dir) = DUMP.get_or_init(|| std::env::var_os("DS_SPV_DUMP").map(|d| {
+        let p = std::path::PathBuf::from(d);
+        let _ = std::fs::create_dir_all(&p);
+        p
+    })) {
+        let mut h = super::fx::FxHasher::default();
+        std::hash::Hasher::write(&mut h, unsafe { std::slice::from_raw_parts(spirv.as_ptr() as *const u8, spirv.len() * 4) });
+        let path = dir.join(format!("{:016x}.spv", std::hash::Hasher::finish(&h)));
+        if !path.exists() {
+            let _ = std::fs::write(&path, unsafe { std::slice::from_raw_parts(spirv.as_ptr() as *const u8, spirv.len() * 4) });
+        }
+    }
     static NONCE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
     let nonce = *NONCE.get_or_init(|| {
         // (`DS_SPIRV_NONCE=<hex>`: that nonce, so two sessions share one no
@@ -3707,8 +3731,10 @@ fn note_copy_waits(own: bool, wait: u64) {
 /// there after all the main queue's work so far. Called in sequence order
 /// (`push_batch`): the timelines' signals increase.
 #[allow(clippy::too_many_arguments)]
-fn submit_batch(seq: u64, xpre: Option<vk::CommandBuffer>, pre: Option<vk::CommandBuffer>, cmd: vk::CommandBuffer, wait: u64, on_c: bool, xwait: u64, cpu_wait: u64) -> Result<(), String> {
+fn submit_batch(seq: u64, xpre: Option<vk::CommandBuffer>, pre: Option<vk::CommandBuffer>, cmd: vk::CommandBuffer, wait: u64, on_c: bool, xwait: u64, cpu_wait: u64, c6_want: u32) -> Result<(), String> {
     let c = ctx();
+    // Front end 3's C6: the resident set made current ahead of the batch.
+    super::c6::coverage(c, c6_want)?;
     // Guest page table updates queued before this batch, ahead of it (after
     // the compute family's queue's batches, which read the old entries),
     // and texture uploads recorded batched (`tune upload_batch`).
@@ -3781,6 +3807,10 @@ pub(super) struct SubmitSpec {
     /// The batch whose deferred effects must have run first (0: none;
     /// `Exec::order_after_cpu`).
     cpu_wait: u64,
+    /// Front end 3's C6: the newest epoch its GPU-resolved commands want
+    /// (0: none): a coherence pass of that epoch or later first, then the
+    /// resident set's copies (`c6::coverage`).
+    c6_want: u32,
     name: String,
 }
 
@@ -3817,13 +3847,19 @@ fn submit_specs(specs: Vec<(u64, SubmitSpec)>) {
         }
         if j - i == 1 {
             let (seq, s) = &specs[i];
-            if let Err(e) = submit_batch(*seq, s.xpre, s.pre, s.cmd, s.wait, s.on_c, s.xwait, s.cpu_wait) {
+            if let Err(e) = submit_batch(*seq, s.xpre, s.pre, s.cmd, s.wait, s.on_c, s.xwait, s.cpu_wait, s.c6_want) {
                 fail(e, &s.name);
             }
             i = j;
             continue;
         }
         let c = ctx();
+        // (Front end 3's C6 for the group: the newest epoch any wants.)
+        let c6_want = specs[i..j].iter().map(|(_, s)| s.c6_want).max().unwrap_or(0);
+        if let Err(e) = super::c6::coverage(c, c6_want) {
+            fail(e, &specs[i].1.name);
+            return;
+        }
         if let Err(e) = super::pagetable::submit_pending(c, XQ_SUBMITTED.load(Ordering::Acquire)) {
             fail(e, &specs[i].1.name);
             return;
@@ -8967,6 +9003,9 @@ pub struct Exec {
     /// being recorded began (u32::MAX: none): what a GPU-resolved run its
     /// first command opens was checked for (`fe2_run_want`).
     fe2_min_want: u32,
+    /// Front end 3's C6: the newest epoch the batch's GPU-resolved commands
+    /// want (0: none; `SubmitSpec::c6_want`).
+    pub(super) c6_want: u32,
     /// Prologue copies not recorded yet (`tune pre_merge`): (source,
     /// destination, region), recorded grouped by buffers by `end_pre`.
     pre_copies: Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>,
@@ -9890,6 +9929,8 @@ struct Closed {
     /// queue (`Exec::batch_c`).
     xq: (u64, u32, bool),
     on_c: bool,
+    /// `Exec::c6_want` of the batch.
+    c6_want: u32,
 }
 
 /// Slot sequence of a batch closed but not yet submitted.
@@ -9978,6 +10019,7 @@ impl Exec {
                 f3_reads: Vec::new(),
                 f3_placed: Default::default(),
                 fe2_min_want: u32::MAX,
+                c6_want: 0,
                 pre_copies: Vec::new(),
                 xcopies: Vec::new(),
                 copy_wait: 0,
@@ -10641,7 +10683,7 @@ impl Exec {
             let cpu = self.span_cpu();
             super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why}{cpu})", self.batch_shaders.len()));
             let lists = std::mem::take(&mut self.batch_lists).then(super::vk::defer::release);
-            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises, fe2_up: Vec::new(), fe2_spans: Vec::new(), lists, xq: (self.xq_dep, self.xq_why, self.xq_img), on_c: self.batch_c });
+            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises, fe2_up: Vec::new(), fe2_spans: Vec::new(), lists, xq: (self.xq_dep, self.xq_why, self.xq_img), on_c: self.batch_c, c6_want: std::mem::take(&mut self.c6_want) });
             (self.xq_dep, self.xq_why, self.xq_img) = (0, 0, false);
             self.res_mine.clear();
             if let Some(b) = self.closed.last_mut() {
@@ -10682,6 +10724,7 @@ impl Exec {
         // completion thread sees the request and signals, or this sees that
         // batch completed.)
         let mut cpu_wait = std::mem::take(&mut self.cpu_wait);
+        let c6_want = std::mem::take(&mut self.c6_want);
         if cpu_wait > 0 {
             CPU_WAIT_REQ.fetch_max(cpu_wait, Ordering::SeqCst);
             if DONE_ATOMIC.load(Ordering::SeqCst) >= cpu_wait {
@@ -10702,7 +10745,7 @@ impl Exec {
                 l.replay();
             }
             let _ = seq;
-            Some(SubmitSpec { xpre, pre, cmd, wait: copy_wait, on_c, xwait: 0, cpu_wait, name })
+            Some(SubmitSpec { xpre, pre, cmd, wait: copy_wait, on_c, xwait: 0, cpu_wait, c6_want, name })
         });
         let cpu = self.span_cpu();
         super::timeline::end(&self.name, self.begun_mark.take(), || format!("batch #{seq}, {commands} commands ({why}{cpu})"));
@@ -11436,6 +11479,11 @@ impl Exec {
         let run = Some(self.fe2_share()).filter(|r| r.0 != 0 && super::fe2::run_any(r.0)).unwrap_or((0, 0));
         let mine_any = !mine.is_empty() || run.0 != 0;
         let r = super::fe2::ensure(lo, hi, want, ep, written, &|p| (!mine.is_empty() && mine.contains(&p)) || (run.0 != 0 && super::fe2::run_shared(p, run.0, run.1)), mine_any, &mut |a, b| self.fe2_upload(mbuf, a, b, &mut up), &fe2_armable);
+        // (Front end 3's C6: what the CPU path reads joins the resident set,
+        // so the shaders that resolve their own buffers find it there.)
+        if !written && r.is_ok() {
+            super::c6::note_placed(lo, hi);
+        }
         // Past a label wait the CPU may write the pages it rewrites every
         // frame again before the label (FINDINGS.md 2026-10-29): a small
         // binding's such pages are uploaded as they are when the stretch
@@ -14622,6 +14670,26 @@ impl Exec {
         }
     }
 
+    /// Front end 3's C6 at a stretch past a label wait settling: its label
+    /// orders the CPU writes before epoch `need` ahead of its work, so its
+    /// batches with GPU-resolved commands want that epoch (a new one begun
+    /// when the label needs one that has not: as `past_current_for`).
+    pub fn c6_settle(&mut self, need: u32) {
+        if !super::c6::on() || (self.c6_want == 0 && self.closed.iter().all(|c| c.c6_want == 0)) {
+            return;
+        }
+        if need > super::precache::epoch() as u32 {
+            super::precache::end_scope(1);
+        }
+        let need = need.min(super::precache::epoch() as u32);
+        if self.c6_want != 0 {
+            self.c6_want = self.c6_want.max(need);
+        }
+        for c in self.closed.iter_mut().filter(|c| c.c6_want != 0) {
+            c.c6_want = c.c6_want.max(need);
+        }
+    }
+
     /// The oldest epoch the checks of the stretch past a label wait needed
     /// (u32::MAX: it made none): one older than its label needs may have
     /// missed a CPU write the title ordered before the label (`Cp::past_wait_settle`).
@@ -14849,6 +14917,7 @@ impl Exec {
                 self.fe2_gens = gens;
             }
             let lists = b.lists;
+            let c6_want = b.c6_want;
             let on_c = b.on_c;
             let xq = xq_tracking().then_some(XqBatch { compute: self.xq_c, on_c, acb: acb_id(&self.name), writes: &b.writes, ups: &b.fe2_up, dep: b.xq.0, why: b.xq.1, images: b.xq.2 });
             let note_gate = super::fe2::c4_on().then(|| NOTE_GATE.read_recursive());
@@ -14860,7 +14929,7 @@ impl Exec {
                 if let Some(l) = lists {
                     l.replay();
                 }
-                Some(SubmitSpec { xpre: None, pre, cmd, wait: copy_wait, on_c, xwait: 0, cpu_wait: 0, name })
+                Some(SubmitSpec { xpre: None, pre, cmd, wait: copy_wait, on_c, xwait: 0, cpu_wait: 0, c6_want, name })
             });
             self.slots[b.slot].seq = seq;
             if !b.fe2_up.is_empty() {
@@ -14989,6 +15058,18 @@ impl Exec {
                 let pt = super::pagetable::address();
                 p.sgpr_data[addr_at + 2] = pt as u32;
                 p.sgpr_data[addr_at + 3] = (pt >> 32) as u32;
+            }
+            // Front end 3's C6: the mirror, the resident set and the
+            // feedback ring for the shader's own resolution, and the epoch
+            // the batch's coherence pass must cover (`SubmitSpec::c6_want`).
+            if found.tr.spec.c6 {
+                p.sgpr_data[addr_at] = fx.zero_va as u32;
+                p.sgpr_data[addr_at + 1] = (fx.zero_va >> 32) as u32;
+                let h = super::c6::header();
+                p.sgpr_data[addr_at + 4..addr_at + 10].copy_from_slice(&h);
+                let want = self.fe2_want(super::precache::epoch() as u32);
+                self.c6_want = self.c6_want.max(want);
+                C6_STAGES.fetch_add(1, Ordering::Relaxed);
             }
 
             for b in &found.tr.out.bindings {
@@ -16935,6 +17016,7 @@ pub fn status() -> String {
         + &super::fe2::status()
         + &replay_census_line()
         + &super::kco::status()
+        + &super::c6::status()
         + &import_sites_line()
         + &in_place_line()
         + &sync_why_status()

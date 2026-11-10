@@ -711,6 +711,12 @@ fn build_scatter(reset: bool, count: bool, hold: bool, same: u8, split: bool, sk
         let pli = b.access_chain(p_u, None, marks, [c0, li])?;
         b.load(u32t, None, pli, None, [])?
     };
+    // (A page past the guest page table is never read there or in the map:
+    // stored as unmapped, counted lost. Front end 3's C6 met one: a page
+    // number no store's mark gives.)
+    let c_pages = c(&mut b, ((crate::translate::PT_END - crate::translate::PT_BASE) >> crate::translate::PT_PAGE_SHIFT) as u32);
+    let page_in = b.u_less_than(bool_, None, page, c_pages)?;
+    let page = b.select(u32t, None, page_in, page, c0)?;
     // (`same`: whether any stored dword differs from guest memory's copy,
     // workgroup memory set to 0 by invocation 0 first.)
     let shared2 = if same != 0 {
@@ -746,6 +752,7 @@ fn build_scatter(reset: bool, count: bool, hold: bool, same: u8, split: bool, sk
     let tp = b.convert_u_to_ptr(p_dev64, None, ta)?;
     let dest = b.load(u64t, None, tp, Some(spirv::MemoryAccess::ALIGNED), [lit(8)])?;
     let mapped = b.i_not_equal(bool_, None, dest, c0_64)?;
+    let mapped = b.logical_and(bool_, None, mapped, page_in)?;
     let moff = b.i_mul(u64t, None, page64, c4096_64)?;
     let msrc = b.i_add(u64t, None, mirror, moff)?;
     // (`count`: a page of a lazy bucket stores nothing; its dwords are

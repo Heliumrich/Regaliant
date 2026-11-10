@@ -1741,6 +1741,29 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
         }
         let t0 = std::time::Instant::now();
         let frame = super::FRAMES.load(Ordering::Relaxed);
+        // Parts the coherence pass took after the epoch wanted began
+        // (`kco`, front end 3's C6): their CPU writes were found, so only
+        // their invalid pages are uploaded, without a take of our own.
+        if super::kco::covering() {
+            let mut rest: Vec<(u64, u64)> = Vec::with_capacity(bad.len());
+            let mut err = None;
+            for &(a, b) in bad.iter() {
+                super::kco::split(a, b, want, &mut |x, y, cov| match cov {
+                    Some(stamp) if err.is_none() => {
+                        if let Err(e) = fix_run(x, y, stamp, mine, upload) {
+                            err = Some(e);
+                        }
+                    }
+                    Some(_) => {}
+                    None => rest.push((x, y)),
+                });
+            }
+            if let Some(e) = err {
+                STATS[S_SLOW_NS].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                return Err(e);
+            }
+            *bad = rest;
+        }
         for &(a, b) in bad.iter() {
             note_arming_ended(a, b);
             // Every page written lately: uploaded as it is, without a take.
@@ -2124,6 +2147,172 @@ pub fn fe3_scan_dry() -> (u64, u64, u64, u64, u64) {
 /// pages in the mirror's span, ns of one query-only scan of them whole, the
 /// rings' spans of pages written within 2 flips summed, those pages, rings
 /// holding any, the spans by 64 MiB window summed].
+/// Arms the mirror's cold pages outside the GPU arena (front end 3's C6,
+/// `tune cold_arm`; the 2026-11-09 cold armer again): valid pages not armed,
+/// not held, outside the arena (the coherence pass scans it: its pages
+/// live two frames), whose last CPU write found is at least `min_age` flips
+/// old and past their level's quiet time, by runs: each run is armed
+/// (protected through the host), then taken, so a write since its last take
+/// invalidates its page and an armed page stays valid only when the mirror
+/// holds what guest memory does. Unlike the checks' arming (`try_arm`),
+/// pages used in few epochs are armed too: a scan per batch would otherwise
+/// cover them. At most `max_pages` a call. (runs armed, pages, ns.)
+pub fn arm_cold(min_age: u64, max_pages: u64, armable: &Armable) -> (u64, u64, u64) {
+    if !crate::hosted::on() || min_age == 0 {
+        return (0, 0, 0);
+    }
+    let t = std::time::Instant::now();
+    let frame = super::FRAMES.load(Ordering::Relaxed);
+    let arm_gpu = arm_gpu();
+    let arena = crate::engine::arena_owner();
+    let (mut runs_n, mut pages_n) = (0u64, 0u64);
+    let mut written = Vec::new();
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for (ci, slot) in TABLE.iter().enumerate() {
+        if pages_n >= max_pages {
+            break;
+        }
+        let p = slot.load(Ordering::Acquire);
+        if p.is_null() {
+            continue;
+        }
+        let c = unsafe { &*p };
+        if frame < c.hold_until.load(Ordering::Acquire) {
+            continue;
+        }
+        let base = MIRROR_BASE + ((ci as u64) << CHUNK_SHIFT);
+        runs.clear();
+        let mut start: Option<u64> = None;
+        for w in 0..WORDS {
+            let wa = base + (w as u64) * 64 * PAGE;
+            let mut cand = c.valid[w].load(Ordering::Acquire) & !c.armed[w].load(Ordering::Acquire);
+            if !arm_gpu {
+                cand &= !c.gpu[w].load(Ordering::Acquire);
+            }
+            // (The arena's MiBs: 16 words each.)
+            if cand != 0 && arena != 0 && crate::engine::owner(wa) == arena {
+                cand = 0;
+            }
+            let mut r = cand;
+            while r != 0 {
+                let k = r.trailing_zeros() as usize;
+                r &= r - 1;
+                let wrote = c.wrote[w * 64 + k].load(Ordering::Acquire) as u64;
+                let need = min_age.max(ARM_QUIET << c.level[w * 64 + k].load(Ordering::Acquire));
+                if (wrote != 0 && (frame + 1).saturating_sub(wrote) < need) || crate::hosted::held(wa + k as u64 * PAGE) {
+                    cand &= !(1u64 << k);
+                }
+            }
+            for k in 0..64u32 {
+                let set = (cand >> k) & 1 != 0;
+                let a = wa + k as u64 * PAGE;
+                match (set, start) {
+                    (true, None) => start = Some(a),
+                    (false, Some(s)) => {
+                        runs.push((s, a));
+                        start = None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(s) = start {
+            runs.push((s, base + CHUNK_BYTES));
+        }
+        for &(a, b) in &runs {
+            arm_run(a, b, frame, armable);
+            // (After the arming: a write before it shows in the take and
+            // invalidates its page; one after it faults.)
+            written.clear();
+            let _ = super::precache::take_written_for(a, b - a, &mut written, None, crate::mem::WW_WHO_FE2);
+            runs_n += 1;
+            pages_n += (b - a) / PAGE;
+        }
+    }
+    let ns = t.elapsed().as_nanos() as u64;
+    COLD_ARM[0].fetch_add(runs_n, Ordering::Relaxed);
+    COLD_ARM[1].fetch_add(pages_n, Ordering::Relaxed);
+    COLD_ARM[2].fetch_add(ns, Ordering::Relaxed);
+    COLD_ARM[3].fetch_add(1, Ordering::Relaxed);
+    (runs_n, pages_n, ns)
+}
+
+/// `arm_cold`'s sums: [runs, pages, ns, calls].
+pub static COLD_ARM: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Front end 3's C6 (`c6::admit_round`): arms guest [a, b) through the host
+/// for the resident set, its import windows young or not (pages the title
+/// cannot write on the CPU need none), then takes it (a write before the
+/// arming shows in the take and invalidates its page); true when every page
+/// the CPU may write is armed afterwards.
+/// Whether every page of guest [a, b) the title may write on the CPU is
+/// armed through the host (front end 3's C6: such a write faults).
+pub fn granule_armed(a: u64, b: u64) -> bool {
+    if crate::hosted::all_armed(a, b - a) {
+        return true;
+    }
+    (a..b).step_by(PAGE as usize).all(|p| crate::mem::prot_at(p).is_some_and(|x| x & crate::mem::PROT_CPU_WRITE == 0) || crate::hosted::all_armed(p, PAGE))
+}
+
+pub fn arm_granule(a: u64, b: u64) -> bool {
+    if !crate::hosted::on() {
+        return false;
+    }
+    let writable = |p: u64| crate::mem::prot_at(p).is_none_or(|x| x & crate::mem::PROT_CPU_WRITE != 0);
+    let done = |a: u64, b: u64| granule_armed(a, b);
+    if done(a, b) {
+        return true;
+    }
+    let frame = super::FRAMES.load(Ordering::Relaxed);
+    let mut p = a;
+    while p < b {
+        if !writable(p) || crate::hosted::all_armed(p, PAGE) {
+            p += PAGE;
+            continue;
+        }
+        let mut q = p + PAGE;
+        while q < b && writable(q) && !crate::hosted::all_armed(q, PAGE) {
+            q += PAGE;
+        }
+        arm_part(p, q, frame, false);
+        p = q;
+    }
+    let mut written = Vec::new();
+    let _ = super::precache::take_written_for(a, b - a, &mut written, None, crate::mem::WW_WHO_FE2);
+    done(a, b)
+}
+
+/// Starts the cold armer's thread (`tune cold_arm`; it idles while the
+/// switch is 0).
+pub fn start_cold_armer(armable: fn(u64, u64, &mut dyn FnMut(u64, u64)) -> bool) {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let _ = crate::thread::spawn_host(
+            "fe2-cold-armer",
+            1 << 20,
+            Box::new(move || {
+                crate::log::set_thread_name("fe2-cold-armer");
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    let age = super::tune::cold_arm();
+                    if age != 0 && on() {
+                        arm_cold(age, 1 << 18, &armable);
+                    }
+                }
+            }),
+        );
+    });
+}
+
+/// The cold armer's line ("" before any call).
+pub fn cold_arm_line() -> String {
+    let ca: Vec<u64> = COLD_ARM.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    if ca[3] == 0 {
+        return String::new();
+    }
+    format!("    cold armer (`tune cold_arm`): {} calls, {} runs, {:.1} MiB armed, {:.1} ms\n", ca[3], ca[0], ca[1] as f64 * PAGE as f64 / 1048576.0, ca[2] as f64 / 1e6)
+}
+
 pub fn fe3_scan_dry2() -> [u64; 22] {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     let t = std::time::Instant::now();
@@ -3221,7 +3410,7 @@ fn arm_run(x: u64, y: u64, frame: u64, armable: &Armable) {
     let mut inside = 0u64;
     let listed = armable(x, y, &mut |p, q| {
         inside += q - p;
-        arm_part(p, q, frame);
+        arm_part(p, q, frame, true);
     });
     if !listed {
         NOT_ARMED[R_BUSY].fetch_add((y - x) / PAGE, Ordering::Relaxed);
@@ -3232,7 +3421,7 @@ fn arm_run(x: u64, y: u64, frame: u64, armable: &Armable) {
 
 /// Arms [x, y) (inside settled import windows, asked again under the arm
 /// lock: an import beginning meanwhile waits for it, then disarms it).
-fn arm_part(x: u64, y: u64, frame: u64) {
+fn arm_part(x: u64, y: u64, frame: u64, settled: bool) {
     // No mapping change meanwhile (`resident::remap_guard`), and no other
     // arm or disarm between the checks and the arming (`hosted::arm_lock`:
     // a file read beginning now waits, then disarms what is armed).
@@ -3244,8 +3433,9 @@ fn arm_part(x: u64, y: u64, frame: u64) {
         return;
     }
     // (Still inside settled imports: the caller looked without the arm lock,
-    // and an import listed since is young.)
-    if super::exec::fe2_settled_over(x, y) != Some(true) {
+    // and an import listed since is young. Front end 3's C6 arms its
+    // resident set without waiting for that: `arm_granule`.)
+    if settled && super::exec::fe2_settled_over(x, y) != Some(true) {
         NOT_ARMED[R_WINDOW].fetch_add((y - x) / PAGE, Ordering::Relaxed);
         return;
     }
@@ -3463,12 +3653,16 @@ pub fn cpu_written(pages: &[u64]) {
         n += 1;
     }
     STATS[S_INVAL_TAKEN].fetch_add(n, Ordering::Relaxed);
+    // (Front end 3's C6: resident pages are copied again before the next
+    // batch.)
+    super::c6::note_invalidated(pages);
 }
 
 /// Guest [base, base+len) may have changed without a write mark (file
 /// reads, CP writes the CPU performs, mapping changes): M no longer holds
 /// its pages.
 pub fn invalidate(base: u64, len: u64) {
+    super::c6::note_invalidated_range(base, len);
     if !on() || len == 0 {
         return;
     }
@@ -5490,7 +5684,7 @@ pub fn c4_any_held(lo: u64, hi: u64) -> bool {
 }
 
 /// Whether page `p` is held (the bitmap).
-fn c4_held(p: u64) -> bool {
+pub fn c4_held(p: u64) -> bool {
     c4_any_held(p, p + PAGE)
 }
 

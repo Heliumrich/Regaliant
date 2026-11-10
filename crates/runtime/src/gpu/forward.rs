@@ -151,6 +151,14 @@ struct Roles {
 /// The copy kernel's code hash once recognized (0: not yet).
 static COPY_HASH: AtomicU64 = AtomicU64::new(0);
 
+/// Whether `code_hash` is the copy kernel's (recognized, or the one this
+/// title version's runs found: cs 0x1008881200): its forwarding reads its
+/// resolved buffers on the CPU (front end 3's C6 leaves it CPU-resolved).
+pub fn is_copy(code_hash: u64) -> bool {
+    let h = COPY_HASH.load(Ordering::Acquire);
+    code_hash == 0x6825_ea61_efbc_0222 || (h != 0 && h == code_hash)
+}
+
 /// Recent copy-kernel dispatches of every queue (diagnostics of copies that
 /// did not land): (queue, destination, bytes, flip), the newest last.
 static RECENT_COPIES: Mutex<std::collections::VecDeque<(Arc<str>, u64, u64, u64)>> = Mutex::new(std::collections::VecDeque::new());
