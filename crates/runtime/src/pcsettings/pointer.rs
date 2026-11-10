@@ -50,6 +50,28 @@ pub fn test_move(x: f32, y: f32) {
     input::note_device(input::DEVICE_KBM);
 }
 
+/// Tests: the pointer at `(u, v)` of the picture as shown (1080 units high), placed in the
+/// window's client area as a real mouse there would be (through Menu & HUD Size's mapping).
+pub fn test_screen(u: f32, v: f32) -> Result<(), String> {
+    let cw = crate::gpu::vk::window::CLIENT_W.load(Relaxed);
+    let ch = crate::gpu::vk::window::CLIENT_H.load(Relaxed);
+    let (ow, oh) = crate::dispmode::output_size();
+    let (rx, ry, rw, rh) = crate::gpu::vk::present::fit(ow, oh, cw, ch);
+    if rw == 0 || rh == 0 {
+        return Err("no picture in the window".into());
+    }
+    let width = 1080.0 * ow as f32 / oh as f32;
+    let x = rx as f32 + u / width * rw as f32;
+    let y = ry as f32 + v / 1080.0 * rh as f32;
+    *TEST_AT.lock() = None;
+    CLIENT_X.store(x.round() as i32, Relaxed);
+    CLIENT_Y.store(y.round() as i32, Relaxed);
+    MOVES.fetch_add(1, Relaxed);
+    input::note_device(input::DEVICE_KBM);
+    crate::info!("pointer: test at client ({:.0}, {:.0}) of {cw}x{ch} (picture {u:.0},{v:.0}; canvas {:?})", x, y, canvas_pos());
+    Ok(())
+}
+
 struct State {
     /// The item the pointer last moved onto (the focus is moved there) and its list.
     target: Option<u64>,
@@ -92,6 +114,9 @@ fn canvas_pos() -> Option<(f32, f32)> {
     let width = 1080.0 * ow as f32 / oh as f32;
     let u = (x as f32 - rx as f32) / rw as f32 * width;
     let v = (y as f32 - ry as f32) / rh as f32 * 1080.0;
+    // Menu & HUD Size: the interface is drawn scaled around the screen's centre.
+    let s = super::ui_size();
+    let (u, v) = if s < 1.0 { ((u - width / 2.0) / s + width / 2.0, (v - 540.0) / s + 540.0) } else { (u, v) };
     ((0.0..width).contains(&u) && (0.0..1080.0).contains(&v)).then_some((u, v))
 }
 

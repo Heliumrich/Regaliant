@@ -1982,6 +1982,7 @@ pub mod swizzle_tables;
 pub mod tiling;
 pub mod upscale;
 pub mod upmerge;
+pub mod uiscale;
 pub mod verify;
 pub mod vk;
 pub mod xwait;

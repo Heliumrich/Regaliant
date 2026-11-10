@@ -368,9 +368,14 @@ fn poll_control(path: &Path, offset: &mut u64) {
             }
             "pointer" => {
                 // Tests: `pointer <x> <y>` moves the menu pointer to canvas coordinates (1920x1080);
+                // `pointer screen <x> <y>` to a point of the picture as shown, through the window;
                 // `pointer click|right|wheel <n>`.
-                use pcsettings::pointer::{Event, event, test_move};
+                use pcsettings::pointer::{Event, event, test_move, test_screen};
                 match (parts.next(), parts.next()) {
+                    (Some("screen"), Some(x)) => match (x.parse::<f32>(), parts.next().and_then(|y| y.parse::<f32>().ok())) {
+                        (Ok(x), Some(y)) => test_screen(x, y),
+                        _ => Err("usage: pointer screen <x> <y>".into()),
+                    },
                     (Some("click"), _) => {
                         event(Event::Left);
                         Ok(())

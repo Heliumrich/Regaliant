@@ -955,7 +955,15 @@ impl Exec {
             return "skipped (`tune skip_cmds`)".into();
         }
         let t_prog = super::laps().then(std::time::Instant::now);
+        // Menu & HUD Size: the interface layer scaled before the title composites it.
+        if super::super::uiscale::scale() < 1.0 {
+            let ps = ((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8;
+            if ps == super::super::uiscale::COMPOSITE_PS {
+                self.scale_ui_layer(cp);
+            }
+        }
         let r = self.draw_inner(cp, &args);
+        self.ui_sub = None;
         if let Some(t) = t_prog {
             let ps = ((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8;
             super::prog_note(self.prog_class(), shaders::ngg_addr(cp), ps.max(2), t.elapsed().as_nanos() as u64);
@@ -987,6 +995,23 @@ impl Exec {
             }
         }
         outcome
+    }
+
+    /// Menu & HUD Size (`gpu::uiscale`): the interface layer the title's composite samples (its
+    /// pixel stage's resource 0) scaled around its centre into an image of ours, outside
+    /// rendering, before the composite is recorded; the composite binds that image in the
+    /// layer's place (`ui_sub`, read where the draw binds its pixel stage).
+    fn scale_ui_layer(&mut self, cp: &Cp) {
+        let Ok(p) = shaders::prepare_ps(cp) else { return };
+        let Some(super::Resolved::Image(t)) = p.resources.first() else { return };
+        let frame = super::super::FRAMES.load(Ordering::Relaxed);
+        let Ok(tex) = super::super::images::with(|im| im.upscale_tex(t, false, frame)) else { return };
+        self.end_rendering();
+        let cmd = self.cmd();
+        let s = super::super::uiscale::scale();
+        if let Some(view) = super::super::uiscale::record(cmd, tex.image, tex.format, tex.size.0, tex.size.1, s) {
+            self.ui_sub = Some((tex.view, view));
+        }
     }
 
     /// The same for an indexed indirect draw whose arguments the CPU read
@@ -1774,6 +1799,14 @@ impl Exec {
             }
             let mut b = self.bind_stage(p, false)?;
             notes[k] = self.bind_note.take();
+            // Menu & HUD Size: the composite samples our scaled copy of the interface layer.
+            if k == 1 {
+                if let Some((from, to)) = self.ui_sub {
+                    for e in b.imgs.iter_mut().filter(|e| e.2.image_view == from) {
+                        e.2.image_view = to;
+                    }
+                }
+            }
             if self.stopped {
                 return Err(super::STOPPED.into());
             }

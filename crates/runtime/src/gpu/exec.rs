@@ -9115,6 +9115,9 @@ pub struct Exec {
     /// writes (`Cp::compute_pass`), whose promises its closed batches keep
     /// to their submission.
     par_worker: bool,
+    /// Menu & HUD Size (`Exec::scale_ui_layer`): the interface layer's view and the view of our
+    /// scaled copy that the composite draw being recorded binds in its place.
+    pub(super) ui_sub: Option<(vk::ImageView, vk::ImageView)>,
     /// A parallel worker's chunk: the guest ranges CP writes of its run's
     /// earlier chunks write (`par::Run::cp_writes`); a CPU read of one stops
     /// the chunk (those batches are not submitted yet).
@@ -10104,6 +10107,7 @@ impl Exec {
                 sync_culprit: None,
                 deferred: false,
                 par_worker: false,
+                ui_sub: None,
                 run_writes: Vec::new(),
                 hs_seg: 0,
                 effect_writes: Default::default(),

@@ -217,7 +217,7 @@ sysv! {
     fn sceSystemServiceGetDisplaySafeAreaInfo(info: *mut f32) -> i32 {
         if info.is_null() { return 0x80A1_0002u32 as i32; }
         std::ptr::write_bytes(info as *mut u8, 0, 4 + 128);
-        *info = 1.0;
+        *info = safe_area_ratio();
         0
     }
     /// System setting to skip notice screens: off, so the title shows its
@@ -328,4 +328,13 @@ pub fn register(r: &mut Registry) {
         scePlayGoGetInstallSpeed, scePlayGoGetEta, scePlayGoGetToDoList, scePlayGoPrefetch,
     ]);
     let _ = cstr; // shared helper import
+}
+
+/// The display safe area the title is told (1.0: the whole screen; the PC tab's HUD Size, or
+/// `DS_SAFE_AREA=<ratio>` for tests).
+fn safe_area_ratio() -> f32 {
+    if let Some(v) = std::env::var("DS_SAFE_AREA").ok().and_then(|v| v.trim().parse::<f32>().ok()) {
+        return v.clamp(0.5, 1.0);
+    }
+    crate::pcsettings::safe_area().unwrap_or(1.0)
 }

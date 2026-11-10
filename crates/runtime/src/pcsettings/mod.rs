@@ -264,6 +264,18 @@ pub fn game_items() -> Vec<Item> {
             kind: ItemKind::Choice(vec![s("As Game Setting"), s("Reduced"), s("Off")], 2),
         },
         Item {
+            id: s("UiSize"),
+            label: s("Menu & HUD Size"),
+            tooltip: s("The size of menus and the HUD."),
+            kind: ItemKind::Choice(UI_SIZES.iter().map(|p| format!("{p}%")).collect(), 0),
+        },
+        Item {
+            id: s("HudMargin"),
+            label: s("HUD Margin"),
+            tooltip: s("Moves the HUD in from the screen's edges."),
+            kind: ItemKind::Choice(vec![s("None"), s("5%"), s("10%"), s("15%"), s("20%")], 0),
+        },
+        Item {
             id: s("ButtonPrompts"),
             label: s("Button Prompts"),
             tooltip: s("Which buttons the game shows. Automatic follows the device you use."),
@@ -338,6 +350,7 @@ pub fn apply() {
         crate::gpu::tune::set_default("uncapped", (limit == 2) as u64);
         crate::info!("pc settings: Frame Rate Limit {}", ["30 FPS", "60 FPS", "Uncapped"][limit as usize]);
     }
+    UI_SIZE.store(UI_SIZES.get(get("UiSize").unwrap_or(0) as usize).copied().unwrap_or(100), std::sync::atomic::Ordering::Relaxed);
     // Option 0: the title's own render size (0); 1-9 the percentages.
     let scale = get("RenderScale").unwrap_or(0).checked_sub(1).and_then(|i| RENDER_SCALES.get(i as usize).copied()).unwrap_or(0);
     crate::dispmode::SCALE_PCT.store(scale, std::sync::atomic::Ordering::Relaxed);
@@ -414,6 +427,26 @@ pub fn aa_list() -> &'static [(u32, &'static str)] {
 pub fn hdr_allowed() -> bool {
     store::value("Setting_PC_HdrOutput").unwrap_or(0) == 0
 }
+
+/// The menu and HUD size factor (the PC tab's Menu & HUD Size; 1.0: the original's).
+pub fn ui_size() -> f32 {
+    UI_SIZE.load(std::sync::atomic::Ordering::Relaxed) as f32 / 100.0
+}
+
+/// Menu & HUD Size's percentages (option 0 the original's).
+pub const UI_SIZES: [u32; 4] = [100, 90, 80, 70];
+
+/// The size now, in percent (`apply`; read per frame by `gpu::uiscale`).
+static UI_SIZE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(100);
+
+/// The display safe area for the PC tab's HUD Margin (None: the whole screen).
+pub fn safe_area() -> Option<f32> {
+    let v = store::raw_value("Setting_PC_HudMargin")?;
+    HUD_MARGINS.get(v as usize).copied().filter(|r| *r < 1.0)
+}
+
+/// HUD Margin's safe-area ratios (the title draws its HUD inside that part of the screen).
+pub const HUD_MARGINS: [f32; 5] = [1.0, 0.95, 0.9, 0.85, 0.8];
 
 /// The PC tab's Window Mode (0 windowed, 1 borderless, 2 exclusive fullscreen).
 pub fn window_mode() -> Option<u32> {
