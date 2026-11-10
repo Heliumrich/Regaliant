@@ -1054,6 +1054,7 @@ pub fn reset() {
     *UP_BY_PROG.lock() = None;
     alloc_census_reset();
     heap_census_reset();
+    rb_census_reset();
     let f = crate::gpu::FRAMES.load(Ordering::Relaxed);
     CENSUS_FLIP0.store(if census_on() { f + 1 } else { 0 }, Ordering::Relaxed);
     STATS_FLIP0.store(f, Ordering::Relaxed);
@@ -1061,7 +1062,7 @@ pub fn reset() {
 
 /// `engine report` (control): the census and the bounds' line.
 pub fn report() -> String {
-    census_line() + &bound_line() + &scan_line() + &crate::gpu::fe2::hot_by_owner(2) + &crate::gpu::fe2::hot_by_owner(16) + &alloc_census_lines() + &heap_census_lines()
+    census_line() + &bound_line() + &scan_line() + &crate::gpu::fe2::hot_by_owner(2) + &crate::gpu::fe2::hot_by_owner(16) + &alloc_census_lines() + &heap_census_lines() + &rb_census_line()
 }
 
 /// The allocation table's and the bounds' status line (per flip).
@@ -1595,4 +1596,67 @@ pub fn coherence_runs(out: &mut Vec<(u64, u64)>) {
 pub fn cb_line() -> String {
     let s: Vec<u64> = CB_STATS.iter().map(|x| x.load(Ordering::Relaxed)).collect();
     format!("command buffers: {} initialized ({} live), {} MiBs covered whole marked, {} dropped as stale, {} embedded ranges outside the scanned MiBs", s[0], CBS.read().len(), s[1], s[2], s[3])
+}
+
+// ---------------------------------------------------------------------------
+// Census of the engine's readbacks of GPU memory (`DS_RB_CENSUS=1`;
+// FRONTEND4.md C3): the engine reads GPU buffers through one helper
+// (eboot+0x909970: a V#, a size, a destination, an offset; a bounded
+// memcpy). A title-fix hook at its entry records each call's source range
+// by its caller and the engine allocator owning it: which GPU-written data
+// the title reads on the CPU (front end 2 writes back far more).
+// ---------------------------------------------------------------------------
+
+pub fn rb_census_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_RB_CENSUS").ok().as_deref() == Some("1"))
+}
+
+/// (caller, owner) -> [calls, bytes] since the last reset.
+static RB_CENSUS: parking_lot::Mutex<Option<std::collections::HashMap<(u64, u8), [u64; 2]>>> = parking_lot::Mutex::new(None);
+
+/// The hook at the readback helper's entry (eboot+0x909970: rdi the V#,
+/// esi the size, ecx the offset, [rsp] the return address).
+pub extern "sysv64" fn rb_census_hook(regs: *const u64, _arg: u32) {
+    let r = |i: usize| unsafe { *regs.add(i) };
+    let (vs, size, off, rsp) = (r(7), r(6) & 0xFFFF_FFFF, r(1) & 0xFFFF_FFFF, r(4));
+    let (Some(w0), Some(w2)) = (rd64(vs), rd64(vs + 8)) else { return };
+    let base = w0 & 0xFFFF_FFFF_FFFF;
+    let stride = (w0 >> 48) & 0x3FFF;
+    let records = w2 & 0xFFFF_FFFF;
+    let total = stride.max(1) * records;
+    let n = if off < total { size.min(total - off) } else { 0 };
+    let caller = rd64(rsp).unwrap_or(0);
+    let owner = owner(base + off);
+    let mut g = RB_CENSUS.lock();
+    let e = g.get_or_insert_with(std::collections::HashMap::new).entry((caller, owner)).or_insert([0; 2]);
+    e[0] += 1;
+    e[1] += n;
+}
+
+/// The readback census's line (`engine report`).
+fn rb_census_line() -> String {
+    if !rb_census_on() {
+        return String::new();
+    }
+    let flips = crate::gpu::FRAMES.load(Ordering::Relaxed).saturating_sub(STATS_FLIP0.load(Ordering::Relaxed)).max(1) as f64;
+    let names = names();
+    let g = RB_CENSUS.lock();
+    let Some(m) = g.as_ref() else { return String::new() };
+    let mut v: Vec<(&(u64, u8), &[u64; 2])> = m.iter().collect();
+    v.sort_by(|a, b| b.1[1].cmp(&a.1[1]));
+    let total: u64 = v.iter().map(|x| x.1[1]).sum();
+    let calls: u64 = v.iter().map(|x| x.1[0]).sum();
+    let parts: Vec<String> = v
+        .iter()
+        .take(20)
+        .map(|((caller, owner), e)| format!("{} from {} {}: {:.1} calls, {:.1} KiB a flip", eboot_off(*caller), owner, names.get(owner).map(String::as_str).unwrap_or("?"), e[0] as f64 / flips, e[1] as f64 / flips / 1024.0))
+        .collect();
+    format!("    engine readbacks (eboot+0x909970): {:.1} calls and {:.1} KiB a flip; {}\n", calls as f64 / flips, total as f64 / flips / 1024.0, parts.join("; "))
+}
+
+fn rb_census_reset() {
+    if let Some(m) = RB_CENSUS.lock().as_mut() {
+        m.clear();
+    }
 }

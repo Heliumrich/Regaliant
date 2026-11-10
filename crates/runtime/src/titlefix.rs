@@ -382,6 +382,18 @@ const FIXES: &[Fix] = &[
         why: "the port counts the engine heaps' blocks by their call site (census)",
         only_with: Some("DS_HEAP_CENSUS"),
     },
+    // The engine's readback helper's entry (eboot+0x909970, `xor eax,eax;
+    // cmp dword ptr [rdi+1Ch],1Fh`: rdi the V#, esi the size, rdx the
+    // destination, ecx the offset; the `je` after reads the cmp's flags).
+    Fix {
+        name: "engine map (readback census)",
+        offset: 0x909970,
+        from: &[0x31, 0xc0, 0x83, 0x7f, 0x1c, 0x1f],
+        change: Change::Hook { at: 0, handler: crate::engine::rb_census_hook },
+        kind: "engine map (read only)",
+        why: "the port counts the engine's readbacks of GPU memory by caller and allocator (census)",
+        only_with: Some("DS_RB_CENSUS"),
+    },
     // The end of the Agc library's command-buffer init (eboot+0x1d0a4fb,
     // `mov dword ptr [rax+30h],0`: rax the buffer object, rsi its begin, rdx
     // its end; a leaf function without branches).
