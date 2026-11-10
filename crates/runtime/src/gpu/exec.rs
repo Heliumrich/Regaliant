@@ -2012,6 +2012,76 @@ fn span_cache_put(generation: u64, st: u64, e: u64, b: vk::Buffer) {
 
 /// Imported buffer covering guest [base, base+size): (buffer, window start, window end).
 #[track_caller]
+/// Diagnosis (`ptaudit`): the guest page table read back, every entry
+/// checked against the import windows alive now (listed or in the
+/// graveyard): entries, those in no window (stale: a read through them
+/// would fault), those in a window but at another guest page than theirs,
+/// and the first stale ones.
+pub fn pt_audit() -> String {
+    let Some(tbuf) = super::pagetable::buffer() else { return "no guest page table".into() };
+    let c = ctx();
+    let entries = (rdna::translate::PT_END - rdna::translate::PT_BASE) >> rdna::translate::PT_PAGE_SHIFT;
+    let bytes = entries * 8;
+    let (hb, hmem, hptr) = match c.host_buffer(bytes, vk::BufferUsageFlags::TRANSFER_DST) {
+        Ok(x) => x,
+        Err(e) => return format!("no readback buffer: {e}"),
+    };
+    // (Windows first, the table after: an entry may only lead to a window
+    // that existed when it was read.)
+    let mut wins: Vec<(u64, u64, u64, bool)> = Vec::new();
+    {
+        let gy = GRAVEYARD.lock();
+        for d in gy.iter() {
+            let va = c.buffer_address(d.span.buffer);
+            wins.push((va, va + (d.span.end - d.span.start), d.span.start, false));
+        }
+        for s in spans_read().iter() {
+            let va = c.buffer_address(s.buffer);
+            wins.push((va, va + (s.end - s.start), s.start, s.valid));
+        }
+    }
+    let r = super::resident::one_off_now(|cmd| unsafe { c.device.cmd_copy_buffer(cmd, tbuf, hb, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: bytes }]) });
+    let out = match r {
+        Err(e) => format!("readback failed: {e}"),
+        Ok(()) => {
+            wins.sort_unstable();
+            let t = unsafe { std::slice::from_raw_parts(hptr as *const u64, entries as usize) };
+            let (mut n, mut stale, mut other, mut dead) = (0u64, 0u64, 0u64, 0u64);
+            let mut first: Vec<String> = Vec::new();
+            for (i, &e) in t.iter().enumerate() {
+                if e == 0 {
+                    continue;
+                }
+                n += 1;
+                let guest = rdna::translate::PT_BASE + ((i as u64) << rdna::translate::PT_PAGE_SHIFT);
+                let k = wins.partition_point(|w| w.0 <= e);
+                match k.checked_sub(1).map(|j| wins[j]).filter(|w| e < w.1) {
+                    None => {
+                        stale += 1;
+                        if first.len() < 8 {
+                            first.push(format!("{guest:#x} -> {e:#x}"));
+                        }
+                    }
+                    Some((va, _, start, valid)) => {
+                        if e - va != guest - start {
+                            other += 1;
+                        }
+                        if !valid {
+                            dead += 1;
+                        }
+                    }
+                }
+            }
+            format!("{n} entries over {} windows: {stale} in no live window (first: {}), {other} at another guest page than theirs, {dead} in dropped windows not freed yet", wins.len(), first.join(", "))
+        }
+    };
+    unsafe {
+        c.device.destroy_buffer(hb, None);
+        c.device.free_memory(hmem, None);
+    }
+    out
+}
+
 /// Whether one import window holds guest [base, base+size) (front end 3's
 /// C6: the resident set's copies come from it).
 pub(super) fn import_covers(base: u64, size: u64) -> bool {

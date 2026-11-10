@@ -846,6 +846,12 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     Err(e) => Err(e),
                 }
             }
+            "ptaudit" => {
+                // `ptaudit` (diagnosis): the guest page table read back,
+                // each entry checked against the live import windows.
+                info!("control: ptaudit at flip {flip}: {}", gpu::exec::pt_audit());
+                Ok(())
+            }
             "c4" => {
                 // `c4 off|on` (`DS_C4=1`): front end 4's held pages (off
                 // releases them all).
