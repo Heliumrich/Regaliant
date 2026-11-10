@@ -59,7 +59,9 @@ const PASSED_LOG: usize = 16;
 /// Held-page requests in flight at most (each one's thread is suspended
 /// until dsport takes it: no more than the threads that exist).
 const HELD_RING: usize = 4096;
-const MAGIC: u64 = 0x6473_706f_7274_4831; // "dsportH1"
+/// Runs one hold request carries (`hold_by_host`).
+pub const HOLD_RUNS: usize = 1024;
+const MAGIC: u64 = 0x6473_706f_7274_4832; // "dsportH2"
 
 /// The shared mapping.
 #[repr(C)]
@@ -122,6 +124,15 @@ struct Shared {
     /// (page | 1 for a write | 2 when its thread was not suspended, the
     /// faulting instruction, thread id, QueryPerformanceCounter at the fault).
     held_ring: [[AtomicU64; 4]; HELD_RING],
+    /// Holds the host makes in its event loop, in order with its answers
+    /// (`hold_by_host`): requests written (dsport) and served (the host),
+    /// their runs [lo, hi), and per run 1 held, 2 refused (a page no longer
+    /// armed or already held: a fault was answered since dsport looked), 3
+    /// failed (protection).
+    hold_req: AtomicU64,
+    hold_done: AtomicU64,
+    hold_n: AtomicU64,
+    hold_runs: [[AtomicU64; 3]; HOLD_RUNS],
     /// (page | 1 for a write, the faulting instruction).
     ring: [[AtomicU64; 2]; RING],
     leaves: [[AtomicU64; (LEAF_PAGES / 64) as usize]; MAX_LEAVES],
@@ -559,6 +570,54 @@ pub fn hold(base: u64, len: u64) -> Result<(), String> {
     arm_as(base, len, PAGE_NOACCESS, true)
 }
 
+/// Holds `runs` (whole pages, armed by dsport's checks) through the host:
+/// it serves the request in its event loop, between debug events, so no
+/// fault it answers can interleave with a hold: a fault raised before finds
+/// its page armed and is answered first (the run is then refused: a page
+/// no longer armed), one raised after finds it held. Per run: true held.
+/// At most HOLD_RUNS runs; waits up to 2 s (then none is held).
+pub fn hold_by_host(runs: &[(u64, u64)]) -> Vec<bool> {
+    let mut out = vec![false; runs.len()];
+    let Some(s) = shared() else { return out };
+    if s.flags.load(Ordering::Acquire) & HELD_ANSWERED == 0 && !HELD_SERVED.load(Ordering::Acquire) {
+        return out;
+    }
+    static ONE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    let _one = ONE.lock();
+    let n = runs.len().min(HOLD_RUNS);
+    for (i, &(lo, hi)) in runs[..n].iter().enumerate() {
+        s.hold_runs[i][0].store(lo & !(PAGE - 1), Ordering::Relaxed);
+        s.hold_runs[i][1].store(hi.next_multiple_of(PAGE), Ordering::Relaxed);
+        s.hold_runs[i][2].store(0, Ordering::Relaxed);
+    }
+    s.hold_n.store(n as u64, Ordering::Relaxed);
+    let seq = s.hold_req.load(Ordering::Acquire) + 1;
+    s.hold_req.store(seq, Ordering::Release);
+    let t = std::time::Instant::now();
+    while s.hold_done.load(Ordering::Acquire) < seq {
+        if t.elapsed() > std::time::Duration::from_secs(2) {
+            // (The host may still serve it: the request taken back first.)
+            if s.hold_req.compare_exchange(seq, seq - 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                HOLD_LATE.fetch_add(1, Ordering::Relaxed);
+                return out;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
+    for (i, o) in out[..n].iter_mut().enumerate() {
+        let r = s.hold_runs[i][2].load(Ordering::Acquire);
+        *o = r == 1;
+        if r == 1 {
+            let pages = (s.hold_runs[i][1].load(Ordering::Relaxed) - s.hold_runs[i][0].load(Ordering::Relaxed)) / PAGE;
+            HELD_PAGES.fetch_add(pages, Ordering::Relaxed);
+        }
+    }
+    out
+}
+
+/// Hold requests the host did not serve within 2 s.
+static HOLD_LATE: AtomicU64 = AtomicU64::new(0);
+
 /// Whether guest page `a` is held now.
 pub fn held(a: u64) -> bool {
     shared().is_some_and(|s| is_held(s, a))
@@ -868,8 +927,14 @@ pub fn run_host() -> ! {
     let mut first_bp = true;
     let mut code = 0u32;
     loop {
+        // (Hold requests between events: `hold_by_host`. Waits of 1 ms so
+        // that a request waits no longer than that for a quiet process.)
+        serve_holds(s, pi.hProcess);
         let mut ev: DEBUG_EVENT = unsafe { std::mem::zeroed() };
-        if unsafe { WaitForDebugEvent(&mut ev, INFINITE) } == 0 {
+        if unsafe { WaitForDebugEvent(&mut ev, 1) } == 0 {
+            if unsafe { GetLastError() } == windows_sys::Win32::Foundation::ERROR_SEM_TIMEOUT {
+                continue;
+            }
             break;
         }
         let t_event = std::time::Instant::now();
@@ -1001,6 +1066,51 @@ pub fn run_host() -> ! {
 /// word other than those of an arm in progress made read-write, run by run
 /// (page by page where a run fails: it may cross separately allocated
 /// regions), and their bits cleared where that worked. The pages it did.
+/// The host serves dsport's hold request, if one is pending (`hold_by_host`):
+/// a run whose pages are all armed and none held gets its held bits, then
+/// no-access; else it is refused.
+fn serve_holds(s: &Shared, process: HANDLE) {
+    let req = s.hold_req.load(Ordering::Acquire);
+    if s.hold_done.load(Ordering::Acquire) >= req {
+        return;
+    }
+    let n = (s.hold_n.load(Ordering::Acquire) as usize).min(HOLD_RUNS);
+    for i in 0..n {
+        let (lo, hi) = (s.hold_runs[i][0].load(Ordering::Acquire), s.hold_runs[i][1].load(Ordering::Acquire));
+        let ok = lo < hi && (lo..hi).step_by(PAGE as usize).all(|a| bit(s, a, false).is_some_and(|(w, m)| w.load(Ordering::Acquire) & m != 0) && !is_held(s, a));
+        let r = if !ok {
+            2
+        } else {
+            for a in (lo..hi).step_by(PAGE as usize) {
+                if let Some((hw, hm)) = held_bit(s, a) {
+                    hw.fetch_or(hm, Ordering::AcqRel);
+                }
+            }
+            let mut old = 0u32;
+            if unsafe { VirtualProtectEx(process, lo as _, (hi - lo) as usize, PAGE_NOACCESS, &mut old) } != 0 {
+                1
+            } else {
+                // (Page by page across allocations; any that fails: the run's
+                // held bits taken back, its pages read-only again.)
+                let all = (lo..hi).step_by(PAGE as usize).all(|a| unsafe { VirtualProtectEx(process, a as _, PAGE as usize, PAGE_NOACCESS, &mut old) } != 0);
+                if all {
+                    1
+                } else {
+                    for a in (lo..hi).step_by(PAGE as usize) {
+                        unsafe { VirtualProtectEx(process, a as _, PAGE as usize, PAGE_READONLY, &mut old) };
+                        if let Some((hw, hm)) = held_bit(s, a) {
+                            hw.fetch_and(!hm, Ordering::AcqRel);
+                        }
+                    }
+                    3
+                }
+            }
+        };
+        s.hold_runs[i][2].store(r, Ordering::Release);
+    }
+    s.hold_done.store(req, Ordering::Release);
+}
+
 unsafe fn answer_word(s: &Shared, process: HANDLE, page: u64) -> u64 {
     let wa = page & !(64 * PAGE - 1);
     let Some((w, _)) = bit(s, wa, false) else { return 0 };

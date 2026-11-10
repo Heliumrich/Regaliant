@@ -5432,7 +5432,7 @@ static C4_ALL: AtomicBool = AtomicBool::new(false);
 static C4_SYNC: parking_lot::Mutex<Vec<(u64, u64, bool, std::sync::Arc<AtomicBool>)>> = parking_lot::Mutex::new(Vec::new());
 
 /// C4's counts (since boot).
-static C4X: [AtomicU64; 25] = [const { AtomicU64::new(0) }; 25];
+static C4X: [AtomicU64; 26] = [const { AtomicU64::new(0) }; 26];
 const X_HELD: usize = 0;
 const X_RUNS: usize = 1;
 const X_FAILED: usize = 2;
@@ -5455,6 +5455,9 @@ const X_PLAIN: usize = 22;
 const X_RELEASED: usize = 23;
 /// Pages released through host memory (no valid window).
 const X_CPU_PAGES: usize = 24;
+/// Runs the host refused: a page of them took a write fault (or was
+/// disarmed) since it was looked at.
+const X_UNDONE: usize = 25;
 
 thread_local! {
     /// The release thread (it never waits for itself).
@@ -5510,7 +5513,13 @@ pub fn c4_unheld_runs(lo: u64, hi: u64, out: &mut Vec<(u64, u64)>) {
         a = pe;
     }
     if skipped > 0 {
-        C4X[X_UP_SKIPPED].fetch_add(skipped, Ordering::Relaxed);
+        let n = C4X[X_UP_SKIPPED].fetch_add(skipped, Ordering::Relaxed);
+        if n < 16 {
+            // (Front end 2 took the page for CPU-written: the mirror would be
+            // stale if it was. Expected 0 but for runs uploaded whole.)
+            let wrote = chunk(lo, false).map_or(0, |c| c.wrote[idx(lo)].load(Ordering::Acquire));
+            crate::warn!("fe2: C4: an upload of {lo:#x}..{hi:#x} left out {skipped} held pages (last CPU write seen at flip {}, now {})", wrote.saturating_sub(1), super::FRAMES.load(Ordering::Relaxed));
+        }
     }
 }
 
@@ -5683,6 +5692,14 @@ pub fn c4_forgotten(base: u64, len: u64) {
     }
 }
 
+/// `DS_C4_QUIET=<flips>`: a page is held only that long after the last CPU
+/// write front end 2 saw on it (600 by default; 0: front end 2's arming
+/// alone).
+fn c4_quiet() -> u64 {
+    static Q: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *Q.get_or_init(|| std::env::var("DS_C4_QUIET").ok().and_then(|v| v.parse().ok()).unwrap_or(600))
+}
+
 /// The allocator IDs whose records C4 holds: the engine's GPU page
 /// allocator and GPU heaps (long-lived GPU allocations).
 fn c4_targets() -> [bool; 256] {
@@ -5709,6 +5726,8 @@ fn c4_round() {
     let held = unsafe { std::slice::from_raw_parts(m.words as *const AtomicU32, HELD_MAP_WORDS) };
     let targets = c4_targets();
     let nh = no_hold();
+    let frame = super::FRAMES.load(Ordering::Relaxed);
+    let quiet = c4_quiet();
     let mut runs: Vec<(u64, u64)> = Vec::new();
     let mut cands = 0u64;
     for i in 0..HELD_MAP_WORDS {
@@ -5725,6 +5744,13 @@ fn c4_round() {
             if c.armed[w].load(Ordering::Acquire) >> k & 1 == 0 || c.valid[w].load(Ordering::Acquire) >> k & 1 == 0 || !crate::hosted::armed(p) {
                 continue;
             }
+            // (Pages the CPU wrote within `c4_quiet` flips are left alone:
+            // the title refills streamed GPU heap blocks, and each such hold
+            // ends in a release.)
+            let wrote = c.wrote[idx(p)].load(Ordering::Acquire) as u64;
+            if wrote != 0 && frame.saturating_sub(wrote - 1) < quiet {
+                continue;
+            }
             cands += 1;
             match runs.last_mut() {
                 Some(l) if l.1 == p => l.1 = p + PAGE,
@@ -5733,36 +5759,45 @@ fn c4_round() {
         }
     }
     C4X[X_CANDIDATES].fetch_add(cands, Ordering::Relaxed);
-    for (p, q) in runs {
-        c4_hold_run(p, q);
-    }
+    c4_hold_runs(&runs);
 }
 
-/// Holds guest [p, q): no-access through the host first, then the bitmap's
-/// bits (the write-back leaves the pages' dwords pending from then on).
-fn c4_hold_run(p: u64, q: u64) {
-    let _readers = crate::mem::GUEST_READERS.read_recursive();
-    let _arming = super::resident::arm_guard();
-    let _lock = crate::hosted::arm_lock();
-    if C4_OFF.load(Ordering::Acquire) || host_writing(p, q) || !crate::hosted::all_armed(p, q - p) {
-        return;
-    }
-    let t = std::time::Instant::now();
-    let r = crate::hosted::hold(p, q - p);
-    super::hitch::note_since(super::hitch::Kind::Mirror, t, || format!("C4 holding {p:#x}+{:#x}", q - p));
-    if r.is_err() {
-        C4X[X_FAILED].fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-    let mut n = 0u64;
-    for a in (p..q).step_by(PAGE as usize) {
-        if !held_mark(a, true) {
-            n += 1;
+/// Holds `runs` (sorted guest ranges): through the host, which protects
+/// them in its event loop in order with the faults it answers
+/// (`hosted::hold_by_host`: a run whose page took a write fault since it
+/// was looked at is refused), then the bitmap's bits of those it held (the
+/// write-back leaves their dwords pending from then on).
+fn c4_hold_runs(runs: &[(u64, u64)]) {
+    for part in runs.chunks(crate::hosted::HOLD_RUNS) {
+        let _readers = crate::mem::GUEST_READERS.read_recursive();
+        let _arming = super::resident::arm_guard();
+        let _lock = crate::hosted::arm_lock();
+        if C4_OFF.load(Ordering::Acquire) {
+            return;
+        }
+        let want: Vec<(u64, u64)> = part.iter().copied().filter(|&(p, q)| !host_writing(p, q) && crate::hosted::all_armed(p, q - p)).collect();
+        if want.is_empty() {
+            continue;
+        }
+        let t = std::time::Instant::now();
+        let held = crate::hosted::hold_by_host(&want);
+        super::hitch::note_since(super::hitch::Kind::Mirror, t, || format!("C4 holding {} runs", want.len()));
+        for (i, &(p, q)) in want.iter().enumerate() {
+            if !held[i] {
+                C4X[X_UNDONE].fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let mut n = 0u64;
+            for a in (p..q).step_by(PAGE as usize) {
+                if !held_mark(a, true) {
+                    n += 1;
+                }
+            }
+            C4X[X_HELD].fetch_add(n, Ordering::Relaxed);
+            C4X[X_RUNS].fetch_add(1, Ordering::Relaxed);
+            C4X[X_NOW].fetch_add(n, Ordering::Relaxed);
         }
     }
-    C4X[X_HELD].fetch_add(n, Ordering::Relaxed);
-    C4X[X_RUNS].fetch_add(1, Ordering::Relaxed);
-    C4X[X_NOW].fetch_add(n, Ordering::Relaxed);
 }
 
 /// The release thread (`DS_C4`): faults on held pages (the host's
@@ -6103,21 +6138,22 @@ fn c4_line() -> String {
     if !c4_on() || HELD_MAP.get().is_none() {
         return String::new();
     }
-    static LAST: parking_lot::Mutex<(u64, [u64; 25], u64, u64, u64)> = parking_lot::Mutex::new((0, [0; 25], 0, 0, 0));
+    static LAST: parking_lot::Mutex<(u64, [u64; 26], u64, u64, u64)> = parking_lot::Mutex::new((0, [0; 26], 0, 0, 0));
     let frame = super::FRAMES.load(Ordering::Relaxed);
-    let now: [u64; 25] = std::array::from_fn(|k| C4X[k].load(Ordering::Relaxed));
+    let now: [u64; 26] = std::array::from_fn(|k| C4X[k].load(Ordering::Relaxed));
     let (dw, pg, all) = (WB64[2].load(Ordering::Relaxed), WB64[3].load(Ordering::Relaxed), WB64[1].load(Ordering::Relaxed));
     let mut l = LAST.lock();
     let flips = frame.saturating_sub(l.0).max(1) as f64;
     let d = |k: usize| now[k].saturating_sub(l.1[k]);
     let (ddw, dpg, dall) = (dw.saturating_sub(l.2), pg.saturating_sub(l.3), all.saturating_sub(l.4));
     let line = format!(
-        "    front end 4's held pages (C4{}, over {flips:.0} flips): {} held now ({} held in {} runs, {} runs failed, {} candidates seen); the write-back left out {:.3} M dwords and {:.0} pages a flip ({:.1}% of the dwords it would have stored); releases on faults: the title {} reads / {} writes, ours {} / {}, other code {} / {}; synchronous releases {} ({} late), pages released {} in {} rounds ({:.0} us of take a round; {} through host memory, {:.0} us suspended), plain {}; writer waits {} ({} ms, {} past 50 ms); dropped by mapping changes {}; uploads that left out held pages {}; failed takes {}; pages never held {}\n",
+        "    front end 4's held pages (C4{}, over {flips:.0} flips): {} held now ({} held in {} runs, {} runs failed, {} refused by the host, {} candidates seen); the write-back left out {:.3} M dwords and {:.0} pages a flip ({:.1}% of the dwords it would have stored); releases on faults: the title {} reads / {} writes, ours {} / {}, other code {} / {}; synchronous releases {} ({} late), pages released {} in {} rounds ({:.0} us of take a round; {} through host memory, {:.0} us suspended), plain {}; writer waits {} ({} ms, {} past 50 ms); dropped by mapping changes {}; uploads that left out held pages {}; failed takes {}; pages never held {}\n",
         if C4_OFF.load(Ordering::Relaxed) { ", off" } else { "" },
         now[X_NOW],
         d(X_HELD),
         d(X_RUNS),
         d(X_FAILED),
+        d(X_UNDONE),
         d(X_CANDIDATES),
         ddw as f64 / 1e6 / flips,
         dpg as f64 / flips,

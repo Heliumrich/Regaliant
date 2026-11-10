@@ -6272,20 +6272,30 @@ pub fn inflight_latest(ranges: &[(u64, u64)]) -> Option<u64> {
 }
 
 /// The import windows held still (front end 4's releases): none leaves the
-/// list, so none is freed, until the guard drops.
-pub struct SpansGuard(parking_lot::RwLockReadGuard<'static, Vec<Span>>);
+/// list or the graveyard, so none is freed, until the guard drops (the
+/// graveyard's lock first, as the audit takes them).
+pub struct SpansGuard(parking_lot::MutexGuard<'static, Vec<Dead>>, parking_lot::RwLockReadGuard<'static, Vec<Span>>);
 
 impl SpansGuard {
-    /// The valid window holding guest page `p`: its buffer and the page's
-    /// offset in it.
+    /// The window holding guest page `p` (its buffer and the page's offset
+    /// in it): a listed valid one, else the newest dropped one still in the
+    /// graveyard. A held page's own mapping never changed while held (a
+    /// decommit drops the hold, a commit or protection change releases it
+    /// first), so the window that was settled over it when it was held
+    /// still pins its memory after a change elsewhere in its range dropped
+    /// it; no window made since covers the page (an import releases it).
     pub fn window(&self, p: u64) -> Option<(vk::Buffer, u64)> {
-        self.0.iter().find(|s| s.valid && s.start <= p && p + 4096 <= s.end).map(|s| (s.buffer, p - s.start))
+        if let Some(s) = self.1.iter().find(|s| s.valid && s.start <= p && p + 4096 <= s.end) {
+            return Some((s.buffer, p - s.start));
+        }
+        self.0.iter().filter(|d| d.span.start <= p && p + 4096 <= d.span.end).max_by_key(|d| d.span.born).map(|d| (d.span.buffer, p - d.span.start))
     }
 }
 
 /// Holds the import windows still (`SpansGuard`).
 pub fn spans_guard() -> SpansGuard {
-    SpansGuard(spans_read())
+    let gy = GRAVEYARD.lock();
+    SpansGuard(gy, spans_read())
 }
 
 /// Blocks until batch `seq` and all earlier ones completed (with their actions).
