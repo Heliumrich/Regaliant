@@ -2376,6 +2376,28 @@ pub fn page_valid(p: u64) -> bool {
     chunk(p, false).is_some_and(|c| c.valid[idx(p) / 64].load(Ordering::Acquire) >> (idx(p) % 64) & 1 != 0)
 }
 
+/// Whether every page of [a, a+n) is armed now (front end 2's bit and the
+/// host's): a CPU write to it faults first (R2's census of what stage
+/// preparations read, `DS_R2_ARMED_CENSUS`).
+pub fn range_armed(a: u64, n: u64) -> bool {
+    if n == 0 || !in_span(a, n) {
+        return false;
+    }
+    let (lo, hi) = (a & !(PAGE - 1), (a + n).next_multiple_of(PAGE));
+    let mut x = lo;
+    while x < hi {
+        let e = word_end(x, hi);
+        let Some(c) = chunk(x, false) else { return false };
+        let m = word_mask(x, e);
+        let armed = c.armed[idx(x) / 64].load(Ordering::Acquire) & crate::hosted::armed_word(x & !(64 * PAGE - 1));
+        if armed & m != m {
+            return false;
+        }
+        x = e;
+    }
+    true
+}
+
 pub fn audit_page_state(p: u64) -> String {
     let Some(c) = chunk(p, false) else { return "no chunk".into() };
     let (i, w, bit) = (idx(p), idx(p) / 64, idx(p) % 64);

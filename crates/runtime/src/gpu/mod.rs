@@ -196,7 +196,7 @@ pub mod tune {
         Tunable { name: "wb_probe_site", env: "DS_WB_PROBE_SITE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "unb_bound", env: "DS_UNB_BOUND", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "kco", env: "DS_KCO", default: 0, value: AtomicU64::new(UNSET) },
-        Tunable { name: "r2", env: "DS_R2", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "r2", env: "DS_R2", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1687,7 +1687,9 @@ pub mod tune {
 
     /// The recording path rebuilt (R2, ROUTE60.md 2026-11-10 afternoon):
     /// per-thread program and plan records, leaner preparation, binding and
-    /// synchronization, each producing what the earlier path produces.
+    /// synchronization, each producing what the earlier path produces. The
+    /// default since 2026-11-10 evening (the 1-1 walk x1.06-1.09 in boots,
+    /// the vista level; 0: the earlier path, for A/Bs).
     #[inline(always)]
     pub fn r2() -> bool {
         get(164) != 0
@@ -3113,6 +3115,29 @@ pub fn profile_report() -> String {
         s.push_str(&format!("    R2 checks (`DS_R2_CHECK`): {} template hits checked, {} mismatches
 ", c[0], c[1]));
     }
+    if shaders::armed_census_on() {
+        let pct = |a: u64, b: u64| a as f64 * 100.0 / b.max(1) as f64;
+        let parts: Vec<String> = ["vertex", "pixel", "compute"]
+            .iter()
+            .zip(shaders::ARMED_CENSUS.iter())
+            .map(|(name, st)| {
+                let c: Vec<Vec<u64>> = st.iter().map(|k| k.iter().map(|x| x.load(Ordering::Relaxed)).collect()).collect();
+                format!(
+                    "{name}: descriptors {} ranges, {:.1}% armed ({:.1}% of {} KiB), scalar loads {} ranges, {:.1}% armed ({:.1}% of {} KiB)",
+                    c[0][0],
+                    pct(c[0][1], c[0][0]),
+                    pct(c[0][3], c[0][2]),
+                    c[0][2] >> 10,
+                    c[1][0],
+                    pct(c[1][1], c[1][0]),
+                    pct(c[1][3], c[1][2]),
+                    c[1][2] >> 10
+                )
+            })
+            .collect();
+        s.push_str(&format!("    preparations' reads in armed pages (`DS_R2_ARMED_CENSUS`): {}
+", parts.join("; ")));
+    }
     s.push_str(&exec::async_line());
     s.push_str(&shaders::fmt_line());
     s.push_str(&exec::import_window_line());
@@ -3246,7 +3271,7 @@ pub fn status_ex(with_stacks: bool) -> String {
         cp::PROMISED.load(Ordering::Relaxed),
         exec::FOREIGN_WAITS.load(Ordering::Relaxed),
         format!(
-            "; {} tiny read-only buffers bound as snapshots of guest memory{}",
+            "; {} read-only buffers bound as snapshots of guest memory taken anew (front end 2's tiny buffers, data loads){}",
             exec::TINY_SNAPS.load(Ordering::Relaxed),
             if exec::UPLOAD_HAZARDS[2].load(Ordering::Relaxed) > 0 {
                 format!(

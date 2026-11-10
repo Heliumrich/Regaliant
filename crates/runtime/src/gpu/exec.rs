@@ -4920,11 +4920,79 @@ static SNAPS: AtomicU64 = AtomicU64::new(0);
 static SNAPS_REUSED: AtomicU64 = AtomicU64::new(0);
 static SNAPS_FULL: AtomicU64 = AtomicU64::new(0);
 static SNAP_COPIED: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    /// This thread's snapshot counts not yet added: [snapshots, bytes,
+    /// copies taken anew (`TINY_SNAPS`)] (three shared increments a
+    /// snapshot, ~5,300 snapshots a flip at the vista, contended between
+    /// the recording threads).
+    static SNAP_LOCAL: std::cell::Cell<[u64; 3]> = const { std::cell::Cell::new([0; 3]) };
+}
+
+/// Counts a snapshot of `bytes` (`anew`: one never reused, front end 2's
+/// tiny buffers), adding to SNAPS, SNAP_COPIED and TINY_SNAPS every 256.
+fn snap_count(bytes: u64, anew: bool) {
+    SNAP_LOCAL.with(|c| {
+        let mut v = c.get();
+        v[0] += 1;
+        v[1] += bytes;
+        v[2] += anew as u64;
+        if v[0] >= 256 {
+            SNAPS.fetch_add(v[0], Ordering::Relaxed);
+            SNAP_COPIED.fetch_add(v[1], Ordering::Relaxed);
+            TINY_SNAPS.fetch_add(v[2], Ordering::Relaxed);
+            v = [0; 3];
+        }
+        c.set(v);
+    });
+}
+
 /// Index buffers drawn from snapshots (draws, bytes; reuses included).
 pub(super) static INDEX_SNAPS: AtomicU64 = AtomicU64::new(0);
 pub(super) static INDEX_SNAP_BYTES: AtomicU64 = AtomicU64::new(0);
-/// Video memory for snapshots per slot.
-const SNAP_SEG: u64 = 16 << 20;
+/// Snapshot space per slot (`snap_segment`). 16 MiB a slot in the CPU-visible
+/// video heap (the PCIe BAR window, ~214 MiB here, shared with the driver and
+/// every process) filled it after 13 slots in every boot: each executor's
+/// next allocation failed and it never took a snapshot again (all 28 within
+/// minutes), and a walk boot quit with the heap at 213 MiB of 214 as the
+/// driver logged an out-of-memory error and lost the GPU (FINDINGS.md
+/// 2026-11-10 evening). A batch's snapshots are small (~100 bytes on
+/// average; index buffers up to `snap_index`).
+const SNAP_SEG: u64 = 4 << 20;
+/// The most snapshot space this process keeps in the CPU-visible video heap
+/// (`snap_segment`); the rest is in system memory.
+const BAR_SNAP_CAP: u64 = 32 << 20;
+/// What a snapshot segment leaves free in that heap for the driver and
+/// other processes (its budget less usage after the allocation).
+const BAR_RESERVE: u64 = 64 << 20;
+/// Snapshot space this process holds in the CPU-visible video heap.
+static BAR_SNAP_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// A slot's snapshot segment (SNAP_SEG): video memory the CPU writes while
+/// this process holds at most BAR_SNAP_CAP there and the heap keeps
+/// BAR_RESERVE free, else system memory the GPU reads across PCIe. None
+/// only when neither can be had.
+fn snap_segment(name: &str) -> Option<(vk::Buffer, *mut u8)> {
+    let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::INDEX_BUFFER;
+    let c = ctx();
+    let before = BAR_SNAP_BYTES.fetch_add(SNAP_SEG, Ordering::Relaxed);
+    if before + SNAP_SEG <= BAR_SNAP_CAP && c.bar_room().is_none_or(|r| r >= SNAP_SEG + BAR_RESERVE) {
+        if let Ok((b, _m, p)) = c.bar_buffer(SNAP_SEG, usage) {
+            SLOT_MEM[3].fetch_add(SNAP_SEG, Ordering::Relaxed);
+            return Some((b, p));
+        }
+    }
+    BAR_SNAP_BYTES.fetch_sub(SNAP_SEG, Ordering::Relaxed);
+    match c.upload_buffer(SNAP_SEG, usage) {
+        Ok((b, _m, p)) => {
+            SLOT_MEM[6].fetch_add(SNAP_SEG, Ordering::Relaxed);
+            Some((b, p))
+        }
+        Err(e) => {
+            crate::warn!("gpu[{name}]: no memory for buffer snapshots ({e})");
+            None
+        }
+    }
+}
 /// Device-local space per batch slot for copies made at the start of the
 /// batch (`Exec::pre_copy`).
 const PRE_SEG: u64 = 64 << 20;
@@ -6720,8 +6788,8 @@ struct Slot {
     /// the batch's write-backs (`seg_stamps`; WB_COUNTS records, made on
     /// first use).
     wb_counts: Option<(vk::Buffer, *mut u8)>,
-    /// Read-only buffer snapshots in video memory (SNAP_SEG, allocated on
-    /// first use).
+    /// Read-only buffer snapshots (SNAP_SEG, allocated on first use: video
+    /// memory the CPU writes or system memory, `snap_segment`).
     snap: Option<(vk::Buffer, *mut u8)>,
     /// Device-local shadow space (working and pristine copies), `shadow_cap`
     /// bytes, made on first use (`Exec::shadow_room`; null before).
@@ -6778,8 +6846,9 @@ struct SlotReset {
 /// Batch slots made and the buffers they hold (status line `batch slots`):
 /// [slots, shadow bytes, batch-start copy segment bytes, snapshot bytes
 /// (video memory the CPU writes), SGPR rings in video memory, host rings
-/// and staging bytes]. Slots live as long as their executor.
-static SLOT_MEM: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// and staging bytes, snapshot bytes in system memory]. Slots live as long
+/// as their executor.
+static SLOT_MEM: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 /// The most a batch used of its slot's shadow and batch-start copy
 /// segments, by executor role (graphics, compute queues, parallel
@@ -6803,7 +6872,7 @@ fn slot_mem_line() -> String {
         .map(|(k, n)| format!("{n} {}/{} KiB", SEG_MAX[k][0].load(Ordering::Relaxed) >> 10, SEG_MAX[k][1].load(Ordering::Relaxed) >> 10))
         .collect();
     format!(
-        "    batch slots: {} ({} MiB of video memory: shadows {}, batch-start copy segments {}, snapshots {}, SGPR rings {}; {} MiB of host rings and staging); most a batch used of its shadow/copy segment: {}; slot waits {} ({:.0} ms), {} of them ({:.0} ms) with the GPU done with their batch at their start
+        "    batch slots: {} ({} MiB of video memory: shadows {}, batch-start copy segments {}, snapshots {}, SGPR rings {}; {} MiB of host rings and staging, {} MiB of snapshots in system memory; the CPU-visible video heap's room {}); most a batch used of its shadow/copy segment: {}; slot waits {} ({:.0} ms), {} of them ({:.0} ms) with the GPU done with their batch at their start
 ",
         v[0],
         device >> 20,
@@ -6812,6 +6881,8 @@ fn slot_mem_line() -> String {
         v[3] >> 20,
         v[4] >> 20,
         v[5] >> 20,
+        v[6] >> 20,
+        ctx().bar_room().map(|r| format!("{} MiB", r >> 20)).unwrap_or_else(|| "unknown".into()),
         m.join(", "),
         WAIT_NS[3].load(Ordering::Relaxed),
         WAIT_NS[2].load(Ordering::Relaxed) as f64 / 1e6,
@@ -13903,12 +13974,13 @@ impl Exec {
         }
     }
 
-    /// A copy of guest [base, base+size) in video memory, taken now (when the
-    /// command processor reaches the work that reads it): (buffer, offset of
-    /// the copy's 16-byte aligned start, bias of `base` in it). Bound instead
-    /// of the imported system memory, which every invocation would read across
-    /// PCIe. None: the range is larger than `limit` (0: off), GPU work not yet
-    /// complete (or a deferred CP write) writes it, or no space.
+    /// A copy of guest [base, base+size) in the slot's snapshot segment
+    /// (video memory while `snap_segment` has room there, else system
+    /// memory), taken now (when the command processor reaches the work that
+    /// reads it): (buffer, offset of the copy's 16-byte aligned start, bias of
+    /// `base` in it), as memory holds it now. None: the range is larger than
+    /// `limit` (0: off), GPU work not yet complete (or a deferred CP write)
+    /// writes it, or no space.
     pub(super) fn snapshot(&mut self, base: u64, size: u64, limit: u64) -> Option<(vk::Buffer, u64, u64)> {
         self.snapshot_as(base, size, limit, true)
     }
@@ -13937,13 +14009,9 @@ impl Exec {
             return Some((buf, at, bias));
         }
         if self.slots[self.cur].snap.is_none() {
-            match ctx().bar_buffer(SNAP_SEG, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::INDEX_BUFFER) {
-                Ok((b, _m, p)) => {
-                    SLOT_MEM[3].fetch_add(SNAP_SEG, Ordering::Relaxed);
-                    self.slots[self.cur].snap = Some((b, p))
-                }
-                Err(e) => {
-                    crate::warn!("gpu[{}]: no video memory for buffer snapshots ({e})", self.name);
+            match snap_segment(&self.name) {
+                Some(s) => self.slots[self.cur].snap = Some(s),
+                None => {
                     self.snap_failed = true;
                     return None;
                 }
@@ -13963,9 +14031,13 @@ impl Exec {
         self.snap_used = off + n;
         let at = off;
         unsafe { std::ptr::copy_nonoverlapping(al as *const u8, ptr.add(at as usize), n as usize) };
-        SNAPS.fetch_add(1, Ordering::Relaxed);
-        SNAP_COPIED.fetch_add(n, Ordering::Relaxed);
-        self.snaps.insert((base, size), at);
+        snap_count(n, !reuse);
+        // (Kept for later copies of the range in the batch to reuse; a copy
+        // that must be taken anew each time is never looked up: front end
+        // 2's tiny buffers, ~5,300 a flip at the vista.)
+        if reuse {
+            self.snaps.insert((base, size), at);
+        }
         Some((buf, at, bias))
     }
 
@@ -14821,9 +14893,7 @@ impl Exec {
                         // Front end 2: a tiny read-only buffer no GPU work writes,
                         // as guest memory holds it now (`TINY_SNAP_BYTES`).
                         let tiny = if read_only && super::fe2::on() && size <= TINY_SNAP_BYTES && matches!(found.resources[i], Resolved::Buffer(_)) && !super::resident::mirror_mode() {
-                            self.snapshot_as(base, size, 4096, false).inspect(|_| {
-                                TINY_SNAPS.fetch_add(1, Ordering::Relaxed);
-                            })
+                            self.snapshot_as(base, size, 4096, false)
                         } else {
                             None
                         };

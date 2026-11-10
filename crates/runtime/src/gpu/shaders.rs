@@ -1676,6 +1676,38 @@ pub fn r2_check() -> bool {
     *ON.get_or_init(|| std::env::var("DS_R2_CHECK").ok().as_deref() == Some("1"))
 }
 
+/// `DS_R2_ARMED_CENSUS=1` (diagnosis): the ranges stage preparations read,
+/// by whether front end 2 and the host have their pages armed now (a CPU
+/// write faults first): [vertex, pixel, compute] x [descriptors, scalar
+/// loads] x [ranges, of them armed, bytes, of them armed].
+pub fn armed_census_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_R2_ARMED_CENSUS").ok().as_deref() == Some("1"))
+}
+
+pub static ARMED_CENSUS: [[[std::sync::atomic::AtomicU64; 4]; 2]; 3] = [const { [const { [const { std::sync::atomic::AtomicU64::new(0) }; 4] }; 2] }; 3];
+
+/// Counts a preparation's reads (`ARMED_CENSUS`): the first `res` were the
+/// resources' descriptors, the rest its scalar loads.
+fn armed_census(stage: Stage, reads: &[(u64, u64)], res: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let st = match stage {
+        Stage::Vertex => 0,
+        Stage::Fragment => 1,
+        Stage::Compute => 2,
+    };
+    for (k, &(a, n)) in reads.iter().enumerate() {
+        let c = &ARMED_CENSUS[st][if k < res { 0 } else { 1 }];
+        let armed = super::fe2::range_armed(a, n);
+        c[0].fetch_add(1, Relaxed);
+        c[2].fetch_add(n, Relaxed);
+        if armed {
+            c[1].fetch_add(1, Relaxed);
+            c[3].fetch_add(n, Relaxed);
+        }
+    }
+}
+
 /// [template hits checked, mismatches] (`DS_R2_CHECK=1`).
 pub static R2_CHECKS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
@@ -3934,6 +3966,7 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
         }
     }
     prep_lap(5);
+    let res_reads = rd.reads.len();
     // Depth views keep the hardware comparison, color views emulate it: the
     // image cache decides, for the images comparison instructions sample
     // (the others' translation does not depend on it).
@@ -4134,6 +4167,9 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
     prep_lap_volume(rd.words.len(), rd.reads.len(), rd.ptrs.len(), resources.len());
     if super::slotcensus::on() {
         super::slotcensus::note_reads(&rd.reads);
+    }
+    if armed_census_on() {
+        armed_census(spec.stage, &rd.reads, res_reads);
     }
     // The reader's references into the translation's plan end here.
     let used = [rd.reads.len() as u32, rd.words.len() as u32, rd.ptrs.len() as u32];

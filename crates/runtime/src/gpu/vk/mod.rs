@@ -1339,6 +1339,64 @@ impl Ctx {
         }
     }
 
+    /// Buffer in system memory (never the PCIe BAR window's video memory)
+    /// that the CPU fills and the GPU reads across PCIe: write-combined
+    /// where the driver offers it, else cached.
+    pub fn upload_buffer(&self, size: u64, usage: vk::BufferUsageFlags) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8), String> {
+        unsafe {
+            let bi = self.shared(vk::BufferCreateInfo::default().size(size).usage(self.addressable(usage)));
+            let buf = self.device.create_buffer(&bi, None).map_err(|e| format!("vkCreateBuffer: {e}"))?;
+            let req = self.device.get_buffer_memory_requirements(buf);
+            let hv = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+            let pick = |not: vk::MemoryPropertyFlags| {
+                (0..self.mem_props.memory_type_count).find(|&i| {
+                    let f = self.mem_props.memory_types[i as usize].property_flags;
+                    req.memory_type_bits & (1 << i) != 0 && f.contains(hv) && !f.intersects(not)
+                })
+            };
+            let Some(ty) = pick(vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_CACHED).or_else(|| pick(vk::MemoryPropertyFlags::DEVICE_LOCAL)) else {
+                self.device.destroy_buffer(buf, None);
+                return Err("no host-visible system memory type".into());
+            };
+            let mut fl = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+            let mut ai = vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ty);
+            if self.device_addresses {
+                ai = ai.push_next(&mut fl);
+            }
+            let t0 = std::time::Instant::now();
+            let mem = match self.device.allocate_memory(&ai, None) {
+                Ok(m) => m,
+                Err(e) => {
+                    self.device.destroy_buffer(buf, None);
+                    return Err(format!("vkAllocateMemory({}): {e}", req.size));
+                }
+            };
+            note_alloc("upload memory", req.size, t0);
+            self.device.bind_buffer_memory(buf, mem, 0).map_err(|e| format!("bind buffer: {e}"))?;
+            let ptr = self.device.map_memory(mem, 0, size, vk::MemoryMapFlags::empty()).map_err(|e| format!("map: {e}"))? as *mut u8;
+            Ok((buf, mem, ptr))
+        }
+    }
+
+    /// What this process may still allocate (its budget less its usage,
+    /// VK_EXT_memory_budget) in the heap of the CPU-visible video memory
+    /// `bar_buffer` takes (the PCIe BAR window: ~214 MiB on this machine,
+    /// shared with the driver and every other process). None without the
+    /// extension or without such memory.
+    pub fn bar_room(&self) -> Option<u64> {
+        if !self.memory_budget {
+            return None;
+        }
+        let want = vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let ty = (0..self.mem_props.memory_type_count).find(|&i| self.mem_props.memory_types[i as usize].property_flags.contains(want))?;
+        let heap = self.mem_props.memory_types[ty as usize].heap_index as usize;
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let mut p2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+        unsafe { self.instance.get_physical_device_memory_properties2(self.pdev, &mut p2) };
+        drop(p2);
+        Some(budget.heap_budget[heap].saturating_sub(budget.heap_usage[heap]))
+    }
+
     /// A GPU timestamp and the performance counter read together (None
     /// without VK_EXT_calibrated_timestamps).
     pub fn calibrate(&self) -> Option<(u64, i64)> {
