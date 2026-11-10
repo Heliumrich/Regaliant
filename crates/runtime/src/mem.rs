@@ -1640,6 +1640,9 @@ fn host_commit(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
         }
         note_since(Mirror, t, || format!("a commit of {addr:#x}+{size:#x} zeroing {} bytes left by deferred decommits", stale.iter().map(|r| r.1 - r.0).sum::<u64>()));
     }
+    // (Front end 4's held pages there released first: a commit resets their
+    // protection.)
+    crate::gpu::fe2::c4_release_sync(addr, size, false);
     let t = std::time::Instant::now();
     let _arm = crate::gpu::resident::remap_guard();
     note_since(Mirror, t, || format!("a commit of {addr:#x}+{size:#x} waiting for armings"));
@@ -1868,8 +1871,10 @@ pub fn kernel_io<T>(what: &dyn Fn() -> String, base: u64, len: u64, into_guest: 
                     crate::gpu::resident::disarm_for_host(base, len);
                 }
                 // Pages armed through the host (`hosted`; reads from
-                // no-access pages fail too).
+                // no-access pages fail too); front end 4's held pages
+                // released first.
                 crate::hostcensus::release(base, len);
+                crate::gpu::fe2::c4_release_sync(base, len, false);
                 crate::hosted::disarm(base, len);
                 std::thread::sleep(std::time::Duration::from_millis(1 << tries.min(5)));
                 continue;
@@ -1917,6 +1922,8 @@ pub fn describe_host(base: u64, len: u64) -> String {
 
 fn host_decommit(addr: u64, size: u64) {
     let t0 = std::time::Instant::now();
+    // (Front end 4's held pages there: dropped, their pending words dead.)
+    crate::gpu::fe2::c4_drop_sync(addr, size);
     crate::gpu::track::remapped(addr, size, crate::gpu::track::REMAP_DECOMMIT);
     repaged(addr, size);
     // View windows go now (their guest views: imports are of their aliases),
@@ -1963,8 +1970,10 @@ fn host_decommit(addr: u64, size: u64) {
 pub fn host_protect(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
     let t0 = std::time::Instant::now();
     // Mirror mode: GPU-written dwords reach guest memory before its
-    // protection changes (their pages' protections are restored first).
+    // protection changes (their pages' protections are restored first);
+    // front end 4's held pages likewise (released first).
     crate::gpu::resident::release_range(addr, size);
+    crate::gpu::fe2::c4_release_sync(addr, size, false);
     crate::gpu::track::remapped(addr, size, crate::gpu::track::REMAP_PROTECT);
     let mut old = 0u32;
     let _readers_out = GUEST_READERS.write();

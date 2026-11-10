@@ -2455,6 +2455,8 @@ fn import_once(base: u64, size: u64, window: u64) -> Option<Option<(vk::Buffer, 
     // Pages armed through the host likewise (`hostcensus`, `precache`'s
     // write tracking by protection).
     crate::hostcensus::release(start, end - start);
+    // (Front end 4's held pages: the driver cannot pin a no-access page.)
+    super::fe2::c4_release_sync(start, end - start, false);
     crate::hosted::disarm_if_armed(start, end - start);
     let t0 = std::time::Instant::now();
     let imported = ctx().import_host(start + alias, end - start, usage);
@@ -6256,6 +6258,34 @@ pub fn inflight_writer(a: u64, n: u64) -> Option<u64> {
 /// Every batch up to this sequence has completed.
 pub fn done_now() -> u64 {
     done_seq()
+}
+
+/// Front end 4's releases of held pages (`fe2::c4_*`): a batch's push and
+/// the noting of its writes (`INFLIGHT`) happen under this gate's read side,
+/// so that under its write side every batch pushed has noted its writes
+/// (`inflight_latest` misses none) and none is pushed.
+pub static NOTE_GATE: parking_lot::RwLock<()> = parking_lot::RwLock::new(());
+
+/// The latest unfinished batch noted as writing into `ranges` (None: none).
+pub fn inflight_latest(ranges: &[(u64, u64)]) -> Option<u64> {
+    INFLIGHT.latest(ranges)
+}
+
+/// The import windows held still (front end 4's releases): none leaves the
+/// list, so none is freed, until the guard drops.
+pub struct SpansGuard(parking_lot::RwLockReadGuard<'static, Vec<Span>>);
+
+impl SpansGuard {
+    /// The valid window holding guest page `p`: its buffer and the page's
+    /// offset in it.
+    pub fn window(&self, p: u64) -> Option<(vk::Buffer, u64)> {
+        self.0.iter().find(|s| s.valid && s.start <= p && p + 4096 <= s.end).map(|s| (s.buffer, p - s.start))
+    }
+}
+
+/// Holds the import windows still (`SpansGuard`).
+pub fn spans_guard() -> SpansGuard {
+    SpansGuard(spans_read())
 }
 
 /// Blocks until batch `seq` and all earlier ones completed (with their actions).
@@ -10651,6 +10681,8 @@ impl Exec {
             }
         }
         let xq = xq_tracking().then_some(XqBatch { compute: self.xq_c, on_c, acb: acb_id(&self.name), writes: &self.pending, ups: &self.fe2_up, dep: self.xq_dep, why: self.xq_why, images: self.xq_img });
+        // (Pushed and its writes noted under the note gate: `NOTE_GATE`.)
+        let note_gate = NOTE_GATE.read_recursive();
         let seq = push_batch(fence, self.slots[i].queries, bq, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, gpu_labels, self.ops, std::mem::take(&mut self.segs), reset, on_c, xq, move |seq| {
             if DEVICE_LOST.load(Ordering::Relaxed) {
                 return None;
@@ -10714,6 +10746,7 @@ impl Exec {
         let writes = std::mem::take(&mut self.pending);
         self.pending_log.clear();
         INFLIGHT.note_ranges(seq, &writes);
+        drop(note_gate);
         journal_note(&writes, &self.name);
         crate::hostcensus::gpu_wrote(seq, &writes);
         if !super::resident::mirror_mode() {
@@ -11701,6 +11734,15 @@ impl Exec {
                     } else {
                         runs.push((x, e));
                     }
+                    // (Front end 4's held pages left out: the mirror holds
+                    // their newest words.)
+                    if super::fe2::c4_any_held(x, e) {
+                        let mut kept = Vec::with_capacity(runs.len() + 4);
+                        for &(cx, ce) in &runs {
+                            super::fe2::c4_unheld_runs(cx, ce, &mut kept);
+                        }
+                        runs = kept;
+                    }
                     for &(cx, ce) in &runs {
                         self.pre_copies.push((buf, mbuf, vk::BufferCopy { src_offset: cx - start, dst_offset: cx - MIRROR_BASE, size: ce - cx }));
                         super::fe2::upload_census(cx, ce);
@@ -11714,6 +11756,11 @@ impl Exec {
                     x = e;
                 }
                 None => {
+                    if super::fe2::c4_any_held(x, x + PAGE) {
+                        super::fe2::c4_note_upload_skips(1);
+                        x += PAGE;
+                        continue;
+                    }
                     if !crate::mem::os_readable(x, PAGE) || self.mirror_stage(mbuf, x).is_none() {
                         let readable = crate::mem::os_readable(x, PAGE);
                         self.report_error("front end 2: a page to copy into the mirror has no import window and cannot be copied by the CPU", || format!("{x:#x} (run {a:#x}..{b:#x}; readable {readable})"));
@@ -12897,6 +12944,11 @@ impl Exec {
     /// read; `CP_WRITES`). Returns the batch
     /// sequence it runs after (None: performed now).
     pub fn after_gpu(&mut self, f: Action, write: Option<(u64, u64)>, ordered: bool) -> Option<u64> {
+        // (A CPU action's target is never held: released first, and not held
+        // again; the completion thread must never wait on a held page.)
+        if let Some(w) = write {
+            super::fe2::c4_cp_target(w.0, w.1);
+        }
         if self.held {
             // Never before the work the stretch follows (`Cp::effect` stops
             // it first).
@@ -12915,6 +12967,7 @@ impl Exec {
         }
         if self.recording {
             self.actions.push(f);
+            let note_gate = NOTE_GATE.read_recursive();
             self.submit_for("effect");
             if let Some(w) = write {
                 journal_note_one(w, &self.name);
@@ -12925,8 +12978,10 @@ impl Exec {
                 self.inflight.insert(self.last_seq, w.0, w.1);
                 self.own_gen += 1;
             }
+            drop(note_gate);
             Some(self.last_seq)
         } else if self.last_seq > done_seq() {
+            let note_gate = NOTE_GATE.read_recursive();
             let seq = push_batch(vk::Fence::null(), vk::QueryPool::null(), vk::QueryPool::null(), vec![f], Vec::new(), Vec::new(), &self.name, Vec::new(), [0; OPS], Vec::new(), None, false, None, |_| None);
             self.last_seq = seq;
             self.last_action_seq = seq;
@@ -12940,6 +12995,7 @@ impl Exec {
                 self.inflight.insert(seq, w.0, w.1);
                 self.own_gen += 1;
             }
+            drop(note_gate);
             Some(seq)
         } else {
             if let Some(w) = write {
@@ -13120,6 +13176,8 @@ impl Exec {
     }
 
     pub fn sync_for(&mut self, reads: &[(u64, u64)], why: usize) -> bool {
+        // (Front end 4's held pages read on the CPU: released first.)
+        super::fe2::c4_release_reads(reads);
         if !self.run_writes.is_empty() && reads.iter().any(|&(a, n)| self.run_writes.iter().any(|&(w, m)| a < w + m && w < a + n)) {
             RUN_WRITE_STOPS.fetch_add(1, Ordering::Relaxed);
             self.stop("reads a CP write of its run's earlier chunks");
@@ -13463,6 +13521,9 @@ impl Exec {
         if super::smalltrack::on() {
             super::smalltrack::cp_write(a, bytes, false);
         }
+        // (Front end 4: a CP write's target is never held; our command
+        // processors poll it.)
+        super::fe2::c4_cp_target(a, bytes);
         // Mirror mode: the target pages become host class first (imported
         // exactly, written in place: `resident::host_for_cp`).
         super::resident::host_for_cp(a, bytes);
@@ -14777,6 +14838,7 @@ impl Exec {
             let lists = b.lists;
             let on_c = b.on_c;
             let xq = xq_tracking().then_some(XqBatch { compute: self.xq_c, on_c, acb: acb_id(&self.name), writes: &b.writes, ups: &b.fe2_up, dep: b.xq.0, why: b.xq.1, images: b.xq.2 });
+            let note_gate = NOTE_GATE.read_recursive();
             let seq = push_batch(fence, queries, bq, b.eager_action.into_iter().collect(), b.checks, b.shaders, &self.name, Vec::new(), b.ops, b.segs, reset, on_c, xq, move |_| {
                 if DEVICE_LOST.load(Ordering::Relaxed) {
                     return None;
@@ -14805,6 +14867,7 @@ impl Exec {
             super::precache::submitted(&b.shared, seq);
             super::resident::submitted(&b.res_pages, seq);
             INFLIGHT.note_ranges(seq, &b.writes);
+            drop(note_gate);
             journal_note(&b.writes, &self.name);
             crate::hostcensus::gpu_wrote(seq, &b.writes);
             if !super::resident::mirror_mode() {

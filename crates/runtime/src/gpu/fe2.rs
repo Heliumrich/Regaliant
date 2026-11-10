@@ -613,7 +613,7 @@ static UP_FLIPS: Mutex<UpFlips> = Mutex::new(UpFlips { flip: 0, pages: 0, again:
 /// (`up_census_on`).
 pub fn upload_census(a: u64, b: u64) {
     crate::engine::note(crate::engine::C_UPLOAD, a, b.saturating_sub(a));
-    if HELD_MAP.get().is_some() {
+    if hold_census() && HELD_MAP.get().is_some() {
         // (The hold census: pages uploaded while held.)
         let n = (a & !(PAGE - 1)..b).step_by(PAGE as usize).filter(|&p| crate::hosted::held(p)).count() as u64;
         if n > 0 {
@@ -3022,7 +3022,7 @@ fn watch() {
     let mut reconciled = std::time::Instant::now();
     loop {
         std::thread::sleep(std::time::Duration::from_millis(1));
-        if HELD_MAP.get().is_some() {
+        if hold_census() && HELD_MAP.get().is_some() {
             hold_tick(&mut reconciled);
         }
         if window.elapsed().as_millis() >= BURST_MS {
@@ -3253,7 +3253,7 @@ fn arm_part(x: u64, y: u64, frame: u64) {
         NOT_ARMED[R_HELD].fetch_add((y - x) / PAGE, Ordering::Relaxed);
         return;
     }
-    if HELD_MAP.get().is_some() {
+    if hold_census() && HELD_MAP.get().is_some() {
         hold_part(x, y);
         return;
     }
@@ -3551,7 +3551,7 @@ fn make_scatter(marks: vk::Buffer, marks_c: Option<vk::Buffer>) -> Result<Scatte
         // also counts by bucket.)
         // (`DS_FE2_HOLD`: the hold census's kernel with its map in host
         // memory, read by address.)
-        if hold_census() && HELD_MAP.get().is_none() {
+        if held_map_wanted() && HELD_MAP.get().is_none() {
             let bytes = (HELD_MAP_WORDS * 4) as u64;
             match c.host_buffer(bytes, vk::BufferUsageFlags::STORAGE_BUFFER) {
                 Ok((buf, _mem, ptr)) => {
@@ -3570,6 +3570,9 @@ fn make_scatter(marks: vk::Buffer, marks_c: Option<vk::Buffer>) -> Result<Scatte
             rdna::kernels::mirror_scatter_counting()
         } else if wb_same_mode() == 1 {
             rdna::kernels::mirror_scatter_same_census()
+        } else if c4_on() && HELD_MAP.get().is_some() {
+            // (Front end 4: held pages left pending in the mirror.)
+            rdna::kernels::mirror_scatter_held()
         } else if HELD_MAP.get().is_some() {
             rdna::kernels::mirror_scatter_hold_census()
         } else {
@@ -3592,7 +3595,7 @@ fn make_scatter(marks: vk::Buffer, marks_c: Option<vk::Buffer>) -> Result<Scatte
             c.device.destroy_shader_module(module, None);
             Ok(pipeline?[0])
         };
-        let pipeline = make(&code, if wb_buckets() { 27 } else if wb_same_mode() == 1 { 34 } else if HELD_MAP.get().is_some() { 28 } else if std::env::var("DS_WB_OLD").ok().as_deref() == Some("1") { 20 } else { 42 })?;
+        let pipeline = make(&code, if wb_buckets() { 27 } else if wb_same_mode() == 1 { 34 } else if c4_on() && HELD_MAP.get().is_some() { 44 } else if HELD_MAP.get().is_some() { 28 } else if std::env::var("DS_WB_OLD").ok().as_deref() == Some("1") { 20 } else { 42 })?;
         if wb_same_mode() == 2 && SAME_SKIP.get().is_none() {
             // (The tables first: zeroed, and the buffer of zeros.)
             let mut tables = Vec::new();
@@ -3972,6 +3975,7 @@ fn hold_thread() {
         crate::engine::note_wb_period(by_rec);
         crate::engine::note_wb_sites(&wb_pages);
         WB_RECENT_PAGES.store(n, Ordering::Relaxed);
+        c4_round();
     }
 }
 const H_PAGES: usize = 0;
@@ -4088,7 +4092,7 @@ fn hold_tick(last_reconcile: &mut std::time::Instant) {
 
 /// Status line of the hold census (since the last one: per flip).
 fn hold_line() -> String {
-    if HELD_MAP.get().is_none() {
+    if !hold_census() || HELD_MAP.get().is_none() {
         return String::new();
     }
     static LAST: parking_lot::Mutex<(u64, [u64; 17], u64, u64, u64)> = parking_lot::Mutex::new((0, [0; 17], 0, 0, 0));
@@ -4726,6 +4730,13 @@ pub fn init() {
                     if HELD_MAP.get().is_some() {
                         let _ = std::thread::Builder::new().name("fe2-hold".into()).spawn(hold_thread);
                     }
+                } else if c4_on() && HELD_MAP.get().is_some() {
+                    // (Front end 4: the release service first: a page is
+                    // held only while it runs.)
+                    crate::hosted::set_held_served(true);
+                    let _ = std::thread::Builder::new().name("fe2-c4-release".into()).spawn(c4_release_thread);
+                    let _ = std::thread::Builder::new().name("fe2-hold".into()).spawn(hold_thread);
+                    crate::info!("fe2: front end 4's held pages on (`DS_C4`): GPU-written pages of the GPU page allocator's and heaps' records held in the mirror, released on a CPU access");
                 }
                 let _ = std::thread::Builder::new().name("fe2-faults".into()).spawn(watch);
             }
@@ -4754,7 +4765,8 @@ fn protection_test() -> String {
     use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE};
     let c = ctx();
     let mut out = Vec::new();
-    for (name, prot) in [("no-access", PAGE_NOACCESS), ("read-only", PAGE_READONLY), ("read-write", PAGE_READWRITE)] {
+    // (Also: a page made no-access before its import.)
+    for (name, prot, before) in [("no-access", PAGE_NOACCESS, false), ("read-only", PAGE_READONLY, false), ("read-write", PAGE_READWRITE, false), ("no-access before the import", PAGE_NOACCESS, true)] {
         let n = 64 << 10;
         let h = unsafe { VirtualAlloc(std::ptr::null(), n, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) } as u64;
         if h == 0 {
@@ -4767,10 +4779,20 @@ fn protection_test() -> String {
                 unsafe { words.add(i as usize).write_volatile(0x1111_0000 + i) };
             }
             let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
-            let (hb, hm, _) = c.import_host(h, PAGE, usage)?;
-            let (rb, rbm, rbp) = c.host_buffer(4096, vk::BufferUsageFlags::TRANSFER_DST)?;
             let mut old = 0u32;
-            if unsafe { VirtualProtect(h as _, PAGE as usize, prot, &mut old) } == 0 {
+            if before && unsafe { VirtualProtect(h as _, PAGE as usize, prot, &mut old) } == 0 {
+                return Err("VirtualProtect before the import".into());
+            }
+            let imported = c.import_host(h, PAGE, usage);
+            if before {
+                unsafe { VirtualProtect(h as _, PAGE as usize, PAGE_READWRITE, &mut old) };
+            }
+            let (hb, hm, _) = imported.map_err(|e| format!("the import failed: {e}"))?;
+            if before {
+                unsafe { VirtualProtect(h as _, PAGE as usize, prot, &mut old) };
+            }
+            let (rb, rbm, rbp) = c.host_buffer(4096, vk::BufferUsageFlags::TRANSFER_DST)?;
+            if !before && unsafe { VirtualProtect(h as _, PAGE as usize, prot, &mut old) } == 0 {
                 unsafe {
                     c.device.destroy_buffer(rb, None);
                     c.device.free_memory(rbm, None);
@@ -5195,6 +5217,7 @@ pub fn status() -> String {
         + &callers_line()
         + &wb_buckets_line()
         + &hold_line()
+        + &c4_line()
         + &wb_same_line()
         + &wb_probe_line()
 }
@@ -5357,4 +5380,762 @@ pub fn callers_line() -> String {
         firsts.join("; "),
         sources.join("; ")
     )
+}
+
+// ---------------------------------------------------------------------------
+// Front end 4's deferred write-backs (C4; FRONTEND4.md, `DS_C4=1`, hosted).
+// GPU-written pages of the engine's long-lived GPU allocations (the page
+// allocator's and the GPU heap's records: ~80-87% of the write-back volume,
+// FINDINGS.md 2026-11-10 night) are held: no-access through the host first,
+// then their bit in `HELD_MAP` set, from which on the write-back leaves their
+// dwords pending in the mirror (`rdna::kernels::mirror_scatter_held`: marks
+// kept). GPU work reaches a no-access page through its import as ever
+// (`DS_PROT_TEST`), so protecting first leaves no moment where the CPU could
+// read a page missing GPU words. Any CPU access faults; the host suspends
+// the thread and `c4_release_thread` releases the page: with no batch that
+// writes it in flight and none pushed meanwhile (`exec::NOTE_GATE`), its
+// mirror copy and both maps' mask words are copied out and the masks
+// cleared, its held bit cleared, and with every other thread suspended the
+// page is made read-write and its marked dwords stored; the thread resumes.
+// Our own readers and writers release first instead of faulting (imports,
+// which cannot pin a no-access page; our command processors' reads; CP
+// effects and writes, never held again; file I/O; commits; textures read
+// from guest memory); uploads into the mirror skip held pages; the mirror
+// never unbinds them; a mapping change drops them (marks cleared).
+// ---------------------------------------------------------------------------
+
+/// `DS_C4=1` (front end 2, hosted; not with the hold or bucket census).
+pub fn c4_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_C4").ok().as_deref() == Some("1") && !wb_buckets() && wb_same_mode() != 2 && std::env::var("DS_FE2_HOLD").ok().as_deref() != Some("1") && crate::hosted::on())
+}
+
+/// The held-page bitmap is wanted (the hold census or C4).
+fn held_map_wanted() -> bool {
+    hold_census() || c4_on()
+}
+
+/// `c4 off` (live): no new holds (and every held page released).
+static C4_OFF: AtomicBool = AtomicBool::new(false);
+/// `c4 off` asked the release thread to release every held page.
+static C4_ALL: AtomicBool = AtomicBool::new(false);
+/// Synchronous releases asked: ([lo, hi), not held again, done).
+static C4_SYNC: parking_lot::Mutex<Vec<(u64, u64, bool, std::sync::Arc<AtomicBool>)>> = parking_lot::Mutex::new(Vec::new());
+
+/// C4's counts (since boot).
+static C4X: [AtomicU64; 25] = [const { AtomicU64::new(0) }; 25];
+const X_HELD: usize = 0;
+const X_RUNS: usize = 1;
+const X_FAILED: usize = 2;
+const X_NOW: usize = 3;
+/// Releases on faults: [the title, ours, other code] x [read, write].
+const X_FAULTS: usize = 4;
+const X_SYNC: usize = 10;
+const X_ROUNDS: usize = 11;
+const X_TAKE_US: usize = 12;
+const X_WAITS: usize = 13;
+const X_WAIT_MS: usize = 14;
+const X_DROPPED: usize = 15;
+const X_UP_SKIPPED: usize = 16;
+const X_SYNC_LATE: usize = 17;
+const X_FAILED_TAKES: usize = 18;
+const X_SUSPEND_US: usize = 19;
+const X_WAIT_TIMEOUTS: usize = 20;
+const X_CANDIDATES: usize = 21;
+const X_PLAIN: usize = 22;
+const X_RELEASED: usize = 23;
+/// Pages released through host memory (no valid window).
+const X_CPU_PAGES: usize = 24;
+
+thread_local! {
+    /// The release thread (it never waits for itself).
+    static C4_RELEASER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a page of guest [lo, hi) is held (the bitmap; false without C4).
+pub fn c4_any_held(lo: u64, hi: u64) -> bool {
+    if !c4_on() {
+        return false;
+    }
+    let Some(m) = HELD_MAP.get() else { return false };
+    let (lo, hi) = (lo.max(MIRROR_BASE), hi.min(MIRROR_END));
+    if lo >= hi {
+        return false;
+    }
+    let (a, b) = (((lo - MIRROR_BASE) / PAGE) as usize, ((hi - MIRROR_BASE).div_ceil(PAGE)) as usize);
+    // SAFETY: HELD_MAP_WORDS host-memory words, mapped for the process's life.
+    let words = unsafe { std::slice::from_raw_parts(m.words as *const AtomicU32, HELD_MAP_WORDS) };
+    let mut i = a;
+    while i < b {
+        let n = (32 - i % 32).min(b - i);
+        let mask = if n >= 32 { u32::MAX } else { (1u32 << n) - 1 };
+        if words[i / 32].load(Ordering::Acquire) >> (i % 32) & mask != 0 {
+            return true;
+        }
+        i += n;
+    }
+    false
+}
+
+/// Whether page `p` is held (the bitmap).
+fn c4_held(p: u64) -> bool {
+    c4_any_held(p, p + PAGE)
+}
+
+/// The runs of [lo, hi) outside held pages, appended to `out` (uploads into
+/// the mirror; the pages left out counted).
+pub fn c4_unheld_runs(lo: u64, hi: u64, out: &mut Vec<(u64, u64)>) {
+    let mut a = lo;
+    let mut skipped = 0u64;
+    while a < hi {
+        let pe = ((a & !(PAGE - 1)) + PAGE).min(hi);
+        if c4_held(a & !(PAGE - 1)) {
+            skipped += 1;
+            a = pe;
+            continue;
+        }
+        match out.last_mut() {
+            Some(l) if l.1 == a => l.1 = pe,
+            _ => out.push((a, pe)),
+        }
+        a = pe;
+    }
+    if skipped > 0 {
+        C4X[X_UP_SKIPPED].fetch_add(skipped, Ordering::Relaxed);
+    }
+}
+
+/// Uploads that left out held pages (`exec`'s copies without a window).
+pub fn c4_note_upload_skips(n: u64) {
+    C4X[X_UP_SKIPPED].fetch_add(n, Ordering::Relaxed);
+}
+
+/// Pages of guest [a, a+n) are never held (CP targets, our labels).
+pub fn c4_no_hold(a: u64, n: u64) {
+    if !c4_on() {
+        return;
+    }
+    let lo = (a & !(PAGE - 1)).max(MIRROR_BASE);
+    let hi = a.saturating_add(n.max(1)).next_multiple_of(PAGE).min(MIRROR_END);
+    let mut p = lo;
+    while p < hi {
+        let i = ((p - MIRROR_BASE) / PAGE) as usize;
+        let bit = 1u32 << (i % 32);
+        if no_hold()[i / 32].fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+            NO_HOLD_PAGES.fetch_add(1, Ordering::Relaxed);
+        }
+        p += PAGE;
+    }
+}
+
+/// A CP write or a CPU action targets guest [a, a+n): its pages are never
+/// held, and released first if they are.
+pub fn c4_cp_target(a: u64, n: u64) {
+    if !c4_on() {
+        return;
+    }
+    c4_no_hold(a, n);
+    c4_release_sync(a, n, true);
+}
+
+/// Our command processors read `reads` on the CPU: held pages released first.
+pub fn c4_release_reads(reads: &[(u64, u64)]) {
+    if !c4_on() {
+        return;
+    }
+    for &(a, n) in reads {
+        // (Pages our command processors read are not held: marked first, so
+        // that a later selection leaves them out.)
+        c4_no_hold(a, n);
+        if c4_any_held(a, a.saturating_add(n.max(1))) {
+            c4_release_sync(a, n, false);
+        }
+    }
+}
+
+/// Releases the held pages of guest [base, base+len) and waits (5 s at
+/// most, then logs and goes on): imports, file I/O, commits, textures and
+/// our reads, before they touch the pages. `never`: not held again.
+pub fn c4_release_sync(base: u64, len: u64, never: bool) {
+    if !c4_on() {
+        return;
+    }
+    let hi = base.saturating_add(len.max(1));
+    if !c4_any_held(base, hi) {
+        return;
+    }
+    if C4_RELEASER.with(|r| r.get()) {
+        crate::error!("fe2: C4: the release thread asked to release {base:#x}+{len:#x} itself (skipped)");
+        return;
+    }
+    let done = std::sync::Arc::new(AtomicBool::new(false));
+    C4_SYNC.lock().push((base, hi, never, done.clone()));
+    let t = std::time::Instant::now();
+    while !done.load(Ordering::Acquire) {
+        if t.elapsed() > std::time::Duration::from_secs(5) {
+            if C4X[X_SYNC_LATE].fetch_add(1, Ordering::Relaxed) < 8 {
+                crate::error!("fe2: C4: held pages of {base:#x}+{len:#x} not released within 5 s");
+            }
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_micros(100));
+    }
+}
+
+/// Guest [base, base+len) is about to be decommitted (`mem::host_decommit`):
+/// its held pages' pending words die with it; their bits and both maps'
+/// mask words cleared and the pages made read-write again (as unheld pages
+/// are before a decommit), no words put back.
+pub fn c4_drop_sync(base: u64, len: u64) {
+    if !c4_on() || !c4_any_held(base, base.saturating_add(len)) {
+        return;
+    }
+    let lo = (base & !(PAGE - 1)).max(MIRROR_BASE);
+    let hi = base.saturating_add(len).next_multiple_of(PAGE).min(MIRROR_END);
+    let _lock = crate::hosted::arm_lock();
+    let mut pages = Vec::new();
+    let mut p = lo;
+    while p < hi {
+        if held_mark(p, false) {
+            pages.push(p);
+        }
+        p += PAGE;
+    }
+    if pages.is_empty() {
+        return;
+    }
+    let maps: Vec<vk::Buffer> = [false, true].iter().filter_map(|&on_c| super::resident::marks_for(on_c)).collect();
+    let r = super::resident::one_off_now(|cmd| unsafe {
+        let c = ctx();
+        let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+        for &m in &maps {
+            for &p in &pages {
+                c.device.cmd_fill_buffer(cmd, m, (p - MIRROR_BASE) / PAGE * 128, 128, 0);
+            }
+        }
+        let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+    });
+    if let Err(e) = r {
+        crate::error!("fe2: C4: clearing the marks of {} held pages before a decommit failed: {e}", pages.len());
+    }
+    let mut a = 0;
+    while a < pages.len() {
+        let mut e = a + 1;
+        while e < pages.len() && pages[e] == pages[e - 1] + PAGE {
+            e += 1;
+        }
+        let _ = crate::hosted::release(pages[a], (e - a) as u64 * PAGE);
+        a = e;
+    }
+    C4X[X_DROPPED].fetch_add(pages.len() as u64, Ordering::Relaxed);
+    C4X[X_NOW].fetch_sub(pages.len() as u64, Ordering::Relaxed);
+}
+
+/// A mapping change of guest [base, base+len) is settled (`resident::
+/// settled`, the host's bits cleared): held pages there are dropped, their
+/// pending words dead; their bits and both maps' mask words cleared (now,
+/// before the new mapping is used).
+pub fn c4_forgotten(base: u64, len: u64) {
+    if !c4_on() || !c4_any_held(base, base.saturating_add(len)) {
+        return;
+    }
+    let lo = (base & !(PAGE - 1)).max(MIRROR_BASE);
+    let hi = base.saturating_add(len).next_multiple_of(PAGE).min(MIRROR_END);
+    let mut pages = Vec::new();
+    let mut p = lo;
+    while p < hi {
+        if held_mark(p, false) {
+            pages.push(p);
+        }
+        p += PAGE;
+    }
+    if pages.is_empty() {
+        return;
+    }
+    C4X[X_DROPPED].fetch_add(pages.len() as u64, Ordering::Relaxed);
+    C4X[X_NOW].fetch_sub(pages.len() as u64, Ordering::Relaxed);
+    let maps: Vec<vk::Buffer> = [false, true].iter().filter_map(|&on_c| super::resident::marks_for(on_c)).collect();
+    let r = super::resident::one_off_now(|cmd| unsafe {
+        let c = ctx();
+        let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+        for &m in &maps {
+            for &p in &pages {
+                c.device.cmd_fill_buffer(cmd, m, (p - MIRROR_BASE) / PAGE * 128, 128, 0);
+            }
+        }
+        let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+    });
+    if let Err(e) = r {
+        crate::error!("fe2: C4: clearing the marks of {} dropped held pages failed: {e}", pages.len());
+    }
+}
+
+/// The allocator IDs whose records C4 holds: the engine's GPU page
+/// allocator and GPU heaps (long-lived GPU allocations).
+fn c4_targets() -> [bool; 256] {
+    let mut t = [false; 256];
+    for a in crate::engine::allocators() {
+        if a.mtype == 2 && (a.name.starts_with("PageAllocator") || a.name.starts_with("HeapAllocator")) {
+            t[a.id as usize] = true;
+        }
+    }
+    t
+}
+
+/// One selection round (`hold_thread`, after the written-back bits): pages
+/// written back within the last two periods, in a target allocator's record,
+/// armed by front end 2 (quiet, valid in the mirror) and through the host,
+/// not held, never refused: held in runs.
+fn c4_round() {
+    if !c4_on() || C4_OFF.load(Ordering::Acquire) {
+        return;
+    }
+    let Some(recent) = WB_RECENT.get() else { return };
+    let Some(m) = HELD_MAP.get() else { return };
+    // SAFETY: as `held_mark`.
+    let held = unsafe { std::slice::from_raw_parts(m.words as *const AtomicU32, HELD_MAP_WORDS) };
+    let targets = c4_targets();
+    let nh = no_hold();
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    let mut cands = 0u64;
+    for i in 0..HELD_MAP_WORDS {
+        let mut v = recent[i].load(Ordering::Relaxed) & !held[i].load(Ordering::Acquire) & !nh[i].load(Ordering::Relaxed);
+        while v != 0 {
+            let b = v.trailing_zeros() as u64;
+            v &= v - 1;
+            let p = MIRROR_BASE + (i as u64 * 32 + b) * PAGE;
+            if !targets[crate::engine::record_key(p).2 as usize] {
+                continue;
+            }
+            let Some(c) = chunk(p, false) else { continue };
+            let (k, w) = (idx(p) % 64, idx(p) / 64);
+            if c.armed[w].load(Ordering::Acquire) >> k & 1 == 0 || c.valid[w].load(Ordering::Acquire) >> k & 1 == 0 || !crate::hosted::armed(p) {
+                continue;
+            }
+            cands += 1;
+            match runs.last_mut() {
+                Some(l) if l.1 == p => l.1 = p + PAGE,
+                _ => runs.push((p, p + PAGE)),
+            }
+        }
+    }
+    C4X[X_CANDIDATES].fetch_add(cands, Ordering::Relaxed);
+    for (p, q) in runs {
+        c4_hold_run(p, q);
+    }
+}
+
+/// Holds guest [p, q): no-access through the host first, then the bitmap's
+/// bits (the write-back leaves the pages' dwords pending from then on).
+fn c4_hold_run(p: u64, q: u64) {
+    let _readers = crate::mem::GUEST_READERS.read_recursive();
+    let _arming = super::resident::arm_guard();
+    let _lock = crate::hosted::arm_lock();
+    if C4_OFF.load(Ordering::Acquire) || host_writing(p, q) || !crate::hosted::all_armed(p, q - p) {
+        return;
+    }
+    let t = std::time::Instant::now();
+    let r = crate::hosted::hold(p, q - p);
+    super::hitch::note_since(super::hitch::Kind::Mirror, t, || format!("C4 holding {p:#x}+{:#x}", q - p));
+    if r.is_err() {
+        C4X[X_FAILED].fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let mut n = 0u64;
+    for a in (p..q).step_by(PAGE as usize) {
+        if !held_mark(a, true) {
+            n += 1;
+        }
+    }
+    C4X[X_HELD].fetch_add(n, Ordering::Relaxed);
+    C4X[X_RUNS].fetch_add(1, Ordering::Relaxed);
+    C4X[X_NOW].fetch_add(n, Ordering::Relaxed);
+}
+
+/// The release thread (`DS_C4`): faults on held pages (the host's
+/// requests), synchronous releases and `c4 off`, served in rounds.
+fn c4_release_thread() {
+    C4_RELEASER.with(|r| r.set(true));
+    let mut reqs: Vec<crate::hosted::HeldRequest> = Vec::new();
+    loop {
+        crate::hosted::wait_held(2);
+        reqs.clear();
+        crate::hosted::take_held(&mut reqs);
+        let sync = std::mem::take(&mut *C4_SYNC.lock());
+        let all = C4_ALL.swap(false, Ordering::AcqRel);
+        if reqs.is_empty() && sync.is_empty() && !all {
+            continue;
+        }
+        let mut pages: Vec<u64> = reqs.iter().map(|r| r.page).collect();
+        for &(lo, hi, never, _) in &sync {
+            let mut p = (lo & !(PAGE - 1)).max(MIRROR_BASE);
+            while p < hi.min(MIRROR_END) {
+                if c4_held(p) {
+                    pages.push(p);
+                }
+                if never {
+                    c4_no_hold(p, PAGE);
+                }
+                p += PAGE;
+            }
+        }
+        if all {
+            if let Some(m) = HELD_MAP.get() {
+                // SAFETY: as `held_mark`.
+                let held = unsafe { std::slice::from_raw_parts(m.words as *const AtomicU32, HELD_MAP_WORDS) };
+                for (i, w) in held.iter().enumerate() {
+                    let mut v = w.load(Ordering::Acquire);
+                    while v != 0 {
+                        let b = v.trailing_zeros() as u64;
+                        v &= v - 1;
+                        pages.push(MIRROR_BASE + (i as u64 * 32 + b) * PAGE);
+                    }
+                }
+            }
+        }
+        pages.sort_unstable();
+        pages.dedup();
+        // (A fault on a page the host holds without a bitmap bit, or none
+        // held any more: released plainly; nothing is pending there. Told
+        // apart under the arming lock, under which a hold protects the page
+        // and sets its bit.)
+        let held = {
+            let _lock = crate::hosted::arm_lock();
+            let (held, plain): (Vec<u64>, Vec<u64>) = pages.into_iter().partition(|&p| c4_held(p));
+            for &p in &plain {
+                if crate::hosted::held(p) {
+                    let _ = crate::hosted::release(p, PAGE);
+                    C4X[X_PLAIN].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            held
+        };
+        if !held.is_empty() {
+            for part in held.chunks(16384) {
+                if let Err(e) = c4_release_pages(part)
+                    && C4X[X_FAILED_TAKES].fetch_add(1, Ordering::Relaxed) < 8
+                {
+                    crate::error!("fe2: C4: releasing {} held pages failed: {e}", part.len());
+                }
+            }
+        }
+        let frame = super::FRAMES.load(Ordering::Relaxed);
+        let (b, e) = crate::exception::host_image();
+        for r in &reqs {
+            let origin = if (crate::mem::GUEST_BASE..crate::mem::GUEST_END).contains(&r.rip) {
+                0
+            } else if (b..e).contains(&r.rip) {
+                1
+            } else {
+                2
+            };
+            C4X[X_FAULTS + 2 * origin + r.write as usize].fetch_add(1, Ordering::Relaxed);
+            *HOLD_RIPS.lock().get_or_insert_with(Default::default).entry((r.rip, r.write)).or_insert(0) += 1;
+            crate::engine::note_hold_fault_record(r.page, origin, r.write);
+            // (A page the CPU touched is not held again; its arming level
+            // raised as a fault's.)
+            c4_no_hold(r.page, PAGE);
+            if let Some(c) = chunk(r.page, false) {
+                let _ = c.level[idx(r.page)].fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some((v + 1).min(ARM_MAX_LEVEL)));
+                if r.write {
+                    c.wrote[idx(r.page)].store(frame as u32 + 1, Ordering::Release);
+                    c.uses[idx(r.page) / 64].store(0, Ordering::Relaxed);
+                }
+            }
+            let _ = crate::hosted::resume_waiter(r);
+        }
+        C4X[X_SYNC].fetch_add(sync.len() as u64, Ordering::Relaxed);
+        for (_, _, _, done) in sync {
+            done.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Releases held `pages` (sorted, at most 16,384): see the section's head.
+/// A held page's mirror copy is whole and current (it was valid and armed
+/// when held, and no CPU write reached it since), so the release copies whole
+/// pages: on the GPU into the page's import window while the page is still
+/// no-access (GPU work reaches it there), then the page made read-write; a
+/// page without a valid window goes through host memory and the CPU, with
+/// every other thread suspended meanwhile. No mapping change meanwhile
+/// (`mem::GUEST_READERS`, `resident::arm_guard`): a page committed again
+/// would take the old words.
+fn c4_release_pages(pages: &[u64]) -> Result<(), String> {
+    let _readers = crate::mem::GUEST_READERS.read_recursive();
+    let _arming = super::resident::arm_guard();
+    let c = ctx();
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    for &p in pages {
+        match ranges.last_mut() {
+            Some(l) if l.0 + l.1 == p => l.1 += PAGE,
+            _ => ranges.push((p, PAGE)),
+        }
+    }
+    // No batch that writes the pages in flight, none pushed meanwhile (2 s
+    // a writer at most: a writer waiting on a thread a release suspends
+    // would never finish).
+    let gate = loop {
+        let g = super::exec::NOTE_GATE.write();
+        if let Some(seq) = super::exec::inflight_latest(&ranges) {
+            drop(g);
+            let t = std::time::Instant::now();
+            C4X[X_WAITS].fetch_add(1, Ordering::Relaxed);
+            if !super::exec::wait_done_for(seq, std::time::Duration::from_secs(2)) {
+                C4X[X_WAIT_TIMEOUTS].fetch_add(1, Ordering::Relaxed);
+                crate::error!("fe2: C4: batch {seq} writing held pages from {:#x} not done within 2 s (released with it in flight)", pages[0]);
+                break super::exec::NOTE_GATE.write();
+            }
+            C4X[X_WAIT_MS].fetch_add(t.elapsed().as_millis() as u64, Ordering::Relaxed);
+            continue;
+        }
+        break g;
+    };
+    let t0 = std::time::Instant::now();
+    // (The windows stay listed, none freed, until the release ends.)
+    let spans = super::exec::spans_guard();
+    let wins: Vec<Option<(vk::Buffer, u64)>> = pages.iter().map(|&p| spans.window(p)).collect();
+    let cpu: Vec<usize> = (0..pages.len()).filter(|&i| wins[i].is_none()).collect();
+    let maps: Vec<vk::Buffer> = [false, true].iter().filter_map(|&on_c| super::resident::marks_for(on_c)).collect();
+    let (mbuf, _) = super::resident::mirror_buffer().ok_or("no mirror")?;
+    let staged = if cpu.is_empty() { None } else { Some(c.host_buffer(cpu.len() as u64 * PAGE, vk::BufferUsageFlags::TRANSFER_DST)?) };
+    let r = super::resident::one_off_now(|cmd| unsafe {
+        let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
+        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+        // (Whole pages into their windows, a copy per window.)
+        let mut by_buf: Vec<(vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();
+        for (i, &p) in pages.iter().enumerate() {
+            let Some((buf, off)) = wins[i] else { continue };
+            let region = vk::BufferCopy { src_offset: p - MIRROR_BASE, dst_offset: off, size: PAGE };
+            match by_buf.iter_mut().find(|x| x.0 == buf) {
+                Some(x) => match x.1.last_mut() {
+                    Some(l) if l.src_offset + l.size == region.src_offset && l.dst_offset + l.size == region.dst_offset => l.size += PAGE,
+                    _ => x.1.push(region),
+                },
+                None => by_buf.push((buf, vec![region])),
+            }
+        }
+        for (buf, regions) in &by_buf {
+            c.device.cmd_copy_buffer(cmd, mbuf, *buf, regions);
+        }
+        if let Some((sbuf, _, _)) = &staged {
+            let regions: Vec<vk::BufferCopy> = cpu.iter().enumerate().map(|(j, &i)| vk::BufferCopy { src_offset: pages[i] - MIRROR_BASE, dst_offset: j as u64 * PAGE, size: PAGE }).collect();
+            c.device.cmd_copy_buffer(cmd, mbuf, *sbuf, &regions);
+        }
+        // (The pages' mask words cleared: their dwords are stored.)
+        for &m in &maps {
+            for &p in pages {
+                c.device.cmd_fill_buffer(cmd, m, (p - MIRROR_BASE) / PAGE * 128, 128, 0);
+            }
+        }
+        let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ | vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+    });
+    if let Err(e) = r {
+        if let Some((sbuf, smem, _)) = staged {
+            unsafe {
+                c.device.destroy_buffer(sbuf, None);
+                c.device.free_memory(smem, None);
+            }
+        }
+        drop(spans);
+        drop(gate);
+        return Err(format!("the take: {e} (the pages stay held)"));
+    }
+    drop(spans);
+    C4X[X_TAKE_US].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+    // From here the write-back stores these pages again.
+    for &p in pages {
+        held_mark(p, false);
+    }
+    let chunks: Vec<Option<&'static Chunk>> = pages.iter().map(|&p| chunk(p, false)).collect();
+    // Front end 2's arming of each page ended (a release, not a fault: its
+    // level stays).
+    let unarm = |i: usize, p: u64| {
+        if let Some(c) = chunks[i] {
+            let (k, w) = (idx(p), idx(p) / 64);
+            let bit = 1u64 << (k % 64);
+            if c.armed[w].fetch_and(!bit, Ordering::AcqRel) & bit != 0 {
+                c.cgen.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    };
+    let lock = crate::hosted::arm_lock();
+    use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_READWRITE};
+    let mut old = 0u32;
+    // The pages with a window: their guest copy is current; read-write now.
+    for (i, &p) in pages.iter().enumerate() {
+        if wins[i].is_some() {
+            unsafe { VirtualProtect(p as _, PAGE as usize, PAGE_READWRITE, &mut old) };
+            crate::hosted::released_bits(p, PAGE);
+            unarm(i, p);
+        }
+    }
+    // The others through host memory, every other thread suspended.
+    if let Some((sbuf, smem, sptr)) = staged {
+        let mut handles: Vec<windows_sys::Win32::Foundation::HANDLE> = Vec::with_capacity(4096);
+        let mut tids: Vec<u32> = Vec::with_capacity(4096);
+        let t1 = std::time::Instant::now();
+        suspend_others(&mut handles, &mut tids);
+        // SAFETY: every other thread is suspended; the pages are committed
+        // (held: no mapping change dropped them).
+        unsafe {
+            for (j, &i) in cpu.iter().enumerate() {
+                let p = pages[i];
+                VirtualProtect(p as _, PAGE as usize, PAGE_READWRITE, &mut old);
+                std::ptr::copy_nonoverlapping(sptr.add(j * PAGE as usize), p as *mut u8, PAGE as usize);
+                crate::hosted::released_bits(p, PAGE);
+                unarm(i, p);
+            }
+        }
+        resume_others(&handles);
+        C4X[X_SUSPEND_US].fetch_add(t1.elapsed().as_micros() as u64, Ordering::Relaxed);
+        C4X[X_CPU_PAGES].fetch_add(cpu.len() as u64, Ordering::Relaxed);
+        for h in handles {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(h) };
+        }
+        unsafe {
+            c.device.destroy_buffer(sbuf, None);
+            c.device.free_memory(smem, None);
+        }
+    }
+    drop(lock);
+    drop(gate);
+    C4X[X_ROUNDS].fetch_add(1, Ordering::Relaxed);
+    C4X[X_RELEASED].fetch_add(pages.len() as u64, Ordering::Relaxed);
+    C4X[X_NOW].fetch_sub(pages.len() as u64, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Suspends every other thread of the process (handles and thread IDs into
+/// the caller's vectors, whose capacity must suffice: nothing allocates
+/// once a thread is suspended), snapshots taken until none is new.
+fn suspend_others(handles: &mut Vec<windows_sys::Win32::Foundation::HANDLE>, tids: &mut Vec<u32>) {
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId, OpenThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_SUSPEND_RESUME};
+    let (pid, me) = unsafe { (GetCurrentProcessId(), GetCurrentThreadId()) };
+    for _ in 0..4 {
+        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snap == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            return;
+        }
+        let mut new = 0;
+        let mut te: THREADENTRY32 = unsafe { std::mem::zeroed() };
+        te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+        let mut ok = unsafe { Thread32First(snap, &mut te) } != 0;
+        while ok {
+            if te.th32OwnerProcessID == pid && te.th32ThreadID != me && !tids.contains(&te.th32ThreadID) && tids.len() < tids.capacity() {
+                let h = unsafe { OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, 0, te.th32ThreadID) };
+                if !h.is_null() {
+                    if unsafe { SuspendThread(h) } != u32::MAX {
+                        handles.push(h);
+                        tids.push(te.th32ThreadID);
+                        new += 1;
+                    } else {
+                        unsafe { windows_sys::Win32::Foundation::CloseHandle(h) };
+                    }
+                }
+            }
+            ok = unsafe { Thread32Next(snap, &mut te) } != 0;
+        }
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(snap) };
+        if new == 0 {
+            break;
+        }
+    }
+    // (A suspension takes effect asynchronously: a context read waits for it.)
+    #[repr(C, align(16))]
+    struct Ctx16(windows_sys::Win32::System::Diagnostics::Debug::CONTEXT);
+    for &h in handles.iter() {
+        let mut ctx: Ctx16 = unsafe { std::mem::zeroed() };
+        // (CONTEXT_CONTROL for AMD64.)
+        ctx.0.ContextFlags = 0x0010_0001;
+        unsafe { windows_sys::Win32::System::Diagnostics::Debug::GetThreadContext(h, &mut ctx.0) };
+    }
+}
+
+fn resume_others(handles: &[windows_sys::Win32::Foundation::HANDLE]) {
+    for &h in handles {
+        unsafe { windows_sys::Win32::System::Threading::ResumeThread(h) };
+    }
+}
+
+/// Control `c4 off|on` (`DS_C4`, in-run A/Bs): off stops holding and
+/// releases every held page.
+pub fn c4_control(what: &str) -> Result<String, String> {
+    if !c4_on() {
+        return Err("c4: not on (`DS_C4=1`, hosted)".into());
+    }
+    match what {
+        "off" => {
+            C4_OFF.store(true, Ordering::Release);
+            C4_ALL.store(true, Ordering::Release);
+            Ok("holding off, every held page released".into())
+        }
+        "on" => {
+            C4_OFF.store(false, Ordering::Release);
+            Ok("holding on".into())
+        }
+        _ => Err("usage: c4 off|on".into()),
+    }
+}
+
+/// Status line of C4 (since the last one, per flip where it says so).
+fn c4_line() -> String {
+    if !c4_on() || HELD_MAP.get().is_none() {
+        return String::new();
+    }
+    static LAST: parking_lot::Mutex<(u64, [u64; 25], u64, u64, u64)> = parking_lot::Mutex::new((0, [0; 25], 0, 0, 0));
+    let frame = super::FRAMES.load(Ordering::Relaxed);
+    let now: [u64; 25] = std::array::from_fn(|k| C4X[k].load(Ordering::Relaxed));
+    let (dw, pg, all) = (WB64[2].load(Ordering::Relaxed), WB64[3].load(Ordering::Relaxed), WB64[1].load(Ordering::Relaxed));
+    let mut l = LAST.lock();
+    let flips = frame.saturating_sub(l.0).max(1) as f64;
+    let d = |k: usize| now[k].saturating_sub(l.1[k]);
+    let (ddw, dpg, dall) = (dw.saturating_sub(l.2), pg.saturating_sub(l.3), all.saturating_sub(l.4));
+    let line = format!(
+        "    front end 4's held pages (`DS_C4`{}, over {flips:.0} flips): {} held now ({} held in {} runs, {} runs failed, {} candidates seen); the write-back left out {:.3} M dwords and {:.0} pages a flip ({:.1}% of the dwords it would have stored); releases on faults: the title {} reads / {} writes, ours {} / {}, other code {} / {}; synchronous releases {} ({} late), pages released {} in {} rounds ({:.0} us of take a round; {} through host memory, {:.0} us suspended), plain {}; writer waits {} ({} ms, {} timed out); dropped by mapping changes {}; uploads that left out held pages {}; failed takes {}; pages never held {}\n",
+        if C4_OFF.load(Ordering::Relaxed) { ", off" } else { "" },
+        now[X_NOW],
+        d(X_HELD),
+        d(X_RUNS),
+        d(X_FAILED),
+        d(X_CANDIDATES),
+        ddw as f64 / 1e6 / flips,
+        dpg as f64 / flips,
+        100.0 * ddw as f64 / (ddw + dall).max(1) as f64,
+        d(X_FAULTS),
+        d(X_FAULTS + 1),
+        d(X_FAULTS + 2),
+        d(X_FAULTS + 3),
+        d(X_FAULTS + 4),
+        d(X_FAULTS + 5),
+        d(X_SYNC),
+        d(X_SYNC_LATE),
+        d(X_RELEASED),
+        d(X_ROUNDS),
+        d(X_TAKE_US) as f64 / d(X_ROUNDS).max(1) as f64,
+        d(X_CPU_PAGES),
+        d(X_SUSPEND_US) as f64,
+        d(X_PLAIN),
+        d(X_WAITS),
+        d(X_WAIT_MS),
+        d(X_WAIT_TIMEOUTS),
+        d(X_DROPPED),
+        d(X_UP_SKIPPED),
+        d(X_FAILED_TAKES),
+        NO_HOLD_PAGES.load(Ordering::Relaxed)
+    );
+    *l = (frame, now, dw, pg, all);
+    drop(l);
+    let mut rips: Vec<((u64, bool), u64)> = HOLD_RIPS.lock().take().map(|m| m.into_iter().collect()).unwrap_or_default();
+    rips.sort_by(|a, b| b.1.cmp(&a.1));
+    if rips.is_empty() {
+        return line;
+    }
+    let top: Vec<String> = rips.iter().take(8).map(|&((rip, w), n)| format!("{n} {} at {}", if w { "writes" } else { "reads" }, describe_code(rip))).collect();
+    line + &format!("    front end 4's held pages: releases by code: {} ({} places)\n", top.join(", "), rips.len())
 }

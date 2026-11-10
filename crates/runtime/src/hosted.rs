@@ -317,6 +317,25 @@ fn arm_as(base: u64, len: u64, prot: u32, hold: bool) -> Result<(), String> {
     let s = shared().ok_or("not hosted")?;
     let _lock = arm_lock();
     let (lo, hi) = (base & !(PAGE - 1), (base + len).next_multiple_of(PAGE));
+    // (Arming never touches a held page: its newest words are elsewhere,
+    // and a read-only one would let its stale words be read. The runs
+    // between held pages are armed.)
+    if !hold && (lo..hi).step_by(PAGE as usize).any(|a| is_held(s, a)) {
+        let mut a = lo;
+        while a < hi {
+            if is_held(s, a) {
+                a += PAGE;
+                continue;
+            }
+            let mut e = a + PAGE;
+            while e < hi && !is_held(s, e) {
+                e += PAGE;
+            }
+            arm_as(a, e - a, prot, false)?;
+            a = e;
+        }
+        return Ok(());
+    }
     // (Told to the host first: its word answers skip these pages.)
     s.arming[0].store(lo, Ordering::Release);
     s.arming[1].store(hi, Ordering::Release);
@@ -449,11 +468,17 @@ pub fn disarm(base: u64, len: u64) {
         if a >= hi {
             break;
         }
+        // (A held page stays held: it is released, its words put back, by
+        // whoever holds it, never disarmed.)
+        if is_held(s, a) {
+            a += PAGE;
+            continue;
+        }
         // Its run: armed pages up to the end of the host region holding it.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         let region_end = if unsafe { VirtualQuery(a as _, &mut info, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } != 0 { info.BaseAddress as u64 + info.RegionSize as u64 } else { a + PAGE };
         let mut e = a + PAGE;
-        while e < hi && e < region_end && armed(e) {
+        while e < hi && e < region_end && armed(e) && !is_held(s, e) {
             e += PAGE;
         }
         let mut old = 0u32;
@@ -631,6 +656,16 @@ pub fn release(base: u64, len: u64) -> Result<u64, String> {
         Some(e) => Err(format!("{e} (those pages stay held; {n} released)")),
         None => Ok(n),
     }
+}
+
+/// Held pages of guest [base, base+len) the caller made read-write itself
+/// (their newest words put back with every other thread suspended): their
+/// held and armed bits cleared. Allocates nothing and takes no lock (the
+/// caller holds `arm_lock`).
+pub fn released_bits(base: u64, len: u64) {
+    let Some(s) = shared() else { return };
+    let (lo, hi) = (base & !(PAGE - 1), base.saturating_add(len).next_multiple_of(PAGE).min(crate::mem::GUEST_END));
+    disarm_bits(s, lo, hi, Clear::Released);
 }
 
 /// Waits from a fault on a held page to its thread's resume: count, total

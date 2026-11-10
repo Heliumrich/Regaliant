@@ -601,6 +601,9 @@ pub fn host_write(base: u64, len: u64) -> HostWrite {
     super::precache::invalidate(base, len);
     super::resident::host_write_begin(base, len);
     super::fe2::host_write_begin(base, len);
+    // (Front end 4's held pages: released first, their newest words put
+    // back; a kernel write fails on a no-access page.)
+    super::fe2::c4_release_sync(base, len, false);
     // Pages armed through the host (the GPU-resolved mirror, the copy
     // cache's protection): writable first (the kernel fails a file read
     // into a read-only page instead of faulting).

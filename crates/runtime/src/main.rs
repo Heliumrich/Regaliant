@@ -846,6 +846,17 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     Err(e) => Err(e),
                 }
             }
+            "c4" => {
+                // `c4 off|on` (`DS_C4=1`): front end 4's held pages (off
+                // releases them all).
+                match gpu::fe2::c4_control(parts.next().unwrap_or("")) {
+                    Ok(m) => {
+                        info!("control: c4: {m} at flip {flip}");
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
             "wbb" => {
                 // `wbb lazy|eager` (`DS_WB_BUCKETS=1`, diagnosis): the
                 // write-back leaves out the last census's untouched buckets.

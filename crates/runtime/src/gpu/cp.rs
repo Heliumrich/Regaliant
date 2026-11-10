@@ -6341,6 +6341,8 @@ impl Cp {
         super::exec::request_label_submit(a);
         let what = format!("WAIT_REG_MEM at {at:#x}: [{a:#x}] & {mask:#x} func {func} ref {reference:#x}");
         self.waiting_on = a;
+        // (A label our command processors poll is never held.)
+        super::fe2::c4_cp_target(a, 8);
         // Submitters stop waiting for this queue only when the label is not
         // written by its own outstanding GPU work (it may come from them).
         let own = self.exec.as_mut().is_some_and(|e| e.will_write(a, if wide { 8 } else { 4 }));

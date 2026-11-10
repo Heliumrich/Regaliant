@@ -953,6 +953,9 @@ pub fn remap_guard() -> parking_lot::RwLockWriteGuard<'static, ()> {
 pub fn settled(base: u64, len: u64) {
     remapped(base, len);
     crate::hosted::forget(base, len);
+    // (Front end 4's held pages there: their pending words died with the
+    // mapping; marks and held bits cleared.)
+    super::fe2::c4_forgotten(base, len);
     super::fe2::hash_clear_range(base, len);
 }
 
@@ -1994,9 +1997,15 @@ fn unback_cold(flips: u32, max_words: usize) -> Result<(), String> {
     // Drained words: unbound unless placed since.
     let mut words: Vec<(usize, u64)> = Vec::new();
     let ready: Vec<usize> = g.draining.iter().filter(|&(_, &(_, _, f))| now.wrapping_sub(f) >= DRAIN_FLIPS).map(|(&w, _)| w).collect();
+    // (Front end 4's held pages: the mirror holds their newest words, never
+    // unbound.)
+    let held = |w: usize| {
+        let lo = MIRROR_BASE + w as u64 * 64 * m.page;
+        super::fe2::c4_any_held(lo, lo + 64 * m.page)
+    };
     for w in ready {
         let (bits, u, _) = g.draining.remove(&w).unwrap();
-        if m.used[w].load(Ordering::Acquire) != u {
+        if m.used[w].load(Ordering::Acquire) != u || held(w) {
             m.backed[w].fetch_or(bits, Ordering::AcqRel);
             UNBACKED[3].fetch_add(1, Ordering::Relaxed);
         } else {
@@ -2014,7 +2023,7 @@ fn unback_cold(flips: u32, max_words: usize) -> Result<(), String> {
             continue;
         }
         let u = m.used[w].load(Ordering::Acquire);
-        if now.wrapping_sub(u) <= flips {
+        if now.wrapping_sub(u) <= flips || held(w) {
             continue;
         }
         m.backed[w].fetch_and(!bits, Ordering::AcqRel);

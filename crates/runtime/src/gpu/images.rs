@@ -1963,6 +1963,9 @@ fn choose_2d(key: ImageKey, t: &Tsharp, only: Option<&[(u64, u64)]>, all: bool, 
         notes.push(format!("texture with XOR swizzle mode {} uploaded with an assumed pipe count (2^{})", t.sw_mode, tiling::pipes_log2()));
     }
     let size = lay.size(layers);
+    // (Front end 4's held pages: their newest words put back in guest
+    // memory before the texture reads it.)
+    super::fe2::c4_release_sync(t.base, size, false);
     // GPU detiling for textures of at least `tune gpu_detile` MiB.
     let gpu = allow_gpu
         && match super::tune::gpu_detile() {
