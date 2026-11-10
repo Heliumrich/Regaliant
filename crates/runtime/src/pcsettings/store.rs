@@ -54,6 +54,9 @@ pub enum Live {
     /// The audio device (0: the system's default, k: `audio::output_devices()[k - 1]`; the
     /// choice kept as its endpoint id in local-data/audio-device.txt).
     AudioDevice,
+    /// The display choices (`crate::display`): 0 the monitor, 1 the fullscreen resolution, 2
+    /// the refresh rate (kept in local-data/display.txt).
+    Display(u8),
     /// The Quality Preset: the preset the settings match (`presets::current`); a change sets
     /// the preset's settings.
     Preset,
@@ -139,6 +142,13 @@ pub fn get(hash: u32) -> Option<u32> {
             let id = crate::audio::output_device();
             return Some(id.and_then(|id| crate::audio::output_devices().iter().position(|d| d.0 == id)).map(|k| k as u32 + 1).unwrap_or(0));
         }
+        Some(Live::Display(k)) => {
+            return Some(match k {
+                0 => crate::display::monitor_index(),
+                1 => crate::display::resolution_index(),
+                _ => crate::display::refresh_index(),
+            });
+        }
         None => {}
     }
     Some(s.values.get(&hash).copied().unwrap_or(d.default))
@@ -185,6 +195,15 @@ fn set(hash: u32, bits: u32) -> bool {
             }
         }
         crate::audio::set_output_device(id);
+        return true;
+    }
+    if let Some(Live::Display(k)) = d.live {
+        drop(g);
+        match k {
+            0 => crate::display::set_monitor_index(bits),
+            1 => crate::display::set_resolution_index(bits),
+            _ => crate::display::set_refresh_index(bits),
+        }
         return true;
     }
     if d.live.is_some() {

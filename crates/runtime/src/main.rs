@@ -26,6 +26,7 @@ mod pcsettings;
 mod jobidle;
 mod camhook;
 mod dispmode;
+mod display;
 mod engine;
 mod thread;
 mod titlefix;
@@ -528,12 +529,17 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     (Some("fullscreen"), _) => Ok(gpu::vk::window::set_fullscreen(Some(true))),
                     (Some("windowed"), _) => Ok(gpu::vk::window::set_fullscreen(Some(false))),
                     (Some("toggle"), _) => Ok(gpu::vk::window::set_fullscreen(None)),
+                    (Some("exclusive"), _) => Ok(gpu::vk::window::set_window_mode(2)),
+                    // `window background` / `window foreground`: what Alt+Tab away and back does
+                    // (the window's own activation messages).
+                    (Some("background"), _) => Ok(gpu::vk::window::simulate_activation(false)),
+                    (Some("foreground"), _) => Ok(gpu::vk::window::simulate_activation(true)),
                     (Some("size"), Some(v)) if size(v).is_some() => {
                         let (w, h) = size(v).unwrap();
                         gpu::vk::window::set_client_size(w, h);
                         Ok(())
                     }
-                    _ => Err("usage: window fullscreen|windowed|toggle | window size <w>x<h>".into()),
+                    _ => Err("usage: window fullscreen|exclusive|windowed|toggle|background|foreground | window size <w>x<h>".into()),
                 }
             }
             "fscan" => {
@@ -1262,6 +1268,8 @@ fn thread_summary_ex(with_stacks: bool) -> String {
 }
 
 pub fn fatal_exit(code: u32, reason: &str) -> ! {
+    // Exclusive fullscreen's display mode back first (the desktop must not stay changed).
+    display::restore_on_exit();
     // After a fault, every thread's frames (what the others were doing:
     // the title's teardown when a job read freed memory).
     let summary = if reason == "fatal exception" { thread_summary_ex(true) } else { thread_summary() };
@@ -1291,6 +1299,7 @@ fn pgo_write() {
 }
 
 pub fn shutdown(code: i32) -> ! {
+    display::restore_on_exit();
     hle::libs::videoout::wait_shots();
     gpu::shutdown();
     info!("shutdown with status {code}\n{}", thread_summary());
@@ -1431,6 +1440,8 @@ fn main() {
     // `DS_ACHIEVEMENTS_FILE`: another file (test runs: theirs, apart from a player's).
     let achievements_file = std::env::var_os("DS_ACHIEVEMENTS_FILE").map(PathBuf::from).unwrap_or_else(|| cfg.root.join("local-data").join("achievements.txt"));
     achievements::init(&cfg.app, achievements_file, "en-GB");
+    // Monitors and the PC tab's display choices (before its menu lists are made).
+    display::init(cfg.root.join("local-data").join("display.txt"));
     pcsettings::init(cfg.root.join("local-data").join("pcsettings.txt"));
     // The saves: the PC tab's Save Folder (local-data/saves by default), a PS5 import asked for.
     hle::libs::savedata::init(pcsettings::saves::start(&cfg.root, &hle::libs::savedata::title_id()));

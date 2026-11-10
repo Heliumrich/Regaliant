@@ -59,6 +59,9 @@ pub enum ItemKind {
     PadBinding(u16),
     /// The audio output device: the system's default, then Windows' active devices (live).
     AudioDevice,
+    /// The monitor (0), fullscreen resolution (1) or refresh rate (2): lists made at the start
+    /// (`crate::display`; live, kept in display.txt).
+    Display(u8),
     /// The Quality Preset (`presets`): Custom and the presets as options (live: the preset the
     /// settings match; a change sets its settings).
     Preset(Vec<String>),
@@ -93,6 +96,14 @@ impl Item {
                     (format!("PC_AUDIODEVICE_{}", k + 1), Some(short))
                 }))
                 .collect(),
+            ItemKind::Display(k) => {
+                let opts = match k {
+                    0 => crate::display::monitor_options(),
+                    1 => crate::display::resolution_options(),
+                    _ => crate::display::refresh_options(),
+                };
+                opts.into_iter().enumerate().map(|(n, o)| (self.text_key(&format!("_{n}")), Some(o))).collect()
+            }
         }
     }
     fn def(&self) -> store::Def {
@@ -105,6 +116,7 @@ impl Item {
             ItemKind::Binding(a) => (store::Kind::Int, 0, Some(store::Live::Binding(*a))),
             ItemKind::PadBinding(a) => (store::Kind::Int, 0, Some(store::Live::PadBinding(*a))),
             ItemKind::AudioDevice => (store::Kind::Int, 0, Some(store::Live::AudioDevice)),
+            ItemKind::Display(k) => (store::Kind::Int, 0, Some(store::Live::Display(*k))),
             ItemKind::Preset(_) => (store::Kind::Int, 0, Some(store::Live::Preset)),
         };
         store::Def { name: self.key(), kind, default, live }
@@ -122,8 +134,26 @@ pub fn items() -> Vec<Item> {
         Item {
             id: s("WindowMode"),
             label: s("Window Mode"),
-            tooltip: s("A window or borderless fullscreen. Alt+Enter switches too."),
-            kind: ItemKind::Choice(vec![s("Windowed"), s("Borderless Fullscreen")], 0),
+            tooltip: s("A window or fullscreen. Alt+Enter switches too."),
+            kind: ItemKind::Choice(vec![s("Windowed"), s("Borderless Fullscreen"), s("Fullscreen")], 0),
+        },
+        Item {
+            id: s("Monitor"),
+            label: s("Monitor"),
+            tooltip: s("The monitor the game shows on."),
+            kind: ItemKind::Display(0),
+        },
+        Item {
+            id: s("Resolution"),
+            label: s("Resolution"),
+            tooltip: s("The screen's resolution in Fullscreen mode."),
+            kind: ItemKind::Display(1),
+        },
+        Item {
+            id: s("RefreshRate"),
+            label: s("Refresh Rate"),
+            tooltip: s("The screen's refresh rate in Fullscreen mode."),
+            kind: ItemKind::Display(2),
         },
         Item {
             id: s("AspectRatio"),
@@ -294,7 +324,7 @@ pub fn apply() {
     static WINDOW_MODE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
     if let Some(m) = get("WindowMode") {
         if WINDOW_MODE.swap(m, std::sync::atomic::Ordering::Relaxed) != m {
-            crate::gpu::vk::window::set_fullscreen(Some(m == 1));
+            crate::gpu::vk::window::set_window_mode(m.min(2));
         }
     }
 }
@@ -335,8 +365,9 @@ pub fn mouse_blur_tick() {
 }
 
 /// The window mode the window opens with (the PC tab's; `None`: the window's own default).
-pub fn window_fullscreen() -> Option<bool> {
-    store::value("Setting_PC_WindowMode").map(|m| m == 1)
+/// The PC tab's Window Mode (0 windowed, 1 borderless, 2 exclusive fullscreen).
+pub fn window_mode() -> Option<u32> {
+    store::value("Setting_PC_WindowMode")
 }
 
 /// A tab the port adds to the SETTINGS screen (a copy of DISPLAY's tab and page).
@@ -626,6 +657,14 @@ fn edit_data_source(p: &mut Payload, item: &Item) -> Result<(), String> {
         ItemKind::Binding(_) => (raw_u32(0), Some(raw_u32(0)), Some(raw_u32(bindings::capture_option()))),
         ItemKind::PadBinding(_) => (raw_u32(0), Some(raw_u32(0)), Some(raw_u32(bindings::pad_capture_option()))),
         ItemKind::AudioDevice => (raw_u32(0), Some(raw_u32(0)), Some(raw_u32(crate::audio::output_devices().len() as u32))),
+        ItemKind::Display(k) => {
+            let n = match k {
+                0 => crate::display::monitor_options().len(),
+                1 => crate::display::resolution_options().len(),
+                _ => crate::display::refresh_options().len(),
+            };
+            (raw_u32(0), Some(raw_u32(0)), Some(raw_u32(n.max(1) as u32 - 1)))
+        }
         ItemKind::Preset(opts) => (raw_u32(0), Some(raw_u32(0)), Some(raw_u32(opts.len().max(1) as u32 - 1))),
         ItemKind::Choice(opts, d) => {
             let n = opts.len().max(1) as u32;
@@ -1022,7 +1061,7 @@ fn start_menu(orig: &[u8]) -> Result<Vec<u8>, String> {
         let mut kids = Vec::new();
         for item in &tab.items {
             let (ti, t) = match item.kind {
-                ItemKind::Toggle(_) | ItemKind::Choice(..) | ItemKind::Status(_) | ItemKind::Count(..) | ItemKind::Binding(_) | ItemKind::PadBinding(_) | ItemKind::AudioDevice | ItemKind::Preset(_) => (ti_choice, &CHOICE),
+                ItemKind::Toggle(_) | ItemKind::Choice(..) | ItemKind::Status(_) | ItemKind::Count(..) | ItemKind::Binding(_) | ItemKind::PadBinding(_) | ItemKind::AudioDevice | ItemKind::Display(_) | ItemKind::Preset(_) => (ti_choice, &CHOICE),
                 ItemKind::Slider { .. } => (ti_slider, &SLIDER),
             };
             let tpl = f.roots[ri].at(&page_path).at(&contents_rel).kids[ti].clone();

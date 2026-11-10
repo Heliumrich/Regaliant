@@ -58,6 +58,13 @@ pub struct Ctx {
     pub calibrated: Option<ash::ext::calibrated_timestamps::Device>,
     /// VK_EXT_device_fault: the device's own account of a loss (`fault_report`).
     pub fault: Option<ash::ext::device_fault::Device>,
+    /// VK_EXT_full_screen_exclusive (`present`): exclusive fullscreen acquired by the
+    /// presenter, and windows the driver must not make exclusive on its own.
+    pub fse: Option<ash::ext::full_screen_exclusive::Device>,
+    /// VK_EXT_swapchain_colorspace: HDR10 (ST 2084) swapchains where the display offers them.
+    pub colorspaces: bool,
+    /// VK_EXT_hdr_metadata: the HDR10 mastering metadata of an HDR swapchain.
+    pub hdr_metadata: Option<ash::ext::hdr_metadata::Device>,
     /// bufferDeviceAddress enabled: guest imports and video-memory homes get
     /// GPU addresses that fault reports name (`note_gpu_range`).
     pub device_addresses: bool,
@@ -275,9 +282,21 @@ fn init_inner() -> Result<(), String> {
         }
         let layers: Vec<*const c_char> = if validation { vec![validation_name.as_ptr()] } else { vec![] };
         let mut exts = vec![ash::khr::surface::NAME.as_ptr(), ash::khr::win32_surface::NAME.as_ptr()];
+        let inst_exts = entry.enumerate_instance_extension_properties(None).unwrap_or_default();
+        let inst_has = |n: &CStr| inst_exts.iter().any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == n);
+        // Display modes and HDR (`present`): surface queries with chained structures (exclusive
+        // fullscreen needs them) and the HDR10 color spaces, where the loader offers them.
+        let surface_caps2 = inst_has(ash::khr::get_surface_capabilities2::NAME);
+        if surface_caps2 {
+            exts.push(ash::khr::get_surface_capabilities2::NAME.as_ptr());
+        }
+        let colorspaces = inst_has(ash::ext::swapchain_colorspace::NAME);
+        if colorspaces {
+            exts.push(ash::ext::swapchain_colorspace::NAME.as_ptr());
+        }
         // Command labels for GPU Trace (DS_GPU_LABELS=1).
         let want_labels = std::env::var("DS_GPU_LABELS").ok().as_deref() == Some("1");
-        let has_debug_utils = entry.enumerate_instance_extension_properties(None).unwrap_or_default().iter().any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == ash::ext::debug_utils::NAME);
+        let has_debug_utils = inst_has(ash::ext::debug_utils::NAME);
         let labels_on = want_labels && has_debug_utils;
         if want_labels && !has_debug_utils {
             crate::warn!("DS_GPU_LABELS=1 but VK_EXT_debug_utils is unavailable");
@@ -347,6 +366,18 @@ fn init_inner() -> Result<(), String> {
         let mut dexts = vec![ash::khr::swapchain::NAME.as_ptr(), ash::khr::push_descriptor::NAME.as_ptr()];
         if host_import {
             dexts.push(ash::ext::external_memory_host::NAME.as_ptr());
+        }
+        // Exclusive fullscreen under the application's control, and borderless windows the
+        // driver may not turn into exclusive mode (`present`); HDR metadata for HDR10 output.
+        let dev_exts = instance.enumerate_device_extension_properties(pdev).unwrap_or_default();
+        let dev_has = |n: &CStr| dev_exts.iter().any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == n);
+        let has_fse = surface_caps2 && dev_has(ash::ext::full_screen_exclusive::NAME) && std::env::var("DS_NO_FSE").is_err();
+        if has_fse {
+            dexts.push(ash::ext::full_screen_exclusive::NAME.as_ptr());
+        }
+        let has_hdr_meta = colorspaces && dev_has(ash::ext::hdr_metadata::NAME);
+        if has_hdr_meta {
+            dexts.push(ash::ext::hdr_metadata::NAME.as_ptr());
         }
         let memory_budget = instance
             .enumerate_device_extension_properties(pdev)
@@ -732,6 +763,9 @@ fn init_inner() -> Result<(), String> {
             exec_props: has_stats.then(|| ash::khr::pipeline_executable_properties::Device::new(&instance, &device)),
             calibrated: calibrated.then(|| ash::ext::calibrated_timestamps::Device::new(&instance, &device)),
             fault: has_fault.then(|| ash::ext::device_fault::Device::new(&instance, &device)),
+            fse: has_fse.then(|| ash::ext::full_screen_exclusive::Device::new(&instance, &device)),
+            colorspaces,
+            hdr_metadata: has_hdr_meta.then(|| ash::ext::hdr_metadata::Device::new(&instance, &device)),
             labels: labels_on.then(|| ash::ext::debug_utils::Device::new(&instance, &device)),
             names: validation.then(|| ash::ext::debug_utils::Device::new(&instance, &device)),
             device_addresses,

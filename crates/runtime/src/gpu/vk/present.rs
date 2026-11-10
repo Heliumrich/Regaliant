@@ -43,6 +43,9 @@ struct Presenter {
     /// The PC settings' sharpening pass (made on first use; `sharpen_failed` after an error).
     sharpen: Option<super::sharpen::Sharpen>,
     sharpen_failed: bool,
+    /// The swapchain holds exclusive fullscreen (VK_EXT_full_screen_exclusive, application
+    /// controlled), on this monitor.
+    exclusive: Option<isize>,
 }
 
 unsafe impl Send for Presenter {}
@@ -77,6 +80,15 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
     unsafe {
         let caps = c.surface_i.get_physical_device_surface_capabilities(c.pdev, p.surface).map_err(|e| format!("surface caps: {e}"))?;
         let formats = c.surface_i.get_physical_device_surface_formats(c.pdev, p.surface).map_err(|e| format!("surface formats: {e}"))?;
+        {
+            // (Once: the formats and color spaces the display offers; HDR10's appear while
+            // Windows' HDR is on for it.)
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                let list: Vec<String> = formats.iter().map(|f| format!("{:?}/{:?}", f.format, f.color_space)).collect();
+                crate::info!("present: surface formats {}", list.join(", "));
+            });
+        }
         // Display buffers hold display-encoded values (the title applies its
         // own transfer function): UNORM swapchain formats show them as is,
         // 10-bit first (the title's display buffers are 10:10:10:2).
@@ -98,7 +110,17 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
         }
         let count = (caps.min_image_count + 1).min(if caps.max_image_count == 0 { u32::MAX } else { caps.max_image_count });
         let old = p.swapchain;
-        let sci = vk::SwapchainCreateInfoKHR::default()
+        // Exclusive fullscreen: held by the swapchain when the window asks for it (the PC tab's
+        // Fullscreen), and never taken by the driver on its own for a window or borderless
+        // fullscreen (a driver may change a display's mode for a window that covers it).
+        let exclusive = if c.fse.is_some() { window::exclusive_wanted() } else { None };
+        let mut fse_info = vk::SurfaceFullScreenExclusiveInfoEXT::default().full_screen_exclusive(if exclusive.is_some() {
+            vk::FullScreenExclusiveEXT::APPLICATION_CONTROLLED
+        } else {
+            vk::FullScreenExclusiveEXT::DISALLOWED
+        });
+        let mut fse_win = vk::SurfaceFullScreenExclusiveWin32InfoEXT::default().hmonitor(exclusive.unwrap_or(0) as vk::HMONITOR);
+        let mut sci = vk::SwapchainCreateInfoKHR::default()
             .surface(p.surface)
             .min_image_count(count)
             .image_format(fmt.format)
@@ -112,6 +134,12 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
             .present_mode(vk::PresentModeKHR::FIFO)
             .clipped(true)
             .old_swapchain(old);
+        if c.fse.is_some() {
+            sci = sci.push_next(&mut fse_info);
+            if exclusive.is_some() {
+                sci = sci.push_next(&mut fse_win);
+            }
+        }
         let sc = c.swapchain_d.create_swapchain(&sci, None).map_err(|e| format!("create swapchain: {e}"))?;
         if old != vk::SwapchainKHR::null() {
             // The old swapchain's images are only the presenter's: its frames done and the queue
@@ -134,7 +162,22 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
         for _ in 0..p.images.len() {
             p.done.push(c.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).map_err(|e| e.to_string())?);
         }
-        crate::info!("swapchain {}x{} {:?} ({} images)", extent.width, extent.height, fmt.format, p.images.len());
+        p.exclusive = None;
+        if let (Some(f), Some(mon)) = (c.fse.as_ref(), exclusive) {
+            match f.acquire_full_screen_exclusive_mode(sc) {
+                Ok(()) => p.exclusive = Some(mon),
+                Err(e) => crate::warn!("present: exclusive fullscreen not acquired ({e}): shown as borderless"),
+            }
+        }
+        crate::info!(
+            "swapchain {}x{} {:?} {:?} ({} images{})",
+            extent.width,
+            extent.height,
+            fmt.format,
+            fmt.color_space,
+            p.images.len(),
+            if p.exclusive.is_some() { ", exclusive fullscreen" } else { "" }
+        );
     }
     Ok(())
 }
@@ -176,6 +219,7 @@ pub fn init(title: &str) -> Result<(), String> {
             logged: (0, 0, 0, 0),
             sharpen: None,
             sharpen_failed: false,
+            exclusive: None,
         };
         create_swapchain(&mut p)?;
         *PRESENTER.lock() = Some(p);
@@ -205,6 +249,10 @@ pub fn present(src: Source) -> bool {
     let mut g = PRESENTER.lock();
     let Some(p) = g.as_mut() else { return false };
     unsafe {
+        // The window's exclusive fullscreen changed (Alt+Tab, the mode): a new swapchain.
+        if window::exclusive_wanted() != p.exclusive && c.fse.is_some() {
+            window::RESIZED.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         if window::RESIZED.swap(false, std::sync::atomic::Ordering::SeqCst) {
             if let Err(e) = create_swapchain(p) {
                 crate::debug!("swapchain recreate: {e}");
@@ -216,7 +264,7 @@ pub fn present(src: Source) -> bool {
         c.device.wait_for_fences(&[p.fences[f]], true, u64::MAX).ok();
         let (idx, _) = match c.swapchain_d.acquire_next_image(p.swapchain, u64::MAX, p.acquire[f], vk::Fence::null()) {
             Ok(r) => r,
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => {
                 window::RESIZED.store(true, std::sync::atomic::Ordering::SeqCst);
                 return false;
             }
@@ -370,7 +418,7 @@ pub fn present(src: Source) -> bool {
         let q = c.queue.lock();
         match c.swapchain_d.queue_present(*q, &pi) {
             Ok(false) => {}
-            Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => window::RESIZED.store(true, std::sync::atomic::Ordering::SeqCst),
+            Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => window::RESIZED.store(true, std::sync::atomic::Ordering::SeqCst),
             Err(e) => crate::error!("present: {e}"),
         }
     }

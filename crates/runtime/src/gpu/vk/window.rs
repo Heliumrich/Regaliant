@@ -14,12 +14,17 @@
 //! Modes: the window is per-monitor DPI aware (its client area in physical
 //! pixels, which the presenter fits the frame to) and opens at 1280x720
 //! scaled by its monitor's DPI, inside the work area and centred
-//! (`DS_WINDOW_SIZE=<w>x<h>`: that client size in pixels). Alt+Enter or F11
-//! switches between it and borderless fullscreen on the window's monitor
-//! (`DS_FULLSCREEN=1`: fullscreen from the start, `0` windowed; otherwise the SETTINGS
-//! screen's PC tab, Window Mode, which Alt+Enter updates); neither reaches the game
-//! as a key. `DS_WINDOW_BEHIND=1` (test runs on a shared desktop): shown
-//! without activation at the bottom of the z-order, fullscreen too.
+//! (`DS_WINDOW_SIZE=<w>x<h>`: that client size in pixels). The PC tab's Window
+//! Mode: windowed, borderless fullscreen or exclusive fullscreen, on the PC tab's
+//! Monitor (`crate::display`); exclusive fullscreen sets that monitor to the chosen
+//! Resolution and Refresh Rate and gives it back when the game goes to the
+//! background (Alt+Tab: the window minimizes) or ends. Alt+Enter or F11 switches
+//! between the window and the last fullscreen mode (`DS_FULLSCREEN=1`: borderless
+//! from the start, `2` exclusive, `0` windowed); neither reaches the game as a key.
+//! The presenter keeps the driver from making a borderless window exclusive on its
+//! own (a driver may change the display's mode for a window covering it). `DS_WINDOW_BEHIND=1`
+//! (test runs on a shared desktop): shown without activation at the bottom of the
+//! z-order, fullscreen too.
 //!
 //! Menu pointer (`pcsettings::pointer`): while a menu is open with the keyboard
 //! and mouse in use, the cursor is free and shows the port's arrow; its client
@@ -71,6 +76,16 @@ static ABS_X: AtomicI64 = AtomicI64::new(i64::MIN);
 static ABS_Y: AtomicI64 = AtomicI64::new(i64::MIN);
 /// Borderless fullscreen (`apply_fullscreen`).
 pub static FULLSCREEN: AtomicBool = AtomicBool::new(false);
+/// The window mode in effect: 0 windowed, 1 borderless fullscreen, 2 exclusive fullscreen.
+static WINDOW_MODE: AtomicU32 = AtomicU32::new(0);
+/// The fullscreen mode Alt+Enter returns to (1 or 2).
+static LAST_FULL: AtomicU32 = AtomicU32::new(1);
+/// Exclusive fullscreen held (the presenter acquires it), and given up while the game is in the
+/// background.
+static EXCLUSIVE: AtomicBool = AtomicBool::new(false);
+static SUSPENDED: AtomicBool = AtomicBool::new(false);
+/// The monitor a fullscreen window covers (HMONITOR; the presenter's exclusive mode names it).
+static HMON: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 /// The windowed placement fullscreen returns to.
 static PLACEMENT: parking_lot::Mutex<Option<WINDOWPLACEMENT>> = parking_lot::Mutex::new(None);
 /// Asks the UI thread for a mode (wParam 0 windowed, 1 fullscreen, 2 the
@@ -255,13 +270,59 @@ unsafe fn update_capture(hwnd: HWND) {
 /// Asks the window for borderless fullscreen (`Some(true)`), windowed
 /// (`Some(false)`) or the other one (`None`); from any thread.
 pub fn set_fullscreen(on: Option<bool>) {
+    set_window_mode(match on {
+        Some(false) => 0,
+        Some(true) => 1,
+        None => MODE_TOGGLE,
+    });
+}
+
+/// `WM_DS_MODE` arguments beyond the modes 0-2.
+const MODE_TOGGLE: u32 = 3;
+const MODE_REAPPLY: u32 = 4;
+
+/// Asks the window for a mode (0 windowed, 1 borderless, 2 exclusive fullscreen); from any
+/// thread.
+pub fn set_window_mode(mode: u32) {
     if let Some(w) = WINDOW.get() {
-        let mode = match on {
-            Some(false) => 0,
-            Some(true) => 1,
-            None => 2,
-        };
-        unsafe { PostMessageW(w.hwnd as HWND, WM_DS_MODE, mode, 0) };
+        unsafe { PostMessageW(w.hwnd as HWND, WM_DS_MODE, mode as WPARAM, 0) };
+    }
+}
+
+/// Tests (`window background|foreground`): the activation message Alt+Tab sends.
+pub fn simulate_activation(active: bool) {
+    if let Some(w) = WINDOW.get() {
+        unsafe { PostMessageW(w.hwnd as HWND, WM_ACTIVATEAPP, active as WPARAM, 0) };
+    }
+}
+
+/// The PC tab's Monitor, Resolution or Refresh Rate changed: the window mode is applied again.
+pub fn reapply_mode() {
+    set_window_mode(MODE_REAPPLY);
+}
+
+/// Whether the presenter should hold exclusive fullscreen now, and on which monitor.
+pub fn exclusive_wanted() -> Option<isize> {
+    (EXCLUSIVE.load(Ordering::Relaxed) && !SUSPENDED.load(Ordering::Relaxed)).then(|| HMON.load(Ordering::Relaxed))
+}
+
+/// The window mode in effect (0 windowed, 1 borderless, 2 exclusive fullscreen).
+pub fn window_mode() -> u32 {
+    WINDOW_MODE.load(Ordering::Relaxed)
+}
+
+/// The monitor the window is on (HMONITOR) and its GDI device name.
+pub fn current_monitor() -> Option<(isize, String)> {
+    let w = WINDOW.get()?;
+    unsafe {
+        let h = MonitorFromWindow(w.hwnd as HWND, MONITOR_DEFAULTTONEAREST);
+        let mut mi: windows_sys::Win32::Graphics::Gdi::MONITORINFOEXW = std::mem::zeroed();
+        mi.monitorInfo.cbSize = std::mem::size_of::<windows_sys::Win32::Graphics::Gdi::MONITORINFOEXW>() as u32;
+        if GetMonitorInfoW(h, &mut mi as *mut _ as *mut MONITORINFO) == 0 {
+            return None;
+        }
+        let n = mi.szDevice.iter().position(|&c| c == 0).unwrap_or(mi.szDevice.len());
+        Some((h as isize, String::from_utf16_lossy(&mi.szDevice[..n])))
     }
 }
 
@@ -276,41 +337,120 @@ pub fn set_client_size(w: u32, h: u32) {
 /// UI thread: borderless fullscreen on the window's monitor, or back to the
 /// windowed placement it had.
 unsafe fn apply_fullscreen(hwnd: HWND, on: bool) {
-    if on == FULLSCREEN.load(Ordering::Relaxed) {
+    unsafe { apply_mode(hwnd, if on { LAST_FULL.load(Ordering::Relaxed).clamp(1, 2) } else { 0 }, false) };
+}
+
+/// The area a fullscreen window covers: the PC tab's Monitor (after any mode change), else
+/// the monitor the window is on.
+unsafe fn fullscreen_rect(hwnd: HWND) -> Option<RECT> {
+    if let Some(t) = crate::display::target() {
+        return Some(RECT { left: t.rect[0], top: t.rect[1], right: t.rect[2], bottom: t.rect[3] });
+    }
+    let mut mi: MONITORINFO = unsafe { std::mem::zeroed() };
+    mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    (unsafe { GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi) } != 0).then_some(mi.rcMonitor)
+}
+
+/// UI thread: the window centred on the PC tab's Monitor (windowed).
+unsafe fn center_on_target(hwnd: HWND) {
+    let Some(t) = crate::display::target() else { return };
+    unsafe {
+        let mut wr: RECT = std::mem::zeroed();
+        GetWindowRect(hwnd, &mut wr);
+        let (w, h) = (wr.right - wr.left, wr.bottom - wr.top);
+        let inside = wr.left >= t.rect[0] && wr.top >= t.rect[1] && wr.right <= t.rect[2] && wr.bottom <= t.rect[3];
+        if !inside {
+            let x = t.rect[0] + ((t.rect[2] - t.rect[0] - w) / 2).max(0);
+            let y = t.rect[1] + ((t.rect[3] - t.rect[1] - h) / 2).max(0);
+            SetWindowPos(hwnd, std::ptr::null_mut(), x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+}
+
+/// UI thread: puts the window in `mode` (0 windowed, 1 borderless fullscreen, 2 exclusive
+/// fullscreen) on the PC tab's Monitor; `force` applies it again when it is already in effect
+/// (the monitor, resolution or refresh rate changed).
+unsafe fn apply_mode(hwnd: HWND, mode: u32, force: bool) {
+    let was = WINDOW_MODE.load(Ordering::Relaxed);
+    if mode == was && !force {
         return;
     }
     unsafe {
-        if on {
+        // Exclusive fullscreen's display mode: kept when it is the one wanted, else given back.
+        let target = crate::display::target();
+        let wanted = (mode == 2).then(|| target.as_ref().and_then(|t| crate::display::wanted_mode(&t.device))).flatten();
+        let keep = mode == 2 && wanted.is_some() && target.as_ref().is_some_and(|t| crate::display::current_mode(&t.device) == wanted) && crate::display::mode_changed();
+        if !keep {
+            crate::display::restore();
+        }
+        EXCLUSIVE.store(false, Ordering::Relaxed);
+        SUSPENDED.store(false, Ordering::Relaxed);
+        if mode == 0 {
+            if was != 0 {
+                FULLSCREEN.store(false, Ordering::Relaxed);
+                SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_OVERLAPPEDWINDOW | WS_VISIBLE) as isize);
+                let saved = PLACEMENT.lock().take();
+                if let Some(mut wp) = saved {
+                    if BEHIND.load(Ordering::Relaxed) && wp.showCmd == SW_SHOWNORMAL as u32 {
+                        wp.showCmd = SW_SHOWNOACTIVATE as u32;
+                    }
+                    SetWindowPlacement(hwnd, &wp);
+                }
+                SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE);
+            }
+            center_on_target(hwnd);
+            WINDOW_MODE.store(0, Ordering::Relaxed);
+            RESIZED.store(true, Ordering::SeqCst);
+            crate::info!("window: windowed");
+            return;
+        }
+        if was == 0 {
             let mut wp: WINDOWPLACEMENT = std::mem::zeroed();
             wp.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
-            let mut mi: MONITORINFO = std::mem::zeroed();
-            mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-            if GetWindowPlacement(hwnd, &mut wp) == 0 || GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi) == 0 {
-                crate::warn!("window: no fullscreen ({})", std::io::Error::last_os_error());
-                return;
+            if GetWindowPlacement(hwnd, &mut wp) != 0 {
+                *PLACEMENT.lock() = Some(wp);
             }
-            *PLACEMENT.lock() = Some(wp);
-            FULLSCREEN.store(true, Ordering::Relaxed);
-            SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_POPUP | WS_VISIBLE) as isize);
-            let r = mi.rcMonitor;
-            let behind = BEHIND.load(Ordering::Relaxed);
-            let (after, quiet) = if behind { (HWND_BOTTOM, SWP_NOACTIVATE) } else { (HWND_TOP, 0) };
-            SetWindowPos(hwnd, after, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOOWNERZORDER | SWP_FRAMECHANGED | quiet);
-            crate::info!("window: borderless fullscreen {}x{}", r.right - r.left, r.bottom - r.top);
-        } else {
-            FULLSCREEN.store(false, Ordering::Relaxed);
-            SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_OVERLAPPEDWINDOW | WS_VISIBLE) as isize);
-            let saved = PLACEMENT.lock().take();
-            if let Some(mut wp) = saved {
-                if BEHIND.load(Ordering::Relaxed) && wp.showCmd == SW_SHOWNORMAL as u32 {
-                    wp.showCmd = SW_SHOWNOACTIVATE as u32;
+        }
+        if mode == 2 {
+            if let (Some(t), Some(m)) = (&target, wanted) {
+                if !keep {
+                    crate::display::set_mode(&t.device, m);
                 }
-                SetWindowPlacement(hwnd, &wp);
             }
-            SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE);
-            crate::info!("window: windowed");
+        }
+        let Some(r) = fullscreen_rect(hwnd) else {
+            crate::warn!("window: no fullscreen ({})", std::io::Error::last_os_error());
+            return;
+        };
+        FULLSCREEN.store(true, Ordering::Relaxed);
+        SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_POPUP | WS_VISIBLE) as isize);
+        let behind = BEHIND.load(Ordering::Relaxed);
+        let (after, quiet) = if behind { (HWND_BOTTOM, SWP_NOACTIVATE) } else { (HWND_TOP, 0) };
+        SetWindowPos(hwnd, after, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOOWNERZORDER | SWP_FRAMECHANGED | quiet);
+        HMON.store(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) as isize, Ordering::Relaxed);
+        WINDOW_MODE.store(mode, Ordering::Relaxed);
+        LAST_FULL.store(mode, Ordering::Relaxed);
+        EXCLUSIVE.store(mode == 2, Ordering::Relaxed);
+        RESIZED.store(true, Ordering::SeqCst);
+        crate::info!("window: {} {}x{}", if mode == 2 { "exclusive fullscreen" } else { "borderless fullscreen" }, r.right - r.left, r.bottom - r.top);
+    }
+}
+
+/// UI thread: a fullscreen window fitted to its monitor again (the desktop's layout changed).
+unsafe fn refit(hwnd: HWND) {
+    if !FULLSCREEN.load(Ordering::Relaxed) {
+        return;
+    }
+    unsafe {
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi) != 0 {
+            let r = mi.rcMonitor;
+            SetWindowPos(hwnd, std::ptr::null_mut(), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+            HMON.store(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) as isize, Ordering::Relaxed);
         }
     }
+    RESIZED.store(true, Ordering::SeqCst);
 }
 
 /// WM_INPUT: mouse motion, buttons and wheel while the cursor is captured.
@@ -467,12 +607,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
             }
             if (wp as u16 == VK_RETURN_CODE && msg == WM_SYSKEYDOWN) || wp as u16 == VK_F11_CODE {
-                // Alt+Enter, F11: windowed / borderless fullscreen.
+                // Alt+Enter, F11: windowed / the last fullscreen mode.
                 if (lp >> 30) & 1 == 0 {
-                    let on = !FULLSCREEN.load(Ordering::Relaxed);
-                    unsafe { apply_fullscreen(hwnd, on) };
+                    let mode = if WINDOW_MODE.load(Ordering::Relaxed) != 0 { 0 } else { LAST_FULL.load(Ordering::Relaxed).clamp(1, 2) };
+                    unsafe { apply_mode(hwnd, mode, false) };
                     // The PC tab's Window Mode follows (its menu shows the mode in use).
-                    let _ = crate::pcsettings::store::set_by_name("Setting_PC_WindowMode", if on { "1" } else { "0" });
+                    let _ = crate::pcsettings::store::set_by_name("Setting_PC_WindowMode", &mode.to_string());
                 }
                 return 0;
             }
@@ -508,13 +648,39 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // still opens the window menu.
         WM_SYSCHAR if wp != b' ' as WPARAM => 0,
         WM_DS_MODE => {
-            let on = match wp {
-                0 => false,
-                1 => true,
-                _ => !FULLSCREEN.load(Ordering::Relaxed),
-            };
-            unsafe { apply_fullscreen(hwnd, on) };
+            match wp as u32 {
+                m @ 0..=2 => unsafe { apply_mode(hwnd, m, false) },
+                MODE_TOGGLE => unsafe { apply_fullscreen(hwnd, !FULLSCREEN.load(Ordering::Relaxed)) },
+                _ => unsafe { apply_mode(hwnd, WINDOW_MODE.load(Ordering::Relaxed), true) },
+            }
             0
+        }
+        WM_ACTIVATEAPP => {
+            // Exclusive fullscreen in the background: the desktop's mode back and the window
+            // minimized; in front again: the mode set once more.
+            if WINDOW_MODE.load(Ordering::Relaxed) == 2 {
+                if wp == 0 {
+                    if !SUSPENDED.swap(true, Ordering::Relaxed) {
+                        crate::display::restore();
+                        RESIZED.store(true, Ordering::SeqCst);
+                        unsafe { ShowWindow(hwnd, SW_MINIMIZE) };
+                        crate::info!("window: exclusive fullscreen left for the desktop");
+                    }
+                } else if SUSPENDED.load(Ordering::Relaxed) {
+                    unsafe {
+                        ShowWindow(hwnd, SW_RESTORE);
+                        apply_mode(hwnd, 2, true);
+                    }
+                }
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+        }
+        WM_DISPLAYCHANGE => {
+            // A monitor's mode or the desktop's layout changed (the port's own exclusive mode,
+            // or the player's): a fullscreen window covers its monitor again.
+            crate::info!("window: display changed to {}x{}", lp & 0xFFFF, (lp >> 16) & 0xFFFF);
+            unsafe { refit(hwnd) };
+            unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
         }
         WM_DS_SIZE if !FULLSCREEN.load(Ordering::Relaxed) => {
             let mut r = RECT { left: 0, top: 0, right: wp as i32, bottom: lp as i32 };
@@ -675,13 +841,21 @@ pub fn create(title: &str, width: u32, height: u32) -> Result<&'static Window, S
             } else {
                 ShowWindow(hwnd, SW_SHOW);
             }
-            // `DS_FULLSCREEN` (1 or 0) over the PC tab's Window Mode.
-            let fullscreen = match std::env::var("DS_FULLSCREEN") {
-                Ok(v) => v.trim() == "1",
-                Err(_) => crate::pcsettings::window_fullscreen().unwrap_or(false),
+            // No screen saver or display sleep while the game runs (a controller alone moves
+            // no mouse and presses no key Windows sees).
+            windows_sys::Win32::System::Power::SetThreadExecutionState(
+                windows_sys::Win32::System::Power::ES_CONTINUOUS | windows_sys::Win32::System::Power::ES_DISPLAY_REQUIRED | windows_sys::Win32::System::Power::ES_SYSTEM_REQUIRED,
+            );
+            // `DS_FULLSCREEN` (0, 1 or 2) over the PC tab's Window Mode; a windowed start on
+            // the PC tab's Monitor.
+            let mode = match std::env::var("DS_FULLSCREEN") {
+                Ok(v) => v.trim().parse::<u32>().unwrap_or(0).min(2),
+                Err(_) => crate::pcsettings::window_mode().unwrap_or(0).min(2),
             };
-            if fullscreen {
-                apply_fullscreen(hwnd, true);
+            if mode != 0 {
+                apply_mode(hwnd, mode, false);
+            } else {
+                center_on_target(hwnd);
             }
             let _ = tx.send(Ok((hwnd as isize, hinst as isize)));
             let mut msg: MSG = std::mem::zeroed();

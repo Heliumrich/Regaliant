@@ -173,9 +173,9 @@ fn start_aspect() {
         1..=4 => ASPECTS[choice as usize - 1],
         _ => {
             let fullscreen = match std::env::var("DS_FULLSCREEN").ok().as_deref() {
-                Some("1") => true,
+                Some("1") | Some("2") => true,
                 Some("0") => false,
-                _ => crate::pcsettings::window_fullscreen().unwrap_or(false),
+                _ => crate::pcsettings::window_mode().is_some_and(|m| m != 0),
             };
             if !crate::gpu::vk::present::active() || !fullscreen {
                 return;
