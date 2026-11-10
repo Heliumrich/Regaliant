@@ -3530,9 +3530,6 @@ impl Cp {
             }
         }
         let e = self.exec.as_mut().unwrap();
-        if let Some((n, _)) = needs {
-            e.c6_settle(n);
-        }
         let dropped = if matches!(flow, Flow::Stop) {
             Some("shutdown")
         } else if writes.overlaps_any(e.held_reads()) {

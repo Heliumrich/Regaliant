@@ -508,21 +508,6 @@ fn init_inner() -> Result<(), String> {
         if (super::resident::wanted() || super::fe2::wanted()) && !sparse_buffers {
             crate::warn!("front end 2 (the default), DS_RESIDENT or DS_RGM wanted but the device or the main queue family has no sparse buffers");
         }
-        if std::env::var("DS_SPARSE_HOST_PROBE").is_ok_and(|v| v == "1") {
-            // Whether imported host memory could back the mirror's sparse
-            // pages (front end 3's residency question): the device's
-            // non-resident reads, and external host allocations for a
-            // sparse buffer.
-            let strict = props.sparse_properties.residency_non_resident_strict != 0;
-            let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
-            for (name, flags) in [("plain", vk::BufferCreateFlags::empty()), ("sparse binding", vk::BufferCreateFlags::SPARSE_BINDING), ("sparse residency", vk::BufferCreateFlags::SPARSE_BINDING | vk::BufferCreateFlags::SPARSE_RESIDENCY)] {
-                let info = vk::PhysicalDeviceExternalBufferInfo::default().flags(flags).usage(usage).handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
-                let mut out = vk::ExternalBufferProperties::default();
-                instance.get_physical_device_external_buffer_properties(pdev, &info, &mut out);
-                let p = out.external_memory_properties;
-                crate::info!("sparse host probe: {name} buffer with host allocations: features {:?}, compatible {:?}, exportable from {:?}; non-resident reads strict {strict}", p.external_memory_features, p.compatible_handle_types, p.export_from_imported_handle_types);
-            }
-        }
         // Storage images bound one view per mip level are indexed per
         // invocation (image_store_mip / image_load_mip).
         let core = instance.get_physical_device_features(pdev);

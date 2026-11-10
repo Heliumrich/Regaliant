@@ -225,162 +225,6 @@ fn zero_page(tr: &mut T) -> R<Word> {
     }
 }
 
-/// C6 (`Spec::c6`): the u64 in the address block's header at dword `k`.
-fn c6_hdr64(tr: &mut T, k: u32) -> R<Word> {
-    let lo = tr.addr_header(k)?;
-    let hi = tr.addr_header(k + 1)?;
-    u64_of(tr, lo, hi)
-}
-
-/// C6: whether granules [g0, g1] of the mirror's span (u32, g0 <= g1) are
-/// all in the resident set (a bit per 64 KiB granule at the header's dwords
-/// 6-7); false for ranges over more than `C6_MAX_WORDS` words of granules.
-fn c6_resident(tr: &mut T, g0: Word, g1: Word) -> R<Word> {
-    let (u, u64t, b) = (tr.t.u32, tr.t.u64, tr.t.bool_);
-    let rbase = c6_hdr64(tr, super::C6_HDR_RES)?;
-    let (k5, k31, all, z) = (tr.u(5), tr.u(31), tr.u(u32::MAX), tr.u(0));
-    let w0 = e(tr.b.shift_right_logical(u, None, g0, k5))?;
-    let w1 = e(tr.b.shift_right_logical(u, None, g1, k5))?;
-    let lo0 = e(tr.b.bitwise_and(u, None, g0, k31))?;
-    let hi1 = e(tr.b.bitwise_and(u, None, g1, k31))?;
-    let span = e(tr.b.i_sub(u, None, w1, w0))?;
-    let maxw = tr.u(super::C6_MAX_WORDS - 1);
-    let fits = e(tr.b.u_less_than_equal(b, None, span, maxw))?;
-    let last_word = tr.u((super::C6_RES_WORDS - 1) as u32);
-    let mut okall = fits;
-    for k in 0..super::C6_MAX_WORDS {
-        let kk = tr.u(k);
-        let w = e(tr.b.i_add(u, None, w0, kk))?;
-        // (Words past the range: read clamped, their test passes.)
-        let used = e(tr.b.u_less_than_equal(b, None, w, w1))?;
-        let wc = e(tr.b.ext_inst(u, None, tr.glsl, GLOp::UMin as u32, [Operand::IdRef(w), Operand::IdRef(last_word)]))?;
-        let w64 = e(tr.b.u_convert(u64t, None, wc))?;
-        let two = tr.u64c(2);
-        let off = e(tr.b.shift_left_logical(u64t, None, w64, two))?;
-        let a = e(tr.b.i_add(u64t, None, rbase, off))?;
-        let pty = tr.b.type_pointer(None, StorageClass::PhysicalStorageBuffer, u);
-        let p = e(tr.b.convert_u_to_ptr(pty, None, a))?;
-        let (ma, ops) = aligned(4);
-        let word = e(tr.b.load(u, None, p, ma, ops))?;
-        let first = e(tr.b.i_equal(b, None, w, w0))?;
-        let lo = e(tr.b.select(u, None, first, lo0, z))?;
-        let at_last = e(tr.b.i_equal(b, None, w, w1))?;
-        let hi = e(tr.b.select(u, None, at_last, hi1, k31))?;
-        let m_lo = e(tr.b.shift_left_logical(u, None, all, lo))?;
-        let sh = e(tr.b.i_sub(u, None, k31, hi))?;
-        let m_hi = e(tr.b.shift_right_logical(u, None, all, sh))?;
-        let m = e(tr.b.bitwise_and(u, None, m_lo, m_hi))?;
-        let got = e(tr.b.bitwise_and(u, None, word, m))?;
-        let full = e(tr.b.i_equal(b, None, got, m))?;
-        let unused = e(tr.b.logical_not(b, None, used))?;
-        let okk = e(tr.b.logical_or(b, None, unused, full))?;
-        okall = e(tr.b.logical_and(b, None, okall, okk))?;
-    }
-    Ok(okall)
-}
-
-/// C6: reports guest range [a, a+n) (u64, u32) in the feedback ring (one
-/// invocation of the subgroup), kind as `C6_FB_ENTRIES` says. Call at an
-/// instruction's top level (it opens blocks).
-fn c6_report(tr: &mut T, a: Word, n: Word, kind: Word) -> R<()> {
-    let (u, u64t, b) = (tr.t.u32, tr.t.u64, tr.t.bool_);
-    tr.b.capability(spirv::Capability::GroupNonUniform);
-    let sg = tr.u(spirv::Scope::Subgroup as u32);
-    let el = e(tr.b.group_non_uniform_elect(b, None, sg))?;
-    tr.guarded(el, &mut |tr| {
-        let fb = c6_hdr64(tr, super::C6_HDR_FEEDBACK)?;
-        let p32 = tr.b.type_pointer(None, StorageClass::PhysicalStorageBuffer, u);
-        let cp = e(tr.b.convert_u_to_ptr(p32, None, fb))?;
-        let scope = tr.u(spirv::Scope::Device as u32);
-        let sem = tr.u(0);
-        let one = tr.u(1);
-        let idx = e(tr.b.atomic_i_add(u, None, cp, scope, sem, one))?;
-        // (A ring: the reader keeps its own cursor and counts what it lost.)
-        let cm = tr.u(super::C6_FB_ENTRIES - 1);
-        let slot = e(tr.b.bitwise_and(u, None, idx, cm))?;
-        let always = tr.b.constant_true(b);
-        tr.guarded(always, &mut |tr| {
-            let i64v = e(tr.b.u_convert(u64t, None, slot))?;
-            let four = tr.u64c(4);
-            let eo = e(tr.b.shift_left_logical(u64t, None, i64v, four))?;
-            let sixteen = tr.u64c(16);
-            let eo = e(tr.b.i_add(u64t, None, eo, sixteen))?;
-            let ea = e(tr.b.i_add(u64t, None, fb, eo))?;
-            let v4 = tr.t.v4u;
-            let ab = e(tr.b.bitcast(tr.t.v2u, None, a))?;
-            let alo = e(tr.b.composite_extract(u, None, ab, [0]))?;
-            let ahi = e(tr.b.composite_extract(u, None, ab, [1]))?;
-            let val = e(tr.b.composite_construct(v4, None, [alo, ahi, n, kind]))?;
-            let p4 = tr.b.type_pointer(None, StorageClass::PhysicalStorageBuffer, v4);
-            let ep = e(tr.b.convert_u_to_ptr(p4, None, ea))?;
-            let (ma, ops) = aligned(16);
-            ok(tr.b.store(ep, val, ma, ops))
-        })
-    })
-}
-
-/// C6: the device address of guest range [a, a+n) (u64 a, u32 n > 0) and
-/// whether it is readable there: the mirror where the resident set holds
-/// every granule of it, else guest memory through the page table when one
-/// import window holds the range in one piece (reported, kind 1), else the
-/// zero page (false; reported, kind 2). Outside the span: the zero page.
-/// Call at an instruction's top level (it opens blocks).
-fn c6_place(tr: &mut T, a: Word, n: Word) -> R<(Word, Word)> {
-    let (u, u64t, b) = (tr.t.u32, tr.t.u64, tr.t.bool_);
-    let n64 = e(tr.b.u_convert(u64t, None, n))?;
-    let lo_c = tr.u64c(super::PT_BASE);
-    let hi_c = tr.u64c(super::PT_END);
-    let end = e(tr.b.i_add(u64t, None, a, n64))?;
-    let ge = e(tr.b.u_greater_than_equal(b, None, a, lo_c))?;
-    let le = e(tr.b.u_less_than_equal(b, None, end, hi_c))?;
-    let inside = e(tr.b.logical_and(b, None, ge, le))?;
-    let rel = e(tr.b.i_sub(u64t, None, a, lo_c))?;
-    let z64 = tr.u64c(0);
-    let rel = e(tr.b.select(u64t, None, inside, rel, z64))?;
-    let one64 = tr.u64c(1);
-    let last = e(tr.b.i_add(u64t, None, rel, n64))?;
-    let last = e(tr.b.i_sub(u64t, None, last, one64))?;
-    let gs = tr.u64c(super::C6_GRANULE_SHIFT as u64);
-    let g0 = e(tr.b.shift_right_logical(u64t, None, rel, gs))?;
-    let g1 = e(tr.b.shift_right_logical(u64t, None, last, gs))?;
-    let g0 = e(tr.b.u_convert(u, None, g0))?;
-    let g1 = e(tr.b.u_convert(u, None, g1))?;
-    let res = c6_resident(tr, g0, g1)?;
-    let res = e(tr.b.logical_and(b, None, inside, res))?;
-    let mbase = c6_hdr64(tr, super::C6_HDR_MIRROR)?;
-    let mdev = e(tr.b.i_add(u64t, None, mbase, rel))?;
-    let zp = zero_page(tr)?;
-    let p64 = tr.b.type_pointer(None, StorageClass::Private, u64t);
-    let dv = tr.global_var(p64, StorageClass::Private);
-    let pb = tr.b.type_pointer(None, StorageClass::Private, b);
-    let okv = tr.global_var(pb, StorageClass::Private);
-    let first = e(tr.b.select(u64t, None, res, mdev, zp))?;
-    ok(tr.b.store(dv, first, None, []))?;
-    ok(tr.b.store(okv, res, None, []))?;
-    let nres = e(tr.b.logical_not(b, None, res))?;
-    let miss = e(tr.b.logical_and(b, None, inside, nres))?;
-    tr.guarded(miss, &mut |tr| {
-        let (e0, m0) = pt_translate(tr, a, None)?;
-        let la = e(tr.b.i_add(u64t, None, a, n64))?;
-        let la = e(tr.b.i_sub(u64t, None, la, one64))?;
-        let (e1, m1) = pt_translate(tr, la, None)?;
-        let d = e(tr.b.i_sub(u64t, None, e1, e0))?;
-        let nm1 = e(tr.b.i_sub(u64t, None, n64, one64))?;
-        let same = e(tr.b.i_equal(b, None, d, nm1))?;
-        let both = e(tr.b.logical_and(b, None, m0, m1))?;
-        let cont = e(tr.b.logical_and(b, None, both, same))?;
-        let dev = e(tr.b.select(u64t, None, cont, e0, zp))?;
-        ok(tr.b.store(dv, dev, None, []))?;
-        ok(tr.b.store(okv, cont, None, []))?;
-        let (k1, k2) = (tr.u(1), tr.u(2));
-        let kind = e(tr.b.select(u, None, cont, k1, k2))?;
-        c6_report(tr, a, n, kind)
-    })?;
-    let dev = e(tr.b.load(u64t, None, dv, None, []))?;
-    let okd = e(tr.b.load(b, None, okv, None, []))?;
-    Ok((dev, okd))
-}
-
 /// GPU-resolved chains: the device address of guest address `a` (u64)
 /// through the guest page table, and whether the table maps it (else the
 /// address is meaningless: callers use the zero page). `linear`: the
@@ -440,37 +284,6 @@ fn rt_ref(tr: &mut T, v: super::RtVsharp, off: Word, ty: Word, bytes: u32) -> R<
     let inr = e(tr.b.logical_and(b, None, fits, le))?;
     let o = e(tr.b.u_convert(u64t, None, off))?;
     let ga = e(tr.b.i_add(u64t, None, v.base, o))?;
-    if let Some((dev, okp, small)) = v.c6 {
-        // C6: from the range's placement, or (a range not placed whole)
-        // this access's own page through the page table.
-        let z = zero_page(tr)?;
-        let p64 = tr.b.type_pointer(None, StorageClass::Private, u64t);
-        let av = tr.global_var(p64, StorageClass::Private);
-        let pb = tr.b.type_pointer(None, StorageClass::Private, b);
-        let iv = tr.global_var(pb, StorageClass::Private);
-        let a1 = e(tr.b.i_add(u64t, None, dev, o))?;
-        let in1 = e(tr.b.logical_and(b, None, inr, okp))?;
-        let a1 = e(tr.b.select(u64t, None, in1, a1, z))?;
-        ok(tr.b.store(av, a1, None, []))?;
-        ok(tr.b.store(iv, in1, None, []))?;
-        let big = e(tr.b.logical_not(b, None, small))?;
-        tr.guarded(big, &mut |tr| {
-            // (Each access on its own: the mirror where the resident set
-            // holds its granule, else guest memory through the page table,
-            // reported.)
-            let nbytes = tr.u(bytes);
-            let (d2, m2) = c6_place(tr, ga, nbytes)?;
-            let in2 = e(tr.b.logical_and(b, None, inr, m2))?;
-            let a2 = e(tr.b.select(u64t, None, in2, d2, z))?;
-            ok(tr.b.store(av, a2, None, []))?;
-            ok(tr.b.store(iv, in2, None, []))
-        })?;
-        let a = e(tr.b.load(u64t, None, av, None, []))?;
-        let inr = e(tr.b.load(b, None, iv, None, []))?;
-        let pt = tr.b.type_pointer(None, StorageClass::PhysicalStorageBuffer, ty);
-        let p = e(tr.b.convert_u_to_ptr(pt, None, a))?;
-        return Ok((p, inr));
-    }
     let (dev, mapped) = pt_translate(tr, ga, Some(v.r))?;
     let inr = e(tr.b.logical_and(b, None, inr, mapped))?;
     let z = zero_page(tr)?;
@@ -518,23 +331,7 @@ fn rt_vsharp(tr: &mut T, r: usize, sr: u32) -> R<super::RtVsharp> {
     let extent = e(tr.b.select(u, None, structured, bytes, w2))?;
     let extent = e(tr.b.i_add(u, None, extent, bias))?;
     let range = e(tr.b.select(u, None, unchecked, all, extent))?;
-    // C6: the range placed once for the instruction when it is checked and
-    // at most 8 MiB (the resident set's check reads a few words); else each
-    // access goes through the page table (`rt_ref`).
-    let c6 = if tr.spec.c6 {
-        let cap = tr.u(8 << 20);
-        let le = e(tr.b.u_less_than_equal(b, None, range, cap))?;
-        let nz = e(tr.b.u_greater_than(b, None, range, z))?;
-        let checked = e(tr.b.logical_not(b, None, unchecked))?;
-        let small = e(tr.b.logical_and(b, None, le, nz))?;
-        let small = e(tr.b.logical_and(b, None, small, checked))?;
-        let n = e(tr.b.select(u, None, small, range, one))?;
-        let (dev, okp) = c6_place(tr, base, n)?;
-        Some((dev, okp, small))
-    } else {
-        None
-    };
-    Ok(super::RtVsharp { r, base, bias, stride, limit, range, c6 })
+    Ok(super::RtVsharp { r, base, bias, stride, limit, range })
 }
 
 /// GPU-resolved chains: counts a read through a page the table does not
@@ -574,9 +371,8 @@ fn report_miss(tr: &mut T, miss: Word, guest: Word) -> R<()> {
 /// A GPU-resolved resource's first byte through the page table: a read of
 /// its range would miss when the table does not map the page (counted).
 fn check_rt_base(tr: &mut T, v: super::RtVsharp) -> R<()> {
-    // (Read from the mirror: no table entry to miss, `Spec::pt_linear`;
-    // C6 reports its own misses.)
-    if tr.spec.pt_linear || tr.spec.c6 {
+    // (Read from the mirror: no table entry to miss, `Spec::pt_linear`.)
+    if tr.spec.pt_linear {
         return Ok(());
     }
     let (u, b) = (tr.t.u32, tr.t.bool_);
@@ -615,25 +411,6 @@ fn gpu_smem(tr: &mut T, ins: &Inst, d: u32, n: u32) -> R<()> {
     }
     let am = tr.u64c(!3u64);
     let a = e(tr.b.bitwise_and(u64t, None, a, am))?;
-    // C6: the mirror where the resident set holds the words, else guest
-    // memory through the page table (in one piece: `c6_place`).
-    if tr.spec.c6 {
-        let nb = tr.u(4 * n);
-        let (dev, okp) = c6_place(tr, a, nb)?;
-        let zero = tr.u(0);
-        for j in 0..n {
-            let o = tr.u64c(4 * j as u64);
-            let dj = e(tr.b.i_add(u64t, None, dev, o))?;
-            let pty = tr.b.type_pointer(None, StorageClass::PhysicalStorageBuffer, u);
-            let p = e(tr.b.convert_u_to_ptr(pty, None, dj))?;
-            let (ma, ops) = aligned(4);
-            let v = e(tr.b.load(u, None, p, ma, ops))?;
-            let v = e(tr.b.select(u, None, okp, v, zero))?;
-            tr.set_sreg(d + j, v)?;
-        }
-        let _ = b;
-        return Ok(());
-    }
     let (dev0, ok0) = pt_translate(tr, a, None)?;
     let (dev1, ok1) = if n > 1 {
         let last = tr.u64c(4 * (n as u64 - 1));
@@ -818,8 +595,9 @@ fn load_dwords(tr: &mut T, var: Word, addr: Word, n: u32, bytes: bool) -> R<Vec<
     ok(tr.b.branch(merge))?;
     e(tr.b.begin_block(Some(else_b)))?;
     let vs = scalar(tr)?;
-    // (The scalar path may open blocks: front end 3's C6 checks of each
-    // access. It ends in the block being emitted now.)
+    // (The scalar path may open blocks: it ends in the block being emitted
+    // now, which the phi names; an invalid phi crashed the driver's
+    // compiler, 2026-11-10.)
     let else_end = tr.current_label()?;
     ok(tr.b.branch(merge))?;
     e(tr.b.begin_block(Some(merge)))?;

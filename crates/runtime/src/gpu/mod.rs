@@ -30,7 +30,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 168] = [
+    static ALL: [Tunable; 166] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -197,8 +197,6 @@ pub mod tune {
         Tunable { name: "wb_probe_site", env: "DS_WB_PROBE_SITE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "unb_bound", env: "DS_UNB_BOUND", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "kco", env: "DS_KCO", default: 0, value: AtomicU64::new(UNSET) },
-        Tunable { name: "cold_arm", env: "DS_COLD_ARM", default: 0, value: AtomicU64::new(UNSET) },
-        Tunable { name: "c6", env: "DS_C6_STAGES", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1705,27 +1703,6 @@ pub mod tune {
         get(165) != 0
     }
 
-    /// `kco`'s mode: 1 the census, 2 the coherence service (front end 3's
-    /// C6: passes publish what they took, and front end 2's checks inside a
-    /// pass newer than the epoch they want take nothing).
-    pub fn kco_mode() -> u64 {
-        get(165)
-    }
-
-    /// Front end 3's cold armer (`fe2::arm_cold`): every 2 s, valid pages
-    /// outside the GPU arena not armed whose last CPU write found is at least
-    /// this many flips old (0: off) are armed and taken, so the coherence
-    /// pass need scan only the arena.
-    pub fn cold_arm() -> u64 {
-        get(166)
-    }
-
-    /// Front end 3's C6 for new preparations (with `DS_C6=1`): 0 resolves
-    /// every stage on the CPU again (in-run A/Bs; the resident set stays).
-    pub fn c6() -> bool {
-        get(167) != 0
-    }
-
     /// Pixel programs that write no memory run their depth and stencil
     /// tests before the shader where the draw's state lets them (no kill,
     /// coverage or depth export, or no depth and stencil writes:
@@ -1891,7 +1868,6 @@ pub mod prio;
 pub mod precache;
 pub mod fe2;
 pub mod kco;
-pub mod c6;
 pub mod fe2census;
 pub mod precompile;
 pub mod pipeuse;
@@ -3050,7 +3026,6 @@ pub fn reset_profile() {
     pm4_census_reset();
     fe3_probe::reset();
     kco::reset();
-    c6::reset();
     if let Some(m) = PROFILE.lock().as_mut() {
         m.clear();
     }

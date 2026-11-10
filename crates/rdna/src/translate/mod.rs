@@ -453,32 +453,7 @@ pub struct Spec {
     /// addresses outside the span read 0, and their reads are not counted.
     /// GPU-resolved loads still go through the page table.
     pub pt_linear: bool,
-    /// Front end 3's C6 (needs `addresses`): GPU-resolved loads and buffers
-    /// read the mirror (the address block's header dwords 4-5: the device
-    /// address of guest PT_BASE in it) where the resident set says it holds
-    /// guest memory (header dwords 6-7: a bit per 64 KiB granule of the
-    /// span, `C6_*`), else guest memory through the page table, reporting
-    /// the range in the feedback ring (header dwords 8-9) so the runtime
-    /// makes it resident for later batches. Ranges over more than
-    /// `C6_MAX_WORDS` words of granules always go through the page table.
-    pub c6: bool,
 }
-
-/// C6's resident set: a bit per 64 KiB granule of [PT_BASE, PT_END).
-pub const C6_GRANULE_SHIFT: u32 = 16;
-pub const C6_RES_WORDS: u64 = (PT_END - PT_BASE) >> C6_GRANULE_SHIFT >> 5;
-/// Granule words one check reads at most (4: ranges up to 4-8 MiB).
-pub const C6_MAX_WORDS: u32 = 4;
-/// C6's feedback ring: word 0 the entries written (may exceed the
-/// capacity: those past it are lost), entries of 4 words from word 4
-/// (guest address low, high, bytes, kind: 1 read through the page table, 2
-/// no import window holds it whole (read 0), 3 outside the span).
-pub const C6_FB_ENTRIES: u32 = 8192;
-pub const C6_FB_BYTES: u64 = 16 + 16 * C6_FB_ENTRIES as u64;
-/// The address block's header dwords C6 uses.
-pub const C6_HDR_MIRROR: u32 = 4;
-pub const C6_HDR_RES: u32 = 6;
-pub const C6_HDR_FEEDBACK: u32 = 8;
 
 /// The guest page table of GPU-resolved chains (`Spec::gpu_loads`,
 /// `gpu_res`): per 4 KiB page of [PT_BASE, PT_END) a u64, the device address
@@ -608,9 +583,6 @@ impl std::hash::Hash for Spec {
             self.gpu_res.hash(state);
             if self.pt_linear {
                 0x4C49_4E52u32.hash(state);
-            }
-            if self.c6 {
-                0x4336_5245u32.hash(state);
             }
         }
         if self.sg_appends {
@@ -841,9 +813,8 @@ pub fn table_slot(plan: &Plan, r: usize) -> u32 {
 pub const ADDR_INFO_DWORDS: u32 = 4;
 /// Dwords before the resources' entries in the address block: the zero
 /// page's address (low, high; out-of-range reads load from it), the page
-/// table's, then C6's (`Spec::c6`): the mirror's device address of guest
-/// PT_BASE, the resident set's, the feedback ring's.
-pub const ADDR_HEADER_DWORDS: u32 = 10;
+/// table's.
+pub const ADDR_HEADER_DWORDS: u32 = 4;
 
 /// Dword offset of the address block in the SGPR data buffer, after the
 /// image tables' LOD information (the earlier layout ended there).
@@ -1090,11 +1061,6 @@ pub(crate) struct RtVsharp {
     pub stride: Word,
     pub limit: Word,
     pub range: Word,
-    /// C6 (`Spec::c6`): the device address of `base` for the whole range
-    /// (`c6_place`), whether it is readable there, and whether the range is
-    /// placed whole (checked and at most 8 MiB; else each access goes
-    /// through the page table).
-    pub c6: Option<(Word, Word, Word)>,
 }
 
 pub type R<T> = Result<T, String>;
@@ -1201,7 +1167,7 @@ impl<'a> T<'a> {
         false
     }
     /// The label of the block being emitted (a phi's predecessor after code
-    /// that may have opened blocks, e.g. front end 3's C6 checks).
+    /// that may have opened blocks).
     pub fn current_label(&self) -> R<Word> {
         let (f, bi) = self.b.selected_function().zip(self.b.selected_block()).ok_or("no block being emitted")?;
         self.b.module_ref().functions[f].blocks[bi].label.as_ref().and_then(|l| l.result_id).ok_or_else(|| "a block without its label".into())
@@ -4184,7 +4150,6 @@ mod tests {
             gpu_loads: 0,
             gpu_res: 0,
             pt_linear: false,
-            c6: false,
         }
     }
 

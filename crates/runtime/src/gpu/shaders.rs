@@ -1658,7 +1658,6 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
         gpu_loads: 0,
         gpu_res: 0,
         pt_linear: false,
-        c6: false,
     };
     if super::tune::per_lane() != 0 && per_lane_program(code_hash) {
         let votes = lane_votes_program(code_hash);
@@ -1686,7 +1685,6 @@ pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prep
             spec.pt_linear = super::fe2::on();
         }
     }
-    c6_ask(&mut spec, code_hash);
     prep_lap(2);
     let r = prepare(addr, insts, code_hash, &user, &mut spec);
     spec_vecs_back(spec);
@@ -2026,7 +2024,6 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         gpu_loads: 0,
         gpu_res: 0,
         pt_linear: false,
-        c6: false,
     };
     if spec.batched {
         if let Some((l, r)) = gpu_draw_masks_now(1) {
@@ -2035,7 +2032,6 @@ pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
             spec.pt_linear = super::fe2::on();
         }
     }
-    c6_ask(&mut spec, code_hash);
     // LOD statistics where the depth tests stay after the shader (`tune
     // lod_late`): in rotation only for a draw measuring (`with_lod_stats`)
     // or batched; none at 0 (diagnosis).
@@ -2234,7 +2230,6 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
         gpu_loads: 0,
         gpu_res: 0,
         pt_linear: false,
-        c6: false,
     };
     if spec.batched {
         if let Some((l, r)) = gpu_draw_masks_now(0) {
@@ -2243,7 +2238,6 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
             spec.pt_linear = super::fe2::on();
         }
     }
-    c6_ask(&mut spec, code_hash);
     prep_lap(2);
     let r = prepare(addr, insts, code_hash, &user, &mut spec);
     spec_vecs_back(spec);
@@ -3083,7 +3077,6 @@ pub(crate) fn vertex_spec(addr: u64, user_sgprs: u16, wave64: bool, base_instanc
         gpu_loads: 0,
         gpu_res: 0,
         pt_linear: false,
-        c6: false,
     })
 }
 
@@ -3140,7 +3133,6 @@ pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr
         gpu_loads: 0,
         gpu_res: 0,
         pt_linear: false,
-        c6: false,
     }
 }
 
@@ -3215,7 +3207,6 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         gpu_loads: 0,
         gpu_res: 0,
         pt_linear: false,
-        c6: false,
     };
     if super::tune::per_lane() != 0 && per_lane_program(code_hash) {
         let votes = lane_votes_program(code_hash);
@@ -3227,41 +3218,6 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
     spec.sg_appends = append_program(code_hash);
     spec
 }
-/// Front end 3's C6 (`c6`): asks for the shader to resolve its read-only
-/// buffers and its scalar loads itself (`c6_masks` decides in `prepare`,
-/// from the plan), unless another form already resolves some on the GPU
-/// (`gpures`) or a diagnosis reads the program's registers.
-fn c6_ask(spec: &mut Spec, code_hash: u64) {
-    // (Not batched programs, whose runs share one recording of their
-    // bindings, nor the copy kernel, whose forwarding reads its resolved
-    // buffers on the CPU.)
-    if spec.batched || (spec.stage == Stage::Compute && super::forward::is_copy(code_hash)) {
-        return;
-    }
-    if super::c6::on() && super::tune::c6() && super::c6::stage_wanted(spec.stage) && spec.gpu_loads == 0 && spec.gpu_res == 0 && spec.probe.is_none() && spec.dump.is_none() && NO_C6.with(|c| !c.get()) {
-        spec.c6 = true;
-    }
-}
-
-thread_local! {
-    /// Preparations on this thread resolve on the CPU (`c6_ask`; a command
-    /// the CPU must resolve whole, e.g. a check's second preparation).
-    pub static NO_C6: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// C6's masks for a plan (`Spec::gpu_loads`, `gpu_res`): every scalar load,
-/// every read-only buffer. The shader takes a buffer's V# from the
-/// registers its instruction reads when it runs, so its chain's form in the
-/// analysis does not matter. None: more than 64 loads or resources.
-fn c6_masks(plan: &rdna::analysis::Plan) -> Option<(u64, u64)> {
-    if plan.loads.len() > 64 || plan.resources.len() > 64 {
-        return None;
-    }
-    let loads = if plan.loads.len() == 64 { u64::MAX } else { (1u64 << plan.loads.len()) - 1 };
-    let res = plan.resources.iter().enumerate().filter(|(_, r)| r.kind == ResKind::Buffer && !r.written).fold(0u64, |m, (i, _)| m | 1 << i);
-    Some((loads, res))
-}
-
 fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: &[u32], spec: &mut Spec) -> Result<Prepared, String> {
     // Diagnostics (DS_PROFILE_GPU with DS_PROFILE_REPEATS=1: hashing every
     // word read and a global set per preparation inflate the prepare times
@@ -3304,18 +3260,6 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
     if !plan.errors.is_empty() {
         return Err(format!("{:?} shader {addr:#x}: {}", spec.stage, plan.errors.join("; ")));
     }
-    // C6: the shader resolves its read-only buffers and loads (device
-    // addresses for every buffer then).
-    if spec.c6 {
-        match c6_masks(&plan) {
-            Some((l, r)) if l != 0 || r != 0 => {
-                spec.gpu_loads = l;
-                spec.gpu_res = r;
-                spec.addresses = true;
-            }
-            _ => spec.c6 = false,
-        }
-    }
     prep_lap(3);
     prep_lap(4);
     let map_gen = crate::mem::MAP_GEN.load(std::sync::atomic::Ordering::Acquire);
@@ -3331,14 +3275,6 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
     // `fmt_run_time` while their translation is missing.
     let mut specialized = 0u64;
     for (i, res) in plan.resources.iter().enumerate() {
-        // C6: resolved by the shader (its format read when it runs).
-        if spec.c6 && i < 64 && spec.gpu_res & (1u64 << i) != 0 {
-            res_addrs.push(None);
-            let fmt = if fmt_mask & (1 << i.min(63)) != 0 { translate::FORMAT_RT } else { 0 };
-            spec.resources.push(ResSpec::Buffer { format: fmt, dst_sel: 0 });
-            resources.push(Resolved::Buffer(Vsharp::decode(&[0; 4])));
-            continue;
-        }
         let mut w = [0u32; 8];
         let src = match res.dwords.first() {
             Some(Prov::Mem(ptr, off)) => rd.chain(plan.chain_ids.get(plan.loads.len() + i).copied().unwrap_or(u32::MAX), ptr, user).map(|b| b + *off as u64),
@@ -3579,12 +3515,6 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
     sgpr_data.resize(translate::SGPR_DATA_USER as usize, 0);
     let mut data_loads = pool::loads(tr.plan.load_data.iter().filter(|&&d| d).count());
     for (j, l) in tr.plan.loads.iter().enumerate() {
-        // (C6: loaded by the shader.)
-        if tr.spec.c6 && j < 64 && tr.spec.gpu_loads & (1u64 << j) != 0 {
-            let start = sgpr_data.len();
-            sgpr_data.resize(start + l.dwords as usize, 0);
-            continue;
-        }
         let base = rd.chain(tr.plan.chain_ids.get(j).copied().unwrap_or(u32::MAX), &l.ptr, user);
         let start = sgpr_data.len();
         sgpr_data.resize(start + l.dwords as usize, 0);
