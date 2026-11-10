@@ -1065,6 +1065,7 @@ pub fn reset() {
     *UP_BY_PROG.lock() = None;
     alloc_census_reset();
     heap_census_reset();
+    hold_recs_reset();
     rb_census_reset();
     let f = crate::gpu::FRAMES.load(Ordering::Relaxed);
     CENSUS_FLIP0.store(if census_on() { f + 1 } else { 0 }, Ordering::Relaxed);
@@ -1073,7 +1074,7 @@ pub fn reset() {
 
 /// `engine report` (control): the census and the bounds' line.
 pub fn report() -> String {
-    census_line() + &bound_line() + &scan_line() + &crate::gpu::fe2::hot_by_owner(2) + &crate::gpu::fe2::hot_by_owner(16) + &alloc_census_lines() + &heap_census_lines() + &rb_census_line()
+    census_line() + &bound_line() + &scan_line() + &crate::gpu::fe2::hot_by_owner(2) + &crate::gpu::fe2::hot_by_owner(16) + &alloc_census_lines() + &heap_census_lines() + &rb_census_line() + &hold_recs_line() + &wb_sites_line()
 }
 
 /// The allocation table's and the bounds' status line (per flip).
@@ -1670,4 +1671,233 @@ fn rb_census_reset() {
     if let Some(m) = RB_CENSUS.lock().as_mut() {
         m.clear();
     }
+}
+
+// ---------------------------------------------------------------------------
+// The hold census by engine allocation (`DS_FE2_HOLD=1`; FRONTEND4.md C4):
+// GPU-written pages held no-access and the CPU accesses that faulted on
+// them, per page allocator record (`record_of`): which GPU-written blocks
+// the CPU never touches (C4's candidates for no write-back).
+// ---------------------------------------------------------------------------
+
+/// (record start, end, allocator ID) -> [pages held, title reads, title
+/// writes, our reads and writes, other code's, pages written back summed
+/// over the census's 500 ms periods, periods] since the last reset.
+static HOLD_RECS: parking_lot::Mutex<Option<std::collections::HashMap<(u64, u64, u8), [u64; 7]>>> = parking_lot::Mutex::new(None);
+/// The census's 500 ms periods since the last reset.
+static HOLD_PERIODS: AtomicU64 = AtomicU64::new(0);
+
+/// The census's key for `page`: its record, or (0, 0, owner) outside them.
+pub fn record_key(page: u64) -> (u64, u64, u8) {
+    record_of(page).unwrap_or((0, 0, owner(page)))
+}
+
+/// Pages of a held run (`fe2::hold_part`).
+pub fn note_held_record(page: u64, n: u64) {
+    let k = record_key(page);
+    HOLD_RECS.lock().get_or_insert_with(Default::default).entry(k).or_insert([0; 7])[0] += n;
+}
+
+/// A fault on a held page: origin 0 the title, 1 ours, 2 other code.
+pub fn note_hold_fault_record(page: u64, origin: usize, write: bool) {
+    let k = record_key(page);
+    let i = match (origin, write) {
+        (0, false) => 1,
+        (0, true) => 2,
+        (1, _) => 3,
+        _ => 4,
+    };
+    HOLD_RECS.lock().get_or_insert_with(Default::default).entry(k).or_insert([0; 7])[i] += 1;
+}
+
+/// One 500 ms period of the hold census: pages written back by record.
+pub fn note_wb_period(by_rec: std::collections::HashMap<(u64, u64, u8), u64>) {
+    HOLD_PERIODS.fetch_add(1, Ordering::Relaxed);
+    let mut g = HOLD_RECS.lock();
+    let m = g.get_or_insert_with(Default::default);
+    for (k, n) in by_rec {
+        let e = m.entry(k).or_insert([0; 7]);
+        e[5] += n;
+        e[6] += 1;
+    }
+}
+
+/// The census's line (`engine report`; "" without holds).
+fn hold_recs_line() -> String {
+    let g = HOLD_RECS.lock();
+    let Some(m) = g.as_ref() else { return String::new() };
+    if m.is_empty() {
+        return String::new();
+    }
+    let names = names();
+    let periods = HOLD_PERIODS.load(Ordering::Relaxed).max(1);
+    let total: u64 = m.values().map(|c| c[5]).sum();
+    let mut v: Vec<(&(u64, u64, u8), &[u64; 7])> = m.iter().collect();
+    v.sort_by(|a, b| b.1[5].cmp(&a.1[5]).then(b.1[0].cmp(&a.1[0])));
+    let parts: Vec<String> = v
+        .iter()
+        .take(30)
+        .map(|((s, e, id), c)| {
+            format!(
+                "{s:#x}+{:#x} ({} {}): written back {:.0} pages a period ({:.1}%, in {} of {periods}), held {} pages, faults: title reads {} writes {}, ours {}, other {}",
+                e - s,
+                id,
+                names.get(id).map(String::as_str).unwrap_or("?"),
+                c[5] as f64 / periods as f64,
+                100.0 * c[5] as f64 / total.max(1) as f64,
+                c[6],
+                c[0],
+                c[1],
+                c[2],
+                c[3],
+                c[4]
+            )
+        })
+        .collect();
+    format!("    hold census by engine allocation ({periods} periods of 500 ms, {:.0} pages written back a period): {}\n", total as f64 / periods as f64, parts.join("; "))
+}
+
+fn hold_recs_reset() {
+    if let Some(m) = HOLD_RECS.lock().as_mut() {
+        m.clear();
+    }
+    HOLD_PERIODS.store(0, Ordering::Relaxed);
+    if let Some(m) = WB_SITES.lock().as_mut() {
+        m.clear();
+    }
+}
+
+/// The hold census's written-back pages by allocation call site
+/// (`DS_ALLOC_CENSUS`: the GPU arena's frame allocations, the latest of the
+/// last 8 flips over the page; `DS_HEAP_CENSUS`: the heaps' live blocks):
+/// (0 the arena, 1 a heap; site) -> pages summed over the periods.
+static WB_SITES: parking_lot::Mutex<Option<std::collections::HashMap<(u8, u32), u64>>> = parking_lot::Mutex::new(None);
+
+/// One period's written-back pages with their record's allocator ID.
+pub fn note_wb_sites(pages: &[(u64, u8)]) {
+    if !alloc_census_on() && !heap_census_on() {
+        return;
+    }
+    let arena = arena_owner();
+    let mut out: std::collections::HashMap<(u8, u32), u64> = std::collections::HashMap::new();
+    if alloc_census_on() && arena != 0 {
+        let mut ap: Vec<u64> = pages.iter().filter(|p| p.1 == arena).map(|p| p.0).collect();
+        ap.sort_unstable();
+        let now = crate::gpu::FRAMES.load(Ordering::Relaxed) as u32;
+        // (Newest first: a page goes to the latest allocation over it.)
+        let recs: Vec<AllocRec> = ALLOC_CENSUS.lock().as_ref().map(|c| c.log.iter().rev().take_while(|a| now.wrapping_sub(a.flip) <= 8).copied().collect()).unwrap_or_default();
+        let mut got: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        for a in &recs {
+            let lo = a.start & !4095;
+            let i = ap.partition_point(|&p| p < lo);
+            for &p in ap[i..].iter().take_while(|&&p| p < a.end) {
+                got.entry(p).or_insert(a.site);
+            }
+        }
+        let none = ap.len() as u64 - got.len() as u64;
+        for (_, s) in got {
+            *out.entry((0, s)).or_insert(0) += 1;
+        }
+        if none > 0 {
+            *out.entry((0, u32::MAX)).or_insert(0) += none;
+        }
+    }
+    if heap_census_on() {
+        let g = HEAP_CENSUS.lock();
+        if let Some(c) = g.as_ref() {
+            for &(p, id) in pages {
+                if !c.owners.contains(&id) {
+                    continue;
+                }
+                let site = c.live.range(..=p).next_back().filter(|(_, v)| v.0 > p).map(|(_, v)| v.1).or_else(|| c.live.range(p..p + 4096).next().map(|(_, v)| v.1));
+                *out.entry((1, site.unwrap_or(u32::MAX))).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut g = WB_SITES.lock();
+    let m = g.get_or_insert_with(Default::default);
+    for (k, n) in out {
+        *m.entry(k).or_insert(0) += n;
+    }
+}
+
+/// The written-back pages by call site (`engine report`; "" without them).
+fn wb_sites_line() -> String {
+    let g = WB_SITES.lock();
+    let Some(m) = g.as_ref() else { return String::new() };
+    if m.is_empty() {
+        return String::new();
+    }
+    let periods = HOLD_PERIODS.load(Ordering::Relaxed).max(1) as f64;
+    let mut v: Vec<((u8, u32), u64)> = m.iter().map(|(k, n)| (*k, *n)).collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    let arena_sites: Vec<[u64; 5]> = ALLOC_CENSUS.lock().as_ref().map(|c| c.sites.clone()).unwrap_or_default();
+    let heap_sites: Vec<[u64; 5]> = HEAP_CENSUS.lock().as_ref().map(|c| c.sites.clone()).unwrap_or_default();
+    let name = |kind: u8, s: u32| -> String {
+        let sites = if kind == 0 { &arena_sites } else { &heap_sites };
+        match sites.get(s as usize) {
+            Some(k) => format!("{} [{:#x}] {}", if kind == 0 { "arena" } else { "heap" }, k[4], k[..4].iter().filter(|&&a| a != 0).map(|&a| eboot_off(a)).collect::<Vec<_>>().join(" <- ")),
+            None => format!("{} (no recorded allocation)", if kind == 0 { "arena" } else { "heap" }),
+        }
+    };
+    let parts: Vec<String> = v.iter().take(30).map(|((k, s), n)| format!("{}: {:.0}", name(*k, *s), *n as f64 / periods)).collect();
+    format!("    hold census: written-back pages a period by call site: {}\n", parts.join("; "))
+}
+
+/// Weighted pages (page, its record's allocator ID, weight) summed by the
+/// allocation call site holding each page, as `note_wb_sites` attributes
+/// them (`DS_ALLOC_CENSUS`, `DS_HEAP_CENSUS`): the `n` largest, formatted
+/// with `per` (a divisor) and the total's share.
+pub fn sites_weighted(items: &[(u64, u8, u64)], n: usize, per: f64) -> String {
+    if !alloc_census_on() && !heap_census_on() {
+        return String::new();
+    }
+    let arena = arena_owner();
+    let total: u64 = items.iter().map(|x| x.2).sum();
+    let mut out: std::collections::HashMap<(u8, u32), u64> = std::collections::HashMap::new();
+    if alloc_census_on() && arena != 0 {
+        let mut ap: Vec<(u64, u64)> = items.iter().filter(|x| x.1 == arena).map(|x| (x.0, x.2)).collect();
+        ap.sort_unstable();
+        let now = crate::gpu::FRAMES.load(Ordering::Relaxed) as u32;
+        let recs: Vec<AllocRec> = ALLOC_CENSUS.lock().as_ref().map(|c| c.log.iter().rev().take_while(|a| now.wrapping_sub(a.flip) <= 8).copied().collect()).unwrap_or_default();
+        let mut got: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        for a in &recs {
+            let lo = a.start & !4095;
+            let i = ap.partition_point(|x| x.0 < lo);
+            for x in ap[i..].iter().take_while(|x| x.0 < a.end) {
+                got.entry(x.0).or_insert(a.site);
+            }
+        }
+        for &(p, w) in &ap {
+            *out.entry((0, got.get(&p).copied().unwrap_or(u32::MAX))).or_insert(0) += w;
+        }
+    }
+    if heap_census_on() {
+        let g = HEAP_CENSUS.lock();
+        if let Some(c) = g.as_ref() {
+            for &(p, id, w) in items {
+                if !c.owners.contains(&id) {
+                    continue;
+                }
+                let site = c.live.range(..=p).next_back().filter(|(_, v)| v.0 > p).map(|(_, v)| v.1).or_else(|| c.live.range(p..p + 4096).next().map(|(_, v)| v.1));
+                *out.entry((1, site.unwrap_or(u32::MAX))).or_insert(0) += w;
+            }
+        }
+    }
+    let mut v: Vec<((u8, u32), u64)> = out.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    let arena_sites: Vec<[u64; 5]> = ALLOC_CENSUS.lock().as_ref().map(|c| c.sites.clone()).unwrap_or_default();
+    let heap_sites: Vec<[u64; 5]> = HEAP_CENSUS.lock().as_ref().map(|c| c.sites.clone()).unwrap_or_default();
+    v.iter()
+        .take(n)
+        .map(|((kind, s), w)| {
+            let sites = if *kind == 0 { &arena_sites } else { &heap_sites };
+            let name = match sites.get(*s as usize) {
+                Some(k) => format!("{} [{:#x}] {}", if *kind == 0 { "arena" } else { "heap" }, k[4], k[..4].iter().filter(|&&a| a != 0).map(|&a| eboot_off(a)).collect::<Vec<_>>().join(" <- ")),
+                None => format!("{} (no recorded allocation)", if *kind == 0 { "arena" } else { "heap" }),
+            };
+            format!("{name}: {:.3} M ({:.1}%)", *w as f64 / per / 1e6, 100.0 * *w as f64 / total.max(1) as f64)
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }

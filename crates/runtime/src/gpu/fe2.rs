@@ -3285,7 +3285,11 @@ fn arm_part(x: u64, y: u64, frame: u64) {
 /// census's map), the others armed against writes, run by run.
 fn hold_part(x: u64, y: u64) {
     // (0: not GPU-written, armed; 1: GPU-written and written back lately,
-    // held; 2: GPU-written, not written back lately, left alone.)
+    // held; 2: GPU-written, not written back lately, left alone. Since GPU-
+    // written pages are armed (`arm_gpu`, 2026-11-05) the placement check
+    // sets no GPU-written bits, so nothing is held: taking every page
+    // written back lately instead held label pages the GPU writes in place
+    // and lost a label (2026-11-10, run -002728: a 3 s wait, stopped).)
     let frame = super::FRAMES.load(Ordering::Relaxed);
     let quiet = hold_quiet();
     let kind = |p: u64| -> u8 {
@@ -3349,6 +3353,7 @@ fn hold_part(x: u64, y: u64) {
             HOLD[H_RUNS].fetch_add(1, Ordering::Relaxed);
             HOLD[H_HELD_NOW].fetch_add(n, Ordering::Relaxed);
             crate::engine::note_value(crate::engine::C_HELD, p, n);
+            crate::engine::note_held_record(p, n);
         }
         STATS[S_ARMED].fetch_add((q - p) / PAGE, Ordering::Relaxed);
         p = q;
@@ -3941,6 +3946,10 @@ fn hold_thread() {
             continue;
         }
         let mut n = 0u64;
+        // (This period's written-back pages by engine allocation, and the
+        // pages with their allocator for the census by call site.)
+        let mut by_rec: std::collections::HashMap<(u64, u64, u8), u64> = std::collections::HashMap::new();
+        let mut wb_pages: Vec<(u64, u8)> = Vec::new();
         for i in 0..HELD_MAP_WORDS {
             let mut cur = 0u32;
             for k in 0..maps.len() {
@@ -3950,7 +3959,18 @@ fn hold_thread() {
             recent[i].store(v, Ordering::Relaxed);
             n += v.count_ones() as u64;
             prev[i] = cur;
+            let mut r = cur;
+            while r != 0 {
+                let b = r.trailing_zeros() as u64;
+                r &= r - 1;
+                let page = MIRROR_BASE + (i as u64 * 32 + b) * PAGE;
+                let k = crate::engine::record_key(page);
+                *by_rec.entry(k).or_insert(0) += 1;
+                wb_pages.push((page, k.2));
+            }
         }
+        crate::engine::note_wb_period(by_rec);
+        crate::engine::note_wb_sites(&wb_pages);
         WB_RECENT_PAGES.store(n, Ordering::Relaxed);
     }
 }
@@ -3988,6 +4008,7 @@ fn note_hold_fault(page: u64, write: bool, rip: u64) {
     };
     let n = HOLD[H_FAULTS + 2 * origin + write as usize].fetch_add(1, Ordering::Relaxed);
     HOLD[H_HELD_NOW].fetch_sub(1, Ordering::Relaxed);
+    crate::engine::note_hold_fault_record(page, origin, write);
     if origin == 0 {
         crate::engine::note_count(if write { crate::engine::C_HOLD_TW } else { crate::engine::C_HOLD_TR }, page);
     }
@@ -4300,8 +4321,11 @@ fn wb_buckets_line() -> String {
     // Classes: neither, read by a CP, CPU-written, both: [buckets, dwords, pages].
     let mut cls = [[0u64; 3]; 4];
     let mut quiet: Vec<(u64, u32)> = Vec::new();
-    // (By the engine allocator owning the bucket's MiB: `engine::owner`.)
+    // (By the engine allocator owning the bucket's MiB: `engine::owner`;
+    // and by the page allocator's record holding the bucket's first page.)
     let mut by_owner = [[0u64; 2]; 256];
+    let mut by_rec: std::collections::HashMap<(u64, u64, u8), [u64; 2]> = std::collections::HashMap::new();
+    let mut weighted: Vec<(u64, u8, u64)> = Vec::new();
     let (mut cpu_pages_mixed, mut pages_mixed) = (0u64, 0u64);
     for k in 0..nb {
         let (dw, pg) = (gpu[k], gpu[nb + k]);
@@ -4314,6 +4338,11 @@ fn wb_buckets_line() -> String {
         let id = crate::engine::owner(MIRROR_BASE + ((k as u64) << (rdna::kernels::WB_BUCKET_SHIFT + 12))) as usize;
         by_owner[id][0] += dw;
         by_owner[id][1] += pg;
+        let key = crate::engine::record_key(MIRROR_BASE + ((k as u64) << (rdna::kernels::WB_BUCKET_SHIFT + 12)));
+        let r = by_rec.entry(key).or_default();
+        r[0] += dw;
+        r[1] += pg;
+        weighted.push((MIRROR_BASE + ((k as u64) << (rdna::kernels::WB_BUCKET_SHIFT + 12)), key.2, dw));
         cls[ci][0] += 1;
         cls[ci][1] += dw;
         cls[ci][2] += pg;
@@ -4352,6 +4381,16 @@ fn wb_buckets_line() -> String {
     owners.sort_by(|a, b| b.1[0].cmp(&a.1[0]));
     let owners: Vec<String> = owners.iter().map(|(id, x)| format!("{id} {}: {:.2} M dwords ({:.0}%), {:.0} pages a flip", anames.get(&(*id as u8)).map_or("none", |s| s.as_str()), x[0] as f64 / flips / 1e6, 100.0 * x[0] as f64 / dw_all.max(1) as f64, x[1] as f64 / flips)).collect();
     let owners = if owners.is_empty() { String::new() } else { format!("    write-backs by owning engine allocator: {}\n", owners.join("; ")) };
+    let mut recs: Vec<((u64, u64, u8), [u64; 2])> = by_rec.into_iter().collect();
+    recs.sort_by(|a, b| b.1[0].cmp(&a.1[0]));
+    let recs: Vec<String> = recs
+        .iter()
+        .take(30)
+        .map(|((s, e, id), x)| format!("{s:#x}+{:#x} ({id} {}): {:.3} M dwords ({:.1}%), {:.0} pages a flip", e - s, anames.get(id).map_or("none", |s| s.as_str()), x[0] as f64 / flips / 1e6, 100.0 * x[0] as f64 / dw_all.max(1) as f64, x[1] as f64 / flips))
+        .collect();
+    let owners = owners + &if recs.is_empty() { String::new() } else { format!("    write-backs by engine allocation (the record holding each MiB's first page): {}\n", recs.join("; ")) };
+    let sites = crate::engine::sites_weighted(&weighted, 24, flips);
+    let owners = owners + &if sites.is_empty() { String::new() } else { format!("    write-back dwords a flip by call site (each MiB's first page): {sites}\n") };
     owners + &format!(
         "    write-back buckets (`DS_WB_BUCKETS`, 1 MiB, over {flips:.0} flips): {:.2} M dwords and {:.0} pages a flip; {}; the CPU wrote {:.1}% of the pages of the buckets it wrote; untouched by mapping: {}; `wbb lazy` pages armed no-access {} ({} runs failed), faults on them so far: the title {} reads / {} writes, ours {} / {}, other code {} / {}\n",
         dw_all as f64 / flips / 1e6,
@@ -4700,6 +4739,72 @@ pub fn init() {
         }
         Err(e) => crate::error!("fe2: the write-back's self-test failed: {e}; front end 2 off"),
     }
+    if std::env::var("DS_PROT_TEST").ok().as_deref() == Some("1") {
+        crate::info!("{}", protection_test());
+    }
+}
+
+/// `DS_PROT_TEST=1` (diagnosis, at front end 2's start): whether GPU work
+/// reaches an imported host page whose CPU protection is no-access (and
+/// read-only): a private page with a pattern, imported, protected, then on
+/// the GPU a copy out of it and a fill of its first half, waited for; the
+/// page made read-write again and checked (FRONTEND4.md C4: a held page is
+/// no-access while GPU work may still reach it).
+fn protection_test() -> String {
+    use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE};
+    let c = ctx();
+    let mut out = Vec::new();
+    for (name, prot) in [("no-access", PAGE_NOACCESS), ("read-only", PAGE_READONLY), ("read-write", PAGE_READWRITE)] {
+        let n = 64 << 10;
+        let h = unsafe { VirtualAlloc(std::ptr::null(), n, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) } as u64;
+        if h == 0 {
+            out.push(format!("{name}: VirtualAlloc failed"));
+            continue;
+        }
+        let r = (|| -> Result<String, String> {
+            let words = h as *mut u32;
+            for i in 0..1024u32 {
+                unsafe { words.add(i as usize).write_volatile(0x1111_0000 + i) };
+            }
+            let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
+            let (hb, hm, _) = c.import_host(h, PAGE, usage)?;
+            let (rb, rbm, rbp) = c.host_buffer(4096, vk::BufferUsageFlags::TRANSFER_DST)?;
+            let mut old = 0u32;
+            if unsafe { VirtualProtect(h as _, PAGE as usize, prot, &mut old) } == 0 {
+                unsafe {
+                    c.device.destroy_buffer(rb, None);
+                    c.device.free_memory(rbm, None);
+                    c.device.destroy_buffer(hb, None);
+                    c.device.free_memory(hm, None);
+                }
+                return Err("VirtualProtect".into());
+            }
+            let t = std::time::Instant::now();
+            let r = super::resident::one_off_now(|cmd| unsafe {
+                c.device.cmd_copy_buffer(cmd, hb, rb, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: 4096 }]);
+                let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_READ).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+                c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+                c.device.cmd_fill_buffer(cmd, hb, 0, 2048, 0xDEAD_BEEF);
+            });
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            unsafe { VirtualProtect(h as _, PAGE as usize, PAGE_READWRITE, &mut old) };
+            let read_ok = (0..1024u32).all(|i| unsafe { std::ptr::read_volatile((rbp as *const u32).add(i as usize)) } == 0x1111_0000 + i);
+            let read_zero = (0..1024u32).all(|i| unsafe { std::ptr::read_volatile((rbp as *const u32).add(i as usize)) } == 0);
+            let filled = (0..512u32).filter(|&i| unsafe { words.add(i as usize).read_volatile() } == 0xDEAD_BEEF).count();
+            let kept = (512..1024u32).filter(|&i| unsafe { words.add(i as usize).read_volatile() } == 0x1111_0000 + i).count();
+            unsafe {
+                c.device.destroy_buffer(rb, None);
+                c.device.free_memory(rbm, None);
+                c.device.destroy_buffer(hb, None);
+                c.device.free_memory(hm, None);
+            }
+            r?;
+            Ok(format!("{name}: the GPU's read {}, its fill landed in {filled} of 512 dwords ({kept} of 512 kept), {ms:.2} ms", if read_ok { "saw the pattern" } else if read_zero { "saw zeros" } else { "saw other words" }))
+        })();
+        unsafe { VirtualFree(h as _, 0, MEM_RELEASE) };
+        out.push(r.unwrap_or_else(|e| format!("{name}: failed: {e}")));
+    }
+    format!("fe2: protection test (`DS_PROT_TEST`): {}", out.join("; "))
 }
 
 /// The write-back over one page: guest memory a private page imported like
