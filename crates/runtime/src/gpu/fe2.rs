@@ -5539,7 +5539,11 @@ pub fn c4_no_hold(a: u64, n: u64) {
     while p < hi {
         let i = ((p - MIRROR_BASE) / PAGE) as usize;
         let bit = 1u32 << (i % 32);
-        if no_hold()[i / 32].fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+        // (Tested first: every preparation's reads come here, ~20-34 pages a
+        // draw, nearly all marked already; a shared read-modify-write each
+        // made the word's line bounce between the recording threads.)
+        let w = &no_hold()[i / 32];
+        if w.load(Ordering::Relaxed) & bit == 0 && w.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
             NO_HOLD_PAGES.fetch_add(1, Ordering::Relaxed);
         }
         p += PAGE;

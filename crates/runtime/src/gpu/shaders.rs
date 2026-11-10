@@ -3554,6 +3554,9 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
     }
     prep_lap(8);
     prep_lap_volume(rd.words.len(), rd.reads.len(), rd.ptrs.len(), resources.len());
+    if super::slotcensus::on() {
+        super::slotcensus::note_reads(&rd.reads);
+    }
     // The reader's references into the translation's plan end here.
     let used = [rd.reads.len() as u32, rd.words.len() as u32, rd.ptrs.len() as u32];
     if used != sizes {

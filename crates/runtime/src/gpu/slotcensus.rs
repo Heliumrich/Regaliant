@@ -70,6 +70,41 @@ pub fn note(class: usize, prog: u64, i: u32, base: u64, size: u64) {
     });
 }
 
+/// A preparation's guest reads ([addr, len) ranges): counted by whether
+/// this thread read the same range earlier in the same epoch (global, a
+/// lower bound for one executor's view) [preparations, ranges, ranges read
+/// before in the epoch, bytes, bytes read before].
+static R: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+thread_local! {
+    static SEEN: RefCell<(u64, std::collections::HashSet<(u64, u64)>)> = RefCell::new((u64::MAX, std::collections::HashSet::new()));
+}
+
+pub fn note_reads(reads: &[(u64, u64)]) {
+    let ep = super::precache::epoch();
+    R[0].fetch_add(1, Ordering::Relaxed);
+    SEEN.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.0 != ep || s.1.len() > 1 << 16 {
+            s.0 = ep;
+            s.1.clear();
+        }
+        let (mut n, mut seen, mut bytes, mut seen_bytes) = (0u64, 0u64, 0u64, 0u64);
+        for &(a, l) in reads {
+            n += 1;
+            bytes += l;
+            if !s.1.insert((a, l)) {
+                seen += 1;
+                seen_bytes += l;
+            }
+        }
+        R[1].fetch_add(n, Ordering::Relaxed);
+        R[2].fetch_add(seen, Ordering::Relaxed);
+        R[3].fetch_add(bytes, Ordering::Relaxed);
+        R[4].fetch_add(seen_bytes, Ordering::Relaxed);
+    });
+}
+
 pub fn line() -> String {
     if !on() {
         return String::new();
@@ -95,10 +130,22 @@ pub fn line() -> String {
             )
         })
         .collect();
-    format!("    buffer bindings by repeat (`DS_SLOT_CENSUS`): {}\n", parts.join("; "))
+    let r: Vec<u64> = R.iter().map(|x| x.load(Ordering::Relaxed)).collect();
+    format!(
+        "    buffer bindings by repeat (`DS_SLOT_CENSUS`): {}\n    preparations' guest reads by repeat (`DS_SLOT_CENSUS`): {} preparations, {:.1} ranges and {:.0} bytes each; ranges this thread read before in the same epoch {:.1}% ({:.1}% of the bytes)\n",
+        parts.join("; "),
+        r[0],
+        r[1] as f64 / r[0].max(1) as f64,
+        r[3] as f64 / r[0].max(1) as f64,
+        100.0 * r[2] as f64 / r[1].max(1) as f64,
+        100.0 * r[4] as f64 / r[3].max(1) as f64
+    )
 }
 
 pub fn reset() {
+    for x in R.iter() {
+        x.store(0, Ordering::Relaxed);
+    }
     for c in N.iter() {
         for x in c.iter() {
             x.store(0, Ordering::Relaxed);
