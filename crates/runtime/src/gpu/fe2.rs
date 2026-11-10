@@ -3570,7 +3570,7 @@ fn make_scatter(marks: vk::Buffer, marks_c: Option<vk::Buffer>) -> Result<Scatte
             rdna::kernels::mirror_scatter_counting()
         } else if wb_same_mode() == 1 {
             rdna::kernels::mirror_scatter_same_census()
-        } else if c4_on() && HELD_MAP.get().is_some() {
+        } else if c4_wanted() && HELD_MAP.get().is_some() {
             // (Front end 4: held pages left pending in the mirror.)
             rdna::kernels::mirror_scatter_held()
         } else if HELD_MAP.get().is_some() {
@@ -3595,7 +3595,7 @@ fn make_scatter(marks: vk::Buffer, marks_c: Option<vk::Buffer>) -> Result<Scatte
             c.device.destroy_shader_module(module, None);
             Ok(pipeline?[0])
         };
-        let pipeline = make(&code, if wb_buckets() { 27 } else if wb_same_mode() == 1 { 34 } else if c4_on() && HELD_MAP.get().is_some() { 44 } else if HELD_MAP.get().is_some() { 28 } else if std::env::var("DS_WB_OLD").ok().as_deref() == Some("1") { 20 } else { 42 })?;
+        let pipeline = make(&code, if wb_buckets() { 27 } else if wb_same_mode() == 1 { 34 } else if c4_wanted() && HELD_MAP.get().is_some() { 44 } else if HELD_MAP.get().is_some() { 28 } else if std::env::var("DS_WB_OLD").ok().as_deref() == Some("1") { 20 } else { 42 })?;
         if wb_same_mode() == 2 && SAME_SKIP.get().is_none() {
             // (The tables first: zeroed, and the buffer of zeros.)
             let mut tables = Vec::new();
@@ -4736,7 +4736,7 @@ pub fn init() {
                     crate::hosted::set_held_served(true);
                     let _ = std::thread::Builder::new().name("fe2-c4-release".into()).spawn(c4_release_thread);
                     let _ = std::thread::Builder::new().name("fe2-hold".into()).spawn(hold_thread);
-                    crate::info!("fe2: front end 4's held pages on (`DS_C4`): GPU-written pages of the GPU page allocator's and heaps' records held in the mirror, released on a CPU access");
+                    crate::info!("fe2: front end 4's held pages on (`DS_C4=0` turns them off): GPU-written pages of the GPU page allocator's and heaps' records held in the mirror, released on a CPU access");
                 }
                 let _ = std::thread::Builder::new().name("fe2-faults".into()).spawn(watch);
             }
@@ -5404,15 +5404,24 @@ pub fn callers_line() -> String {
 // never unbinds them; a mapping change drops them (marks cleared).
 // ---------------------------------------------------------------------------
 
-/// `DS_C4=1` (front end 2, hosted; not with the hold or bucket census).
+/// Front end 4's held pages: the default since 2026-11-10 night (x1.15 at the
+/// swamp, x1.015 at the vista: FINDINGS.md); `DS_C4=0` turns them off.
+/// Front end 2, hosted; not with the hold census, the bucket census or
+/// `DS_WB_SAME=2`.
 pub fn c4_on() -> bool {
+    c4_wanted() && on()
+}
+
+/// C4 is wanted (front end 2's own state apart: its write-back is made
+/// before it turns on, and the first callers may come before that).
+fn c4_wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("DS_C4").ok().as_deref() == Some("1") && !wb_buckets() && wb_same_mode() != 2 && std::env::var("DS_FE2_HOLD").ok().as_deref() != Some("1") && crate::hosted::on())
+    *ON.get_or_init(|| std::env::var("DS_C4").ok().as_deref() != Some("0") && !wb_buckets() && wb_same_mode() != 2 && std::env::var("DS_FE2_HOLD").ok().as_deref() != Some("1")) && crate::hosted::on()
 }
 
 /// The held-page bitmap is wanted (the hold census or C4).
 fn held_map_wanted() -> bool {
-    hold_census() || c4_on()
+    hold_census() || c4_wanted()
 }
 
 /// `c4 off` (live): no new holds (and every held page released).
@@ -5875,18 +5884,24 @@ fn c4_release_pages(pages: &[u64]) -> Result<(), String> {
             _ => ranges.push((p, PAGE)),
         }
     }
-    // No batch that writes the pages in flight, none pushed meanwhile (2 s
-    // a writer at most: a writer waiting on a thread a release suspends
-    // would never finish).
+    // No batch that writes the pages in flight, none pushed meanwhile. A
+    // writer is waited for 50 ms at most: one can depend on work of the
+    // very thread that waits for this release (a label another queue's
+    // unsubmitted batch writes: a 2 s stall at a load, run -013954). Past
+    // that the release goes on beside it: exact unless that writer's
+    // write-back stores a dword of the page between this copy's read and
+    // its store of it (a microsecond window on the other queue; counted).
     let gate = loop {
         let g = super::exec::NOTE_GATE.write();
         if let Some(seq) = super::exec::inflight_latest(&ranges) {
             drop(g);
             let t = std::time::Instant::now();
             C4X[X_WAITS].fetch_add(1, Ordering::Relaxed);
-            if !super::exec::wait_done_for(seq, std::time::Duration::from_secs(2)) {
-                C4X[X_WAIT_TIMEOUTS].fetch_add(1, Ordering::Relaxed);
-                crate::error!("fe2: C4: batch {seq} writing held pages from {:#x} not done within 2 s (released with it in flight)", pages[0]);
+            if !super::exec::wait_done_for(seq, std::time::Duration::from_millis(50)) {
+                if C4X[X_WAIT_TIMEOUTS].fetch_add(1, Ordering::Relaxed) < 8 {
+                    crate::warn!("fe2: C4: batch {seq} writing held pages from {:#x} not done within 50 ms: released beside it", pages[0]);
+                }
+                C4X[X_WAIT_MS].fetch_add(t.elapsed().as_millis() as u64, Ordering::Relaxed);
                 break super::exec::NOTE_GATE.write();
             }
             C4X[X_WAIT_MS].fetch_add(t.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -6067,7 +6082,7 @@ fn resume_others(handles: &[windows_sys::Win32::Foundation::HANDLE]) {
 /// releases every held page.
 pub fn c4_control(what: &str) -> Result<String, String> {
     if !c4_on() {
-        return Err("c4: not on (`DS_C4=1`, hosted)".into());
+        return Err("c4: not on (front end 2 hosted, `DS_C4` not 0)".into());
     }
     match what {
         "off" => {
@@ -6097,7 +6112,7 @@ fn c4_line() -> String {
     let d = |k: usize| now[k].saturating_sub(l.1[k]);
     let (ddw, dpg, dall) = (dw.saturating_sub(l.2), pg.saturating_sub(l.3), all.saturating_sub(l.4));
     let line = format!(
-        "    front end 4's held pages (`DS_C4`{}, over {flips:.0} flips): {} held now ({} held in {} runs, {} runs failed, {} candidates seen); the write-back left out {:.3} M dwords and {:.0} pages a flip ({:.1}% of the dwords it would have stored); releases on faults: the title {} reads / {} writes, ours {} / {}, other code {} / {}; synchronous releases {} ({} late), pages released {} in {} rounds ({:.0} us of take a round; {} through host memory, {:.0} us suspended), plain {}; writer waits {} ({} ms, {} timed out); dropped by mapping changes {}; uploads that left out held pages {}; failed takes {}; pages never held {}\n",
+        "    front end 4's held pages (C4{}, over {flips:.0} flips): {} held now ({} held in {} runs, {} runs failed, {} candidates seen); the write-back left out {:.3} M dwords and {:.0} pages a flip ({:.1}% of the dwords it would have stored); releases on faults: the title {} reads / {} writes, ours {} / {}, other code {} / {}; synchronous releases {} ({} late), pages released {} in {} rounds ({:.0} us of take a round; {} through host memory, {:.0} us suspended), plain {}; writer waits {} ({} ms, {} past 50 ms); dropped by mapping changes {}; uploads that left out held pages {}; failed takes {}; pages never held {}\n",
         if C4_OFF.load(Ordering::Relaxed) { ", off" } else { "" },
         now[X_NOW],
         d(X_HELD),

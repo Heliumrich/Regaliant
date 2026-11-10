@@ -10682,7 +10682,7 @@ impl Exec {
         }
         let xq = xq_tracking().then_some(XqBatch { compute: self.xq_c, on_c, acb: acb_id(&self.name), writes: &self.pending, ups: &self.fe2_up, dep: self.xq_dep, why: self.xq_why, images: self.xq_img });
         // (Pushed and its writes noted under the note gate: `NOTE_GATE`.)
-        let note_gate = NOTE_GATE.read_recursive();
+        let note_gate = super::fe2::c4_on().then(|| NOTE_GATE.read_recursive());
         let seq = push_batch(fence, self.slots[i].queries, bq, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, gpu_labels, self.ops, std::mem::take(&mut self.segs), reset, on_c, xq, move |seq| {
             if DEVICE_LOST.load(Ordering::Relaxed) {
                 return None;
@@ -12967,7 +12967,7 @@ impl Exec {
         }
         if self.recording {
             self.actions.push(f);
-            let note_gate = NOTE_GATE.read_recursive();
+            let note_gate = super::fe2::c4_on().then(|| NOTE_GATE.read_recursive());
             self.submit_for("effect");
             if let Some(w) = write {
                 journal_note_one(w, &self.name);
@@ -12981,7 +12981,7 @@ impl Exec {
             drop(note_gate);
             Some(self.last_seq)
         } else if self.last_seq > done_seq() {
-            let note_gate = NOTE_GATE.read_recursive();
+            let note_gate = super::fe2::c4_on().then(|| NOTE_GATE.read_recursive());
             let seq = push_batch(vk::Fence::null(), vk::QueryPool::null(), vk::QueryPool::null(), vec![f], Vec::new(), Vec::new(), &self.name, Vec::new(), [0; OPS], Vec::new(), None, false, None, |_| None);
             self.last_seq = seq;
             self.last_action_seq = seq;
@@ -13714,6 +13714,9 @@ impl Exec {
     }
 
     pub fn gpu_timestamp(&mut self, a: u64) -> bool {
+        // (Front end 4: a timestamp's page is never held; its store reaches
+        // guest memory alone.)
+        super::fe2::c4_cp_target(a, 8);
         if (self.deferred && !self.held && !self.par_worker) || a % 4 != 0 || DEVICE_LOST.load(Ordering::Relaxed) || super::homes::overlaps(a, 8) {
             return false;
         }
@@ -14838,7 +14841,7 @@ impl Exec {
             let lists = b.lists;
             let on_c = b.on_c;
             let xq = xq_tracking().then_some(XqBatch { compute: self.xq_c, on_c, acb: acb_id(&self.name), writes: &b.writes, ups: &b.fe2_up, dep: b.xq.0, why: b.xq.1, images: b.xq.2 });
-            let note_gate = NOTE_GATE.read_recursive();
+            let note_gate = super::fe2::c4_on().then(|| NOTE_GATE.read_recursive());
             let seq = push_batch(fence, queries, bq, b.eager_action.into_iter().collect(), b.checks, b.shaders, &self.name, Vec::new(), b.ops, b.segs, reset, on_c, xq, move |_| {
                 if DEVICE_LOST.load(Ordering::Relaxed) {
                     return None;

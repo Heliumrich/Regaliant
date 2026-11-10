@@ -320,7 +320,7 @@ fn arm_as(base: u64, len: u64, prot: u32, hold: bool) -> Result<(), String> {
     // (Arming never touches a held page: its newest words are elsewhere,
     // and a read-only one would let its stale words be read. The runs
     // between held pages are armed.)
-    if !hold && (lo..hi).step_by(PAGE as usize).any(|a| is_held(s, a)) {
+    if !hold && HELD_PAGES.load(Ordering::Relaxed) > 0 && (lo..hi).step_by(PAGE as usize).any(|a| is_held(s, a)) {
         let mut a = lo;
         while a < hi {
             if is_held(s, a) {
@@ -470,7 +470,7 @@ pub fn disarm(base: u64, len: u64) {
         }
         // (A held page stays held: it is released, its words put back, by
         // whoever holds it, never disarmed.)
-        if is_held(s, a) {
+        if HELD_PAGES.load(Ordering::Relaxed) > 0 && is_held(s, a) {
             a += PAGE;
             continue;
         }
@@ -478,7 +478,8 @@ pub fn disarm(base: u64, len: u64) {
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         let region_end = if unsafe { VirtualQuery(a as _, &mut info, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } != 0 { info.BaseAddress as u64 + info.RegionSize as u64 } else { a + PAGE };
         let mut e = a + PAGE;
-        while e < hi && e < region_end && armed(e) && !is_held(s, e) {
+        let any_held = HELD_PAGES.load(Ordering::Relaxed) > 0;
+        while e < hi && e < region_end && armed(e) && !(any_held && is_held(s, e)) {
             e += PAGE;
         }
         let mut old = 0u32;
