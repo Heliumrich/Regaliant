@@ -3731,10 +3731,18 @@ fn note_copy_waits(own: bool, wait: u64) {
 /// there after all the main queue's work so far. Called in sequence order
 /// (`push_batch`): the timelines' signals increase.
 #[allow(clippy::too_many_arguments)]
-fn submit_batch(seq: u64, xpre: Option<vk::CommandBuffer>, pre: Option<vk::CommandBuffer>, cmd: vk::CommandBuffer, wait: u64, on_c: bool, xwait: u64, cpu_wait: u64, c6_want: u32) -> Result<(), String> {
+fn submit_batch(seq: u64, xpre: Option<vk::CommandBuffer>, pre: Option<vk::CommandBuffer>, cmd: vk::CommandBuffer, wait: u64, on_c: bool, xwait: u64, cpu_wait: u64, c6_claims: &[u32]) -> Result<(), String> {
+    let r = submit_batch_inner(seq, xpre, pre, cmd, wait, on_c, xwait, cpu_wait);
+    // Front end 3's C6: the granules the batch claimed join the resident set
+    // on the GPU after it (its prologue placed their pages).
+    if r.is_ok() {
+        super::c6::note_submitted(ctx(), c6_claims)?;
+    }
+    r
+}
+
+fn submit_batch_inner(seq: u64, xpre: Option<vk::CommandBuffer>, pre: Option<vk::CommandBuffer>, cmd: vk::CommandBuffer, wait: u64, on_c: bool, xwait: u64, cpu_wait: u64) -> Result<(), String> {
     let c = ctx();
-    // Front end 3's C6: the resident set made current ahead of the batch.
-    super::c6::coverage(c, c6_want)?;
     // Guest page table updates queued before this batch, ahead of it (after
     // the compute family's queue's batches, which read the old entries),
     // and texture uploads recorded batched (`tune upload_batch`).
@@ -3807,10 +3815,9 @@ pub(super) struct SubmitSpec {
     /// The batch whose deferred effects must have run first (0: none;
     /// `Exec::order_after_cpu`).
     cpu_wait: u64,
-    /// Front end 3's C6: the newest epoch its GPU-resolved commands want
-    /// (0: none): a coherence pass of that epoch or later first, then the
-    /// resident set's copies (`c6::coverage`).
-    c6_want: u32,
+    /// Front end 3's C6: the granules its GPU-resolved commands' covers
+    /// claimed (their bits set once it is submitted: `c6::note_submitted`).
+    c6_claims: Vec<u32>,
     name: String,
 }
 
@@ -3847,19 +3854,13 @@ fn submit_specs(specs: Vec<(u64, SubmitSpec)>) {
         }
         if j - i == 1 {
             let (seq, s) = &specs[i];
-            if let Err(e) = submit_batch(*seq, s.xpre, s.pre, s.cmd, s.wait, s.on_c, s.xwait, s.cpu_wait, s.c6_want) {
+            if let Err(e) = submit_batch(*seq, s.xpre, s.pre, s.cmd, s.wait, s.on_c, s.xwait, s.cpu_wait, &s.c6_claims) {
                 fail(e, &s.name);
             }
             i = j;
             continue;
         }
         let c = ctx();
-        // (Front end 3's C6 for the group: the newest epoch any wants.)
-        let c6_want = specs[i..j].iter().map(|(_, s)| s.c6_want).max().unwrap_or(0);
-        if let Err(e) = super::c6::coverage(c, c6_want) {
-            fail(e, &specs[i].1.name);
-            return;
-        }
         if let Err(e) = super::pagetable::submit_pending(c, XQ_SUBMITTED.load(Ordering::Acquire)) {
             fail(e, &specs[i].1.name);
             return;
@@ -3874,6 +3875,12 @@ fn submit_specs(specs: Vec<(u64, SubmitSpec)>) {
         COALESCED[1].fetch_add((j - i) as u64, Ordering::Relaxed);
         // (No fence: these signal the batch timeline, `submit_batch`.)
         if let Err(e) = c.submit_batches(&list, vk::Fence::null()) {
+            fail(e, &specs[i].1.name);
+            return;
+        }
+        // (Front end 3's C6: the group's claims after it.)
+        let claims: Vec<u32> = specs[i..j].iter().flat_map(|(_, s)| s.c6_claims.iter().copied()).collect();
+        if let Err(e) = super::c6::note_submitted(c, &claims) {
             fail(e, &specs[i].1.name);
             return;
         }
@@ -9003,9 +9010,10 @@ pub struct Exec {
     /// being recorded began (u32::MAX: none): what a GPU-resolved run its
     /// first command opens was checked for (`fe2_run_want`).
     fe2_min_want: u32,
-    /// Front end 3's C6: the newest epoch the batch's GPU-resolved commands
-    /// want (0: none; `SubmitSpec::c6_want`).
+    /// Front end 3's C6: the newest epoch the batch's covers were made for
+    /// (0: none yet; `c6_cover`), and the granules they claimed.
     pub(super) c6_want: u32,
+    pub(super) c6_claims: Vec<u32>,
     /// Prologue copies not recorded yet (`tune pre_merge`): (source,
     /// destination, region), recorded grouped by buffers by `end_pre`.
     pre_copies: Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>,
@@ -9929,8 +9937,8 @@ struct Closed {
     /// queue (`Exec::batch_c`).
     xq: (u64, u32, bool),
     on_c: bool,
-    /// `Exec::c6_want` of the batch.
-    c6_want: u32,
+    /// `Exec::c6_claims` of the batch.
+    c6_claims: Vec<u32>,
 }
 
 /// Slot sequence of a batch closed but not yet submitted.
@@ -10020,6 +10028,7 @@ impl Exec {
                 f3_placed: Default::default(),
                 fe2_min_want: u32::MAX,
                 c6_want: 0,
+                c6_claims: Vec::new(),
                 pre_copies: Vec::new(),
                 xcopies: Vec::new(),
                 copy_wait: 0,
@@ -10292,6 +10301,7 @@ impl Exec {
 
     fn begin_batch(&mut self) {
         self.batch_count += 1;
+        self.c6_want = 0;
         self.repeat = None;
         self.label_open = false;
         // Imports looked up from now on belong to this batch (`reap_spans`).
@@ -10683,7 +10693,7 @@ impl Exec {
             let cpu = self.span_cpu();
             super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why}{cpu})", self.batch_shaders.len()));
             let lists = std::mem::take(&mut self.batch_lists).then(super::vk::defer::release);
-            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises, fe2_up: Vec::new(), fe2_spans: Vec::new(), lists, xq: (self.xq_dep, self.xq_why, self.xq_img), on_c: self.batch_c, c6_want: std::mem::take(&mut self.c6_want) });
+            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises, fe2_up: Vec::new(), fe2_spans: Vec::new(), lists, xq: (self.xq_dep, self.xq_why, self.xq_img), on_c: self.batch_c, c6_claims: std::mem::take(&mut self.c6_claims) });
             (self.xq_dep, self.xq_why, self.xq_img) = (0, 0, false);
             self.res_mine.clear();
             if let Some(b) = self.closed.last_mut() {
@@ -10724,7 +10734,7 @@ impl Exec {
         // completion thread sees the request and signals, or this sees that
         // batch completed.)
         let mut cpu_wait = std::mem::take(&mut self.cpu_wait);
-        let c6_want = std::mem::take(&mut self.c6_want);
+        let c6_claims = std::mem::take(&mut self.c6_claims);
         if cpu_wait > 0 {
             CPU_WAIT_REQ.fetch_max(cpu_wait, Ordering::SeqCst);
             if DONE_ATOMIC.load(Ordering::SeqCst) >= cpu_wait {
@@ -10745,7 +10755,7 @@ impl Exec {
                 l.replay();
             }
             let _ = seq;
-            Some(SubmitSpec { xpre, pre, cmd, wait: copy_wait, on_c, xwait: 0, cpu_wait, c6_want, name })
+            Some(SubmitSpec { xpre, pre, cmd, wait: copy_wait, on_c, xwait: 0, cpu_wait, c6_claims, name })
         });
         let cpu = self.span_cpu();
         super::timeline::end(&self.name, self.begun_mark.take(), || format!("batch #{seq}, {commands} commands ({why}{cpu})"));
@@ -14602,6 +14612,10 @@ impl Exec {
     /// (`Cp::past_wait_start`): held as past a run, with batch slots added
     /// as its held batches fill them.
     pub fn past_begin_growing(&mut self) {
+        // (Front end 3's C6 off for its stages: its batches close before the
+        // label that orders the CPU writes they read, so no cover then
+        // reaches them.)
+        shaders::NO_C6.with(|c| c.set(true));
         self.past_begin();
         // Past a label wait it records in program order, with no workers:
         // its copies forward globally as before.
@@ -14670,25 +14684,27 @@ impl Exec {
         }
     }
 
-    /// Front end 3's C6 at a stretch past a label wait settling: its label
-    /// orders the CPU writes before epoch `need` ahead of its work, so its
-    /// batches with GPU-resolved commands want that epoch (a new one begun
-    /// when the label needs one that has not: as `past_current_for`).
-    pub fn c6_settle(&mut self, need: u32) {
-        if !super::c6::on() || (self.c6_want == 0 && self.closed.iter().all(|c| c.c6_want == 0)) {
+    /// Front end 3's C6: makes the resident set current for this batch's
+    /// GPU-resolved commands wanting epoch `want` (`c6::take_cover`: a
+    /// coherence pass of that epoch first, on this thread): every resident
+    /// page front end 2 holds invalid placed (uploaded by this batch's
+    /// prologue, ordered as any binding's), and the granules admitted since
+    /// claimed with their pages. Once per batch and newer want.
+    fn c6_cover(&mut self, want: u32) {
+        if want <= self.c6_want {
             return;
         }
-        if need > super::precache::epoch() as u32 {
-            super::precache::end_scope(1);
+        let cov = super::c6::take_cover(want);
+        for &(a, b) in &cov.runs {
+            let _ = self.fe2_place(a, b - a, false);
         }
-        let need = need.min(super::precache::epoch() as u32);
-        if self.c6_want != 0 {
-            self.c6_want = self.c6_want.max(need);
-        }
-        for c in self.closed.iter_mut().filter(|c| c.c6_want != 0) {
-            c.c6_want = c.c6_want.max(need);
-        }
+        self.c6_claims.extend(cov.claims);
+        self.c6_want = want;
     }
+
+    /// Front end 3's C6 at a stretch past a label wait settling: nothing (a
+    /// stretch's stages are CPU-resolved: `shaders::NO_C6` while it grows).
+    pub fn c6_settle(&mut self, _need: u32) {}
 
     /// The oldest epoch the checks of the stretch past a label wait needed
     /// (u32::MAX: it made none): one older than its label needs may have
@@ -14709,6 +14725,7 @@ impl Exec {
         self.held = false;
         self.past = false;
         self.past_grow = false;
+        shaders::NO_C6.with(|c| c.set(false));
         self.stopped = false;
         self.stop_why = "";
         if !self.held_clears.is_empty() || !self.held_over.is_empty() {
@@ -14754,6 +14771,7 @@ impl Exec {
         self.held = false;
         self.past = false;
         self.past_grow = false;
+        shaders::NO_C6.with(|c| c.set(false));
         self.stopped = false;
         self.stop_why = "";
         self.held_clears.clear();
@@ -14917,7 +14935,7 @@ impl Exec {
                 self.fe2_gens = gens;
             }
             let lists = b.lists;
-            let c6_want = b.c6_want;
+            let c6_claims = b.c6_claims;
             let on_c = b.on_c;
             let xq = xq_tracking().then_some(XqBatch { compute: self.xq_c, on_c, acb: acb_id(&self.name), writes: &b.writes, ups: &b.fe2_up, dep: b.xq.0, why: b.xq.1, images: b.xq.2 });
             let note_gate = super::fe2::c4_on().then(|| NOTE_GATE.read_recursive());
@@ -14929,7 +14947,7 @@ impl Exec {
                 if let Some(l) = lists {
                     l.replay();
                 }
-                Some(SubmitSpec { xpre: None, pre, cmd, wait: copy_wait, on_c, xwait: 0, cpu_wait: 0, c6_want, name })
+                Some(SubmitSpec { xpre: None, pre, cmd, wait: copy_wait, on_c, xwait: 0, cpu_wait: 0, c6_claims, name })
             });
             self.slots[b.slot].seq = seq;
             if !b.fe2_up.is_empty() {
@@ -15068,7 +15086,7 @@ impl Exec {
                 let h = super::c6::header();
                 p.sgpr_data[addr_at + 4..addr_at + 10].copy_from_slice(&h);
                 let want = self.fe2_want(super::precache::epoch() as u32);
-                self.c6_want = self.c6_want.max(want);
+                self.c6_cover(want);
                 C6_STAGES.fetch_add(1, Ordering::Relaxed);
             }
 

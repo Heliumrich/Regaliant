@@ -9,14 +9,18 @@
 //!   coherence pass): outside the GPU arena they are armed first (a CPU write
 //!   then faults and ends the arming; the next pass takes such pages:
 //!   `hot_runs`), inside it the pass scans them anyway.
-//! - Before each batch the submission thread records, on the main queue,
-//!   the copies that make the resident set current (`coverage`): newly
-//!   admitted granules, and resident pages a take found written since
-//!   (`note_invalidated`), then the set's new bits. Compute batches wait for
-//!   the main queue's progress at their submission, so one set serves both.
-//! - A batch with C6 commands waits for a coherence pass newer than the
-//!   epoch its commands want (`kco`): every CPU write before that epoch was
-//!   then found by a take, and its page is in the copies.
+//! - A batch with C6 commands makes the resident set current itself, when
+//!   it binds one (`take_cover`, from `Exec::c6_cover` on the recording
+//!   thread): it waits for a coherence pass that began in the epoch its
+//!   command wants (every CPU write before then was found by a take), then
+//!   places every resident page front end 2 holds invalid through front end
+//!   2 (`fe2_place`: uploads in its prologue, ordered against CP writes and
+//!   GPU work as any binding's), and claims the granules admitted since
+//!   (their pages placed with it). Their bits reach the GPU when the
+//!   submission thread, in sequence order, has submitted that batch
+//!   (`note_submitted`: a small update on the main queue after it); a batch
+//!   before it reads them through the page table, one after it from the
+//!   mirror (compute batches wait for the main queue's progress).
 
 use super::resident::{MIRROR_BASE, PAGE};
 use super::vk::{ctx, Ctx};
@@ -122,12 +126,12 @@ pub fn header() -> [u32; 6] {
 static SHADOW: [AtomicU32; WORDS] = [const { AtomicU32::new(0) }; WORDS];
 /// Granules admitted, waiting for the copies that make them resident.
 static ADMIT: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-/// Resident pages to copy again (a take found them written, or guest memory
-/// changed without a write mark).
-static REUP: Mutex<Vec<u64>> = Mutex::new(Vec::new());
-/// Granules to leave the set (their memory unmapped or the mirror's backing
-/// dropped): their bits cleared at the next coverage.
-static GONE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+/// Resident pages front end 2 holds invalid (a take found them written,
+/// guest memory changed without a write mark, or an admitted granule's
+/// page it never held): every batch with C6 commands places them
+/// (`take_cover`); they leave the set when front end 2 validates them (an
+/// uploading batch queued: `note_validated`).
+static INVALID: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
 /// The feedback ring's entries read so far.
 static CURSOR: Mutex<u64> = Mutex::new(0);
 
@@ -149,7 +153,7 @@ pub fn resident(g: u32) -> bool {
 }
 
 fn resident_page(p: u64) -> bool {
-    granule_of(p).is_some_and(resident)
+    granule_of(p).is_some_and(|g| resident(g) || CLAIMED.lock().contains(&g))
 }
 
 /// Front end 2's takes found these pages written (`fe2::cpu_written`):
@@ -158,9 +162,25 @@ pub fn note_invalidated(pages: &[u64]) {
     if !on() {
         return;
     }
-    let mut v: Vec<u64> = pages.iter().copied().filter(|&p| resident_page(p)).collect();
+    let v: Vec<u64> = pages.iter().copied().filter(|&p| resident_page(p)).collect();
     if !v.is_empty() {
-        REUP.lock().append(&mut v);
+        INVALID.lock().extend(v);
+    }
+}
+
+/// Front end 2 validated guest [a, b) (an uploading batch queued:
+/// `fe2::uploaded`).
+pub fn note_validated(a: u64, b: u64) {
+    if !on() {
+        return;
+    }
+    let mut g = INVALID.lock();
+    if g.is_empty() {
+        return;
+    }
+    let gone: Vec<u64> = g.range(a..b).copied().collect();
+    for p in gone {
+        g.remove(&p);
     }
 }
 
@@ -184,7 +204,7 @@ pub fn note_invalidated_range(base: u64, len: u64) {
         }
         p += PAGE;
     }
-    REUP.lock().append(&mut v);
+    INVALID.lock().extend(v);
 }
 
 /// The mirror's backing over [base, base+len) is dropped (`resident`'s
@@ -193,11 +213,8 @@ pub fn note_gone(base: u64, len: u64) {
     if !on() || len == 0 {
         return;
     }
-    let (Some(g0), Some(g1)) = (granule_of(base), granule_of(base + len - 1)) else { return };
-    let v: Vec<u32> = (g0..=g1).filter(|&g| resident(g)).collect();
-    if !v.is_empty() {
-        GONE.lock().extend(v);
-    }
+    // (Not called: the mirror keeps resident granules backed.)
+    let _ = (base, len);
 }
 
 /// Whether any granule of [base, base+len) is resident (the mirror must
@@ -302,32 +319,35 @@ pub fn admit_round() {
     // Resident granules a write took out of the arming last pass: armed
     // again (the next write faults again; a hot one stays taken each pass).
     let hot = std::mem::take(&mut *HOT.lock());
-    for g in hot.into_iter().take(64) {
+    for g in hot.into_iter().filter(|g| REFUSED.lock().get(g).is_none_or(|&until| pass >= until)).take(256) {
         let a = PT_BASE + ((g as u64) << C6_GRANULE_SHIFT);
-        let _ = super::fe2::arm_granule(a, a + GRANULE);
+        if !super::fe2::arm_granule(a, a + GRANULE) {
+            // (Its window not settled yet: tried again 32 rounds on.)
+            REFUSED.lock().insert(g, pass + 32);
+        }
     }
     let pending: std::collections::HashSet<u32> = ADMIT.lock().iter().copied().collect();
     let mut ok = Vec::new();
     for g in want {
-        if resident(g) || pending.contains(&g) {
+        if resident(g) || pending.contains(&g) || CLAIMED.lock().contains(&g) {
             continue;
         }
         let a = PT_BASE + ((g as u64) << C6_GRANULE_SHIFT);
-        // (Imported now when no window holds it: the shaders' reads of what
-        // the set does not hold go through the guest page table.)
-        if !super::exec::import_covers(a, GRANULE) && super::exec::import_span(a, GRANULE).is_none() {
+        // (Not imported here: front end 2 imports from its recording
+        // threads, in order with its holds.)
+        if !super::exec::import_covers(a, GRANULE) {
             STATS[3].fetch_add(1, Ordering::Relaxed);
             continue;
         }
-        if REFUSED.lock().get(&g).is_some_and(|&until| pass < until) {
-            continue;
-        }
+        // (Outside the arena armed where front end 2 may arm: inside import
+        // windows an upload used SETTLE flips ago (arming a younger one raced
+        // its import: the device lost to 10 s GPU hangs at level loads,
+        // 2026-11-10 morning). Else admitted unarmed: each pass takes it
+        // (`hot_runs`) until a later round arms it, its first cover's upload
+        // making its window used.)
         if arena == 0 || crate::engine::owner(a) != arena {
             if !super::fe2::arm_granule(a, a + GRANULE) {
                 STATS[4].fetch_add(1, Ordering::Relaxed);
-                // (Asked again after 64 rounds, not at every pass.)
-                REFUSED.lock().insert(g, pass + 64);
-                continue;
             }
         }
         // (The mirror's backing for it: copies into unbacked pages vanish.)
@@ -338,7 +358,6 @@ pub fn admit_round() {
         ok.push(g);
     }
     if !ok.is_empty() {
-        STATS[2].fetch_add(ok.len() as u64, Ordering::Relaxed);
         ADMIT.lock().extend(ok);
     }
 }
@@ -378,92 +397,30 @@ pub fn hot_runs(out: &mut Vec<(u64, u64)>) {
     *HOT.lock() = hot;
 }
 
-/// Coverage command buffers in flight (freed once their fence signals), with
-/// the staging ring's bytes they read ([start, end)).
-struct Flight {
-    cmd: vk::CommandBuffer,
-    fence: vk::Fence,
-    start: u64,
+/// What a batch with C6 commands must do for its want (`take_cover`): the
+/// runs of resident or claimed pages to place (uploaded by its prologue
+/// when invalid), and the granules it claimed (their bits set once it is
+/// submitted: `note_submitted`).
+pub struct Cover {
+    pub runs: Vec<(u64, u64)>,
+    pub claims: Vec<u32>,
 }
 
-/// The coverage's staging ring: the CPU copies the pages into it when the
-/// batch is submitted (after the coherence pass the batch waits for), and
-/// the coverage's copies read it, so no import window has to outlive them.
-const RING: u64 = 64 << 20;
+/// Granules claimed by batches not submitted yet: their invalidations are
+/// tracked as resident pages' are.
+static CLAIMED: Mutex<std::collections::BTreeSet<u32>> = Mutex::new(std::collections::BTreeSet::new());
 
-struct Submitter {
-    pool: vk::CommandPool,
-    flights: std::collections::VecDeque<Flight>,
-    ring: vk::Buffer,
-    _ring_mem: vk::DeviceMemory,
-    ring_ptr: *mut u8,
-    head: u64,
-}
-
-unsafe impl Send for Submitter {}
-
-impl Submitter {
-    /// Frees the flights that completed (in order: one queue); with `wait`,
-    /// waits for the oldest first and frees it alone.
-    fn retire(&mut self, c: &Ctx, wait: bool) {
-        while let Some(f) = self.flights.front() {
-            let done = unsafe { c.device.get_fence_status(f.fence) }.unwrap_or(false);
-            if !done {
-                if !wait {
-                    break;
-                }
-                let _ = unsafe { c.device.wait_for_fences(&[f.fence], true, u64::MAX) };
-            }
-            let f = self.flights.pop_front().unwrap();
-            unsafe {
-                c.device.destroy_fence(f.fence, None);
-                c.device.free_command_buffers(self.pool, &[f.cmd]);
-            }
-            if wait {
-                break;
-            }
-        }
-    }
-
-    /// `n` bytes of the ring (n <= RING), waiting for flights when it is full.
-    fn alloc(&mut self, c: &Ctx, n: u64) -> u64 {
-        loop {
-            self.retire(c, false);
-            let tail = self.flights.front().map(|f| f.start);
-            let at = match tail {
-                None => Some(if self.head + n <= RING { self.head } else { 0 }),
-                Some(t) if self.head >= t => {
-                    if self.head + n <= RING {
-                        Some(self.head)
-                    } else if n <= t {
-                        Some(0)
-                    } else {
-                        None
-                    }
-                }
-                Some(t) => (self.head + n <= t).then_some(self.head),
-            };
-            if let Some(a) = at {
-                self.head = a + n;
-                return a;
-            }
-            self.retire(c, true);
-        }
-    }
-}
-
-static SUBMITTER: Mutex<Option<Submitter>> = Mutex::new(None);
-
-/// The submission thread, before a batch (in sequence order): a batch with
-/// C6 commands wanting epoch `want` (0: none) first waits for a coherence
-/// pass that began in that epoch or later; then the copies that make the
-/// resident set current and its new bits go to the main queue ahead of the
-/// batch (a compute batch waits for the main queue's progress).
-pub(super) fn coverage(c: &Ctx, want: u32) -> Result<(), String> {
+/// For a batch whose C6 command wants epoch `want` (on its recording
+/// thread): waits for a coherence pass that began in that epoch or later,
+/// claims the granules admitted since (their bits set in the shadow now:
+/// their later invalidations are tracked; on the GPU by this batch's
+/// prologue), and lists every resident page front end 2 holds invalid.
+pub fn take_cover(want: u32) -> Cover {
+    let mut out = Cover { runs: Vec::new(), claims: Vec::new() };
     if !on() {
-        return Ok(());
+        return out;
     }
-    if want != 0 && super::kco::covered_epoch() < want {
+    if super::kco::covered_epoch() < want {
         let t = std::time::Instant::now();
         STATS[10].fetch_add(1, Ordering::Relaxed);
         super::kco::trigger();
@@ -477,141 +434,94 @@ pub(super) fn coverage(c: &Ctx, want: u32) -> Result<(), String> {
         STATS[11].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
     let admits = std::mem::take(&mut *ADMIT.lock());
-    let mut reup = std::mem::take(&mut *REUP.lock());
-    let gone = std::mem::take(&mut *GONE.lock());
-    if admits.is_empty() && reup.is_empty() && gone.is_empty() {
-        return Ok(());
-    }
-    let t = std::time::Instant::now();
-    let b = bufs().ok_or("no resident set")?;
-    let (mbuf, _) = super::resident::mirror_buffer().ok_or("no mirror")?;
-    // Pages to copy: every page of the admitted granules, the written
-    // resident pages; held ones (front end 4: the mirror holds their newest
-    // words) and those GPU work in flight writes (the mirror will hold its
-    // words) left out.
-    let mut pages: Vec<u64> = Vec::with_capacity(admits.len() * 16 + reup.len());
+    let mut inv = Vec::new();
+    // (Claimed first, then their pages listed: an invalidation between the
+    // two is tracked.)
+    CLAIMED.lock().extend(admits.iter().copied());
     for &g in &admits {
         let a = PT_BASE + ((g as u64) << C6_GRANULE_SHIFT);
-        pages.extend((0..GRANULE / PAGE).map(|k| a + k * PAGE));
+        inv.extend((0..GRANULE / PAGE).map(|k| a + k * PAGE).filter(|&p| !super::fe2::page_valid(p)));
     }
-    let n_admit = pages.len();
-    reup.sort_unstable();
-    reup.dedup();
-    pages.extend(reup.iter().copied().filter(|&p| resident_page(p)));
-    pages.sort_unstable();
-    pages.dedup();
-    let mut left = 0u64;
-    let mut dropped: Vec<u32> = Vec::new();
-    let mut copied: Vec<u64> = Vec::with_capacity(pages.len());
-    // (By runs of consecutive pages: one query each for GPU work in flight
-    // and for the mapping, page by page only where a run's answer is mixed.)
-    let mut i = 0;
-    while i < pages.len() {
-        let mut j = i + 1;
-        while j < pages.len() && pages[j] == pages[j - 1] + PAGE {
-            j += 1;
+    let pages: Vec<u64> = {
+        let mut g = INVALID.lock();
+        g.extend(inv);
+        g.iter().copied().collect()
+    };
+    for p in pages {
+        match out.runs.last_mut() {
+            Some(l) if l.1 == p => l.1 = p + PAGE,
+            _ => out.runs.push((p, p + PAGE)),
         }
-        let (a, b) = (pages[i], pages[j - 1] + PAGE);
-        let busy = super::exec::inflight_latest(&[(a, b - a)]).is_some();
-        let readable = crate::mem::os_readable(a, b - a);
-        for &p in &pages[i..j] {
-            if super::fe2::c4_held(p) || (busy && super::exec::inflight_latest(&[(p, PAGE)]).is_some()) {
-                left += 1;
-                continue;
-            }
-            if !readable && !crate::mem::os_readable(p, PAGE) {
-                // (Unmapped meanwhile: the granule leaves the set.)
-                if let Some(g) = granule_of(p) {
-                    dropped.push(g);
-                }
-                continue;
-            }
-            copied.push(p);
-        }
-        i = j;
     }
-    dropped.sort_unstable();
-    dropped.dedup();
-    STATS[5].fetch_add(n_admit as u64, Ordering::Relaxed);
-    STATS[6].fetch_add((pages.len() - n_admit.min(pages.len())) as u64, Ordering::Relaxed);
-    STATS[7].fetch_add(left, Ordering::Relaxed);
-    // The set's words after this coverage.
+    STATS[5].fetch_add(admits.len() as u64 * (GRANULE / PAGE), Ordering::Relaxed);
+    STATS[6].fetch_add(out.runs.iter().map(|r| (r.1 - r.0) / PAGE).sum(), Ordering::Relaxed);
+    STATS[8].fetch_add(1, Ordering::Relaxed);
+    out.claims = admits;
+    out
+}
+
+/// The set's updates in flight: (command buffer, fence), freed once done.
+static UPDATES: Mutex<Option<(vk::CommandPool, Vec<(vk::CommandBuffer, vk::Fence)>)>> = Mutex::new(None);
+
+/// The submission thread, right after submitting a batch that claimed
+/// `claims` (in sequence order): their bits set on the GPU by a small update
+/// on the main queue (after the batch's prologue placed their pages), and
+/// in the shadow.
+pub(super) fn note_submitted(c: &Ctx, claims: &[u32]) -> Result<(), String> {
+    if claims.is_empty() {
+        return Ok(());
+    }
+    let b = bufs().ok_or("no resident set")?;
     let mut words: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
-    for &g in &admits {
-        if dropped.contains(&g) {
-            continue;
-        }
+    for &g in claims {
         let w = g >> 5;
         let v = words.entry(w).or_insert_with(|| SHADOW[w as usize].load(Ordering::Acquire));
         *v |= 1 << (g & 31);
     }
-    for &g in gone.iter().chain(dropped.iter()) {
-        let w = g >> 5;
-        let v = words.entry(w).or_insert_with(|| SHADOW[w as usize].load(Ordering::Acquire));
-        *v &= !(1 << (g & 31));
-    }
-    STATS[12].fetch_add((gone.len() + dropped.len()) as u64, Ordering::Relaxed);
-    let mut s = SUBMITTER.lock();
-    let sub = match s.as_mut() {
+    let mut u = UPDATES.lock();
+    let (pool, flights) = match u.as_mut() {
         Some(x) => x,
         None => {
             let pool = unsafe { c.device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(c.queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None) }.map_err(|e| format!("c6 pool: {e}"))?;
-            let (ring, ring_mem, ring_ptr) = c.host_buffer(RING, vk::BufferUsageFlags::TRANSFER_SRC)?;
-            s.insert(Submitter { pool, flights: std::collections::VecDeque::new(), ring, _ring_mem: ring_mem, ring_ptr, head: 0 })
+            u.insert((pool, Vec::new()))
         }
     };
-    // The pages into the staging ring (in pieces of at most the ring).
-    let max_pages = (RING / PAGE) as usize;
-    let mut copies: Vec<vk::BufferCopy> = Vec::with_capacity(copied.len());
-    let mut first_at = u64::MAX;
-    for part in copied.chunks(max_pages) {
-        let at = sub.alloc(c, part.len() as u64 * PAGE);
-        first_at = first_at.min(at);
-        for (k, &p) in part.iter().enumerate() {
-            let src = at + k as u64 * PAGE;
-            unsafe { std::ptr::copy_nonoverlapping(p as *const u8, sub.ring_ptr.add(src as usize), PAGE as usize) };
-            match copies.last_mut() {
-                Some(lc) if lc.src_offset + lc.size == src && lc.dst_offset + lc.size == p - MIRROR_BASE => lc.size += PAGE,
-                _ => copies.push(vk::BufferCopy { src_offset: src, dst_offset: p - MIRROR_BASE, size: PAGE }),
+    let pool = *pool;
+    flights.retain(|&(cmd, fence)| {
+        let done = unsafe { c.device.get_fence_status(fence) }.unwrap_or(false);
+        if done {
+            unsafe {
+                c.device.destroy_fence(fence, None);
+                c.device.free_command_buffers(pool, &[cmd]);
             }
         }
-    }
-    if first_at == u64::MAX {
-        first_at = sub.head;
-    }
-    let cmd = unsafe { c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(sub.pool).command_buffer_count(1)) }.map_err(|e| format!("c6 command buffer: {e}"))?[0];
+        !done
+    });
+    let cmd = unsafe { c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)) }.map_err(|e| format!("c6 command buffer: {e}"))?[0];
     let fence = unsafe { c.device.create_fence(&vk::FenceCreateInfo::default(), None) }.map_err(|e| format!("c6 fence: {e}"))?;
     unsafe {
         c.device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
-        // (After everything before on the queue: work in flight may still
-        // read the old words of a page the CPU rewrote only after it, as the
-        // title synchronizes.)
-        let pre = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::TRANSFER_READ);
+        let pre = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
         c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[pre], &[], &[]);
-        if !copies.is_empty() {
-            c.device.cmd_copy_buffer(cmd, sub.ring, mbuf, &copies);
+        for (&w, &v) in &words {
+            c.device.cmd_update_buffer(cmd, b.res, w as u64 * 4, &v.to_le_bytes());
         }
-        if !words.is_empty() {
-            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
-            for (&w, &v) in &words {
-                c.device.cmd_update_buffer(cmd, b.res, w as u64 * 4, &v.to_le_bytes());
-            }
-        }
-        let post = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+        let post = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ);
         c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[post], &[], &[]);
         c.device.end_command_buffer(cmd).ok();
     }
-    // (On the main queue with its progress signal: a compute batch waits
-    // for it.)
+    // (With the main queue's progress signal: later compute batches wait for it.)
     c.submit_timeline(false, &[cmd], &[], &[], fence)?;
-    sub.flights.push_back(Flight { cmd, fence, start: first_at });
-    drop(s);
+    flights.push((cmd, fence));
+    drop(u);
     for (&w, &v) in &words {
-        SHADOW[w as usize].store(v, Ordering::Release);
+        SHADOW[w as usize].fetch_or(v, Ordering::AcqRel);
     }
-    STATS[8].fetch_add(1, Ordering::Relaxed);
-    STATS[9].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let mut cl = CLAIMED.lock();
+    for g in claims {
+        cl.remove(g);
+    }
+    STATS[2].fetch_add(claims.len() as u64, Ordering::Relaxed);
     Ok(())
 }
 
@@ -627,7 +537,7 @@ pub fn status() -> String {
     }
     let s: Vec<u64> = STATS.iter().map(|x| x.load(Ordering::Relaxed)).collect();
     format!(
-        "    C6 resident set: {} stages bound since boot; {} granules now ({} MiB); reports {} (lost {}; through the page table {}, no window in one piece {}, outside the span {}), granules admitted {}, refused (no import window) {}, refused (not armed) {}; coverages {} ({:.1} us each), pages copied for admissions {} and again for writes {}, left out (held or written in flight) {}; waits for a pass {} ({:.1} ms), granules gone {}, hot pages taken {}\n",
+        "    C6 resident set: {} stages bound since boot; {} granules now ({} MiB); reports {} (lost {}; through the page table {}, no window in one piece {}, outside the span {}), granules admitted {}, refused (no import window) {}, admitted unarmed {}; batch covers {} (claims {} us), admitted pages to place {} and invalid resident pages placed {}, left out {}; waits for a pass {} ({:.1} ms), granules gone {}, hot pages taken {}\n",
         super::exec::C6_STAGES.load(Ordering::Relaxed),
         resident_count(),
         resident_count() * GRANULE >> 20,

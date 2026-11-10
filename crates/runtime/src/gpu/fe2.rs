@@ -2274,7 +2274,10 @@ pub fn arm_granule(a: u64, b: u64) -> bool {
         while q < b && writable(q) && !crate::hosted::all_armed(q, PAGE) {
             q += PAGE;
         }
-        arm_part(p, q, frame, false);
+        // (Inside settled import windows only, as front end 2 arms: arming
+        // pages of a young window raced its import; 10 s GPU hangs at a
+        // level load, 2026-11-10 morning.)
+        arm_run(p, q, frame, &super::exec::fe2_armable);
         p = q;
     }
     let mut written = Vec::new();
@@ -3608,6 +3611,8 @@ pub fn uploaded(runs: &[(u64, u64)], gens: &[u32], ep: u32) {
                 if Some(c.wgen[idx(x) / 64].load(Ordering::Acquire)) == g {
                     set_clean(x, e, ep, true);
                     STATS[S_VALIDATED].fetch_add((e - x) / PAGE, Ordering::Relaxed);
+                    // (Front end 3's C6: resident pages current again.)
+                    super::c6::note_validated(x, e);
                 } else {
                     STATS[S_RACED].fetch_add((e - x) / PAGE, Ordering::Relaxed);
                 }
