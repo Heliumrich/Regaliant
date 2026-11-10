@@ -3233,6 +3233,29 @@ fn arm_run(x: u64, y: u64, frame: u64, armable: &Armable) {
 /// Arms [x, y) (inside settled import windows, asked again under the arm
 /// lock: an import beginning meanwhile waits for it, then disarms it).
 fn arm_part(x: u64, y: u64, frame: u64) {
+    // R2: the refusals that need no system call checked first without the
+    // locks (most candidates are refused; each took the global arming lock,
+    // which the parallel workers then queued on: 16.7% of their busy samples
+    // in the 1-1 walk once mapping lookups left it, FINDINGS.md 2026-11-10
+    // evening). `plain_rw`'s VirtualQuery stays under the lock: unlocked,
+    // the threads' queries met in the kernel's address-space lock and every
+    // write-watch take slowed with them (~3.6 -> ~7.8 us). Not arming is
+    // always safe (the page is taken again); what passes is checked again.
+    if super::tune::r2() {
+        // (A page front end 4 holds is no-access: not plain read-write.)
+        if host_writing(x, y) || c4_any_held(x, y) {
+            NOT_ARMED[R_RW].fetch_add((y - x) / PAGE, Ordering::Relaxed);
+            return;
+        }
+        if super::exec::fe2_settled_over(x, y) != Some(true) {
+            NOT_ARMED[R_WINDOW].fetch_add((y - x) / PAGE, Ordering::Relaxed);
+            return;
+        }
+        if held(x, y, frame) {
+            NOT_ARMED[R_HELD].fetch_add((y - x) / PAGE, Ordering::Relaxed);
+            return;
+        }
+    }
     // No mapping change meanwhile (`resident::remap_guard`), and no other
     // arm or disarm between the checks and the arming (`hosted::arm_lock`:
     // a file read beginning now waits, then disarms what is armed).
