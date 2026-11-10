@@ -156,6 +156,12 @@ pub fn items() -> Vec<Item> {
             kind: ItemKind::Display(2),
         },
         Item {
+            id: s("HdrOutput"),
+            label: s("HDR"),
+            tooltip: s("HDR when Windows' HDR is on. Display Adjustment sets its brightness."),
+            kind: ItemKind::Choice(vec![s("Automatic"), s("Off")], 0),
+        },
+        Item {
             id: s("AspectRatio"),
             label: s("Aspect Ratio"),
             tooltip: s("The picture's shape, from the next start."),
@@ -365,6 +371,12 @@ pub fn mouse_blur_tick() {
 }
 
 /// The window mode the window opens with (the PC tab's; `None`: the window's own default).
+/// HDR output allowed (the PC tab's HDR: Automatic): the title is told the output is HDR while
+/// Windows' HDR is on for the window's monitor.
+pub fn hdr_allowed() -> bool {
+    store::value("Setting_PC_HdrOutput").unwrap_or(0) == 0
+}
+
 /// The PC tab's Window Mode (0 windowed, 1 borderless, 2 exclusive fullscreen).
 pub fn window_mode() -> Option<u32> {
     store::value("Setting_PC_WindowMode")

@@ -32,7 +32,34 @@ const OUTPUT_RESOLUTION: u32 = 1;
 /// The vblank rate while the frame rate is uncapped (`tune uncapped`, the PC tab's Frame Rate
 /// Limit): well above what the title renders at, so a frame is shown as soon as it is done.
 pub const UNCAPPED_HZ: f64 = 240.0;
-const OUTPUT_DYNAMIC_RANGE: u32 = 1;
+/// Dynamic range values of the output status: SDR, and HDR (HDR10).
+const RANGE_SDR: u32 = 1;
+const RANGE_HDR: u32 = 2;
+
+/// The dynamic range reported to the title: HDR while the window's monitor is in Windows' HDR
+/// mode (checked at most every 2 s), else SDR; `DS_HDR_STATUS=<n>` reports `n` (tests).
+fn dynamic_range() -> u32 {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    static FORCED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    if let Some(v) = *FORCED.get_or_init(|| std::env::var("DS_HDR_STATUS").ok().and_then(|v| v.trim().parse().ok())) {
+        // (Tests: the PC tab's HDR Off still reports SDR.)
+        return if crate::pcsettings::hdr_allowed() { v } else { RANGE_SDR };
+    }
+    static LAST: AtomicU32 = AtomicU32::new(RANGE_SDR);
+    static CHECKED_MS: AtomicU64 = AtomicU64::new(0);
+    let now = crate::log::elapsed_ms() as u64;
+    let at = CHECKED_MS.load(Ordering::Relaxed);
+    if at == 0 || now.saturating_sub(at) >= 2000 {
+        CHECKED_MS.store(now.max(1), Ordering::Relaxed);
+        let hdr = crate::pcsettings::hdr_allowed() && crate::gpu::vk::window::current_monitor().and_then(|(_, dev)| crate::display::hdr_now(&dev)).is_some();
+        let v = if hdr { RANGE_HDR } else { RANGE_SDR };
+        if LAST.swap(v, Ordering::Relaxed) != v || at == 0 {
+            crate::info!("videoout: output reported as {}", if hdr { "HDR" } else { "SDR" });
+        }
+        return v;
+    }
+    LAST.load(Ordering::Relaxed)
+}
 const REFRESH_59_94HZ: u64 = 3;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -362,7 +389,7 @@ sysv! {
         port(h, |_| {
             std::ptr::write_bytes(st, 0, 0x30);
             *(st as *mut u32) = OUTPUT_RESOLUTION;
-            *(st.add(4) as *mut u32) = OUTPUT_DYNAMIC_RANGE;
+            *(st.add(4) as *mut u32) = dynamic_range();
             *(st.add(8) as *mut u64) = REFRESH_59_94HZ;
             0
         }).unwrap_or_else(|e| e)
@@ -470,6 +497,12 @@ pub fn register(r: &mut Registry) {
     ]);
 }
 
+/// Whether a display buffer format holds HDR values (PQ-encoded BT.2020: color space bits set;
+/// the title's SDR format 0x8100000022000000 has none, its HDR one 0x8100070422000000).
+fn is_hdr_format(f: u64) -> bool {
+    (f >> 32) & 0xFFFF != 0
+}
+
 /// The size display buffer `b` is registered with (its set's attribute).
 fn registered_size(b: &DisplayBuffer) -> Option<(u32, u32)> {
     PORT.lock().as_ref().and_then(|p| p.sets.get(b.set as usize).copied().flatten()).map(|a| (a.width, a.height))
@@ -506,7 +539,10 @@ fn present_buffer(b: &DisplayBuffer) {
                 let all = crate::gpu::images::with(|im| im.at_base_report(b.addr));
                 crate::info!("present: buffer {:#x} shows {format:?} {width}x{height} (registered {size:?}); images there: {all}", b.addr);
             }
-            crate::gpu::vk::present::present(crate::gpu::vk::present::Source::Image { image, format, layout: ash::vk::ImageLayout::GENERAL, width, height });
+            // HDR display buffers: the format's color space bits (0x0704: PQ-encoded BT.2020, what
+            // the title registers while the output is reported as HDR; SDR has none).
+            let hdr = PORT.lock().as_ref().and_then(|p| p.sets.get(b.set as usize).copied().flatten()).is_some_and(|a| is_hdr_format(a.pixel_format));
+            crate::gpu::vk::present::present(crate::gpu::vk::present::Source::Image { image, format, layout: ash::vk::ImageLayout::GENERAL, width, height, hdr });
             return;
         }
     }

@@ -46,6 +46,10 @@ struct Presenter {
     /// The swapchain holds exclusive fullscreen (VK_EXT_full_screen_exclusive, application
     /// controlled), on this monitor.
     exclusive: Option<isize>,
+    /// The swapchain is HDR10 (ST 2084 PQ, BT.2020): the title's display buffers hold HDR.
+    hdr: bool,
+    /// The frames shown are HDR (the title's display buffers' format; the next swapchain's).
+    want_hdr: bool,
 }
 
 unsafe impl Send for Presenter {}
@@ -69,8 +73,9 @@ fn window_shot(frame: usize) -> bool {
 }
 
 pub enum Source {
-    /// An image in TRANSFER_SRC_OPTIMAL-compatible state; `layout` is its current layout.
-    Image { image: vk::Image, format: vk::Format, layout: vk::ImageLayout, width: u32, height: u32 },
+    /// An image in TRANSFER_SRC_OPTIMAL-compatible state; `layout` is its current layout; `hdr`:
+    /// its values are HDR10 (PQ-encoded BT.2020, the title's HDR output).
+    Image { image: vk::Image, format: vk::Format, layout: vk::ImageLayout, width: u32, height: u32, hdr: bool },
     /// Linear BGRA8 pixels.
     Pixels { data: Vec<u8>, width: u32, height: u32 },
 }
@@ -93,13 +98,21 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
         // own transfer function): UNORM swapchain formats show them as is,
         // 10-bit first (the title's display buffers are 10:10:10:2).
         let srgb_space = |f: &&vk::SurfaceFormatKHR| f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR;
-        let fmt = formats
+        // The title's HDR output (PQ-encoded BT.2020 in 10:10:10:2 display buffers) goes to an
+        // HDR10 swapchain as it is, where the display offers one.
+        let hdr10 = p.want_hdr && c.colorspaces;
+        let hdr_fmt = formats
             .iter()
-            .filter(srgb_space)
-            .find(|f| f.format == vk::Format::A2B10G10R10_UNORM_PACK32)
-            .or_else(|| formats.iter().filter(srgb_space).find(|f| f.format == vk::Format::B8G8R8A8_UNORM))
-            .or_else(|| formats.first())
-            .copied()
+            .find(|f| hdr10 && f.color_space == vk::ColorSpaceKHR::HDR10_ST2084_EXT && matches!(f.format, vk::Format::A2B10G10R10_UNORM_PACK32 | vk::Format::A2R10G10B10_UNORM_PACK32))
+            .copied();
+        if p.want_hdr && hdr_fmt.is_none() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::warn!("present: the frames are HDR but the display offers no HDR10 format: shown as SDR values"));
+        }
+        let fmt = hdr_fmt
+            .or_else(|| formats.iter().filter(srgb_space).find(|f| f.format == vk::Format::A2B10G10R10_UNORM_PACK32).copied())
+            .or_else(|| formats.iter().filter(srgb_space).find(|f| f.format == vk::Format::B8G8R8A8_UNORM).copied())
+            .or_else(|| formats.first().copied())
             .ok_or("no surface format")?;
         let mut extent = caps.current_extent;
         if extent.width == u32::MAX {
@@ -156,6 +169,24 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
             }
         }
         p.swapchain = sc;
+        p.hdr = fmt.color_space == vk::ColorSpaceKHR::HDR10_ST2084_EXT;
+        if p.hdr {
+            if let Some(m) = c.hdr_metadata.as_ref() {
+                // HDR10's usual mastering description (BT.2020 primaries, D65 white); the title's
+                // own Display Adjustment sets its brightness.
+                let xy = |x: f32, y: f32| vk::XYColorEXT { x, y };
+                let md = vk::HdrMetadataEXT::default()
+                    .display_primary_red(xy(0.708, 0.292))
+                    .display_primary_green(xy(0.170, 0.797))
+                    .display_primary_blue(xy(0.131, 0.046))
+                    .white_point(xy(0.3127, 0.3290))
+                    .max_luminance(1000.0)
+                    .min_luminance(0.001)
+                    .max_content_light_level(1000.0)
+                    .max_frame_average_light_level(400.0);
+                m.set_hdr_metadata(&[sc], &[md]);
+            }
+        }
         p.images = c.swapchain_d.get_swapchain_images(sc).map_err(|e| format!("swapchain images: {e}"))?;
         p.format = fmt.format;
         p.extent = extent;
@@ -220,6 +251,8 @@ pub fn init(title: &str) -> Result<(), String> {
             sharpen: None,
             sharpen_failed: false,
             exclusive: None,
+            hdr: false,
+            want_hdr: false,
         };
         create_swapchain(&mut p)?;
         *PRESENTER.lock() = Some(p);
@@ -249,6 +282,14 @@ pub fn present(src: Source) -> bool {
     let mut g = PRESENTER.lock();
     let Some(p) = g.as_mut() else { return false };
     unsafe {
+        // HDR frames from SDR ones or back (the title's display buffers' format): a new swapchain.
+        if let Source::Image { hdr, .. } = &src {
+            if *hdr != p.want_hdr {
+                p.want_hdr = *hdr;
+                crate::info!("present: the title's frames are {}", if *hdr { "HDR10" } else { "SDR" });
+                window::RESIZED.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
         // The window's exclusive fullscreen changed (Alt+Tab, the mode): a new swapchain.
         if window::exclusive_wanted() != p.exclusive && c.fse.is_some() {
             window::RESIZED.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -280,7 +321,7 @@ pub fn present(src: Source) -> bool {
         let dst = p.images[idx as usize];
         barrier(c, cmd, dst, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
         let (src_img, src_format, src_layout, sw, sh) = match src {
-            Source::Image { image, format, layout, width, height } => {
+            Source::Image { image, format, layout, width, height, .. } => {
                 // GENERAL images are blitted in place (after a barrier that
                 // makes earlier GPU writes visible).
                 let to = if layout == vk::ImageLayout::GENERAL { layout } else { vk::ImageLayout::TRANSFER_SRC_OPTIMAL };
