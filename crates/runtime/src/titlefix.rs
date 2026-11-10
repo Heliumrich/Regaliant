@@ -141,6 +141,17 @@ const FIXES: &[Fix] = &[
         why: "the `cam` command lists the camera rigs and their controllers",
         only_with: Some("DS_CAMDEBUG"),
     },
+    // The TAA's per-view jitter (`jitter`): its function's entry, `mov rax,[rdi+68h]; cmp
+    // dword ptr [rax+0AACh],0` (the forced index's test).
+    Fix {
+        name: "TAA jitter noted",
+        offset: 0x9ed8d0,
+        from: &[0x48, 0x8b, 0x47, 0x68, 0x83, 0xb8, 0xac, 0x0a, 0x00, 0x00, 0x00],
+        change: Change::Hook { at: 0, handler: crate::jitter::hook },
+        kind: "PC settings: DLSS, FSR, XeSS",
+        why: "the upscalers need each frame's jitter, which the title keeps in its projection",
+        only_with: None,
+    },
     // The render resolution (`dispmode`, `DS_DISPLAY_MODE`): the per-frame
     // display mode choice (eboot+0x9fe6a3..), `test ecx,ecx; cmovne esi,ecx`
     // before `test eax,eax; cmovne esi,eax` (eax the options' mode).

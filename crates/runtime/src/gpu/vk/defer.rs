@@ -109,7 +109,13 @@ enum Op {
     LabelBegin(Span),
     LabelEnd,
     Checkpoint(u64),
+    /// Host code that records into the command buffer itself (`external`: the upscalers'
+    /// libraries), by its index in `List::externals`.
+    External(u32),
 }
+
+/// Host code run with the real command buffer at replay (`external`).
+pub type ExternalFn = Box<dyn FnOnce(vk::CommandBuffer) + Send>;
 
 /// A claimed command buffer's commands, in order.
 #[derive(Default)]
@@ -118,6 +124,8 @@ pub struct List {
     /// The commands' arrays (8-byte words: no structure here needs more
     /// alignment).
     arena: Vec<u64>,
+    /// Host code recorded as commands (`Op::External`), taken at replay.
+    externals: Vec<Option<ExternalFn>>,
 }
 
 impl List {
@@ -341,6 +349,7 @@ fn recycle(mut l: Box<List>) {
     }
     l.ops.clear();
     l.arena.clear();
+    l.externals.clear();
     let mut f = FREE.lock();
     if f.len() < 32 {
         f.push(l);
@@ -546,7 +555,28 @@ unsafe fn play_list(cb: vk::CommandBuffer, l: &mut List) {
                         cp.cmd_set_checkpoint(cb, m as *const c_void);
                     }
                 }
+                Op::External(i) => {
+                    if let Some(f) = l.externals.get_mut(i as usize).and_then(Option::take) {
+                        f(cb);
+                    }
+                }
             }
+        }
+    }
+}
+
+/// Host code that records into `cb` itself (a library given the command buffer): kept in
+/// `cb`'s list when this thread claimed it, run at replay in the commands' order; else run now.
+pub fn external(cb: vk::CommandBuffer, f: ExternalFn) {
+    let mut f = Some(f);
+    let kept = record(cb, |l| {
+        let i = l.externals.len() as u32;
+        l.externals.push(f.take());
+        l.ops.push(Op::External(i));
+    });
+    if !kept {
+        if let Some(f) = f.take() {
+            f(cb);
         }
     }
 }

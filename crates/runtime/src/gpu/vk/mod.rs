@@ -304,6 +304,13 @@ fn init_inner() -> Result<(), String> {
         if validation || labels_on {
             exts.push(ash::ext::debug_utils::NAME.as_ptr());
         }
+        // The upscalers' instance extensions (`super::upscale`: XeSS's, Streamline's for DLSS).
+        let up_inst = crate::gpu::upscale::instance_extensions(&inst_exts);
+        for e in &up_inst {
+            if !exts.iter().any(|&x| CStr::from_ptr(x) == e.as_c_str()) {
+                exts.push(e.as_ptr());
+            }
+        }
         let ici = vk::InstanceCreateInfo::default().application_info(&app).enabled_layer_names(&layers).enabled_extension_names(&exts);
         let instance = entry.create_instance(&ici, None).map_err(|e| format!("vkCreateInstance: {e}"))?;
         init_stage(2);
@@ -378,6 +385,13 @@ fn init_inner() -> Result<(), String> {
         let has_hdr_meta = colorspaces && dev_has(ash::ext::hdr_metadata::NAME);
         if has_hdr_meta {
             dexts.push(ash::ext::hdr_metadata::NAME.as_ptr());
+        }
+        // The upscalers' device extensions and features (`super::upscale`).
+        let up_dev = crate::gpu::upscale::device_needs(&instance, pdev);
+        for e in &up_dev.extensions {
+            if !dexts.iter().any(|&x| CStr::from_ptr(x) == e.as_c_str()) {
+                dexts.push(e.as_ptr());
+            }
         }
         let memory_budget = instance
             .enumerate_device_extension_properties(pdev)
@@ -573,7 +587,7 @@ fn init_inner() -> Result<(), String> {
         }
         // Gathers with offsets declare ImageGatherExtended (the validation
         // layer reported every such module without it).
-        let features = vk::PhysicalDeviceFeatures::default()
+        let mut features = vk::PhysicalDeviceFeatures::default()
             .shader_storage_image_array_dynamic_indexing(storage_dyn)
             .shader_image_gather_extended(core.shader_image_gather_extended != 0)
             .draw_indirect_first_instance(first_instance)
@@ -642,6 +656,8 @@ fn init_inner() -> Result<(), String> {
         let mut m5 = vk::PhysicalDeviceMaintenance5FeaturesKHR::default().maintenance5(true);
         let mut pb_feat = pbin::Features { s_type: pbin::ST_FEATURES, p_next: std::ptr::null_mut(), pipeline_binaries: 1 };
         let mut pb_cache = pbin::CacheControl { s_type: pbin::ST_CACHE_CONTROL, p_next: std::ptr::null(), disable_internal_cache: 1 };
+        crate::gpu::upscale::apply_features(&mut features, &mut f11, &mut f12, &mut f13, &up_dev);
+        let mut mutable = vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT::default().mutable_descriptor_type(true);
         let mut dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qci)
             .enabled_extension_names(&dexts)
@@ -649,6 +665,9 @@ fn init_inner() -> Result<(), String> {
             .push_next(&mut f11)
             .push_next(&mut f12)
             .push_next(&mut f13);
+        if up_dev.mutable_descriptor {
+            dci = dci.push_next(&mut mutable);
+        }
         if has_robust2 {
             dci = dci.push_next(&mut r2);
         }
@@ -675,6 +694,8 @@ fn init_inner() -> Result<(), String> {
         }
         init_stage(3);
         let device = instance.create_device(pdev, &dci, None).map_err(|e| format!("vkCreateDevice: {e}"))?;
+        // The upscalers get the device (Streamline's DLSS starts on a thread of its own).
+        crate::gpu::upscale::device_created(&instance, pdev, &device, qf, qci.iter().find(|q| q.queue_family_index == qf).map_or(1, |q| q.queue_count));
         // Its command functions go through deferred recording's (`defer`).
         let device = defer::install(device);
         init_stage(4);

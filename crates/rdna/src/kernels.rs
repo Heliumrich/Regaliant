@@ -1828,6 +1828,108 @@ pub const SHARPEN_LOCAL: u32 = 8;
 /// 1 the result (storage images, rgba16f), push constants {width, height, amount}. Each pixel
 /// moves away from the mean of its four neighbours by `amount` times the difference, kept within
 /// the range of its 3x3 neighbourhood (so edges get no halo); alpha 1.
+/// The upscalers' merge (`gpu::upscale`): each pixel of the title's TAA output (binding 1,
+/// RGBA16F storage image) takes the upscaler's colour (binding 0) times the exposure the TAA
+/// applies to its input (the first float of binding 2, a storage buffer: the TAA's output is
+/// pre-exposed) and keeps its own alpha, which the TAA packs with per-pixel data later passes
+/// read. Push constants: width, height.
+pub fn rgb_merge() -> Vec<u32> {
+    build_rgb_merge().expect("rgb merge kernel")
+}
+
+/// The merge kernel's workgroup side.
+pub const RGB_MERGE_LOCAL: u32 = 8;
+
+fn build_rgb_merge() -> Result<Vec<u32>, rspirv::dr::Error> {
+    use rspirv::spirv::{Dim, ImageFormat};
+    let lit = Operand::LiteralBit32;
+    let mut b = Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
+    let void = b.type_void();
+    let bool_ = b.type_bool();
+    let u32t = b.type_int(32, 0);
+    let i32t = b.type_int(32, 1);
+    let f32t = b.type_float(32, None);
+    let v3u = b.type_vector(u32t, 3);
+    let v2i = b.type_vector(i32t, 2);
+    let v4f = b.type_vector(f32t, 4);
+    let img = b.type_image(f32t, Dim::Dim2D, 0, 0, 0, 2, ImageFormat::Rgba16f, None);
+    let p_img = b.type_pointer(None, StorageClass::UniformConstant, img);
+    let pc = b.type_struct([u32t, u32t]);
+    b.decorate(pc, Decoration::Block, []);
+    b.member_decorate(pc, 0, Decoration::Offset, [lit(0)]);
+    b.member_decorate(pc, 1, Decoration::Offset, [lit(4)]);
+    let rta = b.type_runtime_array(f32t);
+    b.decorate(rta, Decoration::ArrayStride, [lit(4)]);
+    let sb = b.type_struct([rta]);
+    b.decorate(sb, Decoration::Block, []);
+    b.member_decorate(sb, 0, Decoration::Offset, [lit(0)]);
+    let p_sb = b.type_pointer(None, StorageClass::StorageBuffer, sb);
+    let p_sbf = b.type_pointer(None, StorageClass::StorageBuffer, f32t);
+    let p_pc = b.type_pointer(None, StorageClass::PushConstant, pc);
+    let p_pcu = b.type_pointer(None, StorageClass::PushConstant, u32t);
+    let p_in = b.type_pointer(None, StorageClass::Input, v3u);
+    let gid = global(&mut b, p_in, StorageClass::Input);
+    b.decorate(gid, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let src = global(&mut b, p_img, StorageClass::UniformConstant);
+    b.decorate(src, Decoration::DescriptorSet, [lit(0)]);
+    b.decorate(src, Decoration::Binding, [lit(0)]);
+    b.decorate(src, Decoration::NonWritable, []);
+    let dst = global(&mut b, p_img, StorageClass::UniformConstant);
+    b.decorate(dst, Decoration::DescriptorSet, [lit(0)]);
+    b.decorate(dst, Decoration::Binding, [lit(1)]);
+    let expo = global(&mut b, p_sb, StorageClass::StorageBuffer);
+    b.decorate(expo, Decoration::DescriptorSet, [lit(0)]);
+    b.decorate(expo, Decoration::Binding, [lit(2)]);
+    b.decorate(expo, Decoration::NonWritable, []);
+    let pcv = global(&mut b, p_pc, StorageClass::PushConstant);
+    let (u0, u1) = (b.constant_bit32(u32t, 0), b.constant_bit32(u32t, 1));
+    let fty = b.type_function(void, []);
+    let f = b.begin_function(void, None, FunctionControl::NONE, fty)?;
+    b.begin_block(None)?;
+    let g = b.load(v3u, None, gid, None, [])?;
+    let gx = b.composite_extract(u32t, None, g, [0])?;
+    let gy = b.composite_extract(u32t, None, g, [1])?;
+    let p_w = b.access_chain(p_pcu, None, pcv, [u0])?;
+    let w = b.load(u32t, None, p_w, None, [])?;
+    let p_h = b.access_chain(p_pcu, None, pcv, [u1])?;
+    let h = b.load(u32t, None, p_h, None, [])?;
+    let in_x = b.u_less_than(bool_, None, gx, w)?;
+    let in_y = b.u_less_than(bool_, None, gy, h)?;
+    let inside = b.logical_and(bool_, None, in_x, in_y)?;
+    let (l_body, l_end) = (b.id(), b.id());
+    b.selection_merge(l_end, SelectionControl::NONE)?;
+    b.branch_conditional(inside, l_body, l_end, [])?;
+    b.begin_block(Some(l_body))?;
+    let x = b.bitcast(i32t, None, gx)?;
+    let y = b.bitcast(i32t, None, gy)?;
+    let at = b.composite_construct(v2i, None, [x, y])?;
+    let simg = b.load(img, None, src, None, [])?;
+    let s = b.image_read(v4f, None, simg, at, None, [])?;
+    let dimg = b.load(img, None, dst, None, [])?;
+    let d = b.image_read(v4f, None, dimg, at, None, [])?;
+    let p_e = b.access_chain(p_sbf, None, expo, [u0, u0])?;
+    let e = b.load(f32t, None, p_e, None, [])?;
+    let r = b.composite_extract(f32t, None, s, [0])?;
+    let gg = b.composite_extract(f32t, None, s, [1])?;
+    let bb = b.composite_extract(f32t, None, s, [2])?;
+    let r = b.f_mul(f32t, None, r, e)?;
+    let gg = b.f_mul(f32t, None, gg, e)?;
+    let bb = b.f_mul(f32t, None, bb, e)?;
+    let a = b.composite_extract(f32t, None, d, [3])?;
+    let out = b.composite_construct(v4f, None, [r, gg, bb, a])?;
+    b.image_write(dimg, at, out, None, [])?;
+    b.branch(l_end)?;
+    b.begin_block(Some(l_end))?;
+    b.ret()?;
+    b.end_function()?;
+    b.entry_point(ExecutionModel::GLCompute, f, "main", [gid]);
+    b.execution_mode(f, ExecutionMode::LocalSize, [RGB_MERGE_LOCAL, RGB_MERGE_LOCAL, 1]);
+    Ok(b.module().assemble())
+}
+
 pub fn sharpen() -> Vec<u32> {
     build_sharpen().expect("sharpen kernel")
 }

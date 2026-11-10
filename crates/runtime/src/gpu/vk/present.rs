@@ -457,7 +457,16 @@ pub fn present(src: Source) -> bool {
         let waits = [done];
         let pi = vk::PresentInfoKHR::default().wait_semaphores(&waits).swapchains(&scs).image_indices(&idxs);
         let q = c.queue.lock();
-        match c.swapchain_d.queue_present(*q, &pi) {
+        // (Through Streamline's present once DLSS runs: its per-frame bookkeeping.)
+        let presented = match crate::gpu::upscale::present_hook() {
+            Some(f) => match f(*q, &pi) {
+                vk::Result::SUCCESS => Ok(false),
+                vk::Result::SUBOPTIMAL_KHR => Ok(true),
+                e => Err(e),
+            },
+            None => c.swapchain_d.queue_present(*q, &pi),
+        };
+        match presented {
             Ok(false) => {}
             Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => window::RESIZED.store(true, std::sync::atomic::Ordering::SeqCst),
             Err(e) => crate::error!("present: {e}"),

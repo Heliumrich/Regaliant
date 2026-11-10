@@ -62,6 +62,9 @@ pub enum ItemKind {
     /// The monitor (0), fullscreen resolution (1) or refresh rate (2): lists made at the start
     /// (`crate::display`; live, kept in display.txt).
     Display(u8),
+    /// Anti-Aliasing: the title's TAA, Off, then the upscalers ready in this session (`aa_list`;
+    /// the choice kept by its code, `AA_*`).
+    AntiAliasing,
     /// The Quality Preset (`presets`): Custom and the presets as options (live: the preset the
     /// settings match; a change sets its settings).
     Preset(Vec<String>),
@@ -96,6 +99,7 @@ impl Item {
                     (format!("PC_AUDIODEVICE_{}", k + 1), Some(short))
                 }))
                 .collect(),
+            ItemKind::AntiAliasing => aa_list().iter().enumerate().map(|(n, (_, o))| (self.text_key(&format!("_{n}")), Some(o.to_string()))).collect(),
             ItemKind::Display(k) => {
                 let opts = match k {
                     0 => crate::display::monitor_options(),
@@ -117,6 +121,7 @@ impl Item {
             ItemKind::PadBinding(a) => (store::Kind::Int, 0, Some(store::Live::PadBinding(*a))),
             ItemKind::AudioDevice => (store::Kind::Int, 0, Some(store::Live::AudioDevice)),
             ItemKind::Display(k) => (store::Kind::Int, 0, Some(store::Live::Display(*k))),
+            ItemKind::AntiAliasing => (store::Kind::Int, AA_TAA, Some(store::Live::AntiAliasing)),
             ItemKind::Preset(_) => (store::Kind::Int, 0, Some(store::Live::Preset)),
         };
         store::Def { name: self.key(), kind, default, live }
@@ -226,8 +231,8 @@ pub fn graphics_items() -> Vec<Item> {
         Item {
             id: s("AntiAliasing"),
             label: s("Anti-Aliasing"),
-            tooltip: s("Smooths jagged edges. Off makes edges shimmer."),
-            kind: ItemKind::Choice(vec![s("TAA"), s("Off")], 0),
+            tooltip: s("Smooths jagged edges. DLSS, FSR and XeSS replace the game's TAA."),
+            kind: ItemKind::AntiAliasing,
         },
         toggle("Bloom", "Bloom", "The glow around bright lights.", true),
         toggle("Vignette", "Vignette", "The darkening toward the image's edges.", true),
@@ -304,8 +309,18 @@ pub fn apply() {
     convar::want("r_tessellationDensity", geo.map(|g| convar::float(g.0)));
     convar::want("r_tessellationFadeOutStart", geo.map(|g| convar::float(g.1)));
     convar::want("r_tessellationSmallestEdgeLength", geo.map(|g| convar::float(g.2)));
-    // r_aaMethod: EAAMethods::Off 0, TAA 1 (the title's).
-    convar::want("r_aaMethod", (get("AntiAliasing") == Some(1)).then_some(0));
+    // Anti-Aliasing by its code: the title's TAA, Off (r_aaMethod: EAAMethods::Off 0, TAA 1), or
+    // an upscaler in the TAA's place (the TAA stays on: its dispatch is what they replace, its
+    // jitter what they need). A code whose upscaler is not ready here falls back to the TAA.
+    let aa = store::raw_value("Setting_PC_AntiAliasing").unwrap_or(AA_TAA);
+    convar::want("r_aaMethod", (aa == AA_OFF).then_some(0));
+    // (`DS_UPSCALER` decides in development runs.)
+    if std::env::var_os("DS_UPSCALER").is_none() { crate::gpu::upscale::set_choice(match aa {
+        AA_DLSS if crate::gpu::upscale::is_ready("dlss") => "dlss",
+        AA_FSR if crate::gpu::upscale::is_ready("fsr") => "fsr",
+        AA_XESS if crate::gpu::upscale::is_ready("xess") => "xess",
+        _ => "off",
+    }); }
     convar::want("r_bloomEnable", (get("Bloom") == Some(0)).then_some(0));
     let vignette_off = get("Vignette") == Some(0);
     convar::want("r_vignetteOverrideEnable", vignette_off.then_some(1));
@@ -371,6 +386,29 @@ pub fn mouse_blur_tick() {
 }
 
 /// The window mode the window opens with (the PC tab's; `None`: the window's own default).
+/// Anti-Aliasing codes (what pcsettings.txt keeps).
+pub const AA_TAA: u32 = 0;
+pub const AA_OFF: u32 = 1;
+pub const AA_DLSS: u32 = 2;
+pub const AA_FSR: u32 = 3;
+pub const AA_XESS: u32 = 4;
+
+/// The Anti-Aliasing list of this session: TAA, Off, then each upscaler ready when the menu is
+/// first made (codes and labels).
+pub fn aa_list() -> &'static [(u32, &'static str)] {
+    static L: std::sync::OnceLock<Vec<(u32, &'static str)>> = std::sync::OnceLock::new();
+    L.get_or_init(|| {
+        let mut v = vec![(AA_TAA, "TAA"), (AA_OFF, "Off")];
+        for (code, name, label) in [(AA_DLSS, "dlss", "DLSS"), (AA_FSR, "fsr", "FSR"), (AA_XESS, "xess", "XeSS")] {
+            if crate::gpu::upscale::offered(name) {
+                v.push((code, label));
+            }
+        }
+        crate::info!("pc settings: Anti-Aliasing offers {}", v.iter().map(|(_, l)| *l).collect::<Vec<_>>().join(", "));
+        v
+    })
+}
+
 /// HDR output allowed (the PC tab's HDR: Automatic): the title is told the output is HDR while
 /// Windows' HDR is on for the window's monitor.
 pub fn hdr_allowed() -> bool {
@@ -669,6 +707,7 @@ fn edit_data_source(p: &mut Payload, item: &Item) -> Result<(), String> {
         ItemKind::Binding(_) => (raw_u32(0), Some(raw_u32(0)), Some(raw_u32(bindings::capture_option()))),
         ItemKind::PadBinding(_) => (raw_u32(0), Some(raw_u32(0)), Some(raw_u32(bindings::pad_capture_option()))),
         ItemKind::AudioDevice => (raw_u32(0), Some(raw_u32(0)), Some(raw_u32(crate::audio::output_devices().len() as u32))),
+        ItemKind::AntiAliasing => (raw_u32(0), Some(raw_u32(0)), Some(raw_u32(aa_list().len().max(1) as u32 - 1))),
         ItemKind::Display(k) => {
             let n = match k {
                 0 => crate::display::monitor_options().len(),
@@ -1073,7 +1112,7 @@ fn start_menu(orig: &[u8]) -> Result<Vec<u8>, String> {
         let mut kids = Vec::new();
         for item in &tab.items {
             let (ti, t) = match item.kind {
-                ItemKind::Toggle(_) | ItemKind::Choice(..) | ItemKind::Status(_) | ItemKind::Count(..) | ItemKind::Binding(_) | ItemKind::PadBinding(_) | ItemKind::AudioDevice | ItemKind::Display(_) | ItemKind::Preset(_) => (ti_choice, &CHOICE),
+                ItemKind::Toggle(_) | ItemKind::Choice(..) | ItemKind::Status(_) | ItemKind::Count(..) | ItemKind::Binding(_) | ItemKind::PadBinding(_) | ItemKind::AudioDevice | ItemKind::Display(_) | ItemKind::AntiAliasing | ItemKind::Preset(_) => (ti_choice, &CHOICE),
                 ItemKind::Slider { .. } => (ti_slider, &SLIDER),
             };
             let tpl = f.roots[ri].at(&page_path).at(&contents_rel).kids[ti].clone();

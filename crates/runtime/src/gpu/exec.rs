@@ -9923,6 +9923,76 @@ pub static WORKER_SLOTS: AtomicU64 = AtomicU64::new(0);
 /// Error of a command a deferred executor stopped at (see `Exec::stopped`).
 pub(crate) const STOPPED: &str = "stopped (parallel run)";
 
+/// The title's TAA program (01.007.000; `gpu::upscale`): resources 1 colour, 2 depth, 4 motion
+/// vectors, 9 output.
+const TAA_CS: u64 = 0x100893aa00;
+const TAA_RES: [usize; 4] = [1, 2, 4, 9];
+
+/// Diagnosis (`DS_TAA_PROBE=<n>`): the title's TAA dispatch (cs 0x100893aa00) for its first
+/// `n` frames: its resources and its constant buffer's words (the jitter's source).
+/// `taadump <name>`: the TAA's input colour at its next dispatch, as `<name>.raw` (diagnosis).
+pub static TAA_DUMP: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
+
+fn taa_probe(p: &Prepared) {
+    if p.addr == TAA_CS {
+        if let Some(req) = TAA_DUMP.lock().take() {
+            // `<name>` or `<name>:<resource>` (1 colour, 4 motion vectors).
+            let (name, res) = req.split_once(':').map_or((req.as_str(), 1usize), |(n, r)| (n, r.parse().unwrap_or(1)));
+            let name = name.to_string();
+            if let (Some(Resolved::Image(t)), Some(dir)) = (p.resources.get(res), crate::run_dir()) {
+                let r = super::images::with(|im| im.dump_one(t.base, dir, &name));
+                crate::info!("taadump {name}: {}", r.as_deref().unwrap_or_else(|e| e));
+            }
+        }
+    }
+    static LEFT: AtomicU64 = AtomicU64::new(u64::MAX);
+    static START: AtomicU64 = AtomicU64::new(0);
+    let mut left = LEFT.load(Ordering::Relaxed);
+    if left == u64::MAX {
+        // `<count>` or `<count>@<first flip>`.
+        let v = std::env::var("DS_TAA_PROBE").unwrap_or_default();
+        let (n, at) = v.split_once('@').unwrap_or((v.as_str(), "0"));
+        left = n.trim().parse().unwrap_or(0);
+        START.store(at.trim().parse().unwrap_or(0), Ordering::Relaxed);
+        LEFT.store(left, Ordering::Relaxed);
+    }
+    if left == 0 || p.addr != 0x100893aa00 || super::FRAMES.load(Ordering::Relaxed) < START.load(Ordering::Relaxed) {
+        return;
+    }
+    LEFT.store(left - 1, Ordering::Relaxed);
+    let mut s = format!("taa probe at flip {}:", super::FRAMES.load(Ordering::Relaxed));
+    // The per-frame block the user data points at (64 words).
+    let ptr = p.sgpr_data.first().copied().unwrap_or(0) as u64 | (p.sgpr_data.get(1).copied().unwrap_or(0) as u64 & 0xFFFF) << 32;
+    if ptr != 0 && super::cp::guest_readable(ptr, 256) {
+        let words: Vec<String> = (0..64u64).map(|k| {
+            let w = unsafe { std::ptr::read_volatile((ptr + 4 * k) as *const u32) };
+            let f = f32::from_bits(w);
+            if f.is_finite() && (f == 0.0 || f.abs() > 1e-6 && f.abs() < 1e7) { format!("{f:.6}") } else { format!("#{w:08x}") }
+        }).collect();
+        s.push_str(&format!(" user block {ptr:#x} = [{}]", words.join(" ")));
+    }
+    for (i, r) in p.resources.iter().enumerate() {
+        match r {
+            Resolved::Buffer(v) => {
+                let n = v.extent().min(128);
+                s.push_str(&format!(" [{i}] buffer {:#x}+{n}", v.base));
+                if super::cp::guest_readable(v.base, n) {
+                    let words: Vec<String> = (0..n / 4).map(|k| {
+                        let w = unsafe { std::ptr::read_volatile((v.base + 4 * k) as *const u32) };
+                        format!("{:.6}", f32::from_bits(w))
+                    }).collect();
+                    s.push_str(&format!(" = [{}]", words.join(" ")));
+                }
+            }
+            Resolved::Image(t) => s.push_str(&format!(" [{i}] image {:#x} format {} {}x{}", t.base, t.format, t.width, t.height)),
+            Resolved::Global(a, n) => s.push_str(&format!(" [{i}] global {a:#x} {n:?}")),
+            _ => {}
+        }
+    }
+    let user: Vec<String> = p.sgpr_data.iter().take(4).map(|w| format!("{w:08x}")).collect();
+    crate::info!("{s}; user {}", user.join(" "));
+}
+
 impl Exec {
     pub fn new(name: &str) -> Result<Exec, String> {
         let c = ctx();
@@ -15522,6 +15592,81 @@ impl Exec {
         }
     }
 
+    /// The chosen upscaler after the title's TAA dispatch (`gpu::upscale`): the TAA's colour,
+    /// depth and motion vectors in, the frame's jitter from the title's jitter function
+    /// (`crate::jitter`), its own output image out, whose colour then replaces the TAA output's
+    /// (`gpu::upmerge`: the TAA's alpha stays). True when recorded (the executor's bound state
+    /// is then unknown).
+    fn taa_upscale(&mut self, p: &Prepared, bound: &Bound) -> bool {
+        if !super::upscale::active() {
+            return false;
+        }
+        // The TAA's constant buffer (resource 0) as bound: its first float is the exposure the
+        // TAA applies to its input (the merge applies it to the upscaler's colour).
+        let ebind = p.tr.out.bindings.iter().find(|b| matches!(b.kind, BindingKind::Buffer(0))).map(|b| b.binding);
+        let Some(exposure) = ebind.and_then(|bn| bound.bufs.iter().find(|(x, _)| *x == bn).map(|(_, i)| *i)) else {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::warn!("upscaler: the TAA's constant buffer is not bound as expected: the title's TAA runs"));
+            return false;
+        };
+        let frame = super::FRAMES.load(Ordering::Relaxed);
+        let t: Vec<Option<super::desc::Tsharp>> = TAA_RES.iter().map(|&i| match p.resources.get(i) {
+            Some(Resolved::Image(t)) => Some(t.clone()),
+            _ => None,
+        }).collect();
+        let [Some(tc), Some(td), Some(tv), Some(to)] = [t[0].clone(), t[1].clone(), t[2].clone(), t[3].clone()] else {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::warn!("upscaler: the TAA's resources are not the four images expected: the title's TAA runs"));
+            return false;
+        };
+        let r = super::images::with(|im| -> Result<_, String> { Ok((im.upscale_tex(&tc, false, frame)?, im.upscale_tex(&td, false, frame)?, im.upscale_tex(&tv, false, frame)?, im.upscale_tex(&to, true, frame)?)) });
+        let (color, depth, velocity, taa_out) = match r {
+            Ok(v) => v,
+            Err(e) => {
+                static N: AtomicU64 = AtomicU64::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                    crate::warn!("upscaler: the TAA's images: {e} (the title's TAA runs)");
+                }
+                return false;
+            }
+        };
+        let output = match super::upmerge::target(to.width, to.height) {
+            Ok(t) => t,
+            Err(e) => {
+                static N: AtomicU64 = AtomicU64::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                    crate::warn!("upscaler: no output image ({e})");
+                }
+                return false;
+            }
+        };
+        let j = crate::jitter::for_flip(frame);
+        let cmd = self.cmd();
+        let target = output.image;
+        super::vk::defer::external(cmd, Box::new(move |cb| super::upmerge::begin(cb, target)));
+        let inp = super::upscale::Inputs {
+            color,
+            depth,
+            velocity,
+            output,
+            in_width: tc.width,
+            in_height: tc.height,
+            width: to.width,
+            height: to.height,
+            ldr: false,
+            jitter_x: j.map_or(0.0, |j| j.x),
+            jitter_y: j.map_or(0.0, |j| j.y),
+        };
+        if !super::upscale::record(cmd, &inp) {
+            return false;
+        }
+        let (view, w, h) = (taa_out.view, to.width, to.height);
+        super::vk::defer::external(cmd, Box::new(move |cb| super::upmerge::record(cb, view, w, h, exposure)));
+        // (The upscaler and the merge bound pipelines and descriptors of their own.)
+        self.dyncache = Default::default();
+        true
+    }
+
     /// Diagnosis: the reads of a GPU-resolved command's shader-resolved
     /// loads and buffers that the CPU path would have bound elsewhere than
     /// guest memory (`GPU_RES_CHECKS`; the first 40 logged).
@@ -15781,6 +15926,7 @@ impl Exec {
             None if memo => shaders::prep_memo(shaders::prep_memo_key(shaders::StageKind::Compute, cp.packet_addr(), cp, wave64 as u64 | (indirect.is_some() as u64) << 1), || shaders::prepare_compute(cp, wave64))?,
             None => shaders::prepare_compute(cp, wave64)?,
         };
+        taa_probe(&p);
         // LOD statistics in rotation (`tune lod_cs` >= 2): a stage prepared
         // without them measures in one dispatch in N (prepared again with
         // them); the others carry their textures' recent measurements.
@@ -16479,6 +16625,10 @@ impl Exec {
                 c.device.cmd_dispatch(cmd, groups[0], groups[1], groups[2]);
             }
         }
+        }
+        // The chosen upscaler after the title's TAA (`gpu::upscale`, `gpu::upmerge`).
+        if !batched && p.addr == TAA_CS && indirect.is_none() {
+            self.taa_upscale(&p, &bound);
         }
         stamp(2);
         lap.mark(12);

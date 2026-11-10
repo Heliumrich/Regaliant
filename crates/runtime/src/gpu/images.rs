@@ -5180,6 +5180,75 @@ impl Images {
         Some(format!("gpu image mip {mip}: {z}% zero"))
     }
 
+    /// An upscaler's view of a resource (`gpu::upscale`): the image behind `t` as a binding
+    /// finds it (GENERAL layout), with its format, size, usage and the aspect its view shows.
+    pub fn upscale_tex(&mut self, t: &Tsharp, storage: bool, frame: u64) -> Result<super::upscale::Tex, String> {
+        let (view, image) = self.view(t, storage, frame)?;
+        let key = self.map.values().find(|i| i.image == image).map(|i| i.key).ok_or("its image is not in the cache")?;
+        let c = ctx();
+        let f = unsafe { c.instance.get_physical_device_format_properties(c.pdev, key.format) }.optimal_tiling_features;
+        let mut usage = vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC;
+        if f.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE) {
+            usage |= vk::ImageUsageFlags::SAMPLED;
+        }
+        if !is_depth(key.format) {
+            let sprops = unsafe { c.instance.get_physical_device_format_properties(c.pdev, storage_format(key.format)) };
+            if sprops.optimal_tiling_features.contains(vk::FormatFeatureFlags::STORAGE_IMAGE) {
+                usage |= vk::ImageUsageFlags::STORAGE;
+            }
+        }
+        if f.contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT) {
+            usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        }
+        if f.contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT) {
+            usage |= vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT;
+        }
+        let aspect = if is_depth(key.format) { vk::ImageAspectFlags::DEPTH } else { vk::ImageAspectFlags::COLOR };
+        Ok(super::upscale::Tex {
+            image,
+            view,
+            range: vk::ImageSubresourceRange { aspect_mask: aspect, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 },
+            format: key.format,
+            size: (key.width, key.height),
+            usage,
+            layout: vk::ImageLayout::GENERAL,
+        })
+    }
+
+    /// Diagnosis (`imgpng <address> <name>`): the largest GPU-written color image at `base`
+    /// (mip 0, layer 0) to `<dir>/<name>.png`; its description.
+    pub fn dump_one(&mut self, base: u64, dir: &std::path::Path, name: &str) -> Result<String, String> {
+        // A depth surface: its depth as R32 floats (`<name>.raw`).
+        if let Some(k) = self.map.values().filter(|i| i.key.base == base && is_depth(i.key.format)).map(|i| i.key).next() {
+            if self.map.values().all(|i| i.key.base != base || is_depth(i.key.format)) {
+                let image = self.map[&k].image;
+                let raw = self.read_back_aspect(image, k.format, vk::ImageAspectFlags::DEPTH, k.width, k.height)?;
+                let mut out = Vec::with_capacity(raw.len() + 8);
+                out.extend_from_slice(&k.width.to_le_bytes());
+                out.extend_from_slice(&k.height.to_le_bytes());
+                out.extend_from_slice(&raw);
+                std::fs::write(dir.join(format!("{name}.raw")), out).map_err(|e| e.to_string())?;
+                return Ok(format!("{}x{} {:?} depth", k.width, k.height, k.format));
+            }
+        }
+        let k = self.map.values().filter(|i| i.key.base == base && !is_depth(i.key.format)).max_by_key(|i| (i.key.width as u64 * i.key.height as u64, i.gpu_written)).map(|i| i.key).ok_or("no color image there")?;
+        let image = self.map[&k].image;
+        let raw = self.read_back(image, k.format, k.width, k.height)?;
+        // Float images as their raw texels too (`<name>.raw`: width, height as u32, then the
+        // texels): a PNG clamps their range.
+        if matches!(k.format, vk::Format::R16G16B16A16_SFLOAT | vk::Format::R32G32B32A32_SFLOAT | vk::Format::R16G16_SFLOAT | vk::Format::B10G11R11_UFLOAT_PACK32 | vk::Format::R32_SFLOAT) {
+            let mut out = Vec::with_capacity(raw.len() + 8);
+            out.extend_from_slice(&k.width.to_le_bytes());
+            out.extend_from_slice(&k.height.to_le_bytes());
+            out.extend_from_slice(&raw);
+            std::fs::write(dir.join(format!("{name}.raw")), out).map_err(|e| e.to_string())?;
+        }
+        if let Some(rgba) = to_rgba8(k.format, &raw) {
+            std::fs::write(dir.join(format!("{name}.png")), super::png::encode(k.width, k.height, &rgba)).map_err(|e| e.to_string())?;
+        }
+        Ok(format!("{}x{} {:?}", k.width, k.height, k.format))
+    }
+
     /// Writes the GPU-written color images (mip 0, layer 0) to `dir` as PNG
     /// files named <address>_<width>x<height>_<format>.png (frame captures).
     pub fn dump_targets(&mut self, dir: &std::path::Path) -> usize {

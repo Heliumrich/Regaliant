@@ -56,6 +56,11 @@ pub const VARS: &[Var] = &[
     v("r_tessellationSmallestEdgeLength", 0x24bc7b7, 0x2f2bd88, Kind::Float),
     // An enum (an int in the render settings): EAAMethods::Off 0, TAA 1 (the title's).
     v("r_aaMethod", 0x246708e, 0x2f0d5d8, Kind::Int),
+    // The TAA's projection jitter (bool, built at eboot+0x9222ce) and a jitter index forced in
+    // its place (int, -1 the default: the title's own sequence; at most 100; +0x9223ec): the
+    // upscalers hold the title's jitter at a phase of their choosing (`gpu::upscale`).
+    v("r_aaEnableTemporalProjectMatrixJitter", 0x2467099, 0x2f0d7d8, Kind::Bool),
+    v("r_aaForceJitterIndex", 0x23cfd87, 0x2f0d9b8, Kind::Int),
     // The wind simulation the grass and plants sway by (diagnosis: the grass glitch).
     v("r_windSimEnable", 0x2482de5, 0x2f24508, Kind::Bool),
     v("r_windSimAsync", 0x2407e6d, 0x2f245f8, Kind::Bool),

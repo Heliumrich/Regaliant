@@ -27,6 +27,7 @@ mod jobidle;
 mod camhook;
 mod dispmode;
 mod display;
+mod jitter;
 mod engine;
 mod thread;
 mod titlefix;
@@ -985,6 +986,39 @@ fn poll_control(path: &Path, offset: &mut u64) {
                         None => Err("usage: fillimg <hex address>|cs=<hex shader> <value>".into()),
                     },
                     _ => Err("usage: fillimg <hex address>|cs=<hex shader> <value>".into()),
+                }
+            }
+            "upscaler" => {
+                // `upscaler off|dlss|fsr|xess`: the Anti-Aliasing's upscaler, live (tests).
+                let v = parts.next().unwrap_or("off");
+                gpu::upscale::set_choice(v);
+                Ok(())
+            }
+            "upjitter" => {
+                // `upjitter <x> <y>`: the upscalers' jitter scale from now on (tests).
+                let x = parts.next().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.5);
+                let y = parts.next().and_then(|v| v.parse::<f32>().ok()).unwrap_or(-0.5);
+                gpu::upscale::set_jitter_scale(x, y);
+                Ok(())
+            }
+            "taadump" => {
+                // `taadump <name>`: the TAA's input colour at its next dispatch (diagnosis).
+                let name: String = parts.next().unwrap_or("taa").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || *c == ':').collect();
+                *gpu::exec::TAA_DUMP.lock() = Some(name);
+                Ok(())
+            }
+            "imgpng" => {
+                // Diagnosis: `imgpng <hex address> <name>`: the GPU image at that guest address as
+                // <run dir>/<name>.png.
+                let a = parts.next().and_then(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok());
+                let name: String = parts.next().unwrap_or("img").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect();
+                match (a, RUN_DIR.get()) {
+                    (Some(a), Some(dir)) => {
+                        let r = gpu::images::with(|im| im.dump_one(a, dir, &name));
+                        info!("control: imgpng {a:#x} {name}: {}", r.as_deref().unwrap_or_else(|e| e));
+                        r.map(|_| ())
+                    }
+                    _ => Err("usage: imgpng <hex address> <name>".into()),
                 }
             }
             "imgstat" => {

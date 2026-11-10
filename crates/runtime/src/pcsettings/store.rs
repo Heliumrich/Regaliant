@@ -57,6 +57,9 @@ pub enum Live {
     /// The display choices (`crate::display`): 0 the monitor, 1 the fullscreen resolution, 2
     /// the refresh rate (kept in local-data/display.txt).
     Display(u8),
+    /// Anti-Aliasing: the menu shows the session list's index of the code kept
+    /// (`super::aa_list`); a change keeps the code.
+    AntiAliasing,
     /// The Quality Preset: the preset the settings match (`presets::current`); a change sets
     /// the preset's settings.
     Preset,
@@ -142,6 +145,11 @@ pub fn get(hash: u32) -> Option<u32> {
             let id = crate::audio::output_device();
             return Some(id.and_then(|id| crate::audio::output_devices().iter().position(|d| d.0 == id)).map(|k| k as u32 + 1).unwrap_or(0));
         }
+        Some(Live::AntiAliasing) => {
+            let code = s.values.get(&hash).copied().unwrap_or(d.default);
+            drop(g);
+            return Some(super::aa_list().iter().position(|(c, _)| *c == code).unwrap_or(0) as u32);
+        }
         Some(Live::Display(k)) => {
             return Some(match k {
                 0 => crate::display::monitor_index(),
@@ -151,6 +159,15 @@ pub fn get(hash: u32) -> Option<u32> {
         }
         None => {}
     }
+    Some(s.values.get(&hash).copied().unwrap_or(d.default))
+}
+
+/// The value kept for a PC setting (its code, not what a live row shows).
+pub fn raw_value(name: &str) -> Option<u32> {
+    let hash = super::setting_hash(name);
+    let g = STORE.lock();
+    let s = g.as_ref()?;
+    let d = s.defs.get(&hash)?;
     Some(s.values.get(&hash).copied().unwrap_or(d.default))
 }
 
@@ -197,6 +214,8 @@ fn set(hash: u32, bits: u32) -> bool {
         crate::audio::set_output_device(id);
         return true;
     }
+    // Anti-Aliasing: the menu's index becomes the code kept (the normal path below stores it).
+    let bits = if let Some(Live::AntiAliasing) = d.live { super::aa_list().get(bits as usize).map_or(super::AA_TAA, |(c, _)| *c) } else { bits };
     if let Some(Live::Display(k)) = d.live {
         drop(g);
         match k {
@@ -206,7 +225,7 @@ fn set(hash: u32, bits: u32) -> bool {
         }
         return true;
     }
-    if d.live.is_some() {
+    if d.live.is_some() && !matches!(d.live, Some(Live::AntiAliasing)) {
         // A row showing the achievements; the menu cannot change it.
         return true;
     }
