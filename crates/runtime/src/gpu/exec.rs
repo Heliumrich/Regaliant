@@ -14781,6 +14781,9 @@ impl Exec {
                         if size >= 16 << 20 && trace_large() {
                             note_large_binding(&self.name, p, i, base, size, sized_by);
                         }
+                        if super::slotcensus::on() && size > 0 {
+                            super::slotcensus::note(if self.compute_cp { 2 } else if self.deferred { 1 } else { 0 }, p.addr, i as u32, base, size);
+                        }
                         BindClock::mark(&mut clk, 0);
                         if size > 0 && !found.tr.plan.resources[i].written {
                             bound.reads.push((base, size));

@@ -12,6 +12,7 @@ pub mod cp;
 pub mod desc;
 pub mod emucheck;
 pub mod frameprobe;
+pub mod slotcensus;
 pub mod hitch;
 pub mod runprobe;
 pub mod smalltrack;
@@ -3001,6 +3002,7 @@ pub fn start_profiler() {
 
 /// Clears the samples and dispatch timings (`profile reset` control command).
 pub fn reset_profile() {
+    slotcensus::reset();
     cp::reset_classes();
     exec::wb_census_reset();
     exec::replay_census_reset();
@@ -3080,6 +3082,7 @@ pub fn profile_report() -> String {
         s.push_str(&crate::mem::ww_lines());
     }
     s.push_str(&exec::push_line());
+    s.push_str(&slotcensus::line());
     s.push_str(&exec::async_line());
     s.push_str(&shaders::fmt_line());
     s.push_str(&exec::import_window_line());
