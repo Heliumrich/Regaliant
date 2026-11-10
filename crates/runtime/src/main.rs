@@ -40,7 +40,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub struct Config {
-    pub root: PathBuf,
+    /// Where the port keeps its files (`dsconfig::paths`: the checkout's local-data, a portable
+    /// folder, or the player's AppData folders).
+    pub paths: dsconfig::paths::Paths,
+    /// Why the game folder cannot be used (told to the player at start), if so.
+    pub game_problem: Option<String>,
     /// Application root (`PPSA01341-app0`): read-only assets mounted at /app0.
     pub app: PathBuf,
     /// Directory holding the decrypted executable and `sce_module/`.
@@ -70,6 +74,12 @@ pub struct Config {
 }
 
 static RUN_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+static PATHS: std::sync::OnceLock<dsconfig::paths::Paths> = std::sync::OnceLock::new();
+
+/// Where the port keeps its files (set at start).
+pub fn paths() -> &'static dsconfig::paths::Paths {
+    PATHS.get_or_init(dsconfig::paths::Paths::current)
+}
 
 /// This run's output directory (logs, captures).
 pub fn run_dir() -> Option<&'static Path> {
@@ -159,9 +169,7 @@ pub(crate) fn utc_stamp() -> String {
 }
 
 fn parse_args() -> Config {
-    let exe = std::env::current_exe().unwrap();
-    // target/<profile>/dsport.exe -> project root
-    let mut root = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent()).map(Path::to_path_buf).unwrap_or_default();
+    let mut paths = dsconfig::paths::Paths::current();
     let mut seconds = None;
     let mut trace = false;
     let mut lenient = false;
@@ -185,7 +193,12 @@ fn parse_args() -> Config {
             "--headless" => headless = true,
             // (Read by `hosted::wants_host`: front end 2 unhosted, its arming off.)
             "--no-host" => {}
-            "--root" => root = PathBuf::from(args.next().expect("--root needs a path")),
+            "--root" => {
+                // A development checkout's root (its local-data holds everything).
+                let root = PathBuf::from(args.next().expect("--root needs a path"));
+                let data = root.join("local-data");
+                paths = dsconfig::paths::Paths { layout: dsconfig::paths::Layout::Dev, exe_dir: paths.exe_dir.clone(), user: data.clone(), cache: data, root: Some(root) };
+            }
             "--control" => control = Some(PathBuf::from(args.next().expect("--control needs a path"))),
             "--cache" => cache = Some(PathBuf::from(args.next().expect("--cache needs a directory"))),
             "--app" => app = Some(PathBuf::from(args.next().expect("--app needs a path"))),
@@ -216,13 +229,24 @@ fn parse_args() -> Config {
             }
         }
     }
-    let data = root.join("local-data");
-    let app = app.unwrap_or_else(|| root.join("Game").join("Demon-Souls-Remake-PPSA01341-1.07").join("PPSA01341-app0"));
+    // The game: `--app`, else the folder chosen in the launcher (or the checkout's own copy),
+    // checked as the launcher checks it (`dsconfig::game`).
+    let chosen = app.or_else(|| paths.chosen_game());
+    let (app, code, game_problem) = match chosen.as_deref().map(dsconfig::game::check) {
+        Some(Ok(g)) => (g.app, g.code, None),
+        Some(Err(e)) => {
+            let dir = chosen.clone().unwrap_or_default();
+            (dir.clone(), dir.join("decrypted"), Some(format!("{e}\n\nThe game folder: {}\nStart {} to choose another.", dir.display(), dsconfig::paths::LAUNCHER_EXE)))
+        }
+        None => (PathBuf::new(), PathBuf::new(), Some(format!("The game folder is not set. Start {} and choose it.", dsconfig::paths::LAUNCHER_EXE))),
+    };
+    let run_dir = paths.logs().join(utc_stamp());
     Config {
-        code: app.join("decrypted"),
+        code,
         app,
-        run_dir: data.join("runs").join(utc_stamp()),
-        root,
+        run_dir,
+        paths,
+        game_problem,
         seconds,
         trace,
         lenient,
@@ -1306,6 +1330,23 @@ fn thread_summary_ex(with_stacks: bool) -> String {
     s
 }
 
+/// Whether this run has no window (`--headless`): no message boxes then.
+pub static HEADLESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tells the player about a failure in a message box (the log alone reaches no one), unless
+/// this is a development run (`DS_MESSAGES=1` shows them there too) or a headless one.
+pub fn player_error(text: &str) {
+    let dev = paths().layout == dsconfig::paths::Layout::Dev;
+    let show = std::env::var("DS_MESSAGES").map(|v| v == "1").unwrap_or(!dev);
+    if !show || HEADLESS.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MessageBoxW};
+    let w = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let (t, m) = (w("Demon's Souls"), w(text));
+    unsafe { MessageBoxW(std::ptr::null_mut(), m.as_ptr(), t.as_ptr(), MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST) };
+}
+
 pub fn fatal_exit(code: u32, reason: &str) -> ! {
     // Exclusive fullscreen's display mode back first (the desktop must not stay changed).
     display::restore_on_exit();
@@ -1401,11 +1442,14 @@ fn main() {
         }
     };
     let cfg = parse_args();
-    let runs = cfg.root.join("local-data").join("runs");
-    prune_runs(&runs, 100);
-    std::fs::create_dir_all(&cfg.run_dir).expect("create run dir");
+    PATHS.set(cfg.paths.clone()).ok();
+    HEADLESS.store(cfg.headless, std::sync::atomic::Ordering::Relaxed);
+    prune_runs(&cfg.paths.logs(), cfg.paths.logs_kept());
+    if let Err(e) = std::fs::create_dir_all(&cfg.run_dir).and_then(|_| log::init(&cfg.run_dir.join("dsport.log"))) {
+        player_error(&format!("The game could not write its log in {}.\n\n{e}", cfg.run_dir.display()));
+        std::process::exit(1);
+    }
     RUN_DIR.set(cfg.run_dir.clone()).ok();
-    log::init(&cfg.run_dir.join("dsport.log")).expect("open log");
     log::set_thread_name("host");
     // Panics (host threads abort the process) are logged with the thread
     // that panicked: the run log is what post-mortems read.
@@ -1420,6 +1464,13 @@ fn main() {
     log::TRACE_HLE.store(cfg.trace, std::sync::atomic::Ordering::Relaxed);
     hle::LENIENT_IMPORTS.store(cfg.lenient, std::sync::atomic::Ordering::Relaxed);
     info!("dsport {} | run dir {} | TLS slot {} | host heap: {} | guest write watch: {}", env!("CARGO_PKG_VERSION"), cfg.run_dir.display(), slot, heap::name(), mem::write_watch_state());
+    info!("files: {:?} layout, settings and saves in {}, logs and caches in {}", cfg.paths.layout, cfg.paths.user.display(), cfg.paths.cache.display());
+    if let Some(p) = &cfg.game_problem {
+        error!("game files: {}", p.replace('\n', " "));
+        player_error(p);
+        log::flush();
+        std::process::exit(3);
+    }
     exception::install();
     heapsites::start();
     hosted::init();
@@ -1459,8 +1510,8 @@ fn main() {
     }
 
     // Guest file system. The supplied game tree is mounted read-only; all
-    // writable state lives under local-data/.
-    let rt = cfg.root.join("local-data").join("runtime");
+    // writable state lives in the port's own folders (`dsconfig::paths`).
+    let rt = cfg.paths.runtime();
     for d in ["temp0", "download0", "data", "devlog"] {
         hle::kernel::fs::ensure_dir(&rt.join(d));
     }
@@ -1475,19 +1526,19 @@ fn main() {
     hle::kernel::fs::ensure_dir(&rt.join("devlog").join("logs"));
     hle::kernel::fs::mount("/devlog/app", vec![rt.join("devlog")], true);
     // Keyboard and mouse layout (written with the defaults when missing).
-    input::init(&cfg.root.join("local-data").join("controls.txt"));
+    input::init(&cfg.paths.controls_file());
     // `DS_ACHIEVEMENTS_FILE`: another file (test runs: theirs, apart from a player's).
-    let achievements_file = std::env::var_os("DS_ACHIEVEMENTS_FILE").map(PathBuf::from).unwrap_or_else(|| cfg.root.join("local-data").join("achievements.txt"));
+    let achievements_file = std::env::var_os("DS_ACHIEVEMENTS_FILE").map(PathBuf::from).unwrap_or_else(|| cfg.paths.achievements_file());
     achievements::init(&cfg.app, achievements_file, "en-GB");
     // Monitors and the PC tab's display choices (before its menu lists are made).
-    display::init(cfg.root.join("local-data").join("display.txt"));
-    pcsettings::init(cfg.root.join("local-data").join("pcsettings.txt"));
-    // The saves: the PC tab's Save Folder (local-data/saves by default), a PS5 import asked for.
-    hle::libs::savedata::init(pcsettings::saves::start(&cfg.root, &hle::libs::savedata::title_id()));
+    display::init(cfg.paths.display_file());
+    pcsettings::init(cfg.paths.settings_file());
+    // The saves: the PC tab's Save Folder (the port's own by default), a PS5 import asked for.
+    hle::libs::savedata::init(pcsettings::saves::start(&cfg.paths, &hle::libs::savedata::title_id()));
     // Compiled pipelines and learned shader specs: local-data, or the
     // `--cache` directory (Play.bat: one next to the package folder, so a
     // new package starts with what earlier ones learned on this machine).
-    let cache_root = cfg.cache.clone().unwrap_or_else(|| cfg.root.join("local-data"));
+    let cache_root = cfg.cache.clone().unwrap_or_else(|| cfg.paths.shaders());
     if cfg.cache.is_some() {
         hle::kernel::fs::ensure_dir(&cache_root);
         info!("pipeline and shader-spec cache: {}", cache_root.display());

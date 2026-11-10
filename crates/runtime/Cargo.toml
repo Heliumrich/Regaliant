@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 sce-elf = { path = "../sce-elf" }
+dsconfig = { path = "../dsconfig" }
 rdna = { path = "../rdna" }
 parking_lot = "0.12"
 ash = { version = "0.38", default-features = false, features = ["loaded", "std", "debug"] }

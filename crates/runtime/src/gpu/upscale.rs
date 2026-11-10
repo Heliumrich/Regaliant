@@ -216,19 +216,13 @@ impl WideNull for std::ffi::OsStr {
     }
 }
 
-/// The upscalers' folder: `DS_UPSCALER_DIR`, else `upscalers` beside dsport.exe, else the
-/// project's local-data/upscalers (development runs start a copy of the executable).
+/// The upscalers' folder: `DS_UPSCALER_DIR`, else `upscalers` beside dsport.exe (a
+/// development checkout's: local-data/upscalers; `dsconfig::paths`).
 fn lib_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("DS_UPSCALER_DIR") {
         return PathBuf::from(d);
     }
-    let dir = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)).unwrap_or_default();
-    let sub = dir.join("upscalers");
-    if sub.is_dir() {
-        return sub;
-    }
-    let dev = dir.join("..").join("upscalers");
-    if dev.is_dir() { dev } else { sub }
+    crate::paths().upscalers()
 }
 
 /// Checks that `path` carries a valid Authenticode signature whose signer's

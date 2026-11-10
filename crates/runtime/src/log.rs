@@ -72,6 +72,64 @@ pub fn elapsed_ms() -> f64 {
     START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
 }
 
+/// Personal data kept out of logs and crash reports (players attach them to public issues): the
+/// user profile's path, the user and computer names (whole words). (pattern in lowercase,
+/// replacement, whole words only.)
+fn redactions() -> &'static [(String, &'static str, bool)] {
+    static R: OnceLock<Vec<(String, &'static str, bool)>> = OnceLock::new();
+    R.get_or_init(|| {
+        let var = |n: &str| std::env::var(n).ok().map(|v| v.trim().to_ascii_lowercase()).filter(|v| v.len() >= 2);
+        let mut v = Vec::new();
+        if let Some(p) = var("USERPROFILE").filter(|p| p.len() >= 4) {
+            let p = p.replace('/', "\\");
+            // (Debug formatting prints paths with their backslashes doubled.)
+            v.push((p.replace('\\', "\\\\"), "%USERPROFILE%", false));
+            v.push((p.replace('\\', "/"), "%USERPROFILE%", false));
+            v.push((p, "%USERPROFILE%", false));
+        }
+        if let Some(u) = var("USERNAME") {
+            v.push((u, "<user>", true));
+        }
+        if let Some(c) = var("COMPUTERNAME") {
+            v.push((c, "<computer>", true));
+        }
+        v
+    })
+}
+
+/// `s` with personal data replaced (ASCII case-insensitive).
+pub fn redact(s: &str) -> std::borrow::Cow<'_, str> {
+    let r = redactions();
+    if r.is_empty() {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut hay = s.to_ascii_lowercase();
+    if !r.iter().any(|(p, _, _)| hay.contains(p.as_str())) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = s.to_string();
+    for (pat, rep, words) in r {
+        if !hay.contains(pat.as_str()) {
+            continue;
+        }
+        let word = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+        let mut res = String::with_capacity(out.len());
+        let mut i = 0usize;
+        while let Some(off) = hay[i..].find(pat.as_str()) {
+            let at = i + off;
+            let end = at + pat.len();
+            let bounded = !*words || (!word(out[..at].chars().next_back()) && !word(out[end..].chars().next()));
+            res.push_str(&out[i..at]);
+            res.push_str(if bounded { rep } else { &out[at..end] });
+            i = end;
+        }
+        res.push_str(&out[i..]);
+        out = res;
+        hay = out.to_ascii_lowercase();
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 pub fn write(level: Level, args: fmt::Arguments) {
     let tag = match level {
         Level::Error => "E",
@@ -81,6 +139,7 @@ pub fn write(level: Level, args: fmt::Arguments) {
         Level::Trace => "T",
     };
     let line = format!("[{:>10.3}][{}] {}: {}\n", elapsed_ms(), thread_name(), tag, args);
+    let line = redact(&line);
     // Errors go to stderr and the file at once; warnings to stderr only the first ones, and to
     // the file through its buffer (flushed every 250 ms, and by the crash handlers).
     let echo = level == Level::Error || (level == Level::Warn && WARNINGS.fetch_add(1, Ordering::Relaxed) < STDERR_WARNINGS);
@@ -123,3 +182,20 @@ macro_rules! info { ($($t:tt)*) => { if $crate::log::enabled($crate::log::Level:
 macro_rules! debug { ($($t:tt)*) => { if $crate::log::enabled($crate::log::Level::Debug) { $crate::log::write($crate::log::Level::Debug, format_args!($($t)*)) } } }
 #[macro_export]
 macro_rules! trace { ($($t:tt)*) => { if $crate::log::enabled($crate::log::Level::Trace) { $crate::log::write($crate::log::Level::Trace, format_args!($($t)*)) } } }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn redaction() {
+        let user = std::env::var("USERNAME").unwrap_or_default();
+        let profile = std::env::var("USERPROFILE").unwrap_or_default();
+        if user.len() < 2 || profile.len() < 4 {
+            return;
+        }
+        let s = format!("save {}\\AppData\\Roaming\\X and {} (by {user}) {user}x", profile.to_ascii_uppercase(), profile.replace('\\', "/"));
+        assert_eq!(super::redact(&s), format!("save %USERPROFILE%\\AppData\\Roaming\\X and %USERPROFILE% (by <user>) {user}x"));
+        let dbg = format!("{:?}", vec![std::path::PathBuf::from(format!("{profile}\\AppData"))]);
+        assert_eq!(super::redact(&dbg), "[\"%USERPROFILE%\\\\AppData\"]");
+        assert!(matches!(super::redact("nothing personal"), std::borrow::Cow::Borrowed(_)));
+    }
+}

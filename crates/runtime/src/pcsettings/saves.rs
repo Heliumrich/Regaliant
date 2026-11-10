@@ -2,18 +2,24 @@
 //! PS5 Saves), both applied when the port starts: the title keeps its saves open while it runs.
 //!
 //! A changed folder that holds no saves of the game gets a copy of those in the folder used
-//! before (local-data/save-folder.txt names it), so the progress moves along; the old folder is
-//! left as it was. The import takes the save directories of a decrypted PS5 save of the game
-//! (`SAVEDATA0PlayerProfile0`, `SAVEDATA0OptionsProfile0`: each with its `USR-DATA`, directly
-//! or under a `PPSA0134x` folder, at any depth) from the folder "PS5 Saves" next to the game,
-//! keeps the saves it replaces in save-backups, and renames the folder when done.
+//! before (save-folder.txt in the settings' folder names it), so the progress moves along; the
+//! old folder is left as it was. The import takes the save directories of a decrypted PS5 save
+//! of the game (`SAVEDATA0PlayerProfile0`, `SAVEDATA0OptionsProfile0`: each with its
+//! `USR-DATA`, directly or under a `PPSA0134x` folder, at any depth) from the folder "PS5 Saves"
+//! (`import_dir`), keeps the saves it replaces in save-backups, and renames the folder when
+//! done.
 
 use std::path::{Path, PathBuf};
 
 /// The Save Folder choice's options.
 pub const FOLDERS: [&str; 3] = ["Game Folder", "Documents", "Saved Games"];
-/// The folder the import reads, in the port's root.
+/// The folder the import reads (`import_dir`).
 pub const IMPORT_DIR: &str = "PS5 Saves";
+
+/// Where the import looks: the checkout's root in development, else the settings' folder.
+pub fn import_dir(paths: &dsconfig::paths::Paths) -> PathBuf {
+    paths.root.as_ref().unwrap_or(&paths.user).join(IMPORT_DIR)
+}
 /// The login user's directory (`savedata`: saves/<user>/<title>/).
 fn user() -> String {
     crate::hle::libs::app::USER_ID.to_string()
@@ -29,11 +35,11 @@ fn known_folder(id: &windows::core::GUID) -> Option<PathBuf> {
     }
 }
 
-/// The saves' folder of a Save Folder option (0, or a known folder Windows does not give:
-/// local-data/saves in the port's folder).
-pub fn folder(option: u32, root: &Path) -> PathBuf {
+/// The saves' folder of a Save Folder option (0, or a known folder Windows does not give: the
+/// port's own, `port`).
+pub fn folder(option: u32, port: &Path) -> PathBuf {
     use windows::Win32::UI::Shell::{FOLDERID_Documents, FOLDERID_SavedGames};
-    let port = root.join("local-data").join("saves");
+    let port = port.to_path_buf();
     match option {
         1 => known_folder(&FOLDERID_Documents).map(|d| d.join("My Games").join("Demon's Souls").join("saves")).unwrap_or(port),
         2 => known_folder(&FOLDERID_SavedGames).map(|d| d.join("Demon's Souls").join("saves")).unwrap_or(port),
@@ -82,10 +88,10 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<u64> {
 
 /// The saves' folder for this start (after `super::init`): the Save Folder setting's, with
 /// the saves of the folder used before copied in when it has none; then a pending import.
-pub fn start(root: &Path, title: &str) -> PathBuf {
+pub fn start(paths: &dsconfig::paths::Paths, title: &str) -> PathBuf {
     let option = super::store::value("Setting_PC_SaveFolder").unwrap_or(0);
-    let dir = folder(option, root);
-    let record = root.join("local-data").join("save-folder.txt");
+    let dir = folder(option, &paths.saves());
+    let record = paths.save_folder_record();
     let before = std::fs::read_to_string(&record).ok().map(|s| PathBuf::from(s.trim())).filter(|p| !p.as_os_str().is_empty());
     if let Some(prev) = before.filter(|p| *p != dir) {
         if !has_saves(&dir) && has_saves(&prev) {
@@ -102,7 +108,7 @@ pub fn start(root: &Path, title: &str) -> PathBuf {
     }
     let _ = std::fs::write(&record, format!("{}\n", dir.display()));
     if super::store::value("Setting_PC_ImportSaves") == Some(1) {
-        import(&root.join(IMPORT_DIR), &dir, title);
+        import(&import_dir(paths), &dir, title);
         super::store::set_value("Setting_PC_ImportSaves", 0);
     }
     dir
