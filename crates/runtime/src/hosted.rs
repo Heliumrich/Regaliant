@@ -1519,7 +1519,7 @@ fn tracking_test() -> Result<String, String> {
 }
 
 /// Arguments of a mode that runs no game: never hosted by default.
-const NO_GAME: [&str; 4] = ["--pipeline-test", "--dispatch-bench", "--compile-bench", "--record-bench"];
+const NO_GAME: [&str; 5] = ["--pipeline-test", "--dispatch-bench", "--compile-bench", "--record-bench", "--precompile-all"];
 
 /// Whether this process hosts dsport instead of running it: with `--host`,
 /// and by default when front end 2 is wanted (it arms quiet guest pages, and

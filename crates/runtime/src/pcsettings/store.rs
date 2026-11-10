@@ -121,6 +121,15 @@ pub fn init(path: PathBuf, defs: Vec<Def>) {
     *STORE.lock() = Some(Store { path: Some(path), defs, values });
 }
 
+/// Safe mode's store (the launcher's, for one start): every setting at its default but those in
+/// `set`, nothing read from or written to the settings file.
+pub fn init_session(defs: Vec<Def>, set: &[(&str, u32)]) {
+    let values: HashMap<u32, u32> = set.iter().map(|(n, v)| (super::setting_hash(n), *v)).collect();
+    let defs: HashMap<u32, Def> = defs.into_iter().map(|d| (super::setting_hash(&d.name), d)).collect();
+    crate::info!("pc settings: safe mode: {} settings at their defaults for this session ({} set), the settings file left as it is", defs.len(), values.len());
+    *STORE.lock() = Some(Store { path: None, defs, values });
+}
+
 /// The value of a PC key (its default when unset); `None` for other keys.
 pub fn get(hash: u32) -> Option<u32> {
     let g = STORE.lock();

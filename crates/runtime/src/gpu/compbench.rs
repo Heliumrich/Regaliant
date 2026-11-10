@@ -261,8 +261,11 @@ fn bundle_compute(app: &std::path::Path) -> Vec<(u64, std::sync::Arc<Vec<u32>>, 
 /// later sessions then find it instead of compiling it at the program's
 /// first dispatch, wherever the dispatch binds what the guess says (86% of
 /// the particle programs' learned specs, FINDINGS.md 2026-11-02 evening).
-/// Pipelines already in the store take moments. Progress every 10 s.
-pub fn precompile_all(app: &std::path::Path, threads: usize) -> i32 {
+/// Pipelines already in the store take moments. Progress every 10 s in the log, and every
+/// second in `progress` (the launcher's: `<programs done> <programs>` and `<code words done>
+/// <code words>` lines); when all are done, `marker` records it (the launcher's "prepared": the
+/// date, the counts, the device and its driver, for which the pipelines hold).
+pub fn precompile_all(app: &std::path::Path, threads: usize, progress: Option<&std::path::Path>, marker: Option<&std::path::Path>) -> i32 {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
     if let Err(e) = super::vk::init() {
         crate::error!("precompile all: Vulkan: {e}");
@@ -279,9 +282,16 @@ pub fn precompile_all(app: &std::path::Path, threads: usize) -> i32 {
     let code_done = AtomicU64::new(0);
     let failed = AtomicUsize::new(0);
     let compile_ns = AtomicU64::new(0);
+    // A stop asked for by the launcher (`<progress>.stop`): the programs being compiled finish,
+    // no other starts.
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let stop_file = progress.map(|p| p.with_extension("stop"));
     std::thread::scope(|s| {
         for _ in 0..threads.max(1) {
             s.spawn(|| loop {
+                if stop.load(Relaxed) {
+                    break;
+                }
                 let i = next.fetch_add(1, Relaxed);
                 let Some((h, code, spec, n)) = progs.get(i) else { break };
                 let r = super::shaders::translate_code_unkept(code, *h, spec.clone()).and_then(|tr| super::exec::store_compute_pipeline(&tr));
@@ -302,8 +312,34 @@ pub fn precompile_all(app: &std::path::Path, threads: usize) -> i32 {
         // Progress: programs and code words done, and the time left at
         // the rate of the words so far.
         let mut last = Instant::now();
+        let mut last_file = Instant::now();
+        let write_progress = || {
+            if let Some(p) = progress {
+                let t = format!("{} {}\n{} {}\n", done.load(Relaxed), progs.len(), code_done.load(Relaxed), total_words);
+                let tmp = p.with_extension("tmp");
+                if std::fs::write(&tmp, t).is_ok() {
+                    let _ = std::fs::rename(&tmp, p);
+                }
+            }
+        };
+        write_progress();
         while done.load(Relaxed) < progs.len() {
             std::thread::sleep(std::time::Duration::from_millis(200));
+            if !stop.load(Relaxed) && stop_file.as_ref().is_some_and(|f| f.exists()) {
+                crate::info!("precompile all: stop asked for at {} of {} programs", done.load(Relaxed), progs.len());
+                stop.store(true, Relaxed);
+            }
+            if stop.load(Relaxed) {
+                // (Done once the threads in a compile come back.)
+                if next.load(Relaxed) >= progs.len() || done.load(Relaxed) >= next.load(Relaxed).min(progs.len()) {
+                    break;
+                }
+                continue;
+            }
+            if last_file.elapsed().as_millis() >= 1000 {
+                last_file = Instant::now();
+                write_progress();
+            }
             if last.elapsed().as_secs() >= 10 {
                 last = Instant::now();
                 let w = code_done.load(Relaxed) as f64;
@@ -313,6 +349,10 @@ pub fn precompile_all(app: &std::path::Path, threads: usize) -> i32 {
             }
         }
     });
+    if stop.load(Relaxed) {
+        crate::info!("precompile all: stopped at {} of {} programs ({:.1} s)", done.load(Relaxed), progs.len(), t_all.elapsed().as_secs_f64());
+        return 4;
+    }
     crate::info!(
         "precompile all: {} programs in {:.1} s ({:.1} s of pipeline creation over the threads; {} failed)",
         progs.len(),
@@ -320,6 +360,26 @@ pub fn precompile_all(app: &std::path::Path, threads: usize) -> i32 {
         compile_ns.load(Relaxed) as f64 / 1e9,
         failed.load(Relaxed)
     );
+    if let Some(p) = progress {
+        let _ = std::fs::write(p, format!("{} {}\n{} {}\n", progs.len(), progs.len(), total_words, total_words));
+    }
+    if let Some(m) = marker {
+        let c = super::vk::ctx();
+        let props = unsafe { c.instance.get_physical_device_properties(c.pdev) };
+        let uuid: String = props.pipeline_cache_uuid.iter().map(|b| format!("{b:02x}")).collect();
+        let t = format!(
+            "# The game's shaders prepared ahead (dsport --precompile-all); written when all were done\ndate = {}\nprograms = {}\nfailed = {}\nseconds = {:.0}\ndevice = {}\ndriver = {}\ncache_uuid = {uuid}\n",
+            crate::utc_stamp(),
+            progs.len(),
+            failed.load(Relaxed),
+            t_all.elapsed().as_secs_f64(),
+            c.device_name,
+            props.driver_version,
+        );
+        if let Err(e) = std::fs::write(m, t) {
+            crate::warn!("precompile all: cannot write {}: {e}", m.display());
+        }
+    }
     0
 }
 

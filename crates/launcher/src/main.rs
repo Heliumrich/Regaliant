@@ -1,0 +1,485 @@
+//! DemonsSoulsLauncher: sets up and starts the Demon's Souls port for players.
+//!
+//! - Game: the game folder, checked when chosen (title, version 01.007.000, the decrypted
+//!   executable and libraries, the data folders); what this PC brings; safe mode for one start.
+//! - Shaders: the game's shaders prepared ahead, with progress (the first Play prepares them
+//!   unless that is turned off).
+//! - Saves: the save folder, the backups the game makes and their restore, the PS5 import folder.
+//! - Play / Reset settings / Open logs. When the game stops with an error, its last error lines
+//!   and its log folder are shown.
+//!
+//! The settings are the files the game reads (`dsconfig::paths`); the game's own settings are
+//! in its menus (SETTINGS > PC).
+
+#![windows_subsystem = "windows"]
+
+mod game;
+mod saves;
+mod shaders;
+mod shot;
+mod sys;
+mod ui;
+
+use dsconfig::paths::{Launch, Paths};
+use std::cell::RefCell;
+use std::path::PathBuf;
+use ui::{Builder, Scale, wide};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{DeleteObject, HFONT};
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::Controls::*;
+use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext};
+use windows_sys::Win32::UI::WindowsAndMessaging::*;
+
+pub const TITLE: &str = "Demon's Souls PC port";
+const CLIENT: (i32, i32) = (780, 600);
+
+/// Posted when the game exits (WPARAM: its exit code).
+const WM_GAME_EXIT: u32 = WM_APP + 2;
+/// Retries a game exit that arrived while a dialog held the app.
+const TIMER_RETRY: usize = 2;
+
+const ID_TABS: i32 = 10;
+const ID_PLAY: i32 = 901;
+const ID_RESET: i32 = 903;
+const ID_LOGS: i32 = 904;
+const ID_STATUS_BAR: i32 = 906;
+
+/// The game's exit code when its files cannot be used (it told the player already).
+const EXIT_GAME_FILES: i32 = 3;
+
+pub struct App {
+    pub hwnd: HWND,
+    pub scale: Scale,
+    pub font: HFONT,
+    pub bold: HFONT,
+    /// Every control with its 1/96-inch rectangle (laid out again when the DPI changes).
+    pub layout: Vec<(HWND, (i32, i32, i32, i32))>,
+    pub paths: Paths,
+    pub launch: Launch,
+    pub tabs: HWND,
+    /// The controls of each page.
+    pub pages: Vec<Vec<HWND>>,
+    pub page: usize,
+    pub status: HWND,
+    pub play: HWND,
+    pub game: game::Page,
+    pub shaders: shaders::Page,
+    pub saves: saves::Page,
+    /// The game's process id while it runs.
+    pub running: Option<u32>,
+}
+
+thread_local! {
+    static APP: RefCell<Option<App>> = const { RefCell::new(None) };
+    /// Game exits that could not be handled yet (a dialog was open): their exit codes.
+    static PENDING: RefCell<Vec<WPARAM>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Runs `f` on the app unless it is already borrowed (a message inside a dialog's loop).
+pub fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
+    APP.with(|a| a.try_borrow_mut().ok().and_then(|mut g| g.as_mut().map(f)))
+}
+
+impl App {
+    pub fn builder(&self) -> Builder {
+        Builder { parent: self.hwnd, scale: self.scale, font: self.font }
+    }
+
+    /// Records a control of page `page` (usize::MAX: on every page).
+    pub fn put(&mut self, page: usize, h: HWND, r: (i32, i32, i32, i32)) -> HWND {
+        self.layout.push((h, r));
+        if page < self.pages.len() {
+            self.pages[page].push(h);
+        }
+        h
+    }
+
+    pub fn save_launch(&mut self) {
+        if let Err(e) = self.launch.save(&self.paths) {
+            self.set_status(&format!("Could not save {}: {e}", self.paths.launch_file().display()));
+        }
+    }
+
+    pub fn set_status(&self, s: &str) {
+        unsafe { ui::set_text(self.status, s) };
+    }
+
+    fn show_page(&mut self, n: usize) {
+        self.page = n;
+        for (i, p) in self.pages.iter().enumerate() {
+            for &h in p {
+                unsafe { ui::show(h, i == n) };
+            }
+        }
+    }
+
+    pub fn update_play(&self) {
+        unsafe { ui::enable(self.play, self.game.ok && self.running.is_none()) };
+        saves::update(self);
+    }
+
+    fn relayout(&mut self, dpi: u32) {
+        self.scale = Scale(dpi);
+        unsafe {
+            DeleteObject(self.font as _);
+            DeleteObject(self.bold as _);
+            self.font = ui::message_font(dpi, false, 100);
+            self.bold = ui::message_font(dpi, true, 110);
+            for &(h, r) in &self.layout {
+                let s = self.scale;
+                SetWindowPos(h, std::ptr::null_mut(), s.px(r.0), s.px(r.1), s.px(r.2), s.px(r.3), SWP_NOZORDER | SWP_NOACTIVATE);
+                SendMessageW(h, WM_SETFONT, if h == self.play { self.bold } else { self.font } as WPARAM, 1);
+            }
+        }
+    }
+}
+
+/// Play: the shaders first when they are not prepared (unless turned off), then the game.
+pub fn play(app: &mut App) {
+    if app.running.is_some() || !app.game.ok {
+        return;
+    }
+    if shaders::running(app) {
+        let t = "The shaders are still being prepared. Stop preparing them and start the game now?\n\nThe next preparation goes on where this one stops.";
+        if unsafe { ui::message(app.hwnd, t, TITLE, MB_ICONQUESTION | MB_YESNO) } == IDYES {
+            shaders::stop_then_play(app);
+        }
+        return;
+    }
+    if app.launch.prepare_shaders && !shaders::prepared(app) {
+        shaders::start(app, true);
+        return;
+    }
+    start_game(app);
+}
+
+/// Starts the game (the launcher minimized while it runs; it comes back when the game exits).
+pub fn start_game(app: &mut App) {
+    if app.running.is_some() {
+        return;
+    }
+    let exe = app.paths.exe_dir.join(dsconfig::paths::GAME_EXE);
+    if !exe.is_file() {
+        unsafe { ui::message(app.hwnd, &format!("{} was not found next to the launcher.", dsconfig::paths::GAME_EXE), TITLE, MB_ICONERROR) };
+        return;
+    }
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.current_dir(&app.paths.exe_dir);
+    let safe = game::safe_mode(app);
+    if safe {
+        cmd.arg("--safe-mode");
+    }
+    match cmd.spawn() {
+        Ok(mut child) => {
+            if safe {
+                game::clear_safe_mode(app);
+            }
+            app.running = Some(child.id());
+            app.update_play();
+            let hwnd = app.hwnd as usize;
+            std::thread::spawn(move || {
+                let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
+                unsafe { PostMessageW(hwnd as HWND, WM_GAME_EXIT, code as u32 as WPARAM, 0) };
+            });
+            app.set_status(if safe { "The game runs in safe mode." } else { "The game runs." });
+            unsafe { ShowWindow(app.hwnd, SW_MINIMIZE) };
+        }
+        Err(e) => unsafe {
+            ui::message(app.hwnd, &format!("Could not start {}: {e}", exe.display()), TITLE, MB_ICONERROR);
+        },
+    }
+}
+
+/// The newest run folder in the logs (a session's log).
+fn newest_log(paths: &Paths) -> Option<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(paths.logs()).ok()?.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+    v.sort();
+    v.pop()
+}
+
+/// The last error lines of a session's log (the time stamps left out).
+fn last_errors(dir: &std::path::Path) -> Vec<String> {
+    let Ok(b) = std::fs::read(dir.join("dsport.log")) else { return Vec::new() };
+    let t = String::from_utf8_lossy(&b);
+    let errs: Vec<String> = t.lines().filter_map(|l| l.split_once("] E: ").map(|(_, m)| m.chars().take(300).collect())).collect();
+    errs[errs.len().saturating_sub(5)..].to_vec()
+}
+
+fn handle_exit(hwnd: HWND, wp: WPARAM) {
+    if with_app(|app| game_exited(app, wp as u32 as i32)).is_none() {
+        PENDING.with(|p| p.borrow_mut().push(wp));
+        unsafe { SetTimer(hwnd, TIMER_RETRY, 250, None) };
+    }
+}
+
+fn game_exited(app: &mut App, code: i32) {
+    app.running = None;
+    // (This exit is reported here: its marker would tell the next start of a session that did
+    // not end normally.)
+    let _ = std::fs::remove_file(app.paths.running_marker());
+    app.update_play();
+    saves::refresh(app);
+    unsafe {
+        ShowWindow(app.hwnd, SW_RESTORE);
+        SetForegroundWindow(app.hwnd);
+    }
+    match code {
+        0 => app.set_status(""),
+        EXIT_GAME_FILES => app.set_status("The game could not use its game files. The Game page shows why."),
+        _ => {
+            let log = newest_log(&app.paths);
+            let errs = log.as_deref().map(last_errors).unwrap_or_default();
+            app.set_status(&format!("The game stopped with an error (code {code:#x})."));
+            let text = format!(
+                "The game stopped with an error (code {code:#x}).\n\n{}\n\nIts log is in:\n{}\n\nPlease attach that log when you report the problem. Open the log folder now?",
+                if errs.is_empty() { "No error was recorded.".to_string() } else { errs.join("\n") },
+                log.as_ref().map(|d| d.display().to_string()).unwrap_or_else(|| app.paths.logs().display().to_string())
+            );
+            if unsafe { ui::message(app.hwnd, &text, TITLE, MB_ICONERROR | MB_YESNO) } == IDYES {
+                ui::open_path(&log.unwrap_or_else(|| app.paths.logs()));
+            }
+        }
+    }
+}
+
+/// Reset settings: the PC settings, display choices, key bindings and audio device back to
+/// their defaults (the files kept as .bak); the game folder, saves and shaders stay.
+fn reset_settings(app: &mut App) {
+    if app.running.is_some() {
+        app.set_status("Close the game first.");
+        return;
+    }
+    let text = "Reset the game's PC settings, display choices and key bindings to their defaults?\n\nThe current files are kept as .bak files. Saves are not touched.";
+    if unsafe { ui::message(app.hwnd, text, TITLE, MB_ICONQUESTION | MB_OKCANCEL) } != IDOK {
+        return;
+    }
+    let files = [app.paths.settings_file(), app.paths.display_file(), app.paths.controls_file(), app.paths.user.join("audio-device.txt")];
+    let mut failed = Vec::new();
+    for f in files.iter().filter(|f| f.exists()) {
+        let mut b = f.clone().into_os_string();
+        b.push(".bak");
+        if let Err(e) = std::fs::rename(f, PathBuf::from(b)) {
+            failed.push(format!("{}: {e}", f.display()));
+        }
+    }
+    if failed.is_empty() {
+        app.set_status("Settings reset. The game starts with its defaults.");
+    } else {
+        unsafe { ui::message(app.hwnd, &format!("Some settings could not be reset:\n{}", failed.join("\n")), TITLE, MB_ICONERROR | MB_OK) };
+    }
+}
+
+/// Closing while the shaders are prepared: they stop after their current ones.
+fn close(app: &mut App) -> bool {
+    if shaders::running(app) && !shaders::stopping(app) {
+        let t = "The shaders are still being prepared. Stop and close?\n\nThe next preparation goes on where this one stops.";
+        if unsafe { ui::message(app.hwnd, t, TITLE, MB_ICONQUESTION | MB_YESNO) } != IDYES {
+            return false;
+        }
+        shaders::stop(app);
+    }
+    true
+}
+
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let handled = match msg {
+        WM_COMMAND => {
+            let (id, code) = ((wp & 0xFFFF) as i32, ((wp >> 16) & 0xFFFF) as u32);
+            with_app(|app| match id {
+                ID_PLAY => play(app),
+                ID_RESET => reset_settings(app),
+                ID_LOGS => ui::open_path(&app.paths.logs()),
+                100..=199 => game::command(app, id, code),
+                200..=299 => shaders::command(app, id, code),
+                300..=399 => saves::command(app, id, code),
+                _ => {}
+            })
+            .is_some()
+        }
+        WM_NOTIFY => {
+            let h = unsafe { &*(lp as *const NMHDR) };
+            with_app(|app| {
+                if h.idFrom == ID_TABS as usize && h.code == TCN_SELCHANGE {
+                    let n = unsafe { SendMessageW(app.tabs, TCM_GETCURSEL, 0, 0) }.max(0) as usize;
+                    app.show_page(n);
+                } else if h.idFrom / 100 == 3 && h.code == LVN_ITEMCHANGED {
+                    saves::notify(app);
+                }
+            })
+            .is_some()
+        }
+        WM_TIMER if wp == TIMER_RETRY => {
+            unsafe { KillTimer(hwnd, TIMER_RETRY) };
+            let pending: Vec<WPARAM> = PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
+            for w in pending {
+                handle_exit(hwnd, w);
+            }
+            true
+        }
+        WM_TIMER if wp == shaders::TIMER => with_app(shaders::tick).is_some(),
+        WM_GAME_EXIT => {
+            handle_exit(hwnd, wp);
+            true
+        }
+        WM_DPICHANGED => {
+            let r = unsafe { &*(lp as *const RECT) };
+            unsafe { SetWindowPos(hwnd, std::ptr::null_mut(), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE) };
+            let dpi = (wp & 0xFFFF) as u32;
+            with_app(|app| app.relayout(dpi));
+            true
+        }
+        WM_CLOSE => {
+            if with_app(close).unwrap_or(true) {
+                unsafe { DestroyWindow(hwnd) };
+            }
+            true
+        }
+        WM_DESTROY => {
+            unsafe { PostQuitMessage(0) };
+            true
+        }
+        _ => false,
+    };
+    if handled {
+        return 0;
+    }
+    unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+}
+
+/// The opening status line: a game still running, or a session that did not end normally.
+fn startup_status(app: &mut App) {
+    let marker = app.paths.running_marker();
+    let Ok(t) = std::fs::read_to_string(&marker) else { return };
+    let pid = t.lines().find_map(|l| l.strip_prefix("pid ")).and_then(|p| p.trim().parse::<u32>().ok());
+    if let Some(pid) = pid.filter(|&p| sys::process_alive(p)) {
+        app.running = Some(pid);
+        app.update_play();
+        app.set_status("The game is running.");
+    } else {
+        let _ = std::fs::remove_file(&marker);
+        app.set_status("The last session did not end normally. Open logs shows its log.");
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let arg = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+    unsafe {
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+        let icc = INITCOMMONCONTROLSEX { dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_TAB_CLASSES | ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES | ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES };
+        InitCommonControlsEx(&icc);
+        let hinst = GetModuleHandleW(std::ptr::null());
+        let class = wide("demonssouls_launcher");
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(wndproc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hinst,
+            hIcon: LoadIconW(hinst, 1 as _),
+            hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
+            hbrBackground: (windows_sys::Win32::Graphics::Gdi::COLOR_BTNFACE + 1) as usize as _,
+            lpszMenuName: std::ptr::null(),
+            lpszClassName: class.as_ptr(),
+            hIconSm: LoadIconW(hinst, 1 as _),
+        };
+        RegisterClassExW(&wc);
+        let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+        let title = wide(&format!("{TITLE} {}", dsconfig::VERSION));
+        let hwnd = CreateWindowExW(0, class.as_ptr(), title.as_ptr(), style, CW_USEDEFAULT, CW_USEDEFAULT, 800, 640, std::ptr::null_mut(), std::ptr::null_mut(), hinst, std::ptr::null());
+        if hwnd.is_null() {
+            return;
+        }
+        let dpi = GetDpiForWindow(hwnd).max(96);
+        let scale = Scale(dpi);
+        let mut r = RECT { left: 0, top: 0, right: scale.px(CLIENT.0), bottom: scale.px(CLIENT.1) };
+        AdjustWindowRectExForDpi(&mut r, style, 0, 0, dpi);
+        SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER);
+
+        let paths = Paths::current();
+        let launch = Launch::load(&paths);
+        let font = ui::message_font(dpi, false, 100);
+        let bold = ui::message_font(dpi, true, 110);
+        let mut app = App {
+            hwnd,
+            scale,
+            font,
+            bold,
+            layout: Vec::new(),
+            paths,
+            launch,
+            tabs: std::ptr::null_mut(),
+            pages: vec![Vec::new(); 3],
+            page: 0,
+            status: std::ptr::null_mut(),
+            play: std::ptr::null_mut(),
+            game: game::Page::default(),
+            shaders: shaders::Page::default(),
+            saves: saves::Page::default(),
+            running: None,
+        };
+        let b = app.builder();
+        let rt = (12, 10, 756, 30);
+        let tabs = b.add("SysTabControl32", "", WS_TABSTOP | WS_CLIPSIBLINGS, 0, rt, ID_TABS);
+        app.tabs = app.put(usize::MAX, tabs, rt);
+        for (i, t) in ["Game", "Shaders", "Saves"].iter().enumerate() {
+            let mut w = wide(t);
+            let item = TCITEMW { mask: TCIF_TEXT, pszText: w.as_mut_ptr(), ..Default::default() };
+            SendMessageW(tabs, TCM_INSERTITEMW, i, &item as *const _ as LPARAM);
+        }
+        let r = (16, 520, 748, 20);
+        app.status = app.put(usize::MAX, b.label("", r, ID_STATUS_BAR), r);
+        let r = (16, 548, 120, 36);
+        app.play = app.put(usize::MAX, b.add("BUTTON", "Play", WS_TABSTOP | BS_DEFPUSHBUTTON as u32, 0, r, ID_PLAY), r);
+        SendMessageW(app.play, WM_SETFONT, app.bold as WPARAM, 1);
+        let r = (144, 548, 130, 36);
+        app.put(usize::MAX, b.button("Reset settings...", r, ID_RESET), r);
+        let r = (282, 548, 110, 36);
+        app.put(usize::MAX, b.button("Open logs", r, ID_LOGS), r);
+        // (Saves first: the Game page's check refreshes them.)
+        saves::build(&mut app);
+        game::build(&mut app);
+        shaders::build(&mut app);
+        let first = arg("--page").and_then(|n| n.parse::<usize>().ok()).unwrap_or(0).min(2);
+        SendMessageW(app.tabs, TCM_SETCURSEL, first, 0);
+        app.show_page(first);
+        app.update_play();
+        startup_status(&mut app);
+        // `--shot <file>`: each page as <file>-<page>.png, then exit (layout checks).
+        let shot = arg("--shot").map(PathBuf::from);
+        APP.with(|a| *a.borrow_mut() = Some(app));
+        ShowWindow(hwnd, SW_SHOW);
+        if let Some(file) = shot {
+            for n in 0..3 {
+                with_app(|app| {
+                    SendMessageW(app.tabs, TCM_SETCURSEL, n, 0);
+                    app.show_page(n);
+                });
+                use windows_sys::Win32::Graphics::Gdi::{RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW, RedrawWindow};
+                RedrawWindow(hwnd, std::ptr::null(), std::ptr::null_mut(), RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+                for _ in 0..5 {
+                    let mut msg: MSG = std::mem::zeroed();
+                    while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                        TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                let f = file.with_file_name(format!("{}-{n}.png", file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()));
+                let _ = shot::window(hwnd, &f);
+            }
+            DestroyWindow(hwnd);
+            return;
+        }
+        let mut msg: MSG = std::mem::zeroed();
+        while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+            if IsDialogMessageW(hwnd, &msg) == 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+}

@@ -1,0 +1,37 @@
+[package]
+name = "launcher"
+version = "0.1.0"
+description = "The Demon's Souls port's launcher: the game folder, shader preparation, saves and their backups, Play"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "DemonsSoulsLauncher"
+path = "src/main.rs"
+
+[dependencies]
+dsconfig = { path = "../dsconfig" }
+ash = { version = "0.38", default-features = false, features = ["loaded", "std"] }
+miniz_oxide = "0.8"
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_Xps",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }

@@ -1,6 +1,10 @@
 //! dsport: runs the PS5 Demon's Souls executable (PPSA01341 01.007.000) natively
 //! on Windows x86-64 with high-level emulation of the PS5 system libraries.
 
+// No console window: players start it from the launcher or Explorer (redirected output still
+// reaches development tools).
+#![windows_subsystem = "windows"]
+
 #[macro_use]
 mod log;
 mod ehframe;
@@ -65,6 +69,11 @@ pub struct Config {
     pub compile_bench: Option<Vec<String>>,
     /// `--precompile-all [threads]` (`gpu::compbench::precompile_all`).
     pub precompile_all: Option<usize>,
+    /// `--progress <file>`: the precompile's progress for the launcher.
+    pub progress: Option<PathBuf>,
+    /// `--safe-mode` (the launcher's, for one start): the PC settings' defaults for this session
+    /// only, in a window, without an upscaler, with the GPU front end's cautious fallbacks.
+    pub safe_mode: bool,
     /// `--dispatch-bench` (`gpu::dispbench`).
     pub dispatch_bench: bool,
     pub trace: bool,
@@ -181,6 +190,8 @@ fn parse_args() -> Config {
     let mut pipeline_test = None;
     let mut compile_bench: Option<Vec<String>> = None;
     let mut precompile_all: Option<usize> = None;
+    let mut progress = None;
+    let mut safe_mode = false;
     let mut dispatch_bench = false;
     let mut record_bench = None;
     let mut args = std::env::args().skip(1).peekable();
@@ -204,6 +215,8 @@ fn parse_args() -> Config {
             "--app" => app = Some(PathBuf::from(args.next().expect("--app needs a path"))),
             "--pipeline-test" => pipeline_test = Some(args.next().expect("--pipeline-test needs a capture file")),
             "--dispatch-bench" => dispatch_bench = true,
+            "--progress" => progress = Some(PathBuf::from(args.next().expect("--progress needs a file"))),
+            "--safe-mode" => safe_mode = true,
             "--pb-test" => std::process::exit(gpu::pcache::pb_test()),
             "--compile-bench" => {
                 let min = args.next().expect("--compile-bench needs <min instructions> <max programs>");
@@ -226,6 +239,16 @@ fn parse_args() -> Config {
             other => {
                 eprintln!("unknown argument {other}");
                 std::process::exit(2);
+            }
+        }
+    }
+    if safe_mode {
+        // The GPU front end's cautious fallbacks (no arming of GPU-written pages, no held
+        // pages) and no upscaler library loaded: set before any thread starts or reads them.
+        for (k, v) in [("DS_FE2_ARM_GPU", "0"), ("DS_C4", "0"), ("DS_UPSCALER", "off")] {
+            if std::env::var_os(k).is_none() {
+                // SAFETY: still the only thread (parse_args runs before any is started).
+                unsafe { std::env::set_var(k, v) };
             }
         }
     }
@@ -258,6 +281,8 @@ fn parse_args() -> Config {
         record_bench,
         compile_bench,
         precompile_all,
+        progress,
+        safe_mode,
         dispatch_bench,
     }
 }
@@ -1350,6 +1375,7 @@ pub fn player_error(text: &str) {
 pub fn fatal_exit(code: u32, reason: &str) -> ! {
     // Exclusive fullscreen's display mode back first (the desktop must not stay changed).
     display::restore_on_exit();
+    session_ended();
     // After a fault, every thread's frames (what the others were doing:
     // the title's teardown when a job read freed memory).
     let summary = if reason == "fatal exception" { thread_summary_ex(true) } else { thread_summary() };
@@ -1378,8 +1404,17 @@ fn pgo_write() {
     }
 }
 
+/// The session ended in an orderly way (`shutdown`, `fatal_exit`): its marker goes.
+fn session_ended() {
+    let m = paths().running_marker();
+    if std::fs::read_to_string(&m).is_ok_and(|t| t.starts_with(&format!("pid {}\n", std::process::id()))) {
+        let _ = std::fs::remove_file(m);
+    }
+}
+
 pub fn shutdown(code: i32) -> ! {
     display::restore_on_exit();
+    session_ended();
     hle::libs::videoout::wait_shots();
     gpu::shutdown();
     info!("shutdown with status {code}\n{}", thread_summary());
@@ -1450,6 +1485,10 @@ fn main() {
         std::process::exit(1);
     }
     RUN_DIR.set(cfg.run_dir.clone()).ok();
+    // A session in progress (the launcher's: one left behind did not end normally).
+    if cfg.precompile_all.is_none() {
+        let _ = std::fs::write(cfg.paths.running_marker(), format!("pid {}\nlog {}\n", std::process::id(), cfg.run_dir.display()));
+    }
     log::set_thread_name("host");
     // Panics (host threads abort the process) are logged with the thread
     // that panicked: the run log is what post-mortems read.
@@ -1531,8 +1570,17 @@ fn main() {
     let achievements_file = std::env::var_os("DS_ACHIEVEMENTS_FILE").map(PathBuf::from).unwrap_or_else(|| cfg.paths.achievements_file());
     achievements::init(&cfg.app, achievements_file, "en-GB");
     // Monitors and the PC tab's display choices (before its menu lists are made).
-    display::init(cfg.paths.display_file());
-    pcsettings::init(cfg.paths.settings_file());
+    // Safe mode: the display choices and PC settings at their defaults for this session (a
+    // scratch file for the display's, the player's files left as they are).
+    if cfg.safe_mode {
+        info!("safe mode (the launcher's, for this start): default settings, a window, no upscaler, HDR off, arming and held pages off");
+        let scratch = cfg.paths.cache.join("safe-mode-display.txt");
+        let _ = std::fs::remove_file(&scratch);
+        display::init(scratch);
+    } else {
+        display::init(cfg.paths.display_file());
+    }
+    pcsettings::init(cfg.paths.settings_file(), cfg.safe_mode);
     // The saves: the PC tab's Save Folder (the port's own by default), a PS5 import asked for.
     hle::libs::savedata::init(pcsettings::saves::start(&cfg.paths, &hle::libs::savedata::title_id()));
     // Compiled pipelines and learned shader specs: local-data, or the
@@ -1563,7 +1611,7 @@ fn main() {
         std::process::exit(code);
     }
     if let Some(n) = cfg.precompile_all {
-        let code = gpu::compbench::precompile_all(&cfg.app, n);
+        let code = gpu::compbench::precompile_all(&cfg.app, n, cfg.progress.as_deref(), Some(&cache_root.join("prepared.txt")));
         log::flush();
         std::process::exit(code);
     }

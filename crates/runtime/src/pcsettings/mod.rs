@@ -528,9 +528,9 @@ fn trophy_rows() -> Vec<(String, String, String, String)> {
 }
 
 /// The PC settings' values (local-data/pcsettings.txt); the trophies' rows read their state.
-pub fn init(path: std::path::PathBuf) {
+pub fn init(path: std::path::PathBuf, safe: bool) {
     // The audio device chosen before (its endpoint id), when Windows still lists it.
-    if let Ok(id) = std::fs::read_to_string(path.with_file_name("audio-device.txt")) {
+    if let Some(Ok(id)) = (!safe).then(|| std::fs::read_to_string(path.with_file_name("audio-device.txt"))) {
         let id = id.trim().to_string();
         if !id.is_empty() && crate::audio::output_devices().iter().any(|d| d.0 == id) {
             crate::audio::set_output_device(Some(id));
@@ -547,7 +547,13 @@ pub fn init(path: std::path::PathBuf) {
     for (w, name) in [prompts::SHOWN_PS, prompts::SHOWN_NOT_KB, prompts::SHOWN_NOT_XB, prompts::SHOWN_KB, prompts::SHOWN_XB].into_iter().enumerate() {
         defs.push(store::Def { name: name.into(), kind: store::Kind::Int, default: 0, live: Some(store::Live::Prompts(w as u8)) });
     }
-    store::init(path, defs);
+    if safe {
+        // (HDR off besides the defaults: an HDR swapchain is the display path most likely to
+        // differ between drivers.)
+        store::init_session(defs, &[("Setting_PC_HdrOutput", 1)]);
+    } else {
+        store::init(path, defs);
+    }
     apply();
 }
 
