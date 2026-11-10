@@ -1752,6 +1752,11 @@ static WB_CENSUS: Mutex<Option<HashMap<u64, [u64; 2]>>> = Mutex::new(None);
 /// start: (start, size, name) -> [bindings, bound bytes].
 static WB_CENSUS_MAPS: Mutex<Option<HashMap<(u64, u64, String), [u64; 2]>>> = Mutex::new(None);
 
+/// `DS_WB_CENSUS=1`: the same by the engine's allocation record holding the
+/// binding's start (`engine::record_of`): (start, end, allocator ID) ->
+/// [bindings, bound bytes] (0, 0, ID: outside every record).
+static WB_CENSUS_RECS: Mutex<Option<HashMap<(u64, u64, u8), [u64; 2]>>> = Mutex::new(None);
+
 fn wb_census() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("DS_WB_CENSUS").ok().as_deref() == Some("1"))
@@ -1766,10 +1771,24 @@ fn note_written_binding(base: u64, bytes: u64) {
         e[1] += bytes;
     }
     let key = crate::mem::vma_label(base).unwrap_or((0, 0, String::new()));
-    let mut g = WB_CENSUS_MAPS.lock();
-    let e = g.get_or_insert_with(HashMap::new).entry(key).or_default();
+    {
+        let mut g = WB_CENSUS_MAPS.lock();
+        let e = g.get_or_insert_with(HashMap::new).entry(key).or_default();
+        e[0] += 1;
+        e[1] += bytes;
+    }
+    let rk = crate::engine::record_of(base).unwrap_or((0, 0, crate::engine::owner(base)));
+    let mut g = WB_CENSUS_RECS.lock();
+    let e = g.get_or_insert_with(HashMap::new).entry(rk).or_default();
     e[0] += 1;
     e[1] += bytes;
+}
+
+/// `profile reset`: the written-binding census starts again.
+pub fn wb_census_reset() {
+    WB_CENSUS.lock().take();
+    WB_CENSUS_MAPS.lock().take();
+    WB_CENSUS_RECS.lock().take();
 }
 
 /// Status part: the census's 24 programs with the most bound bytes ("" when
@@ -1790,7 +1809,14 @@ fn wb_census_line() -> String {
         m.sort_by_key(|(_, c)| std::cmp::Reverse(c[1]));
         m.iter().take(16).map(|((s, n, name), c)| format!("{s:#x}+{n:#x} '{name}' {} ({} MiB)", c[0], c[1] >> 20)).collect::<Vec<_>>()
     };
-    format!("    written bindings by program (`DS_WB_CENSUS`): {} programs, {} MiB bound in all; {}\n    written bindings by mapping (`DS_WB_CENSUS`): {}\n", v.len(), total >> 20, top.join(", "), maps.join(", "))
+    let recs = {
+        let names = crate::engine::names();
+        let g = WB_CENSUS_RECS.lock();
+        let mut m: Vec<((u64, u64, u8), [u64; 2])> = g.as_ref().map(|m| m.iter().map(|(k, c)| (*k, *c)).collect()).unwrap_or_default();
+        m.sort_by_key(|(_, c)| std::cmp::Reverse(c[1]));
+        m.iter().take(20).map(|((s, e, id), c)| format!("{s:#x}+{:#x} ({} {}) {} ({} MiB)", e - s, id, names.get(id).map(String::as_str).unwrap_or("?"), c[0], c[1] >> 20)).collect::<Vec<_>>()
+    };
+    format!("    written bindings by program (`DS_WB_CENSUS`): {} programs, {} MiB bound in all; {}\n    written bindings by mapping (`DS_WB_CENSUS`): {}\n    written bindings by engine allocation (`DS_WB_CENSUS`): {}\n", v.len(), total >> 20, top.join(", "), maps.join(", "), recs.join(", "))
 }
 
 /// `<name>:<hex size>,...` from the environment variable `var`.

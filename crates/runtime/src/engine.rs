@@ -1017,6 +1017,17 @@ pub fn record_extent(base: u64) -> Option<u64> {
     None
 }
 
+/// The page allocator's record holding `base`: (start, end, its allocator's
+/// ID), None outside every live record (as `record_extent`).
+pub fn record_of(base: u64) -> Option<(u64, u64, u8)> {
+    record_extent(base)?;
+    let g = RECS.read();
+    let i = g.1.partition_point(|r| r.0 <= base);
+    let (s, e, rec) = *g.1.get(i.checked_sub(1)?)?;
+    let alloc = rd64(rec + 0x40)?;
+    Some((s, e, rd64(alloc + 0x30).map_or(0, |v| v as u8)))
+}
+
 /// The tag-free hook's counts: the GPU arena's tag frees and their MiBs.
 static ARENA_FREES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 

@@ -3021,6 +3021,7 @@ pub fn start_profiler() {
 /// Clears the samples and dispatch timings (`profile reset` control command).
 pub fn reset_profile() {
     cp::reset_classes();
+    exec::wb_census_reset();
     exec::replay_census_reset();
     pm4_census_reset();
     fe3_probe::reset();
