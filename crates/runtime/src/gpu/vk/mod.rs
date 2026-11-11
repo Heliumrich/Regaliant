@@ -1162,7 +1162,9 @@ pub fn fault_report() -> String {
                     let d = CStr::from_ptr(v.description.as_ptr()).to_string_lossy().into_owned();
                     out.push(format!("vendor '{d}' code {:#x} data {:#x}", v.vendor_fault_code, v.vendor_fault_data));
                 }
-                if !bin.is_empty() {
+                // (The vendor's binary in development checkouts only: a player's log folder is
+                // what they attach to a public report.)
+                if !bin.is_empty() && crate::paths().layout == dsconfig::paths::Layout::Dev {
                     if let Some(dir) = crate::run_dir() {
                         let p = dir.join("gpu-fault.bin");
                         if std::fs::write(&p, &bin).is_ok() {

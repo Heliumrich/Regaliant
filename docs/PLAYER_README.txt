@@ -126,9 +126,12 @@ Windows manages the page file size (the default) and the system drive has about 
 then pages more during loads. 32 GB is recommended. 16 GB has not been tested.
 
 Estimated, not tested:
-- Graphics: Vulkan 1.3. The game used 17 to 18 GB of video memory on the tested card, but it
-  lets textures go when memory runs short. AMD and Intel graphics cards have not been tested.
-- Processor: the game uses many threads. Fewer cores lower the frame rate.
+- Graphics: Vulkan 1.3 and about 12 GB of video memory. The game used 17 to 18 GB on the
+  tested card. With an 8 GB budget simulated it kept its textures within it and ran at the
+  same frame rates, but its other GPU memory brought it to about 11 GB, so an 8 GB card
+  would slow down. AMD and Intel graphics cards have not been tested.
+- Processor: limited to 6 of its 12 cores, the tested processor kept 91 to 94% of its frame
+  rate. A slower processor lowers the frame rate in proportion to its single-core speed.
 
 
 Known issues

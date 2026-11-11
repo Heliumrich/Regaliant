@@ -69,8 +69,8 @@ fn pc_text() -> String {
             if g.vendor == sys::VENDOR_AMD || g.vendor == sys::VENDOR_INTEL {
                 lines.push("AMD and Intel graphics cards are untested with this port. Please report how it runs.".into());
             }
-            if g.vram < 7 << 30 {
-                lines.push("The game was tested with more video memory. Use the Low preset in its PC settings.".into());
+            if g.vram < 11 << 30 {
+                lines.push("The game uses about 12 GB of video memory. On this card it may run slowly.".into());
             }
         }
         Err(e) => lines.push(e),

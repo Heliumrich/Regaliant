@@ -134,6 +134,11 @@ fn dump_textures(dir: &std::path::Path, textures: &std::collections::BTreeMap<u6
 /// Fallback size: up to the first s_endpgm (gfx10 0xBF810000), at most 64 KiB.
 /// Writes the shader program at `a` to `<run dir>/shaders/<address>.bin`.
 pub fn save_program(a: u64) -> Option<std::path::PathBuf> {
+    // (Development checkouts only: a player's log folder is what they attach to a public report,
+    // and the programs are the game's own code.)
+    if crate::paths().layout != dsconfig::paths::Layout::Dev {
+        return None;
+    }
     let sdir = crate::run_dir()?.join("shaders");
     let size = crate::hle::libs::agc::shader_code_size(a).unwrap_or_else(|| scan_to_endpgm(a));
     if size == 0 || !crate::gpu::cp::guest_readable(a, size as u64) {

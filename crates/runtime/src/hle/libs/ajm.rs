@@ -380,7 +380,9 @@ fn note_at9_error(r: i32, input: &[u8], at: usize, info: &At9Info) {
         seen.len() - 1
     };
     let head: Vec<String> = key.1[..hn].iter().map(|b| format!("{b:02x}")).collect();
-    let dumped = crate::run_dir().map(|d| d.join(format!("ajm_fail_{k}.bin"))).filter(|f| std::fs::write(f, input).is_ok());
+    // (Development checkouts only: the input is the game's audio, and a player's log folder is
+    // what they attach to a public report.)
+    let dumped = crate::run_dir().filter(|_| crate::paths().layout == dsconfig::paths::Layout::Dev).map(|d| d.join(format!("ajm_fail_{k}.bin"))).filter(|f| std::fs::write(f, input).is_ok());
     crate::warn!(
         "ajm: ATRAC9 decode error {:#x} at input {at}/{} (superframe {} bytes, {} frame(s) x {} samples, {} ch, config {:02x?}); input {}{}",
         r as u32,
