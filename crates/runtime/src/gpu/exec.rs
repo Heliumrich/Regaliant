@@ -455,6 +455,84 @@ pub(super) fn watch_resources(p: &Prepared) -> String {
     out.join("; ")
 }
 
+/// `DS_WRITE_JOURNAL=1` (diagnosis, with the mirror audit): the GPU's
+/// writes of guest ranges as they were recorded, newest last (written
+/// bindings with their placement and whether their stores mark, in-place
+/// fills), for the audit's lasting pages (`journal_for`: which write path
+/// left the mirror and guest memory apart).
+pub(super) fn write_journal_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_WRITE_JOURNAL").ok().as_deref() == Some("1"))
+}
+
+struct JournalEntry {
+    base: u64,
+    size: u64,
+    queue: String,
+    program: u64,
+    res: u32,
+    kind: &'static str,
+    marked: bool,
+    flip: u64,
+}
+
+static WRITE_JOURNAL: Mutex<std::collections::VecDeque<JournalEntry>> = Mutex::new(std::collections::VecDeque::new());
+const WRITE_JOURNAL_CAP: usize = 1 << 18;
+/// Written bindings by placement under the journal: [mirrored, home, host
+/// (in place), other] (status line `write journal`).
+static WRITE_JOURNAL_KINDS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+pub(super) fn journal_write(base: u64, size: u64, queue: &str, program: u64, res: u32, kind: &'static str, marked: bool) {
+    if !write_journal_on() || size == 0 {
+        return;
+    }
+    let k = match kind {
+        "mirrored" => 0,
+        "home" => 1,
+        "host" => 2,
+        _ => 3,
+    };
+    WRITE_JOURNAL_KINDS[k].fetch_add(1, Ordering::Relaxed);
+    // (A written binding in place under front end 2: the GPU writes guest
+    // memory and not the mirror. The first few named.)
+    if k == 2 && super::fe2::on() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 16 {
+            crate::warn!("write journal: {queue} binds resource {res} of {program:#x} written in place over {base:#x}+{size:#x} (front end 2)");
+        }
+    }
+    let mut g = WRITE_JOURNAL.lock();
+    if g.len() >= WRITE_JOURNAL_CAP {
+        g.pop_front();
+    }
+    g.push_back(JournalEntry { base, size, queue: queue.to_string(), program, res, kind, marked, flip: super::FRAMES.load(Ordering::Relaxed) });
+}
+
+/// The journal's last writes over [a, a+n), newest first (at most 8).
+pub(super) fn journal_for(a: u64, n: u64) -> String {
+    if !write_journal_on() {
+        return String::new();
+    }
+    let g = WRITE_JOURNAL.lock();
+    let v: Vec<String> = g
+        .iter()
+        .rev()
+        .filter(|e| e.base < a + n && a < e.base + e.size)
+        .take(8)
+        .map(|e| format!("{} {} {:#x} res {} {} {:#x}+{:#x} at flip {}", e.queue, e.kind, e.program, e.res, if e.marked { "marked" } else { "UNMARKED" }, e.base, e.size, e.flip))
+        .collect();
+    if v.is_empty() { "; write journal: none over it".into() } else { format!("; write journal (newest first): {}", v.join("; ")) }
+}
+
+/// Status part of the journal (`DS_WRITE_JOURNAL=1`).
+pub(super) fn journal_line() -> String {
+    if !write_journal_on() {
+        return String::new();
+    }
+    let k: Vec<u64> = WRITE_JOURNAL_KINDS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    format!("    write journal: written bindings mirrored {}, in a home {}, in place {}, other {}\n", k[0], k[1], k[2], k[3])
+}
+
 /// GPU execution enabled (`DS_GPU=1`) and Vulkan available.
 /// `DS_TRACE_WRITES=<hex bytes>`: logs once each shader (and CP DMA) that
 /// writes a guest range at least that large (who fills a large buffer).
@@ -1640,7 +1718,7 @@ fn audit_mirror(buf: vk::Buffer, ptr: *mut u8, round: u64, cpu: &dyn Fn(u64) -> 
                 Some(e) => format!("page table entry {e:#x}: NO live import's (live: {:x?})", live),
                 None => "page table entry unread".to_string(),
             };
-            let map = format!("{map}; {pt}");
+            let map = format!("{map}; {pt}{}", journal_for(p, 4096));
             // Each live import over the page read on the GPU (into the
             // buffer's second half, past this round's pages): one that reads
             // the mirror's bytes while the CPU reads others pins pages that
@@ -3782,7 +3860,7 @@ fn finish_main(cmd: vk::CommandBuffer, bq: vk::QueryPool, has_pre: bool) {
     unsafe {
         if bq != vk::QueryPool::null() {
             c.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, bq, BQ_BATCH + 1);
-            if !has_pre {
+            if !has_pre && gpu_qresets() {
                 c.device.cmd_reset_query_pool(cmd, bq, BQ_PRE, 2);
             }
         }
@@ -5387,6 +5465,7 @@ fn releaser_thread(q: usize) {
                     }
                     c.device.reset_descriptor_pool(x.desc_pool, vk::DescriptorPoolResetFlags::empty()).ok();
                 }
+                host_qreset(x.bq);
                 x.state.store(0, Ordering::Release);
             }
         }
@@ -6763,6 +6842,8 @@ fn check_watchdog(queue: &str, shaders: &[u64]) {
         return;
     }
     let addr = unsafe { std::ptr::read_volatile(p.add(1)) as u64 | (std::ptr::read_volatile(p.add(2)) as u64) << 32 };
+    // The SGPRs of the last invocation stopped (`rdna::translate::LOOP_LIMIT`).
+    let sgprs: Vec<u32> = (0..32).map(|k| unsafe { std::ptr::read_volatile(p.add((rdna::translate::WATCHDOG_SGPRS_AT + k) as usize)) }).collect();
     WATCHDOG_STOPS.fetch_add(n as u64, Ordering::Relaxed);
     static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
     if !SEEN.lock().get_or_insert_with(HashSet::new).insert(addr) {
@@ -6775,10 +6856,12 @@ fn check_watchdog(queue: &str, shaders: &[u64]) {
     // left out).
     let from = super::shaders::program_hash(addr).ok().and_then(super::particles::origin).map(|d| format!(" from {d}")).unwrap_or_default();
     let pending = ASYNC_QUEUED.lock().as_ref().map_or(0, |s| s.len());
+    let regs: Vec<String> = sgprs.iter().enumerate().map(|(k, v)| format!("s{k}={v:#x}")).collect();
     crate::warn!(
-        "gpu[{queue}]: loop watchdog stopped {n} invocation(s) of shader {addr:#x}{from} after {} blocks; its results are wrong (batch shaders {}; {pending} background compiles pending){saved}",
+        "gpu[{queue}]: loop watchdog stopped {n} invocation(s) of shader {addr:#x}{from} after {} blocks; its results are wrong (batch shaders {}; {pending} background compiles pending){saved}; a stopped invocation's SGPRs: {}",
         rdna::translate::loop_limit(),
-        list.join(" ")
+        list.join(" "),
+        regs.join(" ")
     );
 }
 
@@ -6858,6 +6941,8 @@ struct SlotReset {
     pools: [vk::CommandPool; 3],
     desc_pool: vk::DescriptorPool,
     fence: vk::Fence,
+    /// The slot's batch-stamp queries (reset on the CPU: `host_qreset`).
+    bq: vk::QueryPool,
     state: std::sync::Arc<AtomicU64>,
 }
 
@@ -6955,7 +7040,9 @@ impl Slot {
                     vk::QueryPool::null()
                 },
                 bq: if batch_stamps() {
-                    c.device.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(4), None).map_err(|e| e.to_string())?
+                    let q = c.device.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(4), None).map_err(|e| e.to_string())?;
+                    host_qreset(q);
+                    q
                 } else {
                     vk::QueryPool::null()
                 },
@@ -6990,6 +7077,24 @@ const MAX_TIMED: u32 = 4096;
 /// its prologue's start and end.
 const BQ_BATCH: u32 = 0;
 const BQ_PRE: u32 = 2;
+
+/// Resets a slot's batch-stamp queries on the CPU (hostQueryReset, when the
+/// device has it): at the slot's creation and each release, after its
+/// timestamps were read.
+fn host_qreset(bq: vk::QueryPool) {
+    let c = ctx();
+    if c.host_query_reset && bq != vk::QueryPool::null() {
+        unsafe { c.device.reset_query_pool(bq, 0, 4) };
+    }
+}
+
+/// Whether batches reset their stamp queries on the GPU: only without
+/// hostQueryReset (the CPU resets them at the slot's release since
+/// 2026-11-11: two GPU commands less a batch, the swamp x1.012 and
+/// Castlewall Front x1.005 in in-run A/Bs, FINDINGS.md).
+fn gpu_qresets() -> bool {
+    !ctx().host_query_reset
+}
 
 /// Timestamps at every batch's start and end and its prologue's (`Slot::bq`;
 /// `DS_BATCH_STAMPS=0` at boot: none): each batch's span on the GPU, for the
@@ -10464,6 +10569,7 @@ impl Exec {
                     c.device.reset_command_buffer(slot.pre, vk::CommandBufferResetFlags::empty()).ok();
                     c.device.reset_descriptor_pool(slot.desc_pool, vk::DescriptorPoolResetFlags::empty()).ok();
                 }
+                host_qreset(slot.bq);
             }
             self.slots[self.cur].reset_pending = false;
             self.slots[self.cur].seq = 0;
@@ -10511,7 +10617,7 @@ impl Exec {
                 ctx().device.cmd_reset_query_pool(self.cmd(), qp, 0, STAMPS * MAX_TIMED);
             }
             let bq = self.slots[self.cur].bq;
-            if bq != vk::QueryPool::null() {
+            if bq != vk::QueryPool::null() && gpu_qresets() {
                 ctx().device.cmd_reset_query_pool(self.cmd(), bq, BQ_BATCH, 2);
             }
             // Mirror mode: the batch's touched-page list starts empty (the
@@ -10584,7 +10690,7 @@ impl Exec {
     fn slot_reset(&mut self, i: usize) -> Option<SlotReset> {
         let s = &mut self.slots[i];
         s.reset_pending = true;
-        Some(SlotReset { pools: [s.cpool, s.xcpool, s.ccpool], desc_pool: s.desc_pool, fence: s.fence, state: s.reset_state.clone() })
+        Some(SlotReset { pools: [s.cpool, s.xcpool, s.ccpool], desc_pool: s.desc_pool, fence: s.fence, bq: s.bq, state: s.reset_state.clone() })
     }
 
     /// Creates the current slot when the rotation reached one not made yet
@@ -12587,6 +12693,9 @@ impl Exec {
         if len == 0 || base % 4 != 0 || len % 4 != 0 || DEVICE_LOST.load(Ordering::Relaxed) || super::homes::overlaps(base, len) {
             return Ok(false);
         }
+        if write_journal_on() {
+            journal_write(base, len, &self.name, v as u64, u32::MAX, if guest.is_some() { "fill (guest in parts)" } else { "fill" }, true);
+        }
         if super::census::on() {
             super::census::note(base, len, super::census::FILL);
         }
@@ -13387,7 +13496,7 @@ impl Exec {
         if !self.pre_open {
             unsafe {
                 c.device.begin_command_buffer(pre, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
-                if bq != vk::QueryPool::null() {
+                if bq != vk::QueryPool::null() && gpu_qresets() {
                     c.device.cmd_reset_query_pool(pre, bq, BQ_PRE, 2);
                 }
             }
@@ -15133,6 +15242,10 @@ impl Exec {
                             if found.tr.plan.resources[i].written {
                                 trace_writes(|| format!("{:?} shader {:#x}{} {{{}}}", p.stage, p.addr, super::shaders::program_hash(p.addr).ok().and_then(super::particles::origin).map(|d| format!(" (from {d})")).unwrap_or_default(), if watch_range().is_some() { watch_resources(p) } else { String::new() }), base, size);
                                 bound.writes.push((base, size));
+                                if write_journal_on() {
+                                    let marks = found.tr.out.bindings.iter().any(|b| b.kind == BindingKind::Marks);
+                                    journal_write(base, size, &self.name, p.addr, i as u32, if from_mirror.is_some() { "mirrored" } else { "home" }, marks && from_mirror.is_some());
+                                }
                                 if super::xwait::on() {
                                     super::xwait::note_write(&self.name, base, size);
                                 }
@@ -15180,6 +15293,9 @@ impl Exec {
                                     if found.tr.plan.resources[i].written {
                                         trace_writes(|| format!("{:?} shader {:#x}{} {{{}}}", p.stage, p.addr, super::shaders::program_hash(p.addr).ok().and_then(super::particles::origin).map(|d| format!(" (from {d})")).unwrap_or_default(), if watch_range().is_some() { watch_resources(p) } else { String::new() }), base, size);
                                         bound.writes.push((base, size));
+                                        if write_journal_on() {
+                                            journal_write(base, size, &self.name, p.addr, i as u32, "host", false);
+                                        }
                                         if super::xwait::on() {
                                             super::xwait::note_write(&self.name, base, size);
                                         }
@@ -16949,6 +17065,7 @@ pub fn status() -> String {
         + &super::kco::status()
         + &import_sites_line()
         + &in_place_line()
+        + &journal_line()
         + &sync_why_status()
         + &format!(
             "    buffer snapshots in VRAM: {} ({} MiB), {} reused, {} not for lack of space, {} for memory that cannot be imported; draws with snapshotted indices {} ({} MiB); batch-start copies {} ({} MiB), {} reused, {} not for lack of space; on the copy queue {} ({} MiB)\n",

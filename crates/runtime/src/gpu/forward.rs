@@ -801,8 +801,16 @@ fn trace_refusal(dst: u64, bytes: u64, inputs: &[(u64, u64); 2], busy: &impl Fn(
 
 /// Starts forwarding `words` at `base` (written by the dispatch of `program`
 /// just recorded, after its own writes were noted); returns the entry's id.
+/// Copies forwarded by the engine allocator owning their destination's MiB
+/// (`engine::owner`; 0: none known), with their words (status line): which
+/// allocations hold the per-view blocks (front end 4's targets).
+static BY_OWNER: [[AtomicU64; 2]; 256] = [const { [const { AtomicU64::new(0) }; 2] }; 256];
+
 pub fn add(base: u64, words: Vec<u32>, program: u64, hash: u64, from: Inputs, how: &'static str, queue: &str) -> u64 {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let o = &BY_OWNER[crate::engine::owner(base) as usize];
+    o[0].fetch_add(1, Ordering::Relaxed);
+    o[1].fetch_add(words.len() as u64, Ordering::Relaxed);
     let n = words.len() as u64;
     let old: Arc<[u32]> = if super::cp::guest_readable(base, 4 * n) {
         let mut v = vec![0u32; n as usize];
@@ -1212,15 +1220,20 @@ pub fn status_line() -> String {
     if s[0] == 0 && s[7] == 0 {
         return String::new();
     }
+    let names: std::collections::HashMap<u8, String> = crate::engine::allocators().into_iter().map(|a| (a.id, a.name)).collect();
+    let mut owners: Vec<(u8, u64, u64)> = (0..256usize).map(|i| (i as u8, BY_OWNER[i][0].load(Ordering::Relaxed), BY_OWNER[i][1].load(Ordering::Relaxed))).filter(|x| x.1 > 0).collect();
+    owners.sort_by(|a, b| b.1.cmp(&a.1));
+    let owners: Vec<String> = owners.iter().take(6).map(|&(i, n, w)| format!("{} {n} ({w} words)", names.get(&i).cloned().unwrap_or_else(|| format!("owner {i}")))).collect();
     let k: Vec<u64> = CHECK_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
-        "    forwarded copies: {} made ({} not: inputs still written or odd shapes), {} ended by later writes, {} by the title's rewrites, {} retired after their batch ({} into a video-memory home, not compared); {} words served, {} stage reads with no wait for the copy; after the copies ran {} words equal, {} as before the copy (it did not land; {} copies of a few such words or unchanged inputs kept forwarded, {} words), {} rewritten since; checked after their batches {} ({} words; {} words equal, {} as before, {} rewritten; {} checks ended by later writes); past parallel runs {} (published {}, dropped {})\n",
+        "    forwarded copies: {} made ({} not: inputs still written or odd shapes), {} ended by later writes, {} by the title's rewrites, {} retired after their batch ({} into a video-memory home, not compared); {} words served, {} stage reads with no wait for the copy; after the copies ran {} words equal, {} as before the copy (it did not land; {} copies of a few such words or unchanged inputs kept forwarded, {} words), {} rewritten since; checked after their batches {} ({} words; {} words equal, {} as before, {} rewritten; {} checks ended by later writes); past parallel runs {} (published {}, dropped {}); destinations by engine allocator: {}\n",
         s[0], s[7], s[1], s[8], s[2], s[10], s[3], s[4], s[5], s[6],
         TOLERATED[0].load(Ordering::Relaxed),
         TOLERATED[1].load(Ordering::Relaxed),
         s[9], k[0], k[1], k[2], k[3], k[4], k[5],
         HELD_STATS[0].load(Ordering::Relaxed),
         HELD_STATS[1].load(Ordering::Relaxed),
-        HELD_STATS[2].load(Ordering::Relaxed)
+        HELD_STATS[2].load(Ordering::Relaxed),
+        owners.join(", ")
     )
 }

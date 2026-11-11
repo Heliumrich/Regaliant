@@ -3178,7 +3178,7 @@ impl Images {
                 let since = SUB_HASHES.lock().as_ref().and_then(|m| m.get(&key)).map(|x| x.0);
                 let events = since.map(|s| missed.iter().take(2).flat_map(|&(_, a, n)| super::track::events_since(a, n, s)).take(6).collect::<Vec<_>>().join("; "));
                 lines.push(format!(
-                    "texcheck: {:#x} {}x{}x{} {:?} sw {} levels {} (T# levels {}..{}, {} images at base): {} of {} checked parts changed with no write marked ({}{}); region {region} dirty {}{}",
+                    "texcheck: {:#x} {}x{}x{} {:?} sw {} levels {} (T# levels {}..{}, {} images at base): {} of {} checked parts changed with no write marked ({}{}); region {region} dirty {}{}{}",
                     t.base,
                     key.width,
                     key.height,
@@ -3197,7 +3197,10 @@ impl Images {
                     match (since, events) {
                         (Some(s), Some(e)) => format!("; last upload {} ms ago, writes noted since: {}", s.elapsed().as_millis(), if e.is_empty() { "none" } else { &e }),
                         _ => String::new(),
-                    }
+                    },
+                    // (`DS_WRITE_JOURNAL=1`: the GPU's last writes over its
+                    // first changed part.)
+                    missed.first().map(|&(_, a, n)| super::exec::journal_for(a, n)).unwrap_or_default()
                 ));
             }
         }

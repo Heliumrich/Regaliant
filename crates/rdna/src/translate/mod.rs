@@ -698,8 +698,13 @@ pub const GDS_BYTES: u32 = 64 << 10;
 /// run until the driver declares the device lost (seen in Outpost Passage),
 /// which also stalls other applications' GPU work. A stopped invocation adds
 /// 1 to dword 0 of the watchdog binding and stores its program address
-/// (from the SGPR data, `code_base_offset`) in dwords 1 (low) and 2 (high).
-pub const LOOP_LIMIT: u32 = 1 << 20;
+/// (from the SGPR data, `code_base_offset`) in dwords 1 (low) and 2 (high)
+/// and its SGPRs s0-s31 in dwords 4-35 (the last stopped invocation's).
+/// 2^16 since 2026-11-11 (2^20 before): a culling program's plane loop
+/// running on a wrong count took ~450 ms of GPU to reach 2^20 blocks (~430
+/// ns a block), a walk's 584 ms frame; level loads (2026-10-12/13) and a
+/// 9-level tour (2026-11-11) at 2^14 stopped nothing.
+pub const LOOP_LIMIT: u32 = 1 << 16;
 /// The limit translations use: LOOP_LIMIT unless set (`set_loop_limit`;
 /// diagnosis of device losses, `DS_LOOP_LIMIT`: a lower limit names a
 /// shader whose every invocation loops long instead of losing the device).
@@ -715,8 +720,10 @@ pub fn loop_limit() -> u32 {
         n => n,
     }
 }
-/// Size of the watchdog binding in dwords.
-pub const WATCHDOG_DWORDS: u32 = 4;
+/// Size of the watchdog binding in dwords (`LOOP_LIMIT`'s record).
+pub const WATCHDOG_DWORDS: u32 = 36;
+/// The first of the watchdog record's SGPR dwords (s0-s31).
+pub const WATCHDOG_SGPRS_AT: u32 = 4;
 
 #[derive(Clone, Debug)]
 pub struct Binding {
@@ -3883,6 +3890,14 @@ fn emit_watchdog_record(tr: &mut T) -> R<()> {
         let i = tr.u(k);
         let p = e(tr.b.access_chain(tr.t.sb_u32, None, wd, [z, i]))?;
         ok(tr.b.store(p, c, None, []))?;
+    }
+    // Its SGPRs as they were when it stopped (a loop's bound read from
+    // memory, the user data's pointers).
+    for k in 0..32u32 {
+        let v = tr.sreg(k)?;
+        let i = tr.u(WATCHDOG_SGPRS_AT + k);
+        let p = e(tr.b.access_chain(tr.t.sb_u32, None, wd, [z, i]))?;
+        ok(tr.b.store(p, v, None, []))?;
     }
     ok(tr.b.branch(end))?;
     e(tr.b.begin_block(Some(end)))?;

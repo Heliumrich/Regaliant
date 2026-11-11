@@ -36,6 +36,9 @@ pub struct Ctx {
     pub exec_props: Option<ash::khr::pipeline_executable_properties::Device>,
     pub device_name: String,
     pub validation: bool,
+    /// Vulkan 1.2's hostQueryReset enabled: batch slots' timestamp queries
+    /// are reset by the CPU when the slot is released (`exec::Slot::bq`).
+    pub host_query_reset: bool,
     /// VK_EXT_debug_utils command labels (DS_GPU_LABELS=1): named ranges of
     /// the recorded work for GPU Trace (Nsight Graphics).
     pub labels: Option<ash::ext::debug_utils::Device>,
@@ -643,8 +646,10 @@ fn init_inner() -> Result<(), String> {
         }
         let device_addresses = f12_supported.buffer_device_address != 0;
         let draw_indirect_count = f12_supported.draw_indirect_count != 0;
+        let host_query_reset = f12_supported.host_query_reset != 0;
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
             .buffer_device_address(device_addresses)
+            .host_query_reset(host_query_reset)
             .draw_indirect_count(draw_indirect_count)
             .shader_sampled_image_array_non_uniform_indexing(nonuniform)
             .shader_storage_image_array_non_uniform_indexing(storage_nonuniform)
@@ -830,6 +835,7 @@ fn init_inner() -> Result<(), String> {
             limits: props.limits,
             device_name,
             validation,
+            host_query_reset,
             barycentric,
             bary_gs,
             partitioned,

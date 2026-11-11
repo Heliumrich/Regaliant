@@ -24,8 +24,9 @@ const MAGIC: &[u8; 8] = b"DSTRANS3";
 
 /// Environment switches the translator reads (`rdna`; the dumps write files
 /// while translating): any of them set keeps the store off.
-const TRANSLATOR_ENV: [&str; 16] = [
+const TRANSLATOR_ENV: [&str; 17] = [
     "DS_EXEC_PARTIAL",
+    "DS_LOOP_LIMIT",
     "DS_LOCKSTEP",
     "DS_LOCKSTEP_OFF",
     "DS_MASKED_SKIP",
@@ -51,6 +52,14 @@ static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 static QUEUE: Mutex<Vec<(PathBuf, Vec<u8>)>> = Mutex::new(Vec::new());
 static QUEUED: Condvar = Condvar::new();
 
+/// The first translator switch set in the environment (`TRANSLATOR_ENV`):
+/// translations then differ from the stores' under the same keys, so the
+/// translation store is off and the pipeline store (keyed by program and
+/// spec, not by the SPIR-V) is off too unless `DS_PIPELINE_DIR` names one.
+pub fn translator_switch() -> Option<&'static str> {
+    TRANSLATOR_ENV.iter().copied().find(|v| std::env::var_os(v).is_some())
+}
+
 /// Where the store lives (set once at startup; none: translations are not
 /// kept). Removes the stores of other translator hashes in the background.
 pub fn set_dir(base: PathBuf) {
@@ -58,7 +67,7 @@ pub fn set_dir(base: PathBuf) {
         crate::info!("translation store: off (DS_TRCACHE=0)");
         return;
     }
-    if let Some(v) = TRANSLATOR_ENV.iter().find(|v| std::env::var_os(v).is_some()) {
+    if let Some(v) = translator_switch() {
         crate::info!("translation store: off while {v} is set");
         return;
     }
