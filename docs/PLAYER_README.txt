@@ -117,12 +117,17 @@ one). If the game does not start at all, try safe mode in the launcher.
 
 System requirements
 -------------------
-Tested on one PC: Ryzen 9 5900X, 32 GB of memory, NVIDIA RTX 4090 with driver 610.88,
-Windows 11.
+Tested on one PC: Ryzen 9 5900X (12 cores), 32 GB of memory, NVIDIA RTX 4090 with driver
+610.88, Windows 11.
+
+Memory, measured there: the game reserves about 35 to 40 GB of memory and page file. While you
+play an area it keeps about 4 to 5 GB in active use. With 16 GB of memory it should run if
+Windows manages the page file size (the default) and the system drive has about 30 GB free. It
+then pages more during loads. 32 GB is recommended. 16 GB has not been tested.
 
 Estimated, not tested:
-- Memory: see "Known issues".
-- Graphics: Vulkan 1.3. AMD and Intel graphics cards have not been tested.
+- Graphics: Vulkan 1.3. The game used 17 to 18 GB of video memory on the tested card, but it
+  lets textures go when memory runs short. AMD and Intel graphics cards have not been tested.
 - Processor: the game uses many threads. Fewer cores lower the frame rate.
 
 

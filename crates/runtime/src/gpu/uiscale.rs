@@ -83,20 +83,36 @@ fn spare(format: vk::Format, w: u32, h: u32) -> Result<(vk::Image, vk::ImageView
     }
 }
 
-/// Records into `cb` (outside rendering) `layer` (GENERAL, `w`x`h`) scaled by `s` around its
-/// centre into our image, its edges stretched across the rest; returns that image's view for the composite to
-/// sample in the layer's place. None when no image could be made (the interface keeps its size).
-pub fn record(cb: vk::CommandBuffer, layer: vk::Image, format: vk::Format, w: u32, h: u32, s: f32) -> Option<vk::ImageView> {
-    let (tmp, view, filter) = match spare(format, w, h) {
-        Ok(v) => v,
+/// A scaled copy to record (`prepare`, then `record`).
+#[derive(Clone, Copy)]
+pub struct Job {
+    layer: vk::Image,
+    tmp: vk::Image,
+    /// Our image's view, which the composite binds in the layer's place.
+    pub view: vk::ImageView,
+    w: u32,
+    h: u32,
+    s: f32,
+    filter: vk::Filter,
+}
+
+/// The copy of `layer` (GENERAL, `w`x`h`) scaled by `s` into our image (made when needed);
+/// nothing recorded yet. None when no image could be made (the interface keeps its size).
+pub fn prepare(layer: vk::Image, format: vk::Format, w: u32, h: u32, s: f32) -> Option<Job> {
+    match spare(format, w, h) {
+        Ok((tmp, view, filter)) => Some(Job { layer, tmp, view, w, h, s, filter }),
         Err(e) => {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| crate::warn!("ui scale: no image ({e}): the interface keeps its size"));
-            return None;
+            None
         }
-    };
-    super::vk::defer::external(cb, Box::new(move |cb| unsafe { scale_into(cb, layer, tmp, w, h, s, filter) }));
-    Some(view)
+    }
+}
+
+/// Records the copy into `cb` (recording, outside rendering): the layer scaled around its centre
+/// into our image, its edges stretched across the rest.
+pub fn record(cb: vk::CommandBuffer, j: Job) {
+    super::vk::defer::external(cb, Box::new(move |cb| unsafe { scale_into(cb, j.layer, j.tmp, j.w, j.h, j.s, j.filter) }));
 }
 
 unsafe fn scale_into(cb: vk::CommandBuffer, layer: vk::Image, tmp: vk::Image, w: u32, h: u32, s: f32, filter: vk::Filter) {

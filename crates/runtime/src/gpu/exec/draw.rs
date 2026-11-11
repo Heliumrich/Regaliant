@@ -964,6 +964,7 @@ impl Exec {
         }
         let r = self.draw_inner(cp, &args);
         self.ui_sub = None;
+        self.ui_job = None;
         if let Some(t) = t_prog {
             let ps = ((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8;
             super::prog_note(self.prog_class(), shaders::ngg_addr(cp), ps.max(2), t.elapsed().as_nanos() as u64);
@@ -998,19 +999,22 @@ impl Exec {
     }
 
     /// Menu & HUD Size (`gpu::uiscale`): the interface layer the title's composite samples (its
-    /// pixel stage's resource 0) scaled around its centre into an image of ours, outside
-    /// rendering, before the composite is recorded; the composite binds that image in the
-    /// layer's place (`ui_sub`, read where the draw binds its pixel stage).
+    /// pixel stage's resource 0) scaled around its centre into an image of ours; the composite
+    /// binds that image in the layer's place (`ui_sub`, read where the draw binds its pixel
+    /// stage). Nothing is recorded here: the copy goes in where the composite begins rendering
+    /// (`ui_job`), once the draw's batch is open (a draw may be the first command of a batch, and
+    /// a parallel chunk may stop at it).
     fn scale_ui_layer(&mut self, cp: &Cp) {
         let Ok(p) = shaders::prepare_ps(cp) else { return };
         let Some(super::Resolved::Image(t)) = p.resources.first() else { return };
         let frame = super::super::FRAMES.load(Ordering::Relaxed);
         let Ok(tex) = super::super::images::with(|im| im.upscale_tex(t, false, frame)) else { return };
-        self.end_rendering();
-        let cmd = self.cmd();
         let s = super::super::uiscale::scale();
-        if let Some(view) = super::super::uiscale::record(cmd, tex.image, tex.format, tex.size.0, tex.size.1, s) {
-            self.ui_sub = Some((tex.view, view));
+        if let Some(job) = super::super::uiscale::prepare(tex.image, tex.format, tex.size.0, tex.size.1, s) {
+            self.ui_sub = Some((tex.view, job.view));
+            self.ui_job = Some(job);
+            // (Rendering begins again at the composite: the copy goes in before it.)
+            self.end_rendering();
         }
     }
 
@@ -1927,6 +1931,10 @@ impl Exec {
                     self.end_rendering();
                 }
                 self.barrier_if_wanted(true);
+                // Menu & HUD Size: the interface layer's scaled copy before the composite.
+                if let Some(job) = self.ui_job.take() {
+                    super::super::uiscale::record(self.cmd(), job);
+                }
                 self.begin_rendering(colors, depth, area);
             } else if super::super::tune::race_checks() && self.barrier_wanted {
                 super::UNORDERED[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);

@@ -79,6 +79,8 @@ fn pc_text() -> String {
     lines.push(format!("Memory: {}. Processor: {} threads.", sys::gb(mem), sys::threads()));
     if mem < 15 << 30 {
         lines.push("The game needs 16 GB of memory. It may stop when memory runs out.".into());
+    } else if mem < 30 << 30 {
+        lines.push("Keep Windows' page file on automatic and about 30 GB free on the system drive.".into());
     }
     if sys::threads() < 8 {
         lines.push("The game was tested with at least 6 processor cores. It may run slowly here.".into());

@@ -379,6 +379,16 @@ fn main() {
         InitCommonControlsEx(&icc);
         let hinst = GetModuleHandleW(std::ptr::null());
         let class = wide("demonssouls_launcher");
+        // One launcher at a time (two could prepare the shaders twice): a second start brings
+        // the first one to the front. (`--shot` runs are layout checks: they may run beside one.)
+        if arg("--shot").is_none() {
+            let other = FindWindowW(class.as_ptr(), std::ptr::null());
+            if !other.is_null() {
+                ShowWindow(other, SW_RESTORE);
+                SetForegroundWindow(other);
+                return;
+            }
+        }
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             style: CS_HREDRAW | CS_VREDRAW,
