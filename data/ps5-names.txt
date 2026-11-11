@@ -1,6 +1,6 @@
 # PS5 SDK symbol names (interface facts) verified by NID hash against the supplied
 # PPSA01341 01.007.000 modules. One name per line; NIDs are computed at runtime.
-# Sources of candidates: see docs/PROVENANCE.md (names only; every entry hash-verified).
+# Candidates came from public sources and dictionary search (names only; every entry hash-verified).
 _ZN3sce4Json11Initializer10initializeEPKNS0_13InitParameterE
 _ZN3sce4Json11InitializerC1Ev
 _ZN3sce4Json11InitializerD1Ev
