@@ -87,9 +87,10 @@ The launcher
 - Game: the game folder and its check, what your PC brings, and safe mode for the next start.
   Safe mode starts the game in a window with the default settings and without an upscaler. Use
   it when the game does not start.
-- Shaders: prepares the game's shaders ahead. Without it the game stutters while it compiles
-  each shader the first time. Prepared shaders hold for one graphics card and driver. After a
-  driver update the launcher asks to prepare them again.
+- Shaders: prepares the game's shaders ahead. The game compiles each shader the first time it
+  needs it, which makes play stutter. Prepared shaders make the longest stutters much shorter,
+  but some remain on first visits. They hold for one graphics card and driver. After a driver
+  update the launcher asks to prepare them again.
 - Saves: the save folder and the backups the game makes. The game copies each save before a
   session first changes it. "Restore..." puts a backup back. The save as it is now is kept
   as a backup first.
@@ -137,8 +138,9 @@ Estimated, not tested:
 Known issues
 ------------
 - The frame rate is below 60 in most places. On the tested PC it is about 30 to 45 fps.
-- The first visit to an area can still stutter for a moment while graphics shaders compile,
-  even with prepared shaders.
+- The first visit to an area can still stutter while shaders compile, even with prepared
+  shaders. The first session's first load can pause for many seconds behind the loading
+  screen. Later visits do not compile them again.
 - Areas, bosses and the story were reached by the developer's shortcuts in testing. A full
   playthrough has not been made.
 - World 8-3 sometimes loads too dark. Restarting the game fixes it.

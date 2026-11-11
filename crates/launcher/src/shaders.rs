@@ -73,7 +73,7 @@ pub fn build(app: &mut App) {
     let b: Builder = app.builder();
     unsafe {
         let r = (16, 62, 748, 62);
-        app.put(1, b.label("The game compiles each shader the first time it needs it, which makes play stutter. Preparing them here once takes about 20 to 60 minutes and makes first visits much smoother. Nothing of it shows while you play.", r, -1), r);
+        app.put(1, b.label("The game compiles each shader the first time it needs it, which makes play stutter. Preparing them here once takes about 20 to 60 minutes and makes the longest stutters much shorter. Some stutter remains on first visits. Nothing of it shows while you play.", r, -1), r);
         let r = (16, 134, 748, 40);
         app.shaders.status = app.put(1, b.label("", r, -1), r) as usize;
         let r = (16, 178, 748, 20);
