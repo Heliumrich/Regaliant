@@ -1512,6 +1512,21 @@ fn mark_dwords_once(tr: &mut T, r: usize, d0: Word, n: u32) -> R<()> {
         } else {
             z
         };
+        // C5 (`Spec::marks_held`): no bits for words in held pages (the
+        // spill's word is in the next page when `w` is its page's last).
+        let (m0, m1) = if tr.spec.marks_held {
+            let m0 = held_cleared(tr, marks, w, m0)?;
+            let m1 = if n > 1 {
+                let one = tr.u(1);
+                let w1 = e(tr.b.i_add(u, None, w, one))?;
+                held_cleared(tr, marks, w1, m1)?
+            } else {
+                m1
+            };
+            (m0, m1)
+        } else {
+            (m0, m1)
+        };
         if tr.spec.marks_part {
             return mark_partitioned(tr, marks, w, m0, m1, n);
         }
@@ -1595,11 +1610,23 @@ fn mark_dwords_once(tr: &mut T, r: usize, d0: Word, n: u32) -> R<()> {
         })?;
         ok(tr.b.branch(merge))?;
         e(tr.b.begin_block(Some(far_b)))?;
-        let scope = tr.u(spirv::Scope::Device as u32);
-        let sem = tr.u(0);
-        let p0 = e(tr.b.access_chain(tr.t.sb_u32, None, marks, [z, w]))?;
-        e(tr.b.atomic_or(u, None, p0, scope, sem, m0))?;
-        touch_page(tr, marks, w)?;
+        if tr.spec.marks_held {
+            let any0 = e(tr.b.i_not_equal(b, None, m0, z))?;
+            tr.guarded(any0, &mut |tr| {
+                let (u, z) = (tr.t.u32, tr.u(0));
+                let scope = tr.u(spirv::Scope::Device as u32);
+                let sem = tr.u(0);
+                let p0 = e(tr.b.access_chain(tr.t.sb_u32, None, marks, [z, w]))?;
+                e(tr.b.atomic_or(u, None, p0, scope, sem, m0))?;
+                touch_page(tr, marks, w)
+            })?;
+        } else {
+            let scope = tr.u(spirv::Scope::Device as u32);
+            let sem = tr.u(0);
+            let p0 = e(tr.b.access_chain(tr.t.sb_u32, None, marks, [z, w]))?;
+            e(tr.b.atomic_or(u, None, p0, scope, sem, m0))?;
+            touch_page(tr, marks, w)?;
+        }
         if n > 1 {
             let any = e(tr.b.i_not_equal(b, None, m1, z))?;
             tr.guarded(any, &mut |tr| {
@@ -1624,6 +1651,27 @@ fn mark_dwords_once(tr: &mut T, r: usize, d0: Word, n: u32) -> R<()> {
         e(tr.b.begin_block(Some(merge)))?;
         Ok(())
     })
+}
+
+/// C5 (`Spec::marks_held`): `bits` for map word `w`, or 0 when the word's
+/// page is held (bit `w / 32` of the map's held region, MARK_HELD_AT). The
+/// region changes only between batches (the runtime's copies), so a plain
+/// load.
+fn held_cleared(tr: &mut T, marks: Word, w: Word, bits: Word) -> R<Word> {
+    use crate::kernels::MARK_HELD_AT;
+    let (u, b) = (tr.t.u32, tr.t.bool_);
+    let (five, k10, k31, one, z) = (tr.u(5), tr.u(10), tr.u(31), tr.u(1), tr.u(0));
+    let hw = e(tr.b.shift_right_logical(u, None, w, k10))?;
+    let at = tr.u(MARK_HELD_AT);
+    let hw = e(tr.b.i_add(u, None, at, hw))?;
+    let hp = e(tr.b.access_chain(tr.t.sb_u32, None, marks, [z, hw]))?;
+    let hv = e(tr.b.load(u, None, hp, None, []))?;
+    let page = e(tr.b.shift_right_logical(u, None, w, five))?;
+    let pbit = e(tr.b.bitwise_and(u, None, page, k31))?;
+    let hb = e(tr.b.shift_right_logical(u, None, hv, pbit))?;
+    let hb = e(tr.b.bitwise_and(u, None, hb, one))?;
+    let held = e(tr.b.i_not_equal(b, None, hb, z))?;
+    e(tr.b.select(u, None, held, z, bits))
 }
 
 /// `Spec::marks_part`: the active lanes marking map word `w` (bits `m0`,
@@ -1690,11 +1738,24 @@ fn mark_part_lanes(tr: &mut T, marks: Word, w: Word, m0: Word, m1: Word, n: u32)
 fn mark_lead(tr: &mut T, marks: Word, w: Word, or0: Word, or1: Option<Word>) -> R<()> {
     let (u, b) = (tr.t.u32, tr.t.bool_);
     let z = tr.u(0);
-    let scope = tr.u(spirv::Scope::Device as u32);
-    let sem = tr.u(0);
-    let p0 = e(tr.b.access_chain(tr.t.sb_u32, None, marks, [z, w]))?;
-    e(tr.b.atomic_or(u, None, p0, scope, sem, or0))?;
-    touch_page(tr, marks, w)?;
+    if tr.spec.marks_held {
+        // (C5: a held page's word has no bits; nothing stored or touched.)
+        let any0 = e(tr.b.i_not_equal(b, None, or0, z))?;
+        tr.guarded(any0, &mut |tr| {
+            let (u, z) = (tr.t.u32, tr.u(0));
+            let scope = tr.u(spirv::Scope::Device as u32);
+            let sem = tr.u(0);
+            let p0 = e(tr.b.access_chain(tr.t.sb_u32, None, marks, [z, w]))?;
+            e(tr.b.atomic_or(u, None, p0, scope, sem, or0))?;
+            touch_page(tr, marks, w)
+        })?;
+    } else {
+        let scope = tr.u(spirv::Scope::Device as u32);
+        let sem = tr.u(0);
+        let p0 = e(tr.b.access_chain(tr.t.sb_u32, None, marks, [z, w]))?;
+        e(tr.b.atomic_or(u, None, p0, scope, sem, or0))?;
+        touch_page(tr, marks, w)?;
+    }
     if let Some(o1) = or1 {
         let any = e(tr.b.i_not_equal(b, None, o1, z))?;
         tr.guarded(any, &mut |tr| {

@@ -424,6 +424,11 @@ pub struct Spec {
     /// subgroup ORs over up to five words and the per-lane path, in one
     /// reduction per word.
     pub marks_part: bool,
+    /// With `write_marks`, stores into pages whose bit is set in the map's
+    /// held region (`kernels::MARK_HELD_AT`: front end 4's held pages) set
+    /// no marks and touch no page (C5: a held page's release copies it
+    /// whole from the mirror, so its words need no marks).
+    pub marks_held: bool,
     /// How the SGPR data binding is declared: 0 a storage buffer (u32
     /// array), 1 a uniform buffer (`BindingKind::SgprUniform`: a std140
     /// array of uvec4 sized to the plan's SGPR data) where the binding is the
@@ -574,6 +579,9 @@ impl std::hash::Hash for Spec {
         }
         if self.marks_part {
             0x4D50_5254u32.hash(state);
+        }
+        if self.marks_held {
+            0x4D48_4C44u32.hash(state);
         }
         if self.touch_test {
             0x5454_5354u32.hash(state);
@@ -4207,6 +4215,7 @@ mod tests {
             part_twice: false,
             dep_loads: false,
             marks_part: false,
+            marks_held: false,
             sgpr_ubo: 0,
             gpu_loads: 0,
             gpu_res: 0,
@@ -4359,6 +4368,23 @@ mod tests {
         if let Ok(dir) = std::env::var("RDNA_MARKS_DUMP") {
             let bytes: Vec<u8> = b.spirv.iter().flat_map(|x| x.to_le_bytes()).collect();
             std::fs::write(std::path::Path::new(&dir).join("write_marks.spv"), bytes).unwrap();
+        }
+        // C5 (`Spec::marks_held`), with the ballot and the partitioned forms:
+        // the same bindings and warnings, a longer module.
+        for (part, name) in [(false, "write_marks_held.spv"), (true, "write_marks_held_part.spv")] {
+            spec.marks_part = part;
+            spec.marks_held = false;
+            let plain = translate(&code, &plan, &spec).unwrap();
+            spec.marks_held = true;
+            let held = translate(&code, &plan, &spec).unwrap();
+            assert_eq!(plain.bindings.len(), held.bindings.len());
+            assert_eq!(marks(&held), 1);
+            assert_eq!(plain.warnings, held.warnings);
+            assert!(held.spirv.len() > plain.spirv.len());
+            if let Ok(dir) = std::env::var("RDNA_MARKS_DUMP") {
+                let bytes: Vec<u8> = held.spirv.iter().flat_map(|x| x.to_le_bytes()).collect();
+                std::fs::write(std::path::Path::new(&dir).join(name), bytes).unwrap();
+            }
         }
     }
 

@@ -1607,13 +1607,20 @@ fn claim_mark_page(g: &mut Backing, m: &Mirror, p: u64, alloc_ns: &mut u64) -> R
 /// there is one (the main queue would wait for the batches queued there),
 /// and waits.
 fn zero_mark_pages(sm: &SparseMarks, pages: &[u64]) -> Result<(), String> {
-    let record = |cmd: vk::CommandBuffer| unsafe {
+    one_off_side(|cmd: vk::CommandBuffer| unsafe {
         for &b in &sm.bufs {
             for &k in pages {
                 ctx().device.cmd_fill_buffer(cmd, b, k * sm.page, sm.page.min(MARK_BYTES - k * sm.page), 0);
             }
         }
-    };
+    })
+}
+
+/// A one-off command buffer on the copy queue when there is one (the main
+/// queue would first finish the batches queued there), else on the main
+/// queue; waited for. Nothing orders it with the other queues' work but
+/// the wait: for writes those queues' later batches may see late.
+pub fn one_off_side(record: impl FnOnce(vk::CommandBuffer)) -> Result<(), String> {
     let c = ctx();
     let Some(q) = c.copy.as_ref() else { return one_off(record) };
     unsafe {

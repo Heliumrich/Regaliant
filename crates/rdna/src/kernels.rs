@@ -261,7 +261,13 @@ pub const MARK_LIST_CAP: u32 = 1 << 20;
 /// page counts), else unused.
 pub const MARK_AUX_AT: u32 = MARK_LIST_AT + 4 + MARK_LIST_CAP;
 pub const MARK_AUX_WORDS: u32 = (MARK_SPAN_BYTES / 4096 / 32) as u32;
-pub const MARK_TOTAL_WORDS: u32 = MARK_AUX_AT + MARK_AUX_WORDS;
+/// Then one bit per page: front end 4's held pages as the GPU sees them
+/// (C5, `Spec::marks_held`: stores into them set no marks; the runtime
+/// copies its held map here, a held bit set only after the host holds the
+/// page and cleared before a batch that may write it again is pushed).
+pub const MARK_HELD_AT: u32 = MARK_AUX_AT + MARK_AUX_WORDS;
+pub const MARK_HELD_WORDS: u32 = (MARK_SPAN_BYTES / 4096 / 32) as u32;
+pub const MARK_TOTAL_WORDS: u32 = MARK_HELD_AT + MARK_HELD_WORDS;
 /// `mirror_scatter_counting`'s buckets: 2^WB_BUCKET_SHIFT pages (1 MiB).
 pub const WB_BUCKET_SHIFT: u32 = 8;
 pub const WB_BUCKETS: u32 = (MARK_SPAN_BYTES / 4096 >> WB_BUCKET_SHIFT) as u32;

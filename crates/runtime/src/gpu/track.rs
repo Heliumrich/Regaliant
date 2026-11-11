@@ -539,7 +539,9 @@ pub fn force_dirty(id: u32) {
 pub fn pending_overlaps(id: u32, base: u64, len: u64) -> bool {
     let g = TRACK.lock();
     let Some(r) = g.as_ref().and_then(|t| t.regions.get(id as usize)).and_then(|r| r.as_ref()) else { return false };
-    r.dirty && (r.whole || r.parts.iter().any(|&(b, n)| b < base + len && base < b.saturating_add(n)))
+    // (A GPU write announced over it: the whole region is hashed again at
+    // its next use.)
+    r.gpu || (r.dirty && (r.whole || r.parts.iter().any(|&(b, n)| b < base + len && base < b.saturating_add(n))))
 }
 
 /// Whether the region is marked dirty (not yet taken).

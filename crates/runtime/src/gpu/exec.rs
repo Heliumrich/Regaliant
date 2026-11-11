@@ -1639,8 +1639,10 @@ fn audit_round(buf: vk::Buffer, ptr: *mut u8, next: usize) -> usize {
             if k < 64 {
                 let (s, e, _, pg, born) = picks[i];
                 let at = diff[0];
+                // (The guest's mapping there now: a remap the import outlived.)
+                let map = crate::mem::MEM.try_lock().map_or_else(|| "busy".into(), |g| g.find(pg).map_or_else(|| "none".into(), |v| format!("{:#x}+{:#x} {:?} '{}'", v.start, v.size, v.kind, v.name)));
                 crate::warn!(
-                    "gpu: import audit: import {s:#x}..{e:#x} (born at flip {born}, now {}) reads page {pg:#x} other than the CPU does: {} bytes the CPU had neither before nor after, the first at +{at:#x} (GPU {:02x?}, CPU after {:02x?})",
+                    "gpu: import audit: import {s:#x}..{e:#x} (born at flip {born}, now {}) reads page {pg:#x} other than the CPU does: {} bytes the CPU had neither before nor after, the first at +{at:#x} (GPU {:02x?}, CPU after {:02x?}); mapping {map}",
                     super::FRAMES.load(Relaxed),
                     diff.len(),
                     &gpu[at..(at + 8).min(4096)],

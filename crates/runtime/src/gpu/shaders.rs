@@ -1907,6 +1907,7 @@ fn cs_spec(addr: u64, rsrc2: u32, local: [u32; 3], wave64: bool, code_hash: u64)
         part_twice: marks_wanted() && super::tune::tr_ballast() & 8 != 0,
         dep_loads: super::tune::tr_ballast() & 2 != 0,
         marks_part: marks_part_wanted(),
+        marks_held: marks_held_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -2054,7 +2055,15 @@ static APPEND_HASHES: [std::sync::atomic::AtomicU64; 64] = [const { std::sync::a
 
 fn append_program(code_hash: u64) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
-    code_hash != 0 && APPEND_HASHES.iter().take_while(|h| h.load(Relaxed) != 0).any(|h| h.load(Relaxed) == code_hash)
+    code_hash != 0 && sg_appends_wanted() && APPEND_HASHES.iter().take_while(|h| h.load(Relaxed) != 0).any(|h| h.load(Relaxed) == code_hash)
+}
+
+/// `DS_SG_APPENDS=0` (diagnosis, boot; a spec field, so translations are
+/// keyed apart): wave-aggregated appends translated in wave-mask mode as
+/// before 2026-11-03 (the mirror audit's lasting pages by store path).
+fn sg_appends_wanted() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !*OFF.get_or_init(|| std::env::var("DS_SG_APPENDS").ok().as_deref() == Some("0"))
 }
 
 fn note_append(addr: u64, insts: &[rdna::Inst], hash: u64) {
@@ -2178,6 +2187,12 @@ fn marks_wanted() -> bool {
 fn marks_part_wanted() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     marks_wanted() && super::vk::subgroup_partitioned() && !*OFF.get_or_init(|| std::env::var("DS_MARKS_PART").ok().as_deref() == Some("0"))
+}
+
+/// C5: stores into pages front end 4 holds set no marks (`Spec::marks_held`,
+/// with C4; `DS_C5=0` off, a spec field, so translations are keyed apart).
+fn marks_held_wanted() -> bool {
+    marks_wanted() && super::fe2::c5_wanted()
 }
 
 /// Front end 2's stores test their pages' touched bits before setting them
@@ -2437,6 +2452,7 @@ fn ps_spec(addr: u64, rsrc2: u32, ctx: &dyn Fn(u32) -> u32) -> Spec {
         part_twice: marks_wanted() && super::tune::tr_ballast() & 8 != 0,
         dep_loads: super::tune::tr_ballast() & 2 != 0,
         marks_part: marks_part_wanted(),
+        marks_held: marks_held_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -2728,6 +2744,7 @@ fn ngg_spec(addr: u64, rsrc2: u32, stages: u32, insts: &[rdna::Inst]) -> Spec {
         part_twice: marks_wanted() && super::tune::tr_ballast() & 8 != 0,
         dep_loads: super::tune::tr_ballast() & 2 != 0,
         marks_part: marks_part_wanted(),
+        marks_held: marks_held_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -3573,6 +3590,7 @@ pub(crate) fn vertex_spec(addr: u64, user_sgprs: u16, wave64: bool, base_instanc
         part_twice: marks_wanted() && super::tune::tr_ballast() & 8 != 0,
         dep_loads: super::tune::tr_ballast() & 2 != 0,
         marks_part: marks_part_wanted(),
+        marks_held: marks_held_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -3630,6 +3648,7 @@ pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr
         part_twice: marks_wanted() && super::tune::tr_ballast() & 8 != 0,
         dep_loads: super::tune::tr_ballast() & 2 != 0,
         marks_part: marks_part_wanted(),
+        marks_held: marks_held_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -3705,6 +3724,7 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         part_twice: marks_wanted() && super::tune::tr_ballast() & 8 != 0,
         dep_loads: super::tune::tr_ballast() & 2 != 0,
         marks_part: marks_part_wanted(),
+        marks_held: marks_held_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,

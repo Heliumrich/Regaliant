@@ -927,6 +927,17 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     Err(e) => Err(e),
                 }
             }
+            "c5" => {
+                // `c5 off|on` (front end 4's C5): stores into held pages
+                // marked again, or not.
+                match gpu::fe2::c5_control(parts.next().unwrap_or("")) {
+                    Ok(m) => {
+                        info!("control: c5: {m} at flip {flip}");
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
             "wbb" => {
                 // `wbb lazy|eager` (`DS_WB_BUCKETS=1`, diagnosis): the
                 // write-back leaves out the last census's untouched buckets.

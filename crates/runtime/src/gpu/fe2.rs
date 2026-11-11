@@ -5464,6 +5464,133 @@ fn c4_wanted() -> bool {
     *ON.get_or_init(|| std::env::var("DS_C4").ok().as_deref() != Some("0") && !wb_buckets() && wb_same_mode() != 2 && std::env::var("DS_FE2_HOLD").ok().as_deref() != Some("1")) && crate::hosted::on()
 }
 
+/// C5 is wanted: stores into held pages set no marks (`Spec::marks_held`;
+/// `DS_C5=0` off). Decided at start like C4 (translations are keyed by it).
+pub fn c5_wanted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_C5").ok().as_deref() != Some("0")) && c4_wanted()
+}
+
+/// `c5 off` (in-run A/Bs): the GPU's held region kept zero, so every store
+/// marks as without C5 (the shaders' held test stays).
+static C5_OFF: AtomicBool = AtomicBool::new(false);
+/// [copies into the GPU's held region, words copied, us].
+static C5X: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// One copy at a time, each reading the host map's words when it records
+/// them: the last copy leaves the GPU's region as the host map is then.
+static C5_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// C5: records into `cmd` the copy of the held map's words over `pages`
+/// (all of them with `pages` None) into both written-bit maps' held region
+/// (`rdna::kernels::MARK_HELD_AT`), zeros while `c5 off`. Caller holds
+/// C5_LOCK and records the barriers around it.
+fn c5_record(cmd: vk::CommandBuffer, pages: Option<&[u64]>) -> u64 {
+    c5_record_clearing(cmd, pages, false)
+}
+
+/// `c5_record`; with `clear`, the bits of `pages` written clear whatever
+/// the host map says (a release, before it clears them there).
+fn c5_record_clearing(cmd: vk::CommandBuffer, pages: Option<&[u64]>, clear: bool) -> u64 {
+    let Some(m) = HELD_MAP.get() else { return 0 };
+    let cleared: std::collections::HashMap<usize, u32> = match (clear, pages) {
+        (true, Some(pages)) => {
+            let mut h = std::collections::HashMap::new();
+            for &p in pages.iter().filter(|&&p| (MIRROR_BASE..MIRROR_END).contains(&p)) {
+                let i = ((p - MIRROR_BASE) / PAGE) as usize;
+                *h.entry(i / 32).or_insert(0u32) |= 1u32 << (i % 32);
+            }
+            h
+        }
+        _ => std::collections::HashMap::new(),
+    };
+    let maps: Vec<vk::Buffer> = [false, true].iter().filter_map(|&on_c| super::resident::marks_for(on_c)).collect();
+    // The words, as runs [first, end).
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    match pages {
+        None => runs.push((0, HELD_MAP_WORDS)),
+        Some(pages) => {
+            let mut ws: Vec<usize> = pages.iter().filter(|&&p| (MIRROR_BASE..MIRROR_END).contains(&p)).map(|&p| ((p - MIRROR_BASE) / PAGE / 32) as usize).collect();
+            ws.sort_unstable();
+            ws.dedup();
+            for w in ws {
+                match runs.last_mut() {
+                    Some(r) if r.1 == w => r.1 = w + 1,
+                    _ => runs.push((w, w + 1)),
+                }
+            }
+        }
+    }
+    let off = C5_OFF.load(Ordering::Acquire);
+    // SAFETY: HELD_MAP_WORDS host-memory words, mapped for the process's life.
+    let host = unsafe { std::slice::from_raw_parts(m.words as *const AtomicU32, HELD_MAP_WORDS) };
+    let mut words = 0u64;
+    let c = ctx();
+    for (a, e) in runs {
+        // (vkCmdUpdateBuffer takes at most 65,536 bytes a call.)
+        let mut at = a;
+        while at < e {
+            let n = (e - at).min(16384);
+            let data: Vec<u8> = (at..at + n).flat_map(|i| if off { 0u32 } else { host[i].load(Ordering::Acquire) & !cleared.get(&i).copied().unwrap_or(0) }.to_le_bytes()).collect();
+            for &mb in &maps {
+                unsafe { c.device.cmd_update_buffer(cmd, mb, (rdna::kernels::MARK_HELD_AT as u64 + at as u64) * 4, &data) };
+            }
+            words += n as u64;
+            at += n;
+        }
+    }
+    words
+}
+
+/// C5: the GPU's held region made the host map's over `pages` (all with
+/// None), on the copy queue (a one-off on the main queue would wait for its
+/// queued batches and drain it every hold round), waited for under C5_LOCK
+/// (a release's clear, in its own one-off on the main queue, comes after
+/// it). Holds and `c5 on|off`: batches already queued may see it late,
+/// which only marks some stores into held pages.
+fn c5_sync(pages: Option<&[u64]>) {
+    if !c5_wanted() || HELD_MAP.get().is_none() {
+        return;
+    }
+    let t = std::time::Instant::now();
+    let _g = C5_LOCK.lock();
+    let mut words = 0u64;
+    let r = super::resident::one_off_side(|cmd| unsafe {
+        let c = ctx();
+        let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+        words = c5_record(cmd, pages);
+        let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+    });
+    if let Err(e) = r {
+        crate::error!("fe2: C5: copying the held map to the GPU failed: {e}");
+    }
+    C5X[0].fetch_add(1, Ordering::Relaxed);
+    C5X[1].fetch_add(words, Ordering::Relaxed);
+    C5X[2].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
+
+/// Control `c5 off|on` (in-run A/Bs; `DS_C5` not 0): off zeroes the GPU's
+/// held region (every store marks), on copies the host map there.
+pub fn c5_control(what: &str) -> Result<String, String> {
+    if !c5_wanted() || !c4_on() {
+        return Err("c5: not on (front end 4 on, `DS_C5` not 0)".into());
+    }
+    match what {
+        "off" => {
+            C5_OFF.store(true, Ordering::Release);
+            c5_sync(None);
+            Ok("held pages marked again".into())
+        }
+        "on" => {
+            C5_OFF.store(false, Ordering::Release);
+            c5_sync(None);
+            Ok("held pages unmarked".into())
+        }
+        _ => Err("usage: c5 off|on".into()),
+    }
+}
+
 /// The held-page bitmap is wanted (the hold census or C4).
 fn held_map_wanted() -> bool {
     hold_census() || c4_wanted()
@@ -5682,6 +5809,7 @@ pub fn c4_drop_sync(base: u64, len: u64) {
         return;
     }
     let maps: Vec<vk::Buffer> = [false, true].iter().filter_map(|&on_c| super::resident::marks_for(on_c)).collect();
+    let _c5 = C5_LOCK.lock();
     let r = super::resident::one_off_now(|cmd| unsafe {
         let c = ctx();
         let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
@@ -5690,6 +5818,10 @@ pub fn c4_drop_sync(base: u64, len: u64) {
             for &p in &pages {
                 c.device.cmd_fill_buffer(cmd, m, (p - MIRROR_BASE) / PAGE * 128, 128, 0);
             }
+        }
+        // (C5: their stores marked again.)
+        if c5_wanted() {
+            c5_record(cmd, Some(&pages));
         }
         let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
         c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
@@ -5734,6 +5866,7 @@ pub fn c4_forgotten(base: u64, len: u64) {
     C4X[X_DROPPED].fetch_add(pages.len() as u64, Ordering::Relaxed);
     C4X[X_NOW].fetch_sub(pages.len() as u64, Ordering::Relaxed);
     let maps: Vec<vk::Buffer> = [false, true].iter().filter_map(|&on_c| super::resident::marks_for(on_c)).collect();
+    let _c5 = C5_LOCK.lock();
     let r = super::resident::one_off_now(|cmd| unsafe {
         let c = ctx();
         let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
@@ -5742,6 +5875,10 @@ pub fn c4_forgotten(base: u64, len: u64) {
             for &p in &pages {
                 c.device.cmd_fill_buffer(cmd, m, (p - MIRROR_BASE) / PAGE * 128, 128, 0);
             }
+        }
+        // (C5: their stores marked again.)
+        if c5_wanted() {
+            c5_record(cmd, Some(&pages));
         }
         let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
         c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
@@ -5827,6 +5964,18 @@ fn c4_round() {
 /// was looked at is refused), then the bitmap's bits of those it held (the
 /// write-back leaves their dwords pending from then on).
 fn c4_hold_runs(runs: &[(u64, u64)]) {
+    // (C5: the pages held, copied to the GPU's held region once no lock is
+    // held: a wait for the main queue under the host's arming lock could
+    // wait on a completion that needs it. Late is safe: until then their
+    // stores mark as before.)
+    let mut c5_pages: Vec<u64> = Vec::new();
+    c4_hold_parts(runs, &mut c5_pages);
+    if !c5_pages.is_empty() {
+        c5_sync(Some(&c5_pages));
+    }
+}
+
+fn c4_hold_parts(runs: &[(u64, u64)], c5_pages: &mut Vec<u64>) {
     for part in runs.chunks(crate::hosted::HOLD_RUNS) {
         let _readers = crate::mem::GUEST_READERS.read_recursive();
         let _arming = super::resident::arm_guard();
@@ -5855,6 +6004,9 @@ fn c4_hold_runs(runs: &[(u64, u64)]) {
             C4X[X_HELD].fetch_add(n, Ordering::Relaxed);
             C4X[X_RUNS].fetch_add(1, Ordering::Relaxed);
             C4X[X_NOW].fetch_add(n, Ordering::Relaxed);
+        }
+        if c5_wanted() {
+            c5_pages.extend(want.iter().enumerate().filter(|&(i, _)| held[i]).flat_map(|(_, &(p, q))| (p..q).step_by(PAGE as usize)));
         }
     }
 }
@@ -6004,6 +6156,9 @@ fn c4_release_pages(pages: &[u64]) -> Result<(), String> {
         break g;
     };
     let t0 = std::time::Instant::now();
+    // (C5: no other copy of the held map to the GPU until the host's bits
+    // of these pages are clear; this one-off clears their GPU bits first.)
+    let c5_guard = c5_wanted().then(|| C5_LOCK.lock());
     // (The windows stay listed, none freed, until the release ends.)
     let spans = super::exec::spans_guard();
     let wins: Vec<Option<(vk::Buffer, u64)>> = pages.iter().map(|&p| spans.window(p)).collect();
@@ -6014,6 +6169,14 @@ fn c4_release_pages(pages: &[u64]) -> Result<(), String> {
     let r = super::resident::one_off_now(|cmd| unsafe {
         let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
         c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+        // (C5: the GPU marks stores into these pages again from here, so a
+        // writer released beside, past its 50 ms, marks its later stores;
+        // its earlier ones are in the mirror the copies below read.)
+        if c5_guard.is_some() {
+            c5_record_clearing(cmd, Some(pages), true);
+            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+        }
         // (Whole pages into their windows, a copy per window.)
         let mut by_buf: Vec<(vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();
         for (i, &p) in pages.iter().enumerate() {
@@ -6060,6 +6223,7 @@ fn c4_release_pages(pages: &[u64]) -> Result<(), String> {
     for &p in pages {
         held_mark(p, false);
     }
+    drop(c5_guard);
     let chunks: Vec<Option<&'static Chunk>> = pages.iter().map(|&p| chunk(p, false)).collect();
     // Front end 2's arming of each page ended (a release, not a fault: its
     // level stays).
@@ -6206,8 +6370,19 @@ fn c4_line() -> String {
     let d = |k: usize| now[k].saturating_sub(l.1[k]);
     let (ddw, dpg, dall) = (dw.saturating_sub(l.2), pg.saturating_sub(l.3), all.saturating_sub(l.4));
     let line = format!(
-        "    front end 4's held pages (C4{}, over {flips:.0} flips): {} held now ({} held in {} runs, {} runs failed, {} refused by the host, {} candidates seen); the write-back left out {:.3} M dwords and {:.0} pages a flip ({:.1}% of the dwords it would have stored); releases on faults: the title {} reads / {} writes, ours {} / {}, other code {} / {}; synchronous releases {} ({} late), pages released {} in {} rounds ({:.0} us of take a round; {} through host memory, {:.0} us suspended), plain {}; writer waits {} ({} ms, {} past 50 ms); dropped by mapping changes {}; uploads that left out held pages {}; failed takes {}; pages never held {}\n",
+        "    front end 4's held pages (C4{}{}, over {flips:.0} flips): {} held now ({} held in {} runs, {} runs failed, {} refused by the host, {} candidates seen); the write-back left out {:.3} M dwords and {:.0} pages a flip ({:.1}% of the dwords it would have stored); releases on faults: the title {} reads / {} writes, ours {} / {}, other code {} / {}; synchronous releases {} ({} late), pages released {} in {} rounds ({:.0} us of take a round; {} through host memory, {:.0} us suspended), plain {}; writer waits {} ({} ms, {} past 50 ms); dropped by mapping changes {}; uploads that left out held pages {}; failed takes {}; pages never held {}\n",
         if C4_OFF.load(Ordering::Relaxed) { ", off" } else { "" },
+        if !c5_wanted() {
+            String::new()
+        } else {
+            format!(
+                "; C5{}: {} copies of the held map to the GPU, {} words, {:.1} ms",
+                if C5_OFF.load(Ordering::Relaxed) { " off" } else { "" },
+                C5X[0].load(Ordering::Relaxed),
+                C5X[1].load(Ordering::Relaxed),
+                C5X[2].load(Ordering::Relaxed) as f64 / 1000.0
+            )
+        },
         now[X_NOW],
         d(X_HELD),
         d(X_RUNS),
