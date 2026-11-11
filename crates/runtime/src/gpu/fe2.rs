@@ -5888,6 +5888,11 @@ pub fn c4_forgotten(base: u64, len: u64) {
     }
 }
 
+/// Pages written back within the last two hold periods, summed over the
+/// hold rounds, by the engine allocator owning them (`c4_round`; status).
+static WB_BY_OWNER: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+static WB_ROUNDS: AtomicU64 = AtomicU64::new(0);
+
 /// `DS_C4_QUIET=<flips>`: a page is held only that long after the last CPU
 /// write front end 2 saw on it (600 by default; 0: front end 2's arming
 /// alone).
@@ -5897,11 +5902,17 @@ fn c4_quiet() -> u64 {
 }
 
 /// The allocator IDs whose records C4 holds: the engine's GPU page
-/// allocator and GPU heaps (long-lived GPU allocations).
+/// allocator and GPU heaps (long-lived GPU allocations); with
+/// `DS_C4_ARENA=1` (C4b's first form, boot A/Bs) the GPU arena's frame
+/// allocations too (the pages written back now are mostly there:
+/// FINDINGS.md 2026-11-11), under the same rules (quiet `DS_C4_QUIET` flips,
+/// never read by our command processors).
 fn c4_targets() -> [bool; 256] {
+    static ARENA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let arena = *ARENA.get_or_init(|| std::env::var("DS_C4_ARENA").ok().as_deref() == Some("1"));
     let mut t = [false; 256];
     for a in crate::engine::allocators() {
-        if a.mtype == 2 && (a.name.starts_with("PageAllocator") || a.name.starts_with("HeapAllocator")) {
+        if a.mtype == 2 && (a.name.starts_with("PageAllocator") || a.name.starts_with("HeapAllocator") || (arena && a.name.contains("TaggedArena"))) {
             t[a.id as usize] = true;
         }
     }
@@ -5924,6 +5935,18 @@ fn c4_round() {
     let nh = no_hold();
     let frame = super::FRAMES.load(Ordering::Relaxed);
     let quiet = c4_quiet();
+    // (Census: the pages written back lately, by the engine allocation
+    // owning them: where front end 2's write-back volume is left.)
+    WB_ROUNDS.fetch_add(1, Ordering::Relaxed);
+    for (i, w) in recent.iter().enumerate() {
+        let mut v = w.load(Ordering::Relaxed);
+        while v != 0 {
+            let b = v.trailing_zeros() as u64;
+            v &= v - 1;
+            let p = MIRROR_BASE + (i as u64 * 32 + b) * PAGE;
+            WB_BY_OWNER[crate::engine::owner(p) as usize].fetch_add(1, Ordering::Relaxed);
+        }
+    }
     let mut runs: Vec<(u64, u64)> = Vec::new();
     let mut cands = 0u64;
     for i in 0..HELD_MAP_WORDS {
@@ -6425,6 +6448,15 @@ fn c4_line() -> String {
     } else {
         let parts: Vec<String> = by.iter().take(8).map(|(i, v)| format!("{} {} (our reads {}, targets {}, faults {})", names.get(&(*i as u8)).cloned().unwrap_or_else(|| format!("owner {i}")), v.iter().sum::<u64>(), v[0], v[1], v[2])).collect();
         line + &format!("    front end 4's pages never held by engine allocator: {}\n", parts.join(", "))
+    };
+    let rounds = WB_ROUNDS.load(Ordering::Relaxed);
+    let mut wb: Vec<(usize, u64)> = (0..256).map(|i| (i, WB_BY_OWNER[i].load(Ordering::Relaxed))).filter(|x| x.1 > 0).collect();
+    wb.sort_by_key(|x| std::cmp::Reverse(x.1));
+    let line = if wb.is_empty() || rounds == 0 {
+        line
+    } else {
+        let parts: Vec<String> = wb.iter().take(8).map(|&(i, n)| format!("{} {:.0}", names.get(&(i as u8)).cloned().unwrap_or_else(|| format!("owner {i}")), n as f64 / rounds as f64)).collect();
+        line + &format!("    pages written back lately (the last two hold periods, a round's mean over {rounds}) by engine allocator: {}\n", parts.join(", "))
     };
     let mut rips: Vec<((u64, bool), u64)> = HOLD_RIPS.lock().take().map(|m| m.into_iter().collect()).unwrap_or_default();
     rips.sort_by(|a, b| b.1.cmp(&a.1));
