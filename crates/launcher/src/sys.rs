@@ -15,8 +15,10 @@ pub struct Gpu {
     /// Device-local memory in bytes.
     pub vram: u64,
     pub api: u32,
-    /// VK_KHR_fragment_shader_barycentric with its feature (the game's shaders need it).
+    /// VK_KHR_fragment_shader_barycentric with its feature (the game's shaders use it).
     pub barycentric: bool,
+    /// Geometry shaders (the game's stand-in without barycentrics).
+    pub geometry: bool,
 }
 
 pub const VENDOR_NVIDIA: u32 = 0x10DE;
@@ -57,6 +59,7 @@ pub fn gpu() -> Result<Gpu, String> {
                     instance.get_physical_device_features2(pd, &mut f2);
                     b.fragment_shader_barycentric != 0
                 };
+                let geometry = instance.get_physical_device_features(pd).geometry_shader != 0;
                 chosen = Some(Gpu {
                     name: std::ffi::CStr::from_ptr(p.device_name.as_ptr()).to_string_lossy().into_owned(),
                     driver: p.driver_version,
@@ -65,6 +68,7 @@ pub fn gpu() -> Result<Gpu, String> {
                     vram,
                     api: p.api_version,
                     barycentric,
+                    geometry,
                 });
             }
         }

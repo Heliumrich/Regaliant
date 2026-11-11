@@ -58,6 +58,19 @@ pub fn stage_inputs(tr: &mut T) -> R<()> {
                 let lv = e(tr.b.load(tr.t.v3f, None, l, None, []))?;
                 tr.bary = Some((pv, lv));
                 Some((pv, lv))
+            } else if let Some(io) = tr.bary_io.clone() {
+                // From the geometry shader (`gs::bary_gs`): (1, 0, 0),
+                // (0, 1, 0), (0, 0, 1) at the vertices, interpolated
+                // perspective-correct and linear.
+                let p = tr.input(tr.t.v4f, None, Some(io.bary[0]));
+                let l = tr.input(tr.t.v4f, None, Some(io.bary[1]));
+                tr.b.decorate(l, Decoration::NoPerspective, []);
+                let p4 = e(tr.b.load(tr.t.v4f, None, p, None, []))?;
+                let l4 = e(tr.b.load(tr.t.v4f, None, l, None, []))?;
+                let pv = e(tr.b.vector_shuffle(tr.t.v3f, None, p4, p4, [0, 1, 2]))?;
+                let lv = e(tr.b.vector_shuffle(tr.t.v3f, None, l4, l4, [0, 1, 2]))?;
+                tr.bary = Some((pv, lv));
+                Some((pv, lv))
             } else {
                 None
             };
@@ -881,22 +894,51 @@ fn interp_per_vertex(tr: &mut T, ins: &Inst, attr: u32, chan: u32) -> R<()> {
     let flat = pi.is_some_and(|p| p.flat);
     let loc = pi.map(|p| p.param as u32).unwrap_or(attr);
     tr.params = tr.params.max(attr + 1);
-    let var = match tr.per_vertex_in.get(&loc) {
-        Some(&v) => v,
-        None => {
-            let k3 = tr.u(3);
-            let arr = tr.b.type_array(tr.t.v4f, k3);
-            let v = tr.input(arr, None, Some(loc));
-            tr.b.decorate(v, Decoration::PerVertexKHR, []);
-            tr.per_vertex_in.insert(loc, v);
-            v
-        }
+    // Each vertex's value: a per-vertex input array, or without fragment
+    // barycentrics three flat inputs the geometry shader writes
+    // (`gs::bary_gs`: vertex 0's at the location itself).
+    let gs_at = tr.bary_io.as_ref().and_then(|io| io.per_vertex.iter().find(|(l, _)| *l == loc).map(|(_, m)| *m));
+    let vars: Result<Word, [Word; 3]> = match gs_at {
+        Some(more) => Err(match tr.per_vertex_gs.get(&loc) {
+            Some(&v) => v,
+            None => {
+                let mut v = [0; 3];
+                for (k, at) in [loc, more[0], more[1]].into_iter().enumerate() {
+                    v[k] = tr.input(tr.t.v4f, None, Some(at));
+                    tr.b.decorate(v[k], Decoration::Flat, []);
+                }
+                tr.per_vertex_gs.insert(loc, v);
+                v
+            }
+        }),
+        None => Ok(match tr.per_vertex_in.get(&loc) {
+            Some(&v) => v,
+            None => {
+                let k3 = tr.u(3);
+                let arr = tr.b.type_array(tr.t.v4f, k3);
+                let v = tr.input(arr, None, Some(loc));
+                tr.b.decorate(v, Decoration::PerVertexKHR, []);
+                tr.per_vertex_in.insert(loc, v);
+                v
+            }
+        }),
     };
     let pf = tr.b.type_pointer(None, StorageClass::Input, f);
+    // (The per-vertex array's constants in their old order: translations
+    // with fragment barycentrics keep their SPIR-V, and their stored
+    // pipelines their fingerprints.)
     let vert = |tr: &mut T, k: u32| -> R<Word> {
-        let kk = tr.u(k);
-        let kc = tr.u(chan);
-        let p = e(tr.b.access_chain(pf, None, var, [kk, kc]))?;
+        let p = match vars {
+            Ok(arr) => {
+                let kk = tr.u(k);
+                let kc = tr.u(chan);
+                e(tr.b.access_chain(pf, None, arr, [kk, kc]))?
+            }
+            Err(v) => {
+                let kc = tr.u(chan);
+                e(tr.b.access_chain(pf, None, v[k as usize], [kc]))?
+            }
+        };
         e(tr.b.load(f, None, p, None, []))
     };
     let val = if ins.base_name() == Some("v_interp_mov_f32") {

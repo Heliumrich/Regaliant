@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
-const MAGIC: &[u8; 8] = b"DSTRANS2";
+const MAGIC: &[u8; 8] = b"DSTRANS3";
 
 /// Environment switches the translator reads (`rdna`; the dumps write files
 /// while translating): any of them set keeps the store off.
@@ -268,6 +268,21 @@ fn encode(o: &Output, plan_key: u64, spec_hash: u64) -> Vec<u8> {
     u32s(&mut w, o.sg_appends);
     u32s(&mut w, o.known_active);
     u32s(&mut w, o.in_mask);
+    // (`Spec::bary_gs`: its per-vertex locations and barycentrics.)
+    match &o.bary_gs {
+        Some(io) => {
+            w.push(1);
+            u32s(&mut w, io.per_vertex.len() as u32);
+            for (l, [a, b]) in &io.per_vertex {
+                u32s(&mut w, *l);
+                u32s(&mut w, *a);
+                u32s(&mut w, *b);
+            }
+            u32s(&mut w, io.bary[0]);
+            u32s(&mut w, io.bary[1]);
+        }
+        None => w.push(0),
+    }
     let h = fnv(&w);
     w.extend_from_slice(&h.to_le_bytes());
     w
@@ -338,6 +353,16 @@ fn decode(b: &[u8], plan_key: u64, spec_hash: u64) -> Option<Output> {
     let sg_appends = r.u32()?;
     let known_active = r.u32()?;
     let in_mask = r.u32()?;
+    let bary_gs = if r.u8()? != 0 {
+        let n = r.u32()? as usize;
+        let mut per_vertex = Vec::with_capacity(n.min(32));
+        for _ in 0..n {
+            per_vertex.push((r.u32()?, [r.u32()?, r.u32()?]));
+        }
+        Some(rdna::translate::gs::BaryIo { per_vertex, bary: [r.u32()?, r.u32()?] })
+    } else {
+        None
+    };
     if !r.0.is_empty() {
         return None;
     }
@@ -358,6 +383,7 @@ fn decode(b: &[u8], plan_key: u64, spec_hash: u64) -> Option<Output> {
         sg_appends,
         known_active,
         in_mask,
+        bary_gs,
     })
 }
 
@@ -384,11 +410,13 @@ mod tests {
             sg_appends: 2,
             known_active: 99,
             in_mask: 0b1011,
+            bary_gs: Some(rdna::translate::gs::BaryIo { per_vertex: vec![(1, [4, 5])], bary: [6, 7] }),
         };
         let b = encode(&o, 0x1234, 0x5678);
         let d = decode(&b, 0x1234, 0x5678).expect("decodes");
         assert_eq!(encode(&d, 0x1234, 0x5678), b);
         assert_eq!(d.in_mask, 0b1011);
+        assert_eq!(d.bary_gs, o.bary_gs);
         assert!(decode(&b, 0x1234, 0x5679).is_none());
         let mut bad = b.clone();
         bad[20] ^= 1;

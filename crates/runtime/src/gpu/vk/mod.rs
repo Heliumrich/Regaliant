@@ -44,6 +44,9 @@ pub struct Ctx {
     pub names: Option<ash::ext::debug_utils::Device>,
     /// VK_KHR_fragment_shader_barycentric enabled.
     pub barycentric: bool,
+    /// Without it: pixel stages that read per vertex get each vertex's
+    /// values from a generated geometry shader (`rdna::translate::Spec::bary_gs`).
+    pub bary_gs: bool,
     /// VK_NV_shader_subgroup_partitioned enabled (`subgroup_partitioned`).
     pub partitioned: bool,
     /// VK_EXT_memory_budget enabled (`heap_report`).
@@ -487,11 +490,15 @@ fn init_inner() -> Result<(), String> {
             instance.get_physical_device_features2(pdev, &mut f2);
         }
         let barycentric = has_bary_ext && bary_supported.fragment_shader_barycentric != 0 && gpu_compat() != Some("intel");
-        if !barycentric {
-            // The title interpolates packed 16-bit attributes itself from each vertex's value and
-            // the barycentric registers: without the extension every pixel gets vertex 0's value
-            // and surfaces look faceted (FINDINGS.md 2026-11-11).
-            crate::warn!("Vulkan: no fragment shader barycentrics (VK_KHR_fragment_shader_barycentric): surfaces whose shaders interpolate their own attributes will look faceted on this device");
+        // The title interpolates packed 16-bit attributes itself from each vertex's value and
+        // the barycentric registers: without the extension a geometry shader hands those pixel
+        // stages each vertex's values and the barycentrics (`DS_BARY_GS=0`: none, every pixel
+        // gets vertex 0's value and surfaces look faceted, FINDINGS.md 2026-11-11).
+        let bary_gs = !barycentric && instance.get_physical_device_features(pdev).geometry_shader != 0 && std::env::var("DS_BARY_GS").ok().as_deref() != Some("0");
+        if bary_gs {
+            crate::info!("Vulkan: no fragment shader barycentrics (VK_KHR_fragment_shader_barycentric): pixel shaders that interpolate their own attributes get them from a geometry shader");
+        } else if !barycentric {
+            crate::warn!("Vulkan: no fragment shader barycentrics (VK_KHR_fragment_shader_barycentric) and no geometry shaders: surfaces whose shaders interpolate their own attributes will look faceted on this device");
         }
         // Partitioned subgroup operations (write marks ORed per map word:
         // `rdna::translate::Spec::marks_part`).
@@ -647,7 +654,16 @@ fn init_inner() -> Result<(), String> {
             .storage_buffer8_bit_access(true)
             .uniform_and_storage_buffer8_bit_access(true)
             .shader_int8(true);
-        let mut f13 = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true).synchronization2(true).maintenance4(true).subgroup_size_control(!subgroup32.is_empty());
+        // Private data slots (Vulkan 1.3's privateData) where the device has them: NVIDIA's DLSS
+        // library makes one at its start (the validation layer reported the feature missing,
+        // 2026-11-11).
+        let private_data = {
+            let mut f = vk::PhysicalDeviceVulkan13Features::default();
+            let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut f);
+            instance.get_physical_device_features2(pdev, &mut f2);
+            f.private_data != 0
+        };
+        let mut f13 = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true).synchronization2(true).maintenance4(true).subgroup_size_control(!subgroup32.is_empty()).private_data(private_data);
         // Pipeline binaries (`pipeline_binaries`): VK_KHR_maintenance5 (for
         // the capture flag) and VK_KHR_pipeline_binary with its feature.
         let has_m5 = instance.enumerate_device_extension_properties(pdev).unwrap_or_default().iter().any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == ash::khr::maintenance5::NAME);
@@ -815,6 +831,7 @@ fn init_inner() -> Result<(), String> {
             device_name,
             validation,
             barycentric,
+            bary_gs,
             partitioned,
             memory_budget,
             subgroup_size,
@@ -822,7 +839,7 @@ fn init_inner() -> Result<(), String> {
         };
         crate::info!("Vulkan device: {} (queue family {qf}, validation {})", ctx.device_name, validation);
         if let Some(v) = gpu_compat() {
-            crate::info!("Vulkan: DS_GPU_COMPAT={v}: partitioned subgroups {}, fragment barycentrics {}, 32-lane subgroups required for {:?}", ctx.partitioned, ctx.barycentric, ctx.subgroup32);
+            crate::info!("Vulkan: DS_GPU_COMPAT={v}: partitioned subgroups {}, fragment barycentrics {} (geometry shader instead {}), 32-lane subgroups required for {:?}", ctx.partitioned, ctx.barycentric, ctx.bary_gs, ctx.subgroup32);
         }
         {
             let exts = ctx.instance.enumerate_device_extension_properties(pdev).unwrap_or_default();

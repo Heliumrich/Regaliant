@@ -1382,7 +1382,8 @@ static FMT_PENDING_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 static FMT_FAILED: Mutex<Option<std::collections::HashSet<(u64, u64)>>> = Mutex::new(None);
 /// The background jobs, their workers, and [preparations given the run-time
 /// variant, specialized keys queued, made, ns making them, failed, first
-/// uses made in place (no run-time variant ready)].
+/// uses made in place (no run-time variant ready), run-time variants still
+/// compiling ahead, run-time variants made from the store].
 struct FmtJob {
     addr: u64,
     insts: Arc<Vec<rdna::Inst>>,
@@ -1395,7 +1396,7 @@ struct FmtJob {
 static FMT_JOBS: Mutex<std::collections::VecDeque<FmtJob>> = Mutex::new(std::collections::VecDeque::new());
 static FMT_CV: parking_lot::Condvar = parking_lot::Condvar::new();
 static FMT_WORKERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static FMT_STATS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+static FMT_STATS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 
 /// Whether a specialized key is being made in the background.
 fn fmt_pending(plan_key: u64, spec_hash: u64) -> bool {
@@ -1410,9 +1411,11 @@ fn fmt_failed(plan_key: u64, spec_hash: u64) -> bool {
 /// The run-time variant of a compute stage whose buffers `specialized` (a
 /// bit per resource) were specialized to their one format and whose
 /// specialized translation is missing: its translation when it and its
-/// pipeline are made (else None: the specialized one is made in place).
-/// `key_spec` is the specialized key spec.
-fn fmt_run_time(key_spec: &Spec, specialized: u64, plan_key: u64) -> Option<Arc<Translated>> {
+/// pipeline are made, or when the store holds its pipeline (else None: the
+/// specialized one is made in place). `key_spec` is the specialized key
+/// spec, `code_base` the dispatch's.
+#[allow(clippy::too_many_arguments)]
+fn fmt_run_time(key_spec: &Spec, specialized: u64, plan_key: u64, addr: u64, insts: &[rdna::Inst], plan: &Arc<Plan>, code_base: u64) -> Option<Arc<Translated>> {
     let mut rt = key_spec.clone();
     for (i, r) in rt.resources.iter_mut().enumerate().take(64) {
         if specialized & (1 << i) != 0 {
@@ -1424,21 +1427,46 @@ fn fmt_run_time(key_spec: &Spec, specialized: u64, plan_key: u64) -> Option<Arc<
         rt.hash(&mut h);
         h.finish()
     };
-    let t = LOCAL_TRANSLATIONS.with(|c| c.borrow().get(&(plan_key, h)).cloned()).or_else(|| TRANSLATIONS.lock().as_ref().and_then(|m| m.get(&(plan_key, h)).cloned()))?;
-    if t.spec != rt {
+    let t = LOCAL_TRANSLATIONS.with(|c| c.borrow().get(&(plan_key, h)).cloned()).or_else(|| TRANSLATIONS.lock().as_ref().and_then(|m| m.get(&(plan_key, h)).cloned()));
+    if let Some(t) = &t {
+        if t.spec != rt {
+            return None;
+        }
+        if super::exec::compute_pipe_ready(t) {
+            return Some(t.clone());
+        }
+        // (Its pipeline still compiling ahead of use, as after a level load:
+        // the dispatch waits for that compile, begun earlier, instead of
+        // compiling the specialized one where it stands.)
+        if super::exec::compute_pipe_in_flight(t) {
+            FMT_STATS[6].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Some(t.clone());
+        }
+    }
+    // Its pipeline in the store, as the launcher's shader preparation leaves
+    // the run-time variants (it cannot know the formats dispatches bind):
+    // made from its binaries in milliseconds instead of a compile of the
+    // specialized key where the dispatch stands (2026-11-11: 1,032 of a
+    // prepared session's 1,080 compute first uses). Both push modes are
+    // looked up before translating.
+    if !super::exec::compute_key_stored(plan_key ^ h.rotate_left(1)) {
         return None;
     }
-    if super::exec::compute_pipe_ready(&t) {
-        return Some(t);
+    let t = match t {
+        Some(t) => t,
+        None => {
+            let mut spec = rt.clone();
+            spec.code_base = code_base;
+            let t = translate_kept(addr, insts, plan, plan_key, h, &spec, rt).ok()?;
+            LOCAL_TRANSLATIONS.with(|c| c.borrow_mut().insert((plan_key, h), t.clone()));
+            t
+        }
+    };
+    if !super::exec::compute_pipe_stored(&t) {
+        return None;
     }
-    // (Its pipeline still compiling ahead of use, as after a level load:
-    // the dispatch waits for that compile, begun earlier, instead of
-    // compiling the specialized one where it stands.)
-    if super::exec::compute_pipe_in_flight(&t) {
-        FMT_STATS[6].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return Some(t);
-    }
-    None
+    FMT_STATS[7].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(t)
 }
 
 /// Queues a specialized key's translation and pipeline (false when it is
@@ -1513,7 +1541,7 @@ pub fn fmt_line() -> String {
         return String::new();
     }
     format!(
-        "    compute keys specialized to one format, first uses: {} made in the background ({} made, {:.1} s; {} failed; {} pending now), {} preparations ran the run-time variant meanwhile ({} of them with its pipeline still compiling ahead); {} made in place (no run-time variant)\n",
+        "    compute keys specialized to one format, first uses: {} made in the background ({} made, {:.1} s; {} failed; {} pending now), {} preparations ran the run-time variant meanwhile ({} of them with its pipeline still compiling ahead; {} first uses made it from the store); {} made in place (no run-time variant)\n",
         v[1],
         v[2],
         v[3] as f64 / 1e9,
@@ -1521,6 +1549,7 @@ pub fn fmt_line() -> String {
         FMT_PENDING_N.load(std::sync::atomic::Ordering::Relaxed),
         v[0],
         v[6],
+        v[7],
         v[5]
     )
 }
@@ -1843,6 +1872,7 @@ fn cs_spec(addr: u64, rsrc2: u32, local: [u32; 3], wave64: bool, code_hash: u64)
         ps_input_addr: 0,
         ps_inputs,
         barycentric: false,
+        bary_gs: false,
         mrt: [MrtSpec::default(); 8],
         cs_local_size: local,
         cs_rsrc2: rsrc2,
@@ -2361,6 +2391,7 @@ fn ps_spec(addr: u64, rsrc2: u32, ctx: &dyn Fn(u32) -> u32) -> Spec {
         wave64: (in_control >> 15) & 1 == 0,
         ps_input_addr: ctx(SPI_PS_INPUT_ADDR),
         barycentric: super::vk::ctx().barycentric,
+        bary_gs: super::vk::ctx().bary_gs,
         ps_inputs,
         mrt,
         cs_local_size: [1, 1, 1],
@@ -2649,6 +2680,7 @@ fn ngg_spec(addr: u64, rsrc2: u32, stages: u32, insts: &[rdna::Inst]) -> Spec {
         ps_input_addr: 0,
         ps_inputs,
         barycentric: false,
+        bary_gs: false,
         mrt: [MrtSpec::default(); 8],
         cs_local_size: [1, 1, 1],
         cs_rsrc2: 0,
@@ -3496,6 +3528,7 @@ pub(crate) fn vertex_spec(addr: u64, user_sgprs: u16, wave64: bool, base_instanc
         ps_input_addr: 0,
         ps_inputs: Vec::new(),
         barycentric: false,
+        bary_gs: false,
         mrt: [MrtSpec::default(); 8],
         cs_local_size: [1, 1, 1],
         cs_rsrc2: 0,
@@ -3552,6 +3585,7 @@ pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr
         ps_input_addr,
         ps_inputs,
         barycentric: super::vk::ctx().barycentric,
+        bary_gs: super::vk::ctx().bary_gs,
         mrt,
         cs_local_size: [1, 1, 1],
         cs_rsrc2: 0,
@@ -3626,6 +3660,7 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         ps_input_addr: 0,
         ps_inputs: Vec::new(),
         barycentric: false,
+        bary_gs: false,
         mrt: [MrtSpec::default(); 8],
         cs_local_size: local,
         cs_rsrc2: rsrc2,
@@ -4073,7 +4108,7 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
         // processor stopping for them: 370-570 ms per particle program,
         // FINDINGS.md 2026-11-06 morning).
         let run_time = match (&cached, &key_spec) {
-            (None, Some(ks)) if specialized != 0 && spec.stage == Stage::Compute && !fmt_failed(plan_key, spec_hash) => fmt_run_time(ks, specialized, plan_key),
+            (None, Some(ks)) if specialized != 0 && spec.stage == Stage::Compute && !fmt_failed(plan_key, spec_hash) => fmt_run_time(ks, specialized, plan_key, addr, &insts, &plan, spec.code_base),
             _ => None,
         };
         if let (Some(_), Some(ks)) = (&run_time, &key_spec) {

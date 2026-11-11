@@ -66,8 +66,10 @@ fn pc_text() -> String {
             if g.api < ash::vk::API_VERSION_1_3 {
                 lines.push("It offers an older Vulkan than the game needs (1.3). Update the graphics driver.".into());
             }
-            if !g.barycentric {
-                lines.push("This card's driver lacks fragment shader barycentrics, which the game's shaders use. Surfaces will look faceted. A newer driver may add them.".into());
+            if !g.barycentric && !g.geometry {
+                lines.push("This card lacks shader features the game needs. Surfaces will look faceted.".into());
+            } else if !g.barycentric {
+                lines.push("This card lacks fragment shader barycentrics. The game draws some surfaces another way, which costs some speed.".into());
             }
             if g.vendor == sys::VENDOR_AMD || g.vendor == sys::VENDOR_INTEL {
                 lines.push("AMD and Intel graphics cards are untested with this port. Please report how it runs.".into());

@@ -2789,6 +2789,18 @@ pub(crate) fn compute_pipe_ready(tr: &super::shaders::Translated) -> bool {
     PIPES.lock().as_ref().is_some_and(|m| m.contains_key(&key))
 }
 
+/// Whether the store holds the compute pipeline of translation key `key`
+/// in either push mode (before translating, `shaders::fmt_run_time`).
+pub(crate) fn compute_key_stored(key: u64) -> bool {
+    super::pcache::stored_cheap('c', push_key(key, true)) || super::pcache::stored_cheap('c', push_key(key, false))
+}
+
+/// Whether the store holds the compute pipeline of a translation (its
+/// creation then takes milliseconds).
+pub(crate) fn compute_pipe_stored(tr: &super::shaders::Translated) -> bool {
+    super::pcache::stored_cheap('c', push_key(tr.key, push_fits_tr(tr)))
+}
+
 /// Whether the compute pipeline of a translation is being created (a
 /// compile ahead of use, `gpu::precompile`, has it in flight).
 pub(crate) fn compute_pipe_in_flight(tr: &super::shaders::Translated) -> bool {
@@ -2848,7 +2860,7 @@ pub(crate) fn spec_diff(a: &rdna::translate::Spec, b: &rdna::translate::Spec) ->
             })*
         };
     }
-    fields!(stage, user_sgprs, user_base, wave64, ps_input_addr, ps_inputs, barycentric, mrt, cs_local_size, cs_rsrc2, binding_base, probe, dump, force_dispatcher, dispatcher_for_loops, reg_vars, lane_guards, mip_views, lod_stats, early_tests, early_ok, per_lane, lane_votes, lockstep_off, sg_waves, sg_appends, base_instance_sgpr, sgpr_pc, addresses, batched, write_marks, marks_untouched, touch_test, sgpr_ubo);
+    fields!(stage, user_sgprs, user_base, wave64, ps_input_addr, ps_inputs, barycentric, bary_gs, mrt, cs_local_size, cs_rsrc2, binding_base, probe, dump, force_dispatcher, dispatcher_for_loops, reg_vars, lane_guards, mip_views, lod_stats, early_tests, early_ok, per_lane, lane_votes, lockstep_off, sg_waves, sg_appends, base_instance_sgpr, sgpr_pc, addresses, batched, write_marks, marks_untouched, touch_test, sgpr_ubo);
     if a.resources.len() != b.resources.len() {
         d.push(format!("resources {:?} -> {:?}", a.resources, b.resources));
     } else {

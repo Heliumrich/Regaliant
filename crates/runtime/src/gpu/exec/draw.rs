@@ -672,6 +672,22 @@ fn gfx_known(hkey: u64) -> bool {
 /// A stage of a graphics pipeline: its translation and program address.
 type StageTr<'a> = (&'a super::super::shaders::Translated, u64);
 
+/// The barycentric geometry shader's generator version (`rdna::translate::gs::bary_gs`, in
+/// the pipelines' fingerprints).
+const BARY_GS_VERSION: u32 = 1;
+
+/// The barycentric geometry shader a pipeline needs (`rdna::translate::Spec::bary_gs`): a
+/// triangle draw whose pixel stage reads per vertex without fragment barycentrics; with
+/// whether it passes a batched draw's varying.
+fn bary_gs_of<'a>(key: &GfxKey, vs: StageTr, ps: Option<StageTr<'a>>) -> Option<(&'a rdna::translate::gs::BaryIo, bool)> {
+    if key.rect_gs.is_some() || key.topology_class != 2 {
+        return None;
+    }
+    let p = ps?;
+    let io = p.0.out.bary_gs.as_ref()?;
+    Some((io, vs.0.out.batched && p.0.out.in_mask & (1 << rdna::translate::BATCH_VARYING) != 0))
+}
+
 /// A rect-list draw's geometry shader key: the vertex stage's outputs and
 /// the pixel stage's inputs (`rdna::translate::gs::rect_list_gs` passes the
 /// first through and writes zeros at the rest of the second: a pixel input
@@ -808,9 +824,14 @@ fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, 
         if let Some(mask) = key.rect_gs {
             modules.push((vk::ShaderStageFlags::GEOMETRY, module(&rdna::translate::gs::rect_list_gs(vs.0.out.param_mask, mask))?));
             super::super::vk::name_object(modules[modules.len() - 1].1, &format!("rect-list gs {mask:#x}"));
+        } else if let Some((io, batch)) = bary_gs_of(key, vs, ps) {
+            let p = ps.expect("a pixel stage");
+            modules.push((vk::ShaderStageFlags::GEOMETRY, module(&rdna::translate::gs::bary_gs(vs.0.out.param_mask, p.0.out.in_mask, io, batch))?));
+            super::super::vk::name_object(modules[modules.len() - 1].1, &format!("barycentric gs for ps {:#x}", p.1));
         }
         if let Some(p) = ps {
-            let missing = p.0.out.in_mask & !vs.0.out.param_mask;
+            let from_gs = if key.rect_gs.is_none() { bary_gs_of(key, vs, ps).map_or(0, |(io, _)| io.added()) } else { 0 };
+            let missing = p.0.out.in_mask & !vs.0.out.param_mask & !from_gs;
             if key.rect_gs.is_none() && missing != 0 {
                 static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
@@ -912,7 +933,12 @@ fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, 
         let fp = {
             let gs = [key.rect_gs.unwrap_or(u32::MAX), vs.0.out.param_mask];
             let ps_code: &[u32] = ps.map_or(&[], |p| p.0.out.spirv.as_slice());
-            crate::gpu::pcache::fingerprint(&[&vs.0.out.spirv, &gs, ps_code])
+            // (The barycentric geometry shader's version and inputs: pipelines
+            // without one keep their fingerprints.)
+            match bary_gs_of(key, vs, ps) {
+                Some((_, batch)) => crate::gpu::pcache::fingerprint(&[&vs.0.out.spirv, &gs, ps_code, &[BARY_GS_VERSION, batch as u32]]),
+                None => crate::gpu::pcache::fingerprint(&[&vs.0.out.spirv, &gs, ps_code]),
+            }
         };
         let r = crate::gpu::pcache::create_with('g', hkey, fp, |via| {
             let mut gpci = gpci;

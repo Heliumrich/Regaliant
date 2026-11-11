@@ -230,6 +230,10 @@ pub struct Spec {
     /// (VK_KHR_fragment_shader_barycentric): the barycentric VGPRs hold the
     /// real (i, j) and v_interp_mov reads each vertex's value.
     pub barycentric: bool,
+    /// Without them: a generated geometry shader hands a pixel stage that
+    /// reads per vertex each vertex's values and the barycentrics as inputs
+    /// (`gs::bary_gs`; `Output::bary_gs` names their locations).
+    pub bary_gs: bool,
     pub mrt: [MrtSpec; 8],
     pub cs_local_size: [u32; 3],
     /// COMPUTE_PGM_RSRC2 (TGID enables, TG size, TIDIG count, LDS size).
@@ -591,6 +595,9 @@ impl std::hash::Hash for Spec {
         if self.known_active {
             0x4B41_4354u32.hash(state);
         }
+        if self.bary_gs {
+            0x4247_5348u32.hash(state);
+        }
     }
 }
 
@@ -761,6 +768,9 @@ pub struct Output {
     /// The input Locations the stage declares (bit n = Location n; a pixel
     /// stage's: a rect-list draw's geometry shader outputs each of them).
     pub in_mask: u32,
+    /// A pixel stage translated with `Spec::bary_gs` that reads per vertex:
+    /// the locations its geometry shader writes (`gs::bary_gs`).
+    pub bary_gs: Option<gs::BaryIo>,
 }
 
 /// Dwords of user data at the start of the SGPR data buffer.
@@ -920,6 +930,11 @@ pub(crate) struct T<'a> {
     /// `Spec::barycentric`), and their per-vertex input arrays.
     pub per_vertex_locs: BTreeSet<u32>,
     pub per_vertex_in: HashMap<u32, Word>,
+    /// `Spec::bary_gs`: where the geometry shader puts each vertex's values
+    /// and the barycentrics, and the three flat inputs of each per-vertex
+    /// location.
+    pub bary_io: Option<gs::BaryIo>,
+    pub per_vertex_gs: HashMap<u32, [Word; 3]>,
     /// BaryCoordKHR / BaryCoordNoPerspKHR inputs (loaded at entry).
     pub bary: Option<(Word, Word)>,
     pub frag_coord: Option<Word>,
@@ -2458,6 +2473,30 @@ fn per_vertex_locations(code: &[Inst], spec: &Spec) -> BTreeSet<u32> {
     out
 }
 
+/// Where a pixel stage reading the per-vertex locations `pv` gets them
+/// without fragment barycentrics (`Spec::bary_gs`): each location keeps
+/// vertex 0's value, vertices 1 and 2 and the two barycentrics take free
+/// locations below `BATCH_VARYING` (None when too few are free: the stage
+/// keeps vertex 0's values, faceted).
+fn bary_gs_io(code: &[Inst], spec: &Spec, pv: &BTreeSet<u32>) -> Option<gs::BaryIo> {
+    let mut used: u32 = 1 << BATCH_VARYING;
+    for i in code.iter().filter(|i| i.enc == Enc::Vintrp) {
+        if let Some((loc, _)) = attr_location(spec, i.intrp_attr()) {
+            used |= 1u32.checked_shl(loc).unwrap_or(0);
+        }
+    }
+    for &l in pv {
+        used |= 1u32.checked_shl(l).unwrap_or(0);
+    }
+    let mut free = (0..BATCH_VARYING).filter(|l| used & (1 << l) == 0);
+    let mut per_vertex = Vec::new();
+    for &l in pv {
+        per_vertex.push((l, [free.next()?, free.next()?]));
+    }
+    let bary = [free.next()?, free.next()?];
+    Some(gs::BaryIo { per_vertex, bary })
+}
+
 /// Whether `p` may write VGPR `v`: Some(true) for an atomic returning the
 /// previous value into it, Some(false) for any other (possible) write.
 fn vgpr_def(p: &Inst, v: u16) -> Option<bool> {
@@ -2614,6 +2653,10 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         sg_waves_refusal(spec, code, structured)
     };
     let sg_waves = sg_waves_asked && sg_waves_why.is_none();
+    let pv_locs = if (spec.barycentric || spec.bary_gs) && spec.stage == Stage::Fragment { per_vertex_locations(code, spec) } else { BTreeSet::new() };
+    let bary_io = if spec.bary_gs && !spec.barycentric && !pv_locs.is_empty() { bary_gs_io(code, spec, &pv_locs) } else { None };
+    // (Too few free locations for the geometry shader: vertex 0's values.)
+    let pv_locs = if spec.barycentric || bary_io.is_some() { pv_locs } else { BTreeSet::new() };
     let mut tr = T {
         b,
         t,
@@ -2648,8 +2691,10 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         out_mrt: HashMap::default(),
         out_depth: None,
         in_attrs: HashMap::default(),
-        per_vertex_locs: if spec.barycentric && spec.stage == Stage::Fragment { per_vertex_locations(code, spec) } else { BTreeSet::new() },
+        per_vertex_locs: pv_locs,
         per_vertex_in: HashMap::default(),
+        bary_io,
+        per_vertex_gs: HashMap::default(),
         bary: None,
         frag_coord: None,
         lds: None,
@@ -3217,7 +3262,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     // offsets come from a table): the runtime takes that from `sgpr_pc`.
     let batched = spec.batched;
     let sgpr_pc = if batched { Some(sgpr_pc_offset(spec.stage)) } else { spec.sgpr_pc };
-    Ok(Output { spirv, bindings: tr.bindings, params: tr.params, mrt_mask: tr.mrt_mask, param_mask, writes_depth: tr.out_depth.is_some(), warnings: tr.warnings, sgpr_pc, batched, masked_skips: tr.masked_skips, lockstep: tr.lockstep, wave_masks: tr.wave_masks, sg_waves: tr.sg_waves, sg_appends: tr.sg.leaders.len() as u32, known_active: tr.known_active.len() as u32, in_mask: tr.in_locs })
+    Ok(Output { spirv, bindings: tr.bindings, params: tr.params, mrt_mask: tr.mrt_mask, param_mask, writes_depth: tr.out_depth.is_some(), warnings: tr.warnings, sgpr_pc, batched, masked_skips: tr.masked_skips, lockstep: tr.lockstep, wave_masks: tr.wave_masks, sg_waves: tr.sg_waves, sg_appends: tr.sg.leaders.len() as u32, known_active: tr.known_active.len() as u32, in_mask: tr.in_locs, bary_gs: tr.bary_io })
 }
 
 /// Wave-mask mode for the shader at `addr` (diagnosis: `DS_WAVEMASK=0`
@@ -4112,6 +4157,7 @@ mod tests {
             ps_input_addr: 0,
             ps_inputs: Vec::new(),
             barycentric: false,
+            bary_gs: false,
             mrt: [MrtSpec::default(); 8],
             cs_local_size: local,
             cs_rsrc2: 0,
@@ -4546,6 +4592,38 @@ mod tests {
         let out = translate(&code, &plan, &spec).unwrap();
         assert!(out.warnings.is_empty(), "{:?}", out.warnings);
         assert_eq!(input_locations(&out.spirv), vec![(0, false, false), (1, true, false), (2, true, false)]);
+    }
+
+    /// The same program without fragment barycentrics (`Spec::bary_gs`): each
+    /// per-vertex location's three values as flat inputs (vertex 0's at the
+    /// location, 1's and 2's at free ones), then the barycentrics.
+    #[test]
+    fn per_vertex_from_geometry_shader() {
+        let words = [
+            0xc8160702, 0xc8220700, 0xc82e0701, 0xc85a0802, 0xc8280200, 0xc8290201, 0xc8260c02, 0xc8320c00, 0xf800180f, 0x160b0805, 0xbf810000,
+        ];
+        let code = crate::decode_program(&words).unwrap();
+        let mut spec = ps_spec(&[(0, false), (1, true), (1, true), (2, true)]);
+        spec.barycentric = false;
+        spec.bary_gs = true;
+        let plan = crate::analysis::analyze(&code, 0, 0);
+        let out = translate(&code, &plan, &spec).unwrap();
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        let io = out.bary_gs.clone().expect("geometry shader inputs");
+        assert_eq!(io, gs::BaryIo { per_vertex: vec![(1, [3, 4]), (2, [5, 6])], bary: [7, 8] });
+        let flat = |l| (l, false, true);
+        assert_eq!(input_locations(&out.spirv), vec![(0, false, false), flat(1), flat(2), flat(3), flat(4), flat(5), flat(6), (7, false, false), (8, false, false)]);
+        assert!(!out.spirv.windows(2).any(|w| w[0] & 0xFFFF == 17 && w[1] == 5284), "no FragmentBarycentricKHR capability");
+        // The geometry shader for it, with a vertex stage writing 0..=2.
+        let g = gs::bary_gs(0b111, out.in_mask, &io, false);
+        assert_eq!(rspirv::dr::load_words(&g).expect("parses").entry_points[0].operands.len() - 3, 2 + 3 + 1 + 6 + 2);
+        // `RDNA_GS_DUMP=<dir>`: both stages written there for spirv-val.
+        if let Some(dir) = std::env::var_os("RDNA_GS_DUMP") {
+            let dir = std::path::PathBuf::from(dir);
+            for (name, w) in [("bary_ps.spv", &out.spirv), ("bary_ps_gs.spv", &g)] {
+                std::fs::write(dir.join(name), w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()).expect("written");
+            }
+        }
     }
 
     /// Execution modes (OpExecutionMode operands after the entry point) of a

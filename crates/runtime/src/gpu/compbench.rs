@@ -19,6 +19,31 @@ use std::time::Instant;
 /// its learned RSRC2 and thread-group size) and compared with what its
 /// dispatches used, overall and for the engine's own shaders
 /// (coredata/enginesupport/shaders); typed buffers' formats by access.
+/// A `Debug` string's top-level fields (`Name { a: .., b: .. }`: each `a: ..`), nested braces
+/// and brackets kept whole.
+fn top_fields(d: &str) -> Vec<String> {
+    let Some(start) = d.find('{') else { return vec![d.to_string()] };
+    let body = &d[start + 1..d.len().saturating_sub(1)];
+    let (mut out, mut cur, mut depth) = (Vec::new(), String::new(), 0i32);
+    for ch in body.chars() {
+        match ch {
+            '{' | '[' | '(' => depth += 1,
+            '}' | ']' | ')' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(cur.trim().to_string());
+                cur.clear();
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(ch);
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_string());
+    }
+    out
+}
+
 fn guess_report(app: &std::path::Path) -> i32 {
     use rdna::translate::ResSpec;
     use std::collections::HashMap;
@@ -65,6 +90,11 @@ fn guess_report(app: &std::path::Path) -> i32 {
     // for particle programs.
     let mut n = [[0u64; 4]; 3];
     let mut other_why: HashMap<&'static str, u64> = HashMap::new();
+    // Field by field (`Spec`'s top-level fields that differ, guess -> learned), with the
+    // preparation's variant rule applied to the guess first (`precompile_all`: LOD statistics
+    // off where a dispatch prepares without them).
+    let mut fields: HashMap<String, u64> = HashMap::new();
+    let mut examples: Vec<String> = Vec::new();
     // The differences in detail: (guess -> learned) image dimensions and
     // classes, and the resource kinds when their counts differ.
     let mut pairs: HashMap<String, u64> = HashMap::new();
@@ -82,6 +112,25 @@ fn guess_report(app: &std::path::Path) -> i32 {
             actual.code_base = guess.code_base;
             // (Keyed as a preparation keys it now.)
             super::shaders::key_learned(h, &insts, &plan, &mut actual.resources);
+            {
+                let mut g = guess.clone();
+                if g.lod_stats && !g.batched && super::shaders::cs_lod_rotation() && !actual.lod_stats {
+                    g.lod_stats = false;
+                    g.lod_lean = false;
+                }
+                if g != actual {
+                    let (a, b) = (format!("{g:?}"), format!("{actual:?}"));
+                    for (fa, fb) in top_fields(&a).iter().zip(top_fields(&b).iter()) {
+                        if fa != fb {
+                            let name = fa.split(':').next().unwrap_or("?").trim().to_string();
+                            *fields.entry(name.clone()).or_default() += 1;
+                            if examples.len() < 12 {
+                                examples.push(format!("{h:#018x} {name}: {} -> {}", fa.chars().take(160).collect::<String>(), fb.chars().take(160).collect::<String>()));
+                            }
+                        }
+                    }
+                }
+            }
             let class = if guess == actual {
                 1
             } else {
@@ -158,6 +207,12 @@ fn guess_report(app: &std::path::Path) -> i32 {
         crate::info!("guess report ({what}): {} specs: guess equal {}, equal but for typed buffers' formats {}, different {}", n[k][0], n[k][1], n[k][2], n[k][3]);
     }
     crate::info!("guess report: {engine_learned} of the learned programs are the engine's; other differences: {other_why:?}");
+    let mut fv: Vec<_> = fields.into_iter().collect();
+    fv.sort_by(|a, b| b.1.cmp(&a.1));
+    crate::info!("guess report: fields that differ after the preparation's variant rule (count): {fv:?}");
+    for e in &examples {
+        crate::info!("guess report: example {e}");
+    }
     let mut pv: Vec<(&String, &u64)> = pairs.iter().collect();
     pv.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
     crate::info!("guess report: differences in detail (guess -> learned): {}", pv.iter().take(24).map(|(k, c)| format!("{k} {c}")).collect::<Vec<_>>().join(", "));

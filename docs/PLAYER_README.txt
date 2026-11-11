@@ -146,9 +146,9 @@ Known issues
 - At 32:9 the character preview in the equipment menu stands at the right edge.
 - HDR has not been seen on an HDR screen yet.
 - AMD and Intel graphics cards have not been tested.
-- Graphics cards whose driver lacks fragment shader barycentrics show faceted surfaces. Intel
-  Arc A-series, Meteor Lake and Arrow Lake graphics are among them. The launcher's Game page
-  says when a card lacks them.
+- Graphics cards without fragment shader barycentrics draw some surfaces through an extra
+  shader stage, which costs some speed. NVIDIA's GTX 10 series and older and Intel Arc A-series,
+  Meteor Lake and Arrow Lake graphics are among them. This was only simulated on an NVIDIA card.
 - Online features (messages, bloodstains, co-op and invasions) are not available. The game
   plays offline.
 - Linux, Proton and the Steam Deck are not supported yet.
