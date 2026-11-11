@@ -2957,7 +2957,7 @@ pub fn profile_this_thread(kind: &'static str) {
 static PROFILE_MS: AtomicU64 = AtomicU64::new(10);
 
 /// Kinds of sampled threads, in report order.
-const PROFILE_KINDS: [&str; 5] = ["gfx", "acb", "par", "prep", "submit"];
+const PROFILE_KINDS: [&str; 6] = ["gfx", "acb", "par", "cpar", "prep", "submit"];
 
 /// Starts the 10 ms thread sampler: `DS_PROFILE_GPU=1` (with the per-command
 /// timers and statistics) or `DS_PROFILE_GPU=2` (the sampler alone: function

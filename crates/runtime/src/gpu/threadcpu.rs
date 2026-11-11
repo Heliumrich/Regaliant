@@ -70,6 +70,8 @@ pub fn ms(cycles: u64) -> f64 {
 pub fn snapshot() -> [u64; KINDS.len()] {
     let mut out = [0u64; KINDS.len()];
     for (kind, tid) in super::cpu_threads() {
+        // (The compute queues' workers, "cpar" in the sampler, count as "par".)
+        let kind = if kind == "cpar" { "par" } else { kind };
         if let (Some(k), Some(c)) = (KINDS.iter().position(|&x| x == kind), thread_cycles(tid)) {
             out[k] += c;
         }

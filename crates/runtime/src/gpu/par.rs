@@ -418,7 +418,9 @@ impl Pool {
                 Box::new(move || {
                     crate::log::set_thread_name(&tname);
                     crate::exception::arm_watch_current_thread(false);
-                    super::profile_this_thread("par");
+                    // (The compute queues' workers sample as their own kind; their
+                    // CPU counts as "par" in `threadcpu`.)
+                    super::profile_this_thread(if compute { "cpar" } else { "par" });
                     if !compute {
                         super::forward::enable_here();
                     } else if let Some(id) = qname.strip_prefix("gpu-acb").and_then(|h| u32::from_str_radix(h.trim_start_matches("0x"), 16).ok()) {
