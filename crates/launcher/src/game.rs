@@ -119,6 +119,7 @@ pub fn check(app: &mut App, dir: &Path, keep: bool) {
     unsafe { ui::set_text(h(app.game.status), &text) };
     app.update_play();
     crate::saves::refresh(app);
+    unsafe { ui::redraw(app.hwnd) };
 }
 
 /// Safe mode for the next start (the box), cleared once used.

@@ -119,6 +119,14 @@ pub unsafe fn show(h: HWND, on: bool) {
     unsafe { ShowWindow(h, if on { SW_SHOW } else { SW_HIDE }) };
 }
 
+/// Repaints a window and all its controls now. The main window does not clip its children, so
+/// an erase of part of it can leave controls there unpainted (the Game page's lower half was
+/// blank in a first start, 2026-11-11).
+pub unsafe fn redraw(h: HWND) {
+    use windows_sys::Win32::Graphics::Gdi::{RedrawWindow, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW};
+    unsafe { RedrawWindow(h, std::ptr::null(), std::ptr::null_mut(), RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW) };
+}
+
 /// The progress bar at `permille` (0-1000).
 pub unsafe fn set_progress(h: HWND, permille: u32) {
     unsafe { SendMessageW(h, PBM_SETPOS, permille.min(1000) as WPARAM, 0) };

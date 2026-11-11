@@ -118,6 +118,7 @@ impl App {
                 unsafe { ui::show(h, i == n) };
             }
         }
+        unsafe { ui::redraw(self.hwnd) };
     }
 
     pub fn update_play(&self) {
@@ -229,6 +230,7 @@ fn game_exited(app: &mut App, code: i32) {
     unsafe {
         ShowWindow(app.hwnd, SW_RESTORE);
         SetForegroundWindow(app.hwnd);
+        ui::redraw(app.hwnd);
     }
     match code {
         0 => app.set_status(""),
@@ -469,6 +471,7 @@ fn main() {
         let shot = arg("--shot").map(PathBuf::from);
         APP.with(|a| *a.borrow_mut() = Some(app));
         ShowWindow(hwnd, SW_SHOW);
+        ui::redraw(hwnd);
         if let Some(file) = shot {
             for n in 0..3 {
                 with_app(|app| {
