@@ -162,7 +162,7 @@ pub mod tune {
         Tunable { name: "forward_earlier", env: "DS_FORWARD_EARLIER", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "forward_held", env: "DS_FORWARD_HELD", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "past_backoff", env: "DS_PAST_BACKOFF", default: 16, value: AtomicU64::new(UNSET) },
-        Tunable { name: "submit_coalesce", env: "DS_SUBMIT_COALESCE", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "submit_coalesce", env: "DS_SUBMIT_COALESCE", default: 16, value: AtomicU64::new(UNSET) },
         Tunable { name: "past_check", env: "DS_PAST_CHECK", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "past_hot", env: "DS_PAST_HOT", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "past_conflict_hold", env: "DS_PAST_CONFLICT_HOLD", default: 600, value: AtomicU64::new(UNSET) },
@@ -199,7 +199,7 @@ pub mod tune {
         Tunable { name: "r2", env: "DS_R2", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "past_subs", env: "DS_PAST_SUBS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "par_compute", env: "DS_PAR_COMPUTE", default: 1000, value: AtomicU64::new(UNSET) },
-        Tunable { name: "submit_fuse", env: "DS_SUBMIT_FUSE", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "submit_fuse", env: "DS_SUBMIT_FUSE", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1329,10 +1329,19 @@ pub mod tune {
     /// commands) and handed to Vulkan as one submission signalling the last
     /// one's sequence: no submission boundary between them on the GPU (~22
     /// us of idle a batch start at Castlewall Front, FINDINGS.md 2026-11-11).
-    /// Live; default 0 (being measured).
+    /// 2: the same, but with the main queue idle a group's first batch is
+    /// submitted alone at once (the GPU does not wait for the others'
+    /// replay). Live; default 1 since 2026-11-11 (Castlewall Front x1.027,
+    /// the swamp x1.010 in in-run A/Bs; FINDINGS.md).
     #[inline]
     pub fn submit_fuse() -> bool {
         get(167) != 0
+    }
+
+    /// `submit_fuse`'s mode (0, 1, 2).
+    #[inline]
+    pub fn submit_fuse_mode() -> u64 {
+        get(167)
     }
 
     /// The title's convolution reverb computed (`hle::libs::acm_conv`,
@@ -1497,9 +1506,10 @@ pub mod tune {
         get(129)
     }
 
-    /// Batches the submission thread hands to Vulkan in one call when that
-    /// many are queued (`exec::submit_specs`; 1, the default: one call
-    /// each).
+    /// Batches the submission thread takes at once when that many are queued
+    /// (`exec::submit_specs`): fused into one submission with `submit_fuse`
+    /// (the default 16 since 2026-11-11), else handed to Vulkan in one call
+    /// (alone that measured x0.985-0.989, TRIED.md).
     #[inline]
     pub fn submit_coalesce() -> u64 {
         get(130)

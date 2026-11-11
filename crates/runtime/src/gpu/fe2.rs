@@ -5902,17 +5902,14 @@ fn c4_quiet() -> u64 {
 }
 
 /// The allocator IDs whose records C4 holds: the engine's GPU page
-/// allocator and GPU heaps (long-lived GPU allocations); with
-/// `DS_C4_ARENA=1` (C4b's first form, boot A/Bs) the GPU arena's frame
-/// allocations too (the pages written back now are mostly there:
-/// FINDINGS.md 2026-11-11), under the same rules (quiet `DS_C4_QUIET` flips,
-/// never read by our command processors).
+/// allocator and GPU heaps (long-lived GPU allocations). Not the GPU arena's
+/// frame allocations: held, the engine's frame allocation code wrote them
+/// and released them ~0.3 times a flip (the swamp -10% in boots,
+/// TRIED.md 2026-11-11).
 fn c4_targets() -> [bool; 256] {
-    static ARENA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let arena = *ARENA.get_or_init(|| std::env::var("DS_C4_ARENA").ok().as_deref() == Some("1"));
     let mut t = [false; 256];
     for a in crate::engine::allocators() {
-        if a.mtype == 2 && (a.name.starts_with("PageAllocator") || a.name.starts_with("HeapAllocator") || (arena && a.name.contains("TaggedArena"))) {
+        if a.mtype == 2 && (a.name.starts_with("PageAllocator") || a.name.starts_with("HeapAllocator")) {
             t[a.id as usize] = true;
         }
     }

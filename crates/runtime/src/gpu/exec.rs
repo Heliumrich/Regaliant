@@ -3982,8 +3982,13 @@ pub(super) struct SubmitSpec {
 /// Batches submitted in one vkQueueSubmit2 with others (`tune
 /// submit_coalesce`): [calls, batches in them].
 pub static COALESCED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-/// Fused submissions (`tune submit_fuse`): [submissions, batches in them].
-pub static FUSED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// Fused submissions (`tune submit_fuse`): [submissions, batches in them,
+/// groups whose first batch went alone because the main queue was idle
+/// (`submit_fuse` 2)].
+pub static FUSED: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// The last main-queue batch handed to Vulkan (`submit_specs`): the queue
+/// is idle while the batch timeline is there.
+static LAST_MAIN_SUBMITTED: AtomicU64 = AtomicU64::new(0);
 
 /// Submits batches in sequence order: consecutive ones on the main queue
 /// without a copy-queue part go to Vulkan in one call (`tune
@@ -4020,8 +4025,28 @@ fn submit_specs(mut specs: Vec<(u64, SubmitSpec)>) {
             if let Err(e) = submit_batch(*seq, s.xpre, s.pre, s.cmd, s.wait, s.on_c, s.xwait, s.cpu_wait) {
                 fail(e, &s.name);
             }
+            if !s.on_c {
+                LAST_MAIN_SUBMITTED.fetch_max(*seq, Ordering::Relaxed);
+            }
             i = j;
             continue;
+        }
+        // (`submit_fuse` 2: the main queue idle, the group's first batch
+        // goes alone now: the GPU need not wait for the others' replay.)
+        if super::tune::submit_fuse_mode() == 2 && ctx().batch_value() >= LAST_MAIN_SUBMITTED.load(Ordering::Relaxed) {
+            if let Some(l) = specs[i].1.lists.take() {
+                l.replay();
+            }
+            let (seq, s) = &specs[i];
+            if let Err(e) = submit_batch(*seq, s.xpre, s.pre, s.cmd, s.wait, s.on_c, s.xwait, s.cpu_wait) {
+                fail(e, &s.name);
+            }
+            LAST_MAIN_SUBMITTED.fetch_max(*seq, Ordering::Relaxed);
+            FUSED[2].fetch_add(1, Ordering::Relaxed);
+            i += 1;
+            if j - i < 2 {
+                continue;
+            }
         }
         // Fusion: the group's lists into the first batch's buffer, one
         // submission signalling the last batch (its timeline value covers
@@ -4056,6 +4081,7 @@ fn submit_specs(mut specs: Vec<(u64, SubmitSpec)>) {
                 fail(e, &specs[i].1.name);
                 return;
             }
+            LAST_MAIN_SUBMITTED.fetch_max(last, Ordering::Relaxed);
             i = j;
             continue;
         }
@@ -4082,6 +4108,7 @@ fn submit_specs(mut specs: Vec<(u64, SubmitSpec)>) {
             fail(e, &specs[i].1.name);
             return;
         }
+        LAST_MAIN_SUBMITTED.fetch_max(specs[j - 1].0, Ordering::Relaxed);
         i = j;
     }
 }
@@ -17108,14 +17135,15 @@ pub fn status() -> String {
         + &super::forward::status_line()
         + &super::par::status()
         + &format!(
-            "    batches submitted together (`tune submit_coalesce` {}): {} calls with {} batches; fused into one command buffer (`tune submit_fuse` {}): {} submissions with {} batches
+            "    batches submitted together (`tune submit_coalesce` {}): {} calls with {} batches; fused into one command buffer (`tune submit_fuse` {}): {} submissions with {} batches, {} groups' first batch alone (the main queue idle)
 ",
             super::tune::submit_coalesce(),
             COALESCED[0].load(Ordering::Relaxed),
             COALESCED[1].load(Ordering::Relaxed),
-            super::tune::submit_fuse() as u8,
+            super::tune::submit_fuse_mode(),
             FUSED[0].load(Ordering::Relaxed),
-            FUSED[1].load(Ordering::Relaxed)
+            FUSED[1].load(Ordering::Relaxed),
+            FUSED[2].load(Ordering::Relaxed)
         )
         + &format!(
             "    end-of-pipe writes without a full barrier: {} labels; {} waits ordered the work after them; {} CP writes right after front end 2's write-back with no barrier before them; CP writes without end of pipe the GPU performed, graphics / compute queues, by (neither, after a flush or acquire, held past a label wait, both): {:?} / {:?}; after a flush by what asked for it: graphics {}; compute queues {}\n",
