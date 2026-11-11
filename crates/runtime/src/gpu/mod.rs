@@ -199,7 +199,7 @@ pub mod tune {
         Tunable { name: "r2", env: "DS_R2", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "past_subs", env: "DS_PAST_SUBS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "par_compute", env: "DS_PAR_COMPUTE", default: 1000, value: AtomicU64::new(UNSET) },
-        Tunable { name: "submit_fuse", env: "DS_SUBMIT_FUSE", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "submit_fuse", env: "DS_SUBMIT_FUSE", default: 2, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1331,8 +1331,10 @@ pub mod tune {
     /// us of idle a batch start at Castlewall Front, FINDINGS.md 2026-11-11).
     /// 2: the same, but with the main queue idle a group's first batch is
     /// submitted alone at once (the GPU does not wait for the others'
-    /// replay). Live; default 1 since 2026-11-11 (Castlewall Front x1.027,
-    /// the swamp x1.010 in in-run A/Bs; FINDINGS.md).
+    /// replay). Live; default 2 since 2026-11-11 (fusion: Castlewall Front
+    /// x1.027, the swamp x1.010 in-run; mode 2 against 1 x1.004 at
+    /// Castlewall Front; the 1-1 walk x1.015-1.019 against none in
+    /// alternating boots; FINDINGS.md).
     #[inline]
     pub fn submit_fuse() -> bool {
         get(167) != 0
