@@ -813,13 +813,14 @@ pub struct FastClear {
 pub struct BlockCopy {
     pub key: ImageKey,
     /// The view of the whole chain (null when only the tail was written):
-    /// its first `levels` mips.
+    /// its mips `mips`.
     pub src: vk::Image,
     pub dst: vk::Image,
     /// Block grid of mip 0.
     pub width: u32,
     pub height: u32,
-    pub levels: u32,
+    /// The mips copied from `src` (each the same level of both).
+    pub mips: Vec<u32>,
     pub layers: u32,
     /// The mip tail stored through a view of the tail block alone (one
     /// swizzle block at the surface's base, a single level the size of the
@@ -873,6 +874,16 @@ pub struct Image {
     /// Block-compressed textures: generation of the block view last copied
     /// in (see `take_block_copies`).
     block_gen: u64,
+    /// The (mip, layer)s whose blocks GPU work wrote through block views
+    /// (block copies), with the hash of their own guest bytes then
+    /// (`own_part_hash`): guest memory never holds those blocks, so a
+    /// re-upload leaves such a part as it is while its guest bytes stay
+    /// the same (`choose_2d`).
+    gpu_parts: Vec<(u32, u32, u64)>,
+    /// GPU-written images: the write generation of each mip level a
+    /// storage view last had as its base (a storage view writes its base
+    /// level only), 0 for levels never bound so (`block_copies`).
+    mip_gens: Vec<u64>,
     /// Guest bytes of its layout and the T# that described it exactly (0 /
     /// None: not seen through a T#): GPU buffer writes over GPU-owned images.
     span: u64,
@@ -1947,13 +1958,37 @@ fn part_range(lay: &tiling::Layout, elem: u64, mip: usize, layer: u32) -> (u64, 
     (start, if m.tail.is_some() { 1u64 << lay.block_log2 } else { m.pitch as u64 * m.padded_height as u64 * elem })
 }
 
+/// Hash of one (mip, layer)'s own elements in guest memory: its range, or
+/// for a mip in the mip tail only its elements inside the tail block (the
+/// tail's mips share that block: a write to one leaves the others' hashes).
+/// The caller holds the guest-reader lock with the part mapped.
+fn own_part_hash(lay: &tiling::Layout, elem: u64, base: u64, mip: usize, layer: u32) -> u64 {
+    let m = &lay.mips[mip];
+    if m.tail.is_none() {
+        let (s, n) = part_range(lay, elem, mip, layer);
+        return hash_bytes(base + s, n as usize);
+    }
+    let mut h = 0x9E37_79B9_7F4A_7C15u64;
+    for y in 0..m.height {
+        for x in 0..m.width {
+            let v = hash_bytes(base + lay.offset(mip, layer, x, y), elem as usize);
+            h = (h ^ v).wrapping_mul(0x0000_0100_0000_01B3).rotate_left(29);
+        }
+    }
+    h
+}
+
+/// Re-uploads' parts that GPU work wrote through block views (`Image::gpu_parts`):
+/// [checked, left as the GPU wrote them (guest bytes unchanged), uploaded (changed)].
+pub static GPU_PARTS_KEPT: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// Chooses what an upload of a 2D texture reads (`Images::upload_parts`'
 /// first half, without the cache: under its lock for its own uploads, after
 /// it for re-uploads left by `refresh`): `first` (no image yet), `region`
 /// (its write tracking), GPU detiling allowed (`allow_gpu`); the cache's
 /// messages go to `notes`.
 #[allow(clippy::too_many_arguments)]
-fn choose_2d(key: ImageKey, t: &Tsharp, only: Option<&[(u64, u64)]>, all: bool, first: bool, region: Option<u32>, allow_gpu: bool, notes: &mut Vec<String>) -> Result<Chose, String> {
+fn choose_2d(key: ImageKey, t: &Tsharp, only: Option<&[(u64, u64)]>, all: bool, first: bool, region: Option<u32>, allow_gpu: bool, keep: &[(u32, u32, u64)], notes: &mut Vec<String>) -> Result<Chose, String> {
     let precise = super::tune::upload_parts() && !first && !all && only.is_some();
     let el = elem_log2(t.format).ok_or("unknown element size")?;
     let block = is_block(t.format);
@@ -2145,6 +2180,23 @@ fn choose_2d(key: ImageKey, t: &Tsharp, only: Option<&[(u64, u64)]>, all: bool, 
                 continue;
             }
             let (s, n) = range(mip, layer);
+            // Blocks GPU work wrote through a block view (`gpu_parts`): left
+            // as they are while their own guest bytes stay as they were then
+            // (guest memory never held them; a write elsewhere in the shared
+            // mip-tail block re-uploaded the tail with stale bytes and the
+            // title's encoded character textures showed noise, 2026-11-11).
+            if let Some(&(_, _, h0)) = keep.iter().find(|k| k.0 as usize == mip && k.1 == layer) {
+                use std::sync::atomic::Ordering::Relaxed;
+                GPU_PARTS_KEPT[0].fetch_add(1, Relaxed);
+                if own_part_hash(&lay, elem, t.base, mip, layer) == h0 {
+                    GPU_PARTS_KEPT[1].fetch_add(1, Relaxed);
+                    if sums_on && !first && pre_hash.get(i).is_some_and(|&h| h != SUB_NONE) {
+                        sums[i] = pre_hash[i];
+                    }
+                    continue;
+                }
+                GPU_PARTS_KEPT[2].fetch_add(1, Relaxed);
+            }
             // (A first upload hashes its parts after the detiling, on
             // several threads: one by one here it cost as long as
             // detiling a large array.)
@@ -2365,6 +2417,8 @@ struct RefreshJob {
     /// A new texture's first upload (`image_for`): unmapped (mip, layer)s
     /// zero-filled, the image's first layout, its parts' sums.
     first: bool,
+    /// The image's `gpu_parts` when the job was made.
+    keep: Vec<(u32, u32, u64)>,
 }
 
 /// Set once a deferred re-upload is recorded or dropped: threads that bound
@@ -2493,7 +2547,7 @@ fn run_refresh(job: RefreshJob) -> Result<(), String> {
 fn prepare_reupload(job: &RefreshJob) -> Result<Prepared, String> {
     use std::sync::atomic::Ordering::Relaxed;
     let mut notes = Vec::new();
-    let Chosen { lay, layers, elem, size, precise, sums_on, mut sums, end, mut regions, zeroed, parts, total, zero_off, detiled, skipped, parts_done, parts_left, t_detile, readers, block, .. } = match choose_2d(job.key, &job.t, job.parts.as_deref(), job.all, job.first, Some(job.region), false, &mut notes)? {
+    let Chosen { lay, layers, elem, size, precise, sums_on, mut sums, end, mut regions, zeroed, parts, total, zero_off, detiled, skipped, parts_done, parts_left, t_detile, readers, block, .. } = match choose_2d(job.key, &job.t, job.parts.as_deref(), job.all, job.first, Some(job.region), false, &job.keep, &mut notes)? {
         Chose::Done((_, size)) => return Ok(Prepared { copy: None, size, notes }),
         Chose::Parts(c) => c,
     };
@@ -3051,6 +3105,108 @@ impl Images {
         n
     }
 
+    /// Diagnosis (`texcheck`): the 2D textures uploaded from guest memory
+    /// whose guest bytes no longer match their last upload, (mip, layer) by
+    /// (mip, layer) against the sums `tune upload_parts` keeps, while no
+    /// write is marked over the changed parts: writes the tracking missed
+    /// (they stay stale until something else re-uploads them). Write-watch
+    /// marks over a changed part are taken first, so CPU writes the
+    /// scrubber has not reached yet count as marked. Returns report lines.
+    pub fn check_sources() -> Vec<String> {
+        let items: Vec<(ImageKey, Tsharp, u32, usize)> = with(|im| {
+            im.map
+                .values()
+                .filter(|i| !i.gpu_written && !i.key.ty3d && !im.refreshing.contains_key(&i.key))
+                .filter_map(|i| Some((i.key, i.layout?, i.source?, im.by_base.get(&i.key.base).map_or(0, |v| v.len()))))
+                .collect()
+        });
+        let sums = SUB_SUMS.lock().clone().unwrap_or_default();
+        let (mut checked, mut parts_checked, mut no_sums, mut pending_tex, mut missed_tex, mut missed_parts, mut reuploaded) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        let mut lines = Vec::new();
+        for (key, t, region, at_base) in items {
+            let Some(prev) = sums.get(&key) else {
+                no_sums += 1;
+                continue;
+            };
+            let (Some(el), layers) = (elem_log2(t.format), key.layers) else { continue };
+            let Some(lay) = tiling::layout(t.sw_mode, el, key.width, key.height, key.levels, is_block(t.format)) else { continue };
+            if prev.len() != key.levels as usize * layers as usize {
+                continue;
+            }
+            let elem = 1u64 << el;
+            checked += 1;
+            // Parts with a sum from a mapped upload, mapped now (the table
+            // first, then held under the guest-reader lock, as uploads do).
+            let g0 = crate::mem::MAP_GEN.load(std::sync::atomic::Ordering::SeqCst);
+            let todo: Vec<(usize, u64, u64)> = (0..prev.len())
+                .filter(|&i| prev[i] != SUB_NONE && prev[i] != SUB_UNMAPPED)
+                .map(|i| {
+                    let (s, n) = part_range(&lay, elem, i / layers as usize, (i % layers as usize) as u32);
+                    (i, t.base + s, n)
+                })
+                .filter(|&(_, a, n)| super::cp::valid(a, n) && crate::mem::host_readable(a, n))
+                .collect();
+            let readers = crate::mem::GUEST_READERS.read();
+            let held = crate::mem::table_view_held(g0);
+            let now: Vec<(usize, u64, u64, u64)> = todo.iter().filter(|&&(_, a, n)| held || crate::mem::os_readable(a, n)).map(|&(i, a, n)| (i, a, n, hash_bytes(a, n as usize))).collect();
+            drop(readers);
+            parts_checked += now.len() as u64;
+            let differ: Vec<(usize, u64, u64)> = now.iter().filter(|x| x.3 != prev[x.0]).map(|x| (x.0, x.1, x.2)).collect();
+            if differ.is_empty() {
+                continue;
+            }
+            // CPU writes not taken yet: marked on their regions by the take.
+            let mut pages = Vec::new();
+            for &(_, a, n) in &differ {
+                pages.clear();
+                let _ = super::precache::take_written_for(a, n, &mut pages, None, 3);
+            }
+            let missed: Vec<(usize, u64, u64)> = differ.iter().copied().filter(|&(_, a, n)| !super::track::pending_overlaps(region, a, n)).collect();
+            if missed.is_empty() {
+                pending_tex += 1;
+                continue;
+            }
+            // Uploaded meanwhile (the sums moved): not counted.
+            if SUB_SUMS.lock().as_ref().and_then(|m| m.get(&key)).is_none_or(|v| missed.iter().any(|&(i, _, _)| v.get(i) != prev.get(i))) {
+                reuploaded += 1;
+                continue;
+            }
+            missed_tex += 1;
+            missed_parts += missed.len() as u64;
+            if lines.len() < 40 {
+                let parts: Vec<String> = missed.iter().take(6).map(|&(i, a, n)| format!("m{} l{} {a:#x}+{n:#x}", i / layers as usize, i % layers as usize)).collect();
+                let since = SUB_HASHES.lock().as_ref().and_then(|m| m.get(&key)).map(|x| x.0);
+                let events = since.map(|s| missed.iter().take(2).flat_map(|&(_, a, n)| super::track::events_since(a, n, s)).take(6).collect::<Vec<_>>().join("; "));
+                lines.push(format!(
+                    "texcheck: {:#x} {}x{}x{} {:?} sw {} levels {} (T# levels {}..{}, {} images at base): {} of {} checked parts changed with no write marked ({}{}); region {region} dirty {}{}",
+                    t.base,
+                    key.width,
+                    key.height,
+                    layers,
+                    key.format,
+                    t.sw_mode,
+                    key.levels,
+                    t.base_level,
+                    t.last_level,
+                    at_base,
+                    missed.len(),
+                    now.len(),
+                    parts.join(", "),
+                    if missed.len() > 6 { ", ..." } else { "" },
+                    super::track::is_dirty(region),
+                    match (since, events) {
+                        (Some(s), Some(e)) => format!("; last upload {} ms ago, writes noted since: {}", s.elapsed().as_millis(), if e.is_empty() { "none" } else { &e }),
+                        _ => String::new(),
+                    }
+                ));
+            }
+        }
+        lines.push(format!(
+            "texcheck: {checked} textures checked ({parts_checked} (mip, layer)s, {no_sums} without sums), {missed_tex} stale with no write marked ({missed_parts} parts), {pending_tex} changed with writes marked (uploaded at their next use), {reuploaded} uploaded during the check"
+        ));
+        lines
+    }
+
     /// Zero-fills every cached image at guest address `base` (diagnosis:
     /// `clearimg` control command); returns how many.
     pub fn clear_at(&mut self, base: u64) -> usize {
@@ -3435,7 +3591,8 @@ impl Images {
             return self.upload_3d(image, key, t, first);
         }
         let mut notes = Vec::new();
-        let chose = choose_2d(key, t, only, all, first, region, true, &mut notes);
+        let keep = self.map.get(&key).map(|i| i.gpu_parts.clone()).unwrap_or_default();
+        let chose = choose_2d(key, t, only, all, first, region, true, &keep, &mut notes);
         for n in notes {
             self.report(n);
         }
@@ -3747,7 +3904,7 @@ impl Images {
             let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
             d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
         });
-        self.map_insert(new_key, Image { image, key: new_key, views: HashMap::default(), gpu_written: true, source: None, source_gen: None, hashes: [0; SLICES], checked_frame: 0, write_gen: prev.write_gen, block_gen: 0, span: 0, layout: None, overwritten: false, writer: 0, mem, bytes, used: UseStamp::new(super::FRAMES.load(std::sync::atomic::Ordering::Relaxed)) });
+        self.map_insert(new_key, Image { image, key: new_key, views: HashMap::default(), gpu_written: true, source: None, source_gen: None, hashes: [0; SLICES], checked_frame: 0, write_gen: prev.write_gen, block_gen: 0, gpu_parts: Vec::new(), mip_gens: Vec::new(), span: 0, layout: None, overwritten: false, writer: 0, mem, bytes, used: UseStamp::new(super::FRAMES.load(std::sync::atomic::Ordering::Relaxed)) });
         for v in self.stencil_of.values_mut() {
             if *v == old {
                 *v = new_key;
@@ -3850,11 +4007,46 @@ impl Images {
     pub fn take_block_copies(&mut self, keys: &[ImageKey]) -> Vec<BlockCopy> {
         let out = self.block_copies(keys);
         for c in &out {
+            let parts = Self::block_copy_parts(c, self.map.get(&c.key).and_then(|i| i.layout));
             if let Some(i) = self.map.get_mut(&c.key) {
                 i.block_gen = c.seq;
+                for (m, l, h) in parts {
+                    match i.gpu_parts.iter_mut().find(|p| p.0 == m && p.1 == l) {
+                        Some(p) => p.2 = h,
+                        None => i.gpu_parts.push((m, l, h)),
+                    }
+                }
             }
         }
         out
+    }
+
+    /// The (mip, layer)s a block copy writes, with their own guest bytes'
+    /// hashes now (`Image::gpu_parts`; parts not mapped now are left out).
+    fn block_copy_parts(c: &BlockCopy, t: Option<Tsharp>) -> Vec<(u32, u32, u64)> {
+        let Some(t) = t else { return Vec::new() };
+        let Some(el) = elem_log2(t.format) else { return Vec::new() };
+        let Some(lay) = tiling::layout(t.sw_mode, el, c.key.width, c.key.height, c.key.levels, is_block(t.format)) else { return Vec::new() };
+        let elem = 1u64 << el;
+        let mut want: Vec<(u32, u32)> = Vec::new();
+        if c.src != vk::Image::null() {
+            for &m in &c.mips {
+                for l in 0..c.layers {
+                    want.push((m, l));
+                }
+            }
+        }
+        if let Some((_, regs)) = &c.tail {
+            want.extend(regs.iter().map(|r| (r.0, 0)));
+        }
+        let _readers = crate::mem::GUEST_READERS.read();
+        want.into_iter()
+            .filter(|&(m, _)| (m as usize) < lay.mips.len())
+            .filter_map(|(m, l)| {
+                let (s, n) = part_range(&lay, elem, m as usize, l);
+                (super::cp::valid(t.base + s, n) && crate::mem::os_readable(t.base + s, n)).then(|| (m, l, own_part_hash(&lay, elem, t.base, m as usize, l)))
+            })
+            .collect()
     }
 
     /// Whether `depth_copies` may find something for `keys` (depth
@@ -3969,28 +4161,43 @@ impl Images {
             if src.is_none() && tail.is_none() {
                 continue;
             }
-            // Mips with whole blocks, before the tail when a tail view
-            // supplies the tail (the two copies must not overlap).
-            let first_tail = tail.as_ref().and_then(|(_, _, r)| r.first().map(|x| x.0)).unwrap_or(u32::MAX);
-            let mut levels = 0;
-            if let Some(src) = src {
-                while levels < src.key.levels.min(k.levels).min(first_tail) && (k.width >> levels) % 4 == 0 && (k.height >> levels) % 4 == 0 && (k.width >> levels) > 0 && (k.height >> levels) > 0 {
-                    levels += 1;
+            // Each mip from the view that wrote it since the last copy: the
+            // whole chain's view where it wrote that level (each storage
+            // binding writes its base level), else the tail block's view for
+            // a tail mip. (Until 2026-11-11 the chain's view gave only the
+            // mips before the tail and the tail view the rest: the title's
+            // character texture encoders write mips 4-8 through the chain's
+            // view and only the one-block mips through the tail view, so a
+            // soldier's face had stale bytes from mip 4 on.)
+            let whole = |m: u32| (k.width >> m) > 0 && (k.height >> m) > 0 && (k.width >> m) % 4 == 0 && (k.height >> m) % 4 == 0;
+            let main_gen = |m: u32| src.filter(|s| m < s.key.levels).map_or(0, |s| s.mip_gens.get(m as usize).copied().unwrap_or(0));
+            let tail_gen = tail.as_ref().map_or(0, |t| t.1);
+            let mut mips: Vec<u32> = Vec::new();
+            let mut tail_mips: Vec<u32> = Vec::new();
+            let mut seq = 0;
+            for m in 0..k.levels {
+                let g = if whole(m) { main_gen(m) } else { 0 };
+                if g > dst.block_gen {
+                    mips.push(m);
+                    seq = seq.max(g);
+                } else if tail_gen > dst.block_gen && tail.as_ref().is_some_and(|t| t.2.iter().any(|r| r.0 == m)) {
+                    tail_mips.push(m);
+                    seq = seq.max(tail_gen);
                 }
             }
-            if levels == 0 && tail.is_none() {
+            if mips.is_empty() && tail_mips.is_empty() {
                 continue;
             }
-            let seq = src.map_or(0, |s| s.write_gen).max(tail.as_ref().map_or(0, |t| t.1));
+            let tail = tail.filter(|_| !tail_mips.is_empty()).map(|(img, _, r)| (img, r.into_iter().filter(|x| tail_mips.contains(&x.0)).collect::<Vec<_>>()));
             out.push(BlockCopy {
                 key: *k,
-                src: if levels > 0 { src.map_or(vk::Image::null(), |s| s.image) } else { vk::Image::null() },
+                src: if mips.is_empty() { vk::Image::null() } else { src.map_or(vk::Image::null(), |s| s.image) },
                 dst: dst.image,
                 width: bw,
                 height: bh,
-                levels,
+                mips,
                 layers: src.map_or(1, |s| s.key.layers.min(k.layers).max(1)),
-                tail: tail.map(|(img, _, r)| (img, r)),
+                tail,
                 seq,
             });
         }
@@ -4246,8 +4453,8 @@ impl Images {
             let wait = std::sync::Arc::new(RefreshWait::default());
             self.refreshing.insert(key, wait.clone());
             FIRST_OUT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            REFRESH_JOBS.with(|j| j.borrow_mut().push(RefreshJob { key, image, t: *t, region, range: (t.base, n), parts: None, all: true, cause: 0, remap: None, wait, first: true }));
-            self.map_insert(key, Image { image, key, views: HashMap::default(), gpu_written: false, source: Some(region), source_gen: super::track::gen_of(region), hashes: [0; SLICES], checked_frame: frame, write_gen: 0, block_gen: 0, span: 0, layout: None, overwritten: false, writer: 0, mem, bytes, used: UseStamp::new(frame) });
+            REFRESH_JOBS.with(|j| j.borrow_mut().push(RefreshJob { key, image, t: *t, region, range: (t.base, n), parts: None, all: true, cause: 0, remap: None, wait, first: true, keep: Vec::new() }));
+            self.map_insert(key, Image { image, key, views: HashMap::default(), gpu_written: false, source: Some(region), source_gen: super::track::gen_of(region), hashes: [0; SLICES], checked_frame: frame, write_gen: 0, block_gen: 0, gpu_parts: Vec::new(), mip_gens: Vec::new(), span: 0, layout: None, overwritten: false, writer: 0, mem, bytes, used: UseStamp::new(frame) });
             self.note_layout(key, t);
             return Ok(key);
         }
@@ -4276,7 +4483,7 @@ impl Images {
         let ts = timed();
         let hashes = source.map(|(b, n)| all_hashes(b, n)).unwrap_or([0; SLICES]);
         note_step(5, ts);
-        self.map_insert(key, Image { image, key, views: HashMap::default(), gpu_written: false, source: region, source_gen: region.and_then(super::track::gen_of), hashes, checked_frame: frame, write_gen: 0, block_gen: 0, span: 0, layout: None, overwritten: false, writer: 0, mem, bytes, used: UseStamp::new(frame) });
+        self.map_insert(key, Image { image, key, views: HashMap::default(), gpu_written: false, source: region, source_gen: region.and_then(super::track::gen_of), hashes, checked_frame: frame, write_gen: 0, block_gen: 0, gpu_parts: Vec::new(), mip_gens: Vec::new(), span: 0, layout: None, overwritten: false, writer: 0, mem, bytes, used: UseStamp::new(frame) });
         self.note_layout(key, t);
         Ok(key)
     }
@@ -4745,7 +4952,8 @@ impl Images {
                     _ => None,
                 };
                 let all = matches!(why, super::track::Why::Forced);
-                REFRESH_JOBS.with(|j| j.borrow_mut().push(RefreshJob { key, image, t: *t, region, range: (b, n), parts, all, cause, remap, wait, first: false }));
+                let keep = self.map[&key].gpu_parts.clone();
+                REFRESH_JOBS.with(|j| j.borrow_mut().push(RefreshJob { key, image, t: *t, region, range: (b, n), parts, all, cause, remap, wait, first: false, keep }));
                 return Ok(());
             }
             // (`DS_SKIP_REUPLOADS`: timing only, the image keeps its contents.)
@@ -4965,7 +5173,7 @@ impl Images {
         } else {
             let (image, mem, bytes) = self.create(key)?;
             self.to_general(image, key.format);
-            self.map_insert(key, Image { image, key, views: HashMap::default(), gpu_written: true, source: None, source_gen: None, hashes: [0; SLICES], checked_frame: 0, write_gen: 0, block_gen: 0, span: 0, layout: None, overwritten: false, writer: 0, mem, bytes, used: UseStamp::new(super::FRAMES.load(std::sync::atomic::Ordering::Relaxed)) });
+            self.map_insert(key, Image { image, key, views: HashMap::default(), gpu_written: true, source: None, source_gen: None, hashes: [0; SLICES], checked_frame: 0, write_gen: 0, block_gen: 0, gpu_parts: Vec::new(), mip_gens: Vec::new(), span: 0, layout: None, overwritten: false, writer: 0, mem, bytes, used: UseStamp::new(super::FRAMES.load(std::sync::atomic::Ordering::Relaxed)) });
             self.gpu_bases.insert(key.base);
             crate::info!("images: new render target {:#x} {}x{} {:?} at flip {}", key.base, key.width, key.height, key.format, super::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
             // DS_CAPTURE_NEW_RT=<hex base>: capture the frame after a render
@@ -5172,12 +5380,184 @@ impl Images {
         });
         let data = unsafe { std::slice::from_raw_parts(ptr, size as usize) };
         let z = data.iter().filter(|&&b| b == 0).count() * 100 / data.len();
+        // The same mip of the guest data, detiled now: elements (blocks of
+        // block-compressed formats) that differ from the GPU's copy.
+        let mut cmp = String::new();
+        let mut per_mip = false;
+        let gpu_written = self.map.get(&k).is_some_and(|i| i.gpu_written);
+        if let (Some(el), false) = (elem_log2(t.format), gpu_written) {
+            if let Some(lay) = tiling::layout(t.sw_mode, el, k.width, k.height, k.levels, is_block(t.format)) {
+                let e = 1u64 << el;
+                let (s, n) = part_range(&lay, e, mip as usize, 0);
+                let m = &lay.mips[mip as usize];
+                if m.width as u64 * m.height as u64 * e != size {
+                    cmp = format!("; not compared with the guest data (its mip is {}x{} elements of {e} bytes)", m.width, m.height);
+                } else if !super::cp::guest_readable(t.base + s, n) {
+                    cmp = "; guest mip not readable now".into();
+                } else {
+                    let src = unsafe { std::slice::from_raw_parts(t.base as *const u8, (s + n) as usize) };
+                    let mut lin = Vec::new();
+                    lay.detile(src, mip as usize, 0, &mut lin);
+                    let mut differ = 0usize;
+                    let mut first = None;
+                    for (i, (a, b)) in lin.chunks_exact(e as usize).zip(data.chunks_exact(e as usize)).enumerate() {
+                        if a != b {
+                            differ += 1;
+                            first.get_or_insert(i);
+                        }
+                    }
+                    let total = (lin.len() / e as usize).max(1);
+                    // Both copies' raw elements, for offline decoding (the
+                    // first 16 differing textures of a session).
+                    static RAW_DUMPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if first.is_some() && RAW_DUMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+                        if let Some(dir) = crate::run_dir() {
+                            let tdir = dir.join("textures");
+                            let _ = std::fs::create_dir_all(&tdir);
+                            let name = format!("{:010x}_f{}_{}x{}_m{mip}", t.base, t.format, m.width, m.height);
+                            let _ = std::fs::write(tdir.join(format!("{name}_gpu.raw")), data);
+                            let _ = std::fs::write(tdir.join(format!("{name}_guest.raw")), &lin);
+                        }
+                    }
+                    per_mip = first.is_some();
+                    cmp = match first {
+                        None => format!("; equal to the guest data ({total} elements)"),
+                        Some(i) => format!(
+                            "; {differ} of {total} elements ({}%) differ from the guest data detiled now, first at element {},{}",
+                            differ * 100 / total,
+                            i % m.width as usize,
+                            i / m.width as usize
+                        ),
+                    };
+                }
+            }
+        }
         unsafe {
             c.device.destroy_buffer(buf, None);
             c.device.unmap_memory(mem);
             c.device.free_memory(mem, None);
         }
-        Some(format!("gpu image mip {mip}: {z}% zero"))
+        // Its base mip differs from the guest data: every mip's share.
+        if per_mip {
+            let shares: Vec<String> = (0..k.levels).filter_map(|m| self.mip_vs_guest(image, &k, t, m).map(|(d, n)| format!("m{m} {}%", d * 100 / n.max(1)))).collect();
+            cmp.push_str(&format!("; per mip, elements differing from the guest data: {}", shares.join(" ")));
+            cmp.push_str(&self.tail_view_report(&k, t));
+        }
+        Some(format!("gpu image mip {mip}: {z}% zero{cmp}"))
+    }
+
+    /// Captures: where GPU work wrote a compressed texture's mip-tail block
+    /// through its tail view (the GPU-written single-level view of the
+    /// block at the base: elements that differ from the guest block), next
+    /// to where the layout puts each tail mip ("" without such a view).
+    fn tail_view_report(&mut self, k: &ImageKey, t: &Tsharp) -> String {
+        let Some(el) = elem_log2(t.format) else { return String::new() };
+        let Some(lay) = tiling::layout(t.sw_mode, el, k.width, k.height, k.levels, true) else { return String::new() };
+        let bytes = texel_bytes(k.format);
+        let Some(view) = self
+            .by_base
+            .get(&k.base)
+            .into_iter()
+            .flatten()
+            .filter_map(|kk| self.map.get(kk))
+            .find(|i| i.gpu_written && !is_compressed(i.key.format) && !i.key.ty3d && i.key.levels == 1 && texel_bytes(i.key.format) == bytes && i.key.width == lay.block_w && i.key.height == lay.block_h)
+            .map(|i| (i.image, i.key))
+        else {
+            return String::new();
+        };
+        let (vw, vh) = (view.1.width, view.1.height);
+        let Some(vlay) = tiling::layout(t.sw_mode, el, vw, vh, 1, false) else { return String::new() };
+        let e = 1u64 << el;
+        let size = vw as u64 * vh as u64 * e;
+        if !super::cp::guest_readable(t.base, vlay.size(1)) {
+            return "; tail view: guest block not readable".into();
+        }
+        let c = ctx();
+        let Ok((buf, mem, ptr)) = c.host_buffer(size, vk::BufferUsageFlags::TRANSFER_DST) else { return String::new() };
+        self.one_shot(|cmd| unsafe {
+            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 })
+                .image_extent(vk::Extent3D { width: vw, height: vh, depth: 1 });
+            c.device.cmd_copy_image_to_buffer(cmd, view.0, vk::ImageLayout::GENERAL, buf, &[region]);
+            let hb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[hb], &[], &[]);
+        });
+        let data = unsafe { std::slice::from_raw_parts(ptr, size as usize) }.to_vec();
+        unsafe {
+            c.device.destroy_buffer(buf, None);
+            c.device.unmap_memory(mem);
+            c.device.free_memory(mem, None);
+        }
+        let src = unsafe { std::slice::from_raw_parts(t.base as *const u8, vlay.size(1) as usize) };
+        let mut lin = Vec::new();
+        vlay.detile(src, 0, 0, &mut lin);
+        // Rows of written elements as x ranges (a written element differs
+        // from the guest block).
+        let mut rows: Vec<String> = Vec::new();
+        let mut written = 0usize;
+        for y in 0..vh as usize {
+            let mut runs: Vec<(usize, usize)> = Vec::new();
+            for x in 0..vw as usize {
+                let i = (y * vw as usize + x) * e as usize;
+                if lin[i..i + e as usize] != data[i..i + e as usize] {
+                    written += 1;
+                    match runs.last_mut() {
+                        Some(r) if r.1 == x => r.1 = x + 1,
+                        _ => runs.push((x, x + 1)),
+                    }
+                }
+            }
+            if !runs.is_empty() && rows.len() < 24 {
+                rows.push(format!("y{y}: {}", runs.iter().map(|r| format!("{}..{}", r.0, r.1)).collect::<Vec<_>>().join(",")));
+            }
+        }
+        let tails: Vec<String> = lay.mips.iter().enumerate().filter_map(|(i, m)| m.tail.map(|(x, y)| format!("m{i} at {x},{y} {}x{}", m.width, m.height))).collect();
+        format!("; tail view {vw}x{vh}: {written} elements written by GPU work (rows {}); the layout's tail mips: {}", rows.join(" | "), tails.join(", "))
+    }
+
+    /// One mip (layer 0) of a cached image read back and compared with the
+    /// guest data detiled now (frame captures): (differing elements, all).
+    fn mip_vs_guest(&mut self, image: vk::Image, k: &ImageKey, t: &Tsharp, mip: u32) -> Option<(usize, usize)> {
+        let el = elem_log2(t.format)?;
+        let lay = tiling::layout(t.sw_mode, el, k.width, k.height, k.levels, is_block(t.format))?;
+        let m = lay.mips.get(mip as usize)?;
+        let e = 1u64 << el;
+        let (w, h) = ((k.width >> mip).max(1), (k.height >> mip).max(1));
+        let bytes = texel_bytes(k.format) as u64;
+        let size = if is_compressed(k.format) { w.div_ceil(4) as u64 * h.div_ceil(4) as u64 * bytes } else { w as u64 * h as u64 * bytes };
+        if size == 0 || size > 64 << 20 || m.width as u64 * m.height as u64 * e != size {
+            return None;
+        }
+        let (s, n) = part_range(&lay, e, mip as usize, 0);
+        if !super::cp::guest_readable(t.base + s, n) {
+            return None;
+        }
+        let c = ctx();
+        let (buf, mem, ptr) = c.host_buffer(size, vk::BufferUsageFlags::TRANSFER_DST).ok()?;
+        self.one_shot(|cmd| unsafe {
+            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: mip, base_array_layer: 0, layer_count: 1 })
+                .image_extent(vk::Extent3D { width: w, height: h, depth: 1 });
+            c.device.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::GENERAL, buf, &[region]);
+            let hb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[hb], &[], &[]);
+        });
+        let data = unsafe { std::slice::from_raw_parts(ptr, size as usize) };
+        let src = unsafe { std::slice::from_raw_parts(t.base as *const u8, (s + n) as usize) };
+        let mut lin = Vec::new();
+        lay.detile(src, mip as usize, 0, &mut lin);
+        let differ = lin.chunks_exact(e as usize).zip(data.chunks_exact(e as usize)).filter(|(a, b)| a != b).count();
+        let total = lin.len() / e as usize;
+        unsafe {
+            c.device.destroy_buffer(buf, None);
+            c.device.unmap_memory(mem);
+            c.device.free_memory(mem, None);
+        }
+        Some((differ, total))
     }
 
     /// An upscaler's view of a resource (`gpu::upscale`): the image behind `t` as a binding
@@ -5555,6 +5935,11 @@ impl Images {
         let img = self.map.get_mut(&key).unwrap();
         if storage {
             img.write_gen = seq;
+            let m = t.base_level as usize;
+            if img.mip_gens.len() <= m {
+                img.mip_gens.resize(m + 1, 0);
+            }
+            img.mip_gens[m] = seq;
             img.writer = BINDING_SHADER.with(|s| s.get());
             if !img.gpu_written {
                 crate::info!("images: {:#x} {}x{} {:?} becomes a storage image (was uploaded: {}; shader {:#x})", key.base, key.width, key.height, key.format, img.source.is_some(), BINDING_SHADER.with(|s| s.get()));

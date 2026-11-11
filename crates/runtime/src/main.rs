@@ -1156,6 +1156,14 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     None => Err("usage: tiny <hex ps address>".into()),
                 }
             }
+            "texcheck" => {
+                // Diagnosis: `texcheck` lists the textures whose guest bytes
+                // changed since their last upload with no write marked.
+                for l in gpu::images::Images::check_sources() {
+                    info!("{l}");
+                }
+                Ok(())
+            }
             "reupload" => {
                 // Diagnosis: `reupload [<hex address>]` uploads the textures
                 // sourced from guest memory (at that address) again at their

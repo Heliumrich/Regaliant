@@ -12851,9 +12851,11 @@ impl Exec {
         let c = ctx();
         let cmd = self.cmd();
         for b in &copies {
-            if b.levels > 0 {
-                let regions: Vec<vk::ImageCopy> = (0..b.levels)
-                    .map(|l| {
+            if !b.mips.is_empty() {
+                let regions: Vec<vk::ImageCopy> = b
+                    .mips
+                    .iter()
+                    .map(|&l| {
                         let sub = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: l, base_array_layer: 0, layer_count: b.layers };
                         // Extent in texels of the (uncompressed) source.
                         vk::ImageCopy { src_subresource: sub, src_offset: vk::Offset3D::default(), dst_subresource: sub, dst_offset: vk::Offset3D::default(), extent: vk::Extent3D { width: (b.width >> l).max(1), height: (b.height >> l).max(1), depth: 1 } }
@@ -12879,12 +12881,12 @@ impl Exec {
             static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
             if SEEN.lock().get_or_insert_with(HashSet::new).insert(b.key.base) {
                 crate::info!(
-                    "images: {:#x} {}x{} {:?}: {} mip(s) of blocks copied in from its GPU-written {}x{} view{}",
+                    "images: {:#x} {}x{} {:?}: mips {:?} of blocks copied in from its GPU-written {}x{} view{}",
                     b.key.base,
                     b.key.width,
                     b.key.height,
                     b.key.format,
-                    b.levels,
+                    b.mips,
                     b.width,
                     b.height,
                     b.tail.as_ref().map_or(String::new(), |(_, r)| format!(", mips {}..{} from its tail block's view", r.first().map_or(0, |x| x.0), r.last().map_or(0, |x| x.0)))
@@ -16923,9 +16925,12 @@ pub fn status() -> String {
             SHADOWS_SHARED[4].load(Ordering::Relaxed)
         )
         + &format!(
-            "    images: {} block-compressed refreshes from GPU-written views ({} with the mip tail from the tail block's view), {} depth planes from GPU-written color views, {} storage bindings one view per mip level, {} draws without attachments\n",
+            "    images: {} block-compressed refreshes from GPU-written views ({} with the mip tail from the tail block's view; at re-uploads {} of their (mip, layer)s checked, {} left as the GPU wrote them, {} uploaded: guest bytes changed), {} depth planes from GPU-written color views, {} storage bindings one view per mip level, {} draws without attachments\n",
             BLOCK_COPIES.load(Ordering::Relaxed),
             BLOCK_TAIL_COPIES.load(Ordering::Relaxed),
+            super::images::GPU_PARTS_KEPT[0].load(Ordering::Relaxed),
+            super::images::GPU_PARTS_KEPT[1].load(Ordering::Relaxed),
+            super::images::GPU_PARTS_KEPT[2].load(Ordering::Relaxed),
             DEPTH_COPIES.load(Ordering::Relaxed),
             MIP_VIEW_BINDINGS.load(Ordering::Relaxed),
             draw::ATTACHLESS.load(Ordering::Relaxed)
