@@ -6096,6 +6096,9 @@ impl Cp {
         let range = Some((dst, if daic { 4 } else { bytes }));
         super::precache::invalidate(dst, if daic { 4 } else { bytes });
         super::exec::trace_writes(|| format!("{} DMA_DATA (src_sel {src_sel}, from {src:#x})", self.name), dst, bytes);
+        if super::exec::write_journal_on() {
+            super::exec::journal_write(dst, if daic { 4 } else { bytes as u64 }, &self.name, src, u32::MAX, "CP DMA", false);
+        }
         if super::exec::enabled() {
             super::images::with(|im| {
                 im.note_meta_writes(&[(dst, if daic { 4 } else { bytes as u64 })]);

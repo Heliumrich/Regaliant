@@ -1906,7 +1906,7 @@ fn cs_spec(addr: u64, rsrc2: u32, local: [u32; 3], wave64: bool, code_hash: u64)
         touch_twice: marks_wanted() && super::tune::tr_ballast() & 4 != 0,
         part_twice: marks_wanted() && super::tune::tr_ballast() & 8 != 0,
         dep_loads: super::tune::tr_ballast() & 2 != 0,
-        marks_part: marks_wanted() && super::vk::subgroup_partitioned(),
+        marks_part: marks_part_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -2170,6 +2170,16 @@ fn marks_wanted() -> bool {
 }
 // (`tune mark_touch 0`, timing only: `Spec::marks_untouched`.)
 
+/// Marks combined over the lanes that write the same map word through NVIDIA's
+/// partitioned subgroups (`Spec::marks_part`) where the device has them;
+/// `DS_MARKS_PART=0` (diagnosis, boot; a spec field, so translations are
+/// keyed apart): the ballot form for every store (the mirror audit's
+/// lasting pages by store path).
+fn marks_part_wanted() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    marks_wanted() && super::vk::subgroup_partitioned() && !*OFF.get_or_init(|| std::env::var("DS_MARKS_PART").ok().as_deref() == Some("0"))
+}
+
 /// Front end 2's stores test their pages' touched bits before setting them
 /// and touch a page once a store (`Spec::touch_test`; in-run A/B: FINDINGS.md
 /// 2026-11-03 morning).
@@ -2426,7 +2436,7 @@ fn ps_spec(addr: u64, rsrc2: u32, ctx: &dyn Fn(u32) -> u32) -> Spec {
         touch_twice: marks_wanted() && super::tune::tr_ballast() & 4 != 0,
         part_twice: marks_wanted() && super::tune::tr_ballast() & 8 != 0,
         dep_loads: super::tune::tr_ballast() & 2 != 0,
-        marks_part: marks_wanted() && super::vk::subgroup_partitioned(),
+        marks_part: marks_part_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -2717,7 +2727,7 @@ fn ngg_spec(addr: u64, rsrc2: u32, stages: u32, insts: &[rdna::Inst]) -> Spec {
         touch_twice: marks_wanted() && super::tune::tr_ballast() & 4 != 0,
         part_twice: marks_wanted() && super::tune::tr_ballast() & 8 != 0,
         dep_loads: super::tune::tr_ballast() & 2 != 0,
-        marks_part: marks_wanted() && super::vk::subgroup_partitioned(),
+        marks_part: marks_part_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -3562,7 +3572,7 @@ pub(crate) fn vertex_spec(addr: u64, user_sgprs: u16, wave64: bool, base_instanc
         touch_twice: marks_wanted() && super::tune::tr_ballast() & 4 != 0,
         part_twice: marks_wanted() && super::tune::tr_ballast() & 8 != 0,
         dep_loads: super::tune::tr_ballast() & 2 != 0,
-        marks_part: marks_wanted() && super::vk::subgroup_partitioned(),
+        marks_part: marks_part_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -3619,7 +3629,7 @@ pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr
         touch_twice: marks_wanted() && super::tune::tr_ballast() & 4 != 0,
         part_twice: marks_wanted() && super::tune::tr_ballast() & 8 != 0,
         dep_loads: super::tune::tr_ballast() & 2 != 0,
-        marks_part: marks_wanted() && super::vk::subgroup_partitioned(),
+        marks_part: marks_part_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,
@@ -3694,7 +3704,7 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         touch_twice: marks_wanted() && super::tune::tr_ballast() & 4 != 0,
         part_twice: marks_wanted() && super::tune::tr_ballast() & 8 != 0,
         dep_loads: super::tune::tr_ballast() & 2 != 0,
-        marks_part: marks_wanted() && super::vk::subgroup_partitioned(),
+        marks_part: marks_part_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
         gpu_res: 0,

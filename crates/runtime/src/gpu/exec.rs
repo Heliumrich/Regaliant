@@ -514,14 +514,21 @@ pub(super) fn journal_for(a: u64, n: u64) -> String {
         return String::new();
     }
     let g = WRITE_JOURNAL.lock();
-    let v: Vec<String> = g
-        .iter()
-        .rev()
-        .filter(|e| e.base < a + n && a < e.base + e.size)
-        .take(8)
-        .map(|e| format!("{} {} {:#x} res {} {} {:#x}+{:#x} at flip {}", e.queue, e.kind, e.program, e.res, if e.marked { "marked" } else { "UNMARKED" }, e.base, e.size, e.flip))
-        .collect();
-    if v.is_empty() { "; write journal: none over it".into() } else { format!("; write journal (newest first): {}", v.join("; ")) }
+    let fmt = |e: &JournalEntry| format!("{} {} {:#x} res {} {} {:#x}+{:#x} at flip {}", e.queue, e.kind, e.program, e.res, if e.marked { "marked" } else { "UNMARKED" }, e.base, e.size, e.flip);
+    let over: Vec<&JournalEntry> = g.iter().rev().filter(|e| e.base < a + n && a < e.base + e.size).collect();
+    let v: Vec<String> = over.iter().take(8).map(|e| fmt(e)).collect();
+    // (Beyond those: the newest write over it of each other kind, as fills
+    // that leave guest parts out and writes in place part the two copies.)
+    let mut kinds: Vec<&'static str> = over.iter().take(8).map(|e| e.kind).collect();
+    let mut older = Vec::new();
+    for e in over.iter().skip(8) {
+        if !kinds.contains(&e.kind) {
+            kinds.push(e.kind);
+            older.push(fmt(e));
+        }
+    }
+    let older = if older.is_empty() { String::new() } else { format!("; older kinds: {}", older.join("; ")) };
+    if v.is_empty() { "; write journal: none over it".into() } else { format!("; write journal (newest first, {} over it kept): {}{older}", over.len(), v.join("; ")) }
 }
 
 /// Status part of the journal (`DS_WRITE_JOURNAL=1`).
