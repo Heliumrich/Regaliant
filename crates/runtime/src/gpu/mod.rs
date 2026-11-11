@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 167] = [
+    static ALL: [Tunable; 168] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -199,6 +199,7 @@ pub mod tune {
         Tunable { name: "r2", env: "DS_R2", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "past_subs", env: "DS_PAST_SUBS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "par_compute", env: "DS_PAR_COMPUTE", default: 1000, value: AtomicU64::new(UNSET) },
+        Tunable { name: "submit_fuse", env: "DS_SUBMIT_FUSE", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1320,6 +1321,18 @@ pub mod tune {
     #[inline]
     pub fn par_compute() -> u64 {
         get(166)
+    }
+
+    /// Batch fusion (`exec::submit_specs`, with `submit_coalesce` above 1):
+    /// consecutive plain batches the submission thread drains together are
+    /// played into the first one's command buffer (each prologue before its
+    /// commands) and handed to Vulkan as one submission signalling the last
+    /// one's sequence: no submission boundary between them on the GPU (~22
+    /// us of idle a batch start at Castlewall Front, FINDINGS.md 2026-11-11).
+    /// Live; default 0 (being measured).
+    #[inline]
+    pub fn submit_fuse() -> bool {
+        get(167) != 0
     }
 
     /// The title's convolution reverb computed (`hle::libs::acm_conv`,

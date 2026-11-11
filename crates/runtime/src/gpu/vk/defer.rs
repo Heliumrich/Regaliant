@@ -436,21 +436,73 @@ impl Lists {
             if raw != 0 && !l.ops.is_empty() {
                 ops += l.ops.len() as u64;
                 words += l.arena.len() as u64;
-                unsafe { play_list(vk::CommandBuffer::from_raw(raw), &mut l) };
+                unsafe { play_list(vk::CommandBuffer::from_raw(raw), &mut l, 0) };
             }
             recycle(l);
         }
         (ops, words)
     }
+
+    /// Fusion's first batch (`tune submit_fuse`): `replay`, its commands'
+    /// buffer left open (not ended) for the next batches' commands.
+    pub fn replay_open(self) {
+        self.replay_with(|i| if i == 0 { SKIP_END } else { 0 }, None);
+    }
+
+    /// Fusion's later batches: their prologue's commands, then their own,
+    /// played into `into` (the first batch's open buffer) without their
+    /// begins and ends.
+    pub fn replay_into(self, into: vk::CommandBuffer) {
+        self.replay_with(|_| SKIP_BEGIN | SKIP_END, Some(into));
+    }
+
+    fn replay_with(self, skip: impl Fn(usize) -> u8, into: Option<vk::CommandBuffer>) {
+        let t = std::time::Instant::now();
+        let (mut ops, mut words) = (0u64, 0u64);
+        let [main, pre] = self.0;
+        // (The prologue first: into one buffer the order is the submission's.)
+        for (i, (raw, l)) in [(1usize, pre), (0, main)] {
+            let Some(mut l) = l else { continue };
+            if raw != 0 && !l.ops.is_empty() {
+                ops += l.ops.len() as u64;
+                words += l.arena.len() as u64;
+                let cb = into.unwrap_or(vk::CommandBuffer::from_raw(raw));
+                unsafe { play_list(cb, &mut l, skip(i)) };
+            }
+            recycle(l);
+        }
+        STATS[S_BATCHES].fetch_add(1, Ordering::Relaxed);
+        STATS[S_OPS].fetch_add(ops, Ordering::Relaxed);
+        STATS[S_WORDS].fetch_add(words, Ordering::Relaxed);
+        STATS[S_NS].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Whether the batch's lists hold its commands (fusion needs them).
+    pub fn has_main(&self) -> bool {
+        self.0[0].0 != 0 && self.0[0].1.is_some()
+    }
 }
+
+/// Fusion's end: the first batch's buffer ended after the last batch's
+/// commands.
+pub fn end_fused(cb: vk::CommandBuffer) {
+    unsafe {
+        let _ = (real().fp_v1_0().end_command_buffer)(cb);
+    }
+}
+
+/// `play_list`'s skips.
+const SKIP_BEGIN: u8 = 1;
+const SKIP_END: u8 = 2;
 
 /// An arena word + 1 (0: none) as a pointer into the arena at `base`.
 unsafe fn rebase<T>(v: usize, base: *const u64) -> *const T {
     if v == 0 { null() } else { unsafe { base.add(v - 1).cast::<T>() } }
 }
 
-/// Records `l` into `cb` through the driver.
-unsafe fn play_list(cb: vk::CommandBuffer, l: &mut List) {
+/// Records `l` into `cb` through the driver (`skip`: SKIP_BEGIN and
+/// SKIP_END leave out its begin and end, fusion).
+unsafe fn play_list(cb: vk::CommandBuffer, l: &mut List, skip: u8) {
     let d = real();
     let (f0, f1, f2, f3) = (d.fp_v1_0(), d.fp_v1_1(), d.fp_v1_2(), d.fp_v1_3());
     let c = super::ctx();
@@ -461,10 +513,14 @@ unsafe fn play_list(cb: vk::CommandBuffer, l: &mut List) {
         unsafe {
             match *op {
                 Op::Begin(flags) => {
-                    let _ = (f0.begin_command_buffer)(cb, &vk::CommandBufferBeginInfo::default().flags(flags));
+                    if skip & SKIP_BEGIN == 0 {
+                        let _ = (f0.begin_command_buffer)(cb, &vk::CommandBufferBeginInfo::default().flags(flags));
+                    }
                 }
                 Op::End => {
-                    let _ = (f0.end_command_buffer)(cb);
+                    if skip & SKIP_END == 0 {
+                        let _ = (f0.end_command_buffer)(cb);
+                    }
                 }
                 Op::BindPipeline(bp, p) => (f0.cmd_bind_pipeline)(cb, bp, p),
                 Op::Viewports(first, s) => (f0.cmd_set_viewport)(cb, first, s.n, at(s).cast()),

@@ -3966,6 +3966,10 @@ pub(super) struct SubmitSpec {
     xpre: Option<vk::CommandBuffer>,
     pre: Option<vk::CommandBuffer>,
     cmd: vk::CommandBuffer,
+    /// Deferred recording: the batch's lists, played by `submit_specs` just
+    /// before it submits (into the batch's own buffers, or fused into an
+    /// earlier batch's: `tune submit_fuse`).
+    lists: Option<super::vk::defer::Lists>,
     wait: u64,
     on_c: bool,
     xwait: u64,
@@ -3978,13 +3982,15 @@ pub(super) struct SubmitSpec {
 /// Batches submitted in one vkQueueSubmit2 with others (`tune
 /// submit_coalesce`): [calls, batches in them].
 pub static COALESCED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// Fused submissions (`tune submit_fuse`): [submissions, batches in them].
+pub static FUSED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 /// Submits batches in sequence order: consecutive ones on the main queue
 /// without a copy-queue part go to Vulkan in one call (`tune
 /// submit_coalesce`: at most that many; the GPU then starts each right
 /// after the one before instead of after a submission of its own), the
 /// others one by one as `submit_batch`.
-fn submit_specs(specs: Vec<(u64, SubmitSpec)>) {
+fn submit_specs(mut specs: Vec<(u64, SubmitSpec)>) {
     if specs.is_empty() || DEVICE_LOST.load(Ordering::Relaxed) {
         return;
     }
@@ -4007,12 +4013,56 @@ fn submit_specs(specs: Vec<(u64, SubmitSpec)>) {
             }
         }
         if j - i == 1 {
+            if let Some(l) = specs[i].1.lists.take() {
+                l.replay();
+            }
             let (seq, s) = &specs[i];
             if let Err(e) = submit_batch(*seq, s.xpre, s.pre, s.cmd, s.wait, s.on_c, s.xwait, s.cpu_wait) {
                 fail(e, &s.name);
             }
             i = j;
             continue;
+        }
+        // Fusion: the group's lists into the first batch's buffer, one
+        // submission signalling the last batch (its timeline value covers
+        // the earlier ones'; their slots are released after it).
+        // (Only when no later batch of the group waits for compute work not
+        // done yet: that work may wait for an earlier batch of the group,
+        // and the group starts as one.)
+        let cdone_now = if ctx().compute.is_some() { ctx().batch_value_c() } else { 0 };
+        // (Copy-queue waits of later batches likewise: done already.)
+        let copied_now = ctx().copy.as_ref().map_or(u64::MAX, |q| unsafe { ctx().device.get_semaphore_counter_value(q.copied) }.unwrap_or(0));
+        if super::tune::submit_fuse() && specs[i..j].iter().all(|(_, s)| s.lists.as_ref().is_some_and(|l| l.has_main())) && specs[i + 1..j].iter().all(|(_, s)| s.xwait <= cdone_now && s.wait <= copied_now) {
+            let first_cmd = specs[i].1.cmd;
+            specs[i].1.lists.take().expect("lists").replay_open();
+            for k in i + 1..j {
+                specs[k].1.lists.take().expect("lists").replay_into(first_cmd);
+            }
+            super::vk::defer::end_fused(first_cmd);
+            let c = ctx();
+            if let Err(e) = super::pagetable::submit_pending(c, XQ_SUBMITTED.load(Ordering::Acquire)) {
+                fail(e, &specs[i].1.name);
+                return;
+            }
+            super::images::flush_uploads();
+            let cdone = if c.compute.is_some() { c.batch_value_c() } else { 0 };
+            let cmds: Vec<vk::CommandBuffer> = specs[i].1.pre.into_iter().chain([first_cmd]).collect();
+            let wait = specs[i..j].iter().map(|(_, s)| s.wait).max().unwrap_or(0);
+            let xwait = specs[i..j].iter().map(|(_, s)| s.xwait).max().unwrap_or(0);
+            let last = specs[j - 1].0;
+            FUSED[0].fetch_add(1, Ordering::Relaxed);
+            FUSED[1].fetch_add((j - i) as u64, Ordering::Relaxed);
+            if let Err(e) = c.submit_batches(&[(cmds.as_slice(), wait, last, if xwait > cdone { xwait } else { 0 })], vk::Fence::null()) {
+                fail(e, &specs[i].1.name);
+                return;
+            }
+            i = j;
+            continue;
+        }
+        for (_, s) in specs[i..j].iter_mut() {
+            if let Some(l) = s.lists.take() {
+                l.replay();
+            }
         }
         let c = ctx();
         if let Err(e) = super::pagetable::submit_pending(c, XQ_SUBMITTED.load(Ordering::Acquire)) {
@@ -10939,12 +10989,9 @@ impl Exec {
             if DEVICE_LOST.load(Ordering::Relaxed) {
                 return None;
             }
-            // Deferred recording: the driver records the batch now.
-            if let Some(l) = lists {
-                l.replay();
-            }
+            // (Deferred recording: `submit_specs` plays the lists.)
             let _ = seq;
-            Some(SubmitSpec { xpre, pre, cmd, wait: copy_wait, on_c, xwait: 0, cpu_wait, name })
+            Some(SubmitSpec { xpre, pre, cmd, lists, wait: copy_wait, on_c, xwait: 0, cpu_wait, name })
         });
         let cpu = self.span_cpu();
         super::timeline::end(&self.name, self.begun_mark.take(), || format!("batch #{seq}, {commands} commands ({why}{cpu})"));
@@ -14947,11 +14994,8 @@ impl Exec {
                 if DEVICE_LOST.load(Ordering::Relaxed) {
                     return None;
                 }
-                // Deferred recording: the driver records the batch now.
-                if let Some(l) = lists {
-                    l.replay();
-                }
-                Some(SubmitSpec { xpre: None, pre, cmd, wait: copy_wait, on_c, xwait: 0, cpu_wait: 0, name })
+                // (Deferred recording: `submit_specs` plays the lists.)
+                Some(SubmitSpec { xpre: None, pre, cmd, lists, wait: copy_wait, on_c, xwait: 0, cpu_wait: 0, name })
             });
             self.slots[b.slot].seq = seq;
             if !b.fe2_up.is_empty() {
@@ -17064,11 +17108,14 @@ pub fn status() -> String {
         + &super::forward::status_line()
         + &super::par::status()
         + &format!(
-            "    batches submitted together (`tune submit_coalesce` {}): {} calls with {} batches
+            "    batches submitted together (`tune submit_coalesce` {}): {} calls with {} batches; fused into one command buffer (`tune submit_fuse` {}): {} submissions with {} batches
 ",
             super::tune::submit_coalesce(),
             COALESCED[0].load(Ordering::Relaxed),
-            COALESCED[1].load(Ordering::Relaxed)
+            COALESCED[1].load(Ordering::Relaxed),
+            super::tune::submit_fuse() as u8,
+            FUSED[0].load(Ordering::Relaxed),
+            FUSED[1].load(Ordering::Relaxed)
         )
         + &format!(
             "    end-of-pipe writes without a full barrier: {} labels; {} waits ordered the work after them; {} CP writes right after front end 2's write-back with no barrier before them; CP writes without end of pipe the GPU performed, graphics / compute queues, by (neither, after a flush or acquire, held past a label wait, both): {:?} / {:?}; after a flush by what asked for it: graphics {}; compute queues {}\n",
