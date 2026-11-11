@@ -4863,7 +4863,18 @@ fn fill_by_lines(flips: u64) -> String {
     let total: u64 = v.iter().map(|x| x.1[0]).sum();
     let bytes: u64 = v.iter().map(|x| x.1[0] * x.0 .1).sum();
     let per = |n: u64| n as f64 / flips.max(1) as f64;
-    let parts: Vec<String> = v.iter().take(12).map(|((b, n), x)| format!("{b:#x}+{n:#x} (value {:#x}) {:.1}", x[1], per(x[0]))).collect();
+    // (Each range's engine allocation: which allocators' memory the title
+    // zero-fills, for leaving GPU-only fills out of guest memory.)
+    let names: HashMap<u8, String> = crate::engine::allocators().into_iter().map(|a| (a.id, a.name)).collect();
+    let parts: Vec<String> = v
+        .iter()
+        .take(12)
+        .map(|((b, n), x)| {
+            let owner = crate::engine::owner(*b);
+            let name = names.get(&owner).cloned().unwrap_or_else(|| format!("owner {owner}"));
+            format!("{b:#x}+{n:#x} (value {:#x}, {name}{}) {:.1}", x[1], if super::fe2::c4_any_held(*b, b + n) { ", held pages" } else { "" }, per(x[0]))
+        })
+        .collect();
     format!("    buffer fills in place by range, per flip ({:.1} in all, {:.2} MiB, {} ranges): {}
 ", per(total), per(bytes) / 1048576.0, v.len(), parts.join(", "))
 }
