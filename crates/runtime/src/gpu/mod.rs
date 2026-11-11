@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 166] = [
+    static ALL: [Tunable; 167] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -198,6 +198,7 @@ pub mod tune {
         Tunable { name: "kco", env: "DS_KCO", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "r2", env: "DS_R2", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "past_subs", env: "DS_PAST_SUBS", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "par_compute", env: "DS_PAR_COMPUTE", default: 1000, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1306,6 +1307,19 @@ pub mod tune {
     #[inline]
     pub fn past_subs() -> bool {
         get(165) != 0
+    }
+
+    /// Workers each compute queue's command processor records its runs'
+    /// chunks with under front end 2 (`cp::compute_workers`; live: a pool
+    /// grows to it at the next run), 0 none; 1000 (the default since
+    /// 2026-11-11): as many as the graphics queue's (`par::workers`: half
+    /// the logical CPUs, 2 to 8; until then a fixed 4). On 24 logical CPUs
+    /// 8 against 4: Castlewall Front x1.038, where queue 0x50 records the
+    /// title's GPU particles in one long run a frame on the critical path,
+    /// the vista x1.031; 12 level (FINDINGS.md).
+    #[inline]
+    pub fn par_compute() -> u64 {
+        get(166)
     }
 
     /// The title's convolution reverb computed (`hle::libs::acm_conv`,

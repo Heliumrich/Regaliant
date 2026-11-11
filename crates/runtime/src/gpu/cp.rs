@@ -817,7 +817,13 @@ fn par_event(op: u32, compute: bool) -> bool {
 /// synchronization-free runs: four under front end 2 (+6-10% at the vista,
 /// FINDINGS.md 2026-10-28 night), none in the old front end (a loss there).
 fn compute_workers() -> usize {
-    if super::fe2::on() { 4 } else { 0 }
+    if !super::fe2::on() {
+        return 0;
+    }
+    match super::tune::par_compute() {
+        1000 => super::par::workers(),
+        v => (v as usize).min(16),
+    }
 }
 
 fn is_state(op: u32) -> bool {
