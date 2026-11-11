@@ -325,6 +325,36 @@ impl<'a> Patcher<'a> {
         self.divert(rel, len, &bytes, tramp_at)
     }
 
+    /// The module image as patched so far (module-relative).
+    pub fn image_view(&self) -> &[u8] {
+        self.image
+    }
+
+    /// Replaces the instruction at module-relative `rel` with `code`
+    /// (position-independent): a jump to a trampoline that runs `code`, then
+    /// the other instructions the jump displaces, and jumps back. The
+    /// constraints of `insert` apply.
+    pub fn replace(&mut self, rel: u64, ranges: &[(u64, u64)], code: &[u8]) -> Result<u64, String> {
+        use iced_x86::code_asm::*;
+        let len = self.displaced_len(rel, ranges)?;
+        let first = {
+            let mut d = Decoder::with_ip(64, &self.image[rel as usize..], self.base + rel, DecoderOptions::NONE);
+            d.decode().len()
+        };
+        let at = self.base + rel;
+        let tramp_at = self.tramp_base + self.tramp_used as u64;
+        let start = rel as usize;
+        let asm = || -> Result<Vec<u8>, IcedError> {
+            let mut a = CodeAssembler::new(64)?;
+            a.db(code)?;
+            a.db(&self.image[start + first..start + len])?;
+            a.jmp(at + len as u64)?;
+            a.assemble(tramp_at)
+        };
+        let bytes = asm().map_err(|e| format!("assemble: {e}"))?;
+        self.divert(rel, len, &bytes, tramp_at)
+    }
+
     /// Emits trampoline `bytes` (assembled for `tramp_at`, the next free
     /// trampoline address) and replaces the `len` bytes at `rel` with a jump
     /// to it, padded with nops.

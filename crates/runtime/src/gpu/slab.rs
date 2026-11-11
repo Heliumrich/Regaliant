@@ -6,10 +6,11 @@
 //! so bufferImageGranularity does not apply). In the 23 arrivals of 1-1 the time over the median
 //! went from 6.1 to 5.8 s and the worst frame from 267 to 217 ms, the GPU's time per frame level.
 //!
-//! Only with a device-local heap of 16 GiB or more (`on`): under a small budget the image cache
-//! evicts, and an evicted image's range stays a hole in its slab until the slab empties (an 8 GB
-//! budget left 29 slabs half used after evicting 1.9 GB), video memory that eviction exists to
-//! give back. Smaller cards keep an allocation per image, as before.
+//! Only with a device-local heap of 16 GiB or more, or a driver with a limit on allocations
+//! (`on`): under a small budget the image cache evicts, and an evicted image's range stays a hole
+//! in its slab until the slab empties (an 8 GB budget left 29 slabs half used after evicting 1.9
+//! GB), video memory that eviction exists to give back. Smaller cards without a limit keep an
+//! allocation per image, as before.
 
 use super::vk::ctx;
 use ash::vk;
@@ -97,10 +98,13 @@ static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 static DEDICATED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// A slab's size: a 64th of the video memory, 64-256 MiB.
-/// Slabs in use: a device-local heap of 16 GiB or more (at most `vram_cap`).
+/// Slabs in use: a device-local heap of 16 GiB or more (at most `vram_cap`), or a driver that
+/// limits the number of allocations (AMD's Windows driver allows 4,096: a boot holds ~3,100
+/// images, so each with an allocation of its own would run out; NVIDIA states no limit).
 pub fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| ctx().device_heap_size() >= 16 << 30)
+    // (`DS_GPU_COMPAT` takes AMD's or Intel's limit as given.)
+    *ON.get_or_init(|| ctx().device_heap_size() >= 16 << 30 || ctx().limits.max_memory_allocation_count < 1 << 20 || super::vk::gpu_compat().is_some())
 }
 
 fn slab_size() -> u64 {
@@ -290,7 +294,7 @@ pub fn idle_bytes() -> u64 {
 pub fn status() -> String {
     let st: Vec<u64> = STATS.iter().map(|c| c.load(Relaxed)).collect();
     if !on() {
-        return format!("image memory: no slabs (a device-local heap under 16 GiB), {} images with their own ({} MiB; {} allocations, {} ms)", st[2], st[3] >> 20, st[9], st[10] / 1_000_000);
+        return format!("image memory: no slabs (a device-local heap under 16 GiB, no allocation limit), {} images with their own ({} MiB; {} allocations, {} ms)", st[2], st[3] >> 20, st[9], st[10] / 1_000_000);
     }
     let g = STATE.lock();
     let slabs: Vec<&Slab> = g.slabs.iter().flatten().collect();

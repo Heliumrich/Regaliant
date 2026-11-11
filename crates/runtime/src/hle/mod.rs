@@ -297,7 +297,7 @@ extern "sysv64" fn unresolved_handler(index: u64, args: *const u64, ret: u64) ->
         a[4],
         a[5]
     );
-    crate::fatal_exit(3, "unimplemented import called");
+    crate::fatal_exit(0xD530, "unimplemented import called");
 }
 
 /// Builds a 24-byte trap stub: `mov rax, index; jmp [rip+0]; dq ds_unresolved_entry`.

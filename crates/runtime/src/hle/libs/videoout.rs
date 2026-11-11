@@ -38,7 +38,7 @@ const RANGE_HDR: u32 = 2;
 
 /// The dynamic range reported to the title: HDR while the window's monitor is in Windows' HDR
 /// mode (checked at most every 2 s), else SDR; `DS_HDR_STATUS=<n>` reports `n` (tests).
-fn dynamic_range() -> u32 {
+pub fn dynamic_range() -> u32 {
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     static FORCED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
     if let Some(v) = *FORCED.get_or_init(|| std::env::var("DS_HDR_STATUS").ok().and_then(|v| v.trim().parse().ok())) {

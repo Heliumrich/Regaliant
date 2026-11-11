@@ -4,7 +4,15 @@
 
 use std::path::{Path, PathBuf};
 
+/// The release the port was made and tested with (Europe).
 pub const TITLE_ID: &str = "PPSA01341";
+
+/// Demon's Souls' PS5 title ids (PPSA0134x: the regions' releases). Only PPSA01341 was tested;
+/// the others are taken when their version matches (the executable's fingerprint says whether
+/// its code is the tested one).
+pub fn is_demons_souls(id: &str) -> bool {
+    id.len() == 9 && id.starts_with("PPSA0134") && id.as_bytes()[8].is_ascii_digit()
+}
 /// The one version the port supports.
 pub const VERSION: &str = "01.007.000";
 /// The application folder's usual name.
@@ -18,6 +26,8 @@ const DATA_DIRS: [&str; 8] = ["cp11demonssouls", "levels", "sound", "text", "tex
 
 #[derive(Clone, Debug)]
 pub struct Game {
+    /// The title id (`TITLE_ID`, or another region's release).
+    pub id: String,
     /// The application folder (data and `sce_sys`), mounted read-only.
     pub app: PathBuf,
     /// The folder holding the decrypted `eboot.bin` and `sce_module`.
@@ -42,7 +52,7 @@ impl std::fmt::Display for Problem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Problem::NotFound => write!(f, "No Demon's Souls game files were found in this folder. Choose the folder that holds eboot.bin and sce_sys."),
-            Problem::OtherGame(id) => write!(f, "This folder holds another game ({id}). This port runs Demon's Souls (PPSA01341)."),
+            Problem::OtherGame(id) => write!(f, "This folder holds another game ({id}). This port runs the PS5 game Demon's Souls (PPSA01341)."),
             Problem::Version(v) => write!(f, "This is version {v} of the game. This port needs version {VERSION}."),
             Problem::Param(e) => write!(f, "The game's sce_sys\\param.json could not be read ({e})."),
             Problem::NoExecutable => write!(f, "The game's eboot.bin is missing."),
@@ -95,7 +105,7 @@ pub fn param(app: &Path) -> Result<(String, String), Problem> {
 pub fn check(dir: &Path) -> Result<Game, Problem> {
     let app = locate(dir).ok_or(Problem::NotFound)?;
     let (id, version) = param(&app)?;
-    if id != TITLE_ID {
+    if !is_demons_souls(&id) {
         return Err(Problem::OtherGame(id));
     }
     if version != VERSION {
@@ -122,7 +132,7 @@ pub fn check(dir: &Path) -> Result<Game, Problem> {
     if let Some(d) = DATA_DIRS.iter().find(|d| !app.join(d).is_dir()) {
         return Err(Problem::MissingData(d.to_string()));
     }
-    Ok(Game { app, code, version })
+    Ok(Game { id, app, code, version })
 }
 
 /// Whether the executable is the one the port was tested with (its SHA-256).

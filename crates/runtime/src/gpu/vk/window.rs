@@ -296,6 +296,14 @@ pub fn simulate_activation(active: bool) {
     }
 }
 
+/// Tests: the message a monitor's mode change sends (with the primary screen's size now).
+pub fn simulate_display_change() {
+    if let Some(w) = get() {
+        let (cx, cy) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+        unsafe { PostMessageW(w.hwnd as HWND, WM_DISPLAYCHANGE, 32, ((cy as isize) << 16 | (cx as isize & 0xFFFF)) as LPARAM) };
+    }
+}
+
 /// The PC tab's Monitor, Resolution or Refresh Rate changed: the window mode is applied again.
 pub fn reapply_mode() {
     set_window_mode(MODE_REAPPLY);
@@ -675,6 +683,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
         }
+        // No screen saver or monitor power-off while the game is in front (a controller alone
+        // moves no mouse and presses no key Windows sees; the execution state set at creation
+        // keeps the display on, this keeps the screen saver off too).
+        // (SC_SCREENSAVE 0xF140, SC_MONITORPOWER 0xF170.)
+        WM_SYSCOMMAND if matches!(wp & 0xFFF0, 0xF140 | 0xF170) && FOCUSED.load(Ordering::Relaxed) => 0,
         WM_DISPLAYCHANGE => {
             // A monitor's mode or the desktop's layout changed (the port's own exclusive mode,
             // or the player's): a fullscreen window covers its monitor again.

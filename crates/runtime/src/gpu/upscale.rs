@@ -30,8 +30,7 @@
 //! FSR: AMD's FSR API (amd_fidelityfx_loader_vk.dll, which loads amd_fidelityfx_upscaler_vk.dll
 //! beside it: FSR 4 on the AMD GPUs it supports, else FSR 3.1; MIT).
 //!
-//! The design and most of this code come from the user's other port (its own work, reused with
-//! the user's permission).
+//! The design and most of this code come from the author's own earlier work.
 //!
 //! Debug: `DS_UPSCALER=off|xess|dlss|fsr` chooses at start and prepares only that library;
 //! `DS_UPSCALE_MV=<x>,<y>` multiplies the motion vectors' scale, `DS_UPSCALE_JITTER=<x>,<y>`

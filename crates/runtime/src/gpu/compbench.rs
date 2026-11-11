@@ -272,11 +272,35 @@ pub fn precompile_all(app: &std::path::Path, threads: usize, progress: Option<&s
         return 2;
     }
     let t_all = Instant::now();
-    let mut progs: Vec<(u64, std::sync::Arc<Vec<u32>>, rdna::translate::Spec, usize)> = bundle_compute(app).into_iter().filter_map(|(h, code, mut specs)| Some((h, code.clone(), specs.pop()?, code.len()))).collect();
-    // (The largest first: they set the end.)
-    progs.sort_by(|a, b| b.3.cmp(&a.3));
+    // Each program's variants as its dispatches prepare them: with LOD statistics in rotation
+    // (`shaders::cs_lod_rotation`) a dispatch is prepared without them first (every first use),
+    // and a measuring one (one in `tune lod_cs`, binding counted textures: programs that sample
+    // images) with them; the variants without statistics come first, all of them, the largest
+    // first (they set the end).
+    let mut first = Vec::new();
+    let mut second = Vec::new();
+    for (h, code, mut specs) in bundle_compute(app) {
+        let Some(spec) = specs.pop() else { continue };
+        let n = code.len();
+        if spec.lod_stats && !spec.batched && super::shaders::cs_lod_rotation() {
+            let mut plain = spec.clone();
+            plain.lod_stats = false;
+            plain.lod_lean = false;
+            first.push((h, code.clone(), plain, n));
+            if spec.resources.iter().any(|r| matches!(r, rdna::translate::ResSpec::Image { .. })) {
+                second.push((h, code, spec, n));
+            }
+        } else {
+            first.push((h, code, spec, n));
+        }
+    }
+    first.sort_by(|a, b| b.3.cmp(&a.3));
+    second.sort_by(|a, b| b.3.cmp(&a.3));
+    crate::info!("precompile all: {} variants dispatches use first, then {} measuring LOD statistics", first.len(), second.len());
+    let mut progs: Vec<(u64, std::sync::Arc<Vec<u32>>, rdna::translate::Spec, usize)> = first;
+    progs.extend(second);
     let total_words: usize = progs.iter().map(|p| p.3).sum();
-    crate::info!("precompile all: {} compute programs ({} code words) on {threads} threads", progs.len(), total_words);
+    crate::info!("precompile all: {} compute pipelines ({} code words) on {threads} threads", progs.len(), total_words);
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
     let code_done = AtomicU64::new(0);

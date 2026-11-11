@@ -10,6 +10,7 @@ mod log;
 mod ehframe;
 mod achievements;
 mod audio;
+mod cpucheck;
 mod exception;
 mod gpu;
 mod guestprof;
@@ -589,6 +590,8 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     // (the window's own activation messages).
                     (Some("background"), _) => Ok(gpu::vk::window::simulate_activation(false)),
                     (Some("foreground"), _) => Ok(gpu::vk::window::simulate_activation(true)),
+                    // `window displaychange`: what a monitor's mode change sends the window.
+                    (Some("displaychange"), _) => Ok(gpu::vk::window::simulate_display_change()),
                     (Some("size"), Some(v)) if size(v).is_some() => {
                         let (w, h) = size(v).unwrap();
                         gpu::vk::window::set_client_size(w, h);
@@ -1055,6 +1058,41 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 gpu::upscale::set_jitter_scale(x, y);
                 Ok(())
             }
+            "wsinfo" | "wstrim" => {
+                // Diagnosis: `wsinfo` logs the process's working set, private bytes and page
+                // faults; `wstrim` empties the working set first (what play touches again in a
+                // while is its hot set: the RAM it needs to run without paging).
+                use windows_sys::Win32::System::ProcessStatus::{EmptyWorkingSet, GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
+                use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                let info = || {
+                    let mut c: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+                    c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+                    unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut c as *mut PROCESS_MEMORY_COUNTERS_EX as *mut PROCESS_MEMORY_COUNTERS, c.cb) };
+                    format!("working set {} MiB (peak {}), private {} MiB, page faults {}", c.WorkingSetSize >> 20, c.PeakWorkingSetSize >> 20, c.PrivateUsage >> 20, c.PageFaultCount)
+                };
+                if cmd == "wstrim" {
+                    info!("wstrim: before: {}", info());
+                    let t = Instant::now();
+                    unsafe { EmptyWorkingSet(GetCurrentProcess()) };
+                    info!("wstrim: emptied in {:.0} ms: {}", t.elapsed().as_secs_f64() * 1000.0, info());
+                } else {
+                    info!("wsinfo: {}", info());
+                }
+                Ok(())
+            }
+            "pcstate" => {
+                // Tests: every PC setting's stored value beside what is in effect, and the
+                // title's console variables (settings tests: an effect, and the same after a
+                // restart).
+                pcsettings::state_report();
+                Ok(())
+            }
+            "devicelost" => {
+                // Tests: the GPU device taken as lost (the game ends as on a real loss).
+                warn!("devicelost: the GPU device taken as lost (test)");
+                gpu::exec::lose_device();
+                Ok(())
+            }
             "taadump" => {
                 // `taadump <name>`: the TAA's input colour at its next dispatch (diagnosis).
                 let name: String = parts.next().unwrap_or("taa").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || *c == ':').collect();
@@ -1309,7 +1347,7 @@ fn fscan(cmd: &str, arg: &str) -> Result<(), String> {
 pub fn fatal_report(text: &str) {
     crate::log::write(crate::log::Level::Error, format_args!("{text}"));
     if let Some(dir) = RUN_DIR.get() {
-        let _ = std::fs::write(dir.join("crash.txt"), text);
+        let _ = std::fs::write(dir.join("crash.txt"), crate::log::redact(text).as_bytes());
     }
     keep_run("crashed (crash.txt)");
 }
@@ -1355,6 +1393,20 @@ fn thread_summary_ex(with_stacks: bool) -> String {
     s
 }
 
+/// Exit codes the launcher knows (`crates/launcher`): the game files cannot be used (told at
+/// start), the processor lacks what the game's code needs, the GPU device was lost.
+pub const EXIT_GAME_FILES: u32 = 3;
+pub const EXIT_CPU: u32 = 8;
+pub const EXIT_DEVICE_LOST: u32 = 5;
+/// The game's modules could not be loaded, linked or patched (told by `fatal_exit`).
+pub const EXIT_START: u32 = 0xD502;
+/// Another session runs with the same data folder (told at start).
+pub const EXIT_RUNNING: u32 = 9;
+/// The process could not be set up before its log (told at start).
+pub const EXIT_EARLY: u32 = 10;
+/// Windows ran out of memory for the game (told by `fatal_exit`).
+pub const EXIT_MEMORY: u32 = 7;
+
 /// Whether this run has no window (`--headless`): no message boxes then.
 pub static HEADLESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -1372,7 +1424,47 @@ pub fn player_error(text: &str) {
     unsafe { MessageBoxW(std::ptr::null_mut(), m.as_ptr(), t.as_ptr(), MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST) };
 }
 
+/// What the player is told when the game has to end (`fatal_exit`), with its log folder.
+fn fatal_text(code: u32, reason: &str) -> String {
+    let log = RUN_DIR.get().map(|d| format!("\n\nThe log is in:\n{}", d.display())).unwrap_or_default();
+    match code {
+        EXIT_DEVICE_LOST => format!("The graphics card stopped responding, so the game has to close.\n\nUpdating the graphics driver may help. If it happens again, please report it and attach the log.{log}"),
+        EXIT_MEMORY => format!("Windows ran out of memory for the game, so it has to close.\n\nClose other programs and start the game again. If it happens again, let Windows manage the page file size (Settings > System > About > Advanced system settings > Performance > Advanced > Virtual memory).{log}"),
+        EXIT_START => format!("The game could not start ({reason}).\n\nPlease report it and attach the log.{log}"),
+        _ => format!("The game met an error it cannot recover from and has to close.\n\nPlease report it and attach the log.{log}"),
+    }
+}
+
+/// One game session at a time for a data folder (two would share saves, settings and the
+/// shader store): a second start is told and ends. Modes that run no game are not counted.
+fn single_instance(cfg: &Config) {
+    if cfg.precompile_all.is_some() || cfg.compile_bench.is_some() {
+        return;
+    }
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+    // (Named by the data folder: a checkout and a player's install do not exclude each other.)
+    let key: String = cfg.paths.user.display().to_string().chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).collect();
+    let name: Vec<u16> = format!("Local\\DemonsSoulsPort_{key}").encode_utf16().chain(std::iter::once(0)).collect();
+    // (Kept for the process's life: never closed.)
+    let h = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    if !h.is_null() && unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        error!("another game session runs with the same data folder: this start ends");
+        player_error("The game is already running.");
+        log::flush();
+        std::process::exit(EXIT_RUNNING as i32);
+    }
+}
+
+/// Only the first thread that ends the game tells the player (others wait for the end).
+static ENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn fatal_exit(code: u32, reason: &str) -> ! {
+    if ENDING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
     // Exclusive fullscreen's display mode back first (the desktop must not stay changed).
     display::restore_on_exit();
     session_ended();
@@ -1381,6 +1473,11 @@ pub fn fatal_exit(code: u32, reason: &str) -> ! {
     let summary = if reason == "fatal exception" { thread_summary_ex(true) } else { thread_summary() };
     crate::log::write(crate::log::Level::Error, format_args!("terminating: {reason}\n{summary}"));
     crate::log::try_flush();
+    // The player is told (the game's window out of the way of the message).
+    if let Some(w) = gpu::vk::window::get() {
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(w.hwnd as _, windows_sys::Win32::UI::WindowsAndMessaging::SW_MINIMIZE) };
+    }
+    player_error(&fatal_text(code, reason));
     unsafe {
         windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), code);
     }
@@ -1465,15 +1562,20 @@ fn main() {
     }
     // The guest address range must be reserved before the process grows
     // (the first heap allocation reserved it already, see `heap`).
+    // (Before the log exists: the player is told, and the launcher shows the code.)
     if let Err(e) = mem::reserve_guest_range() {
         eprintln!("{e}");
-        std::process::exit(2);
+        player_error(&format!("The game could not reserve the memory range its program needs ({e}).
+
+This happens when other software takes that range. Restart the PC and try again."));
+        std::process::exit(EXIT_EARLY as i32);
     }
     let slot = match tls::init_slot() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("{e}");
-            std::process::exit(2);
+            player_error(&format!("The game could not set up its threads ({e})."));
+            std::process::exit(EXIT_EARLY as i32);
         }
     };
     let cfg = parse_args();
@@ -1492,10 +1594,10 @@ fn main() {
     log::set_thread_name("host");
     // Panics (host threads abort the process) are logged with the thread
     // that panicked: the run log is what post-mortems read.
-    let default_hook = std::panic::take_hook();
+    // A panic ends the game as a crash does (the player told, the display mode back).
     std::panic::set_hook(Box::new(move |info| {
         crate::error!("panic: {info}");
-        default_hook(info);
+        crate::fatal_exit(0xD540, "panic");
     }));
     if cfg.debug || cfg.trace {
         log::LEVEL.store(log::Level::Debug as u8, std::sync::atomic::Ordering::Relaxed);
@@ -1508,8 +1610,10 @@ fn main() {
         error!("game files: {}", p.replace('\n', " "));
         player_error(p);
         log::flush();
-        std::process::exit(3);
+        std::process::exit(EXIT_GAME_FILES as i32);
     }
+    cpucheck::check();
+    single_instance(&cfg);
     exception::install();
     heapsites::start();
     hosted::init();
@@ -1620,20 +1724,20 @@ fn main() {
     let t0 = Instant::now();
     let eboot = loader::load(&cfg.code.join("eboot.bin"), true).unwrap_or_else(|e| {
         error!("loading eboot failed: {e}");
-        fatal_exit(1, "load failure");
+        fatal_exit(EXIT_START, "load failure");
     });
     let mut libs: Vec<Arc<loader::LoadedModule>> = Vec::new();
     for name in ["libc.prx", "libSceNpCppWebApi.prx"] {
         let p = cfg.code.join("sce_module").join(name);
         if !p.exists() {
             error!("{name} not found in {}", p.display());
-            fatal_exit(1, "missing title module");
+            fatal_exit(EXIT_START, "missing title module");
         }
         match loader::load(&p, false) {
             Ok(m) => libs.push(m),
             Err(e) => {
                 error!("loading {name} failed: {e}");
-                fatal_exit(1, "load failure");
+                fatal_exit(EXIT_START, "load failure");
             }
         }
     }
@@ -1644,7 +1748,7 @@ fn main() {
             Ok(s) => info!("{}: linked (lle {}, hle {}, unresolved {}, weak-null {})", m.name, s.lle, s.hle, s.unresolved, s.weak_null),
             Err(e) => {
                 error!("relocating {} failed: {e}", m.name);
-                fatal_exit(1, "link failure");
+                fatal_exit(EXIT_START, "link failure");
             }
         }
     }
@@ -1653,7 +1757,7 @@ fn main() {
             Ok(s) => loader::report_patch(m, &s),
             Err(e) => {
                 error!("finalizing {} failed: {e}", m.name);
-                fatal_exit(1, "patch failure");
+                fatal_exit(EXIT_START, "patch failure");
             }
         }
     }

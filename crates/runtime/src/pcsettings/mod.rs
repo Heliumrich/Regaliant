@@ -453,6 +453,38 @@ pub fn window_mode() -> Option<u32> {
     store::value("Setting_PC_WindowMode")
 }
 
+/// Tests (`pcstate`): each PC setting's stored value and what is in effect, then the title's
+/// console variables.
+pub fn state_report() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let v = |id: &str| store::value(&format!("Setting_PC_{id}")).map_or("-".to_string(), |x| x.to_string());
+    let f = |id: &str| store::value(&format!("Setting_PC_{id}")).map_or("-".to_string(), |x| format!("{:.2}", f32::from_bits(x)));
+    let up = crate::gpu::upscale::choice();
+    let lines = [
+        format!("WindowMode {} (window in mode {})", v("WindowMode"), crate::gpu::vk::window::window_mode()),
+        format!("HdrOutput {} (HDR allowed {}, output range {})", v("HdrOutput"), hdr_allowed(), crate::hle::libs::videoout::dynamic_range()),
+        format!("AspectRatio {} (output {:?})", v("AspectRatio"), crate::dispmode::output_size()),
+        format!("RenderScale {} (scale {}%)", v("RenderScale"), crate::dispmode::SCALE_PCT.load(Relaxed)),
+        format!("Sharpening {} (amount {:.2})", f("Sharpening"), f32::from_bits(crate::gpu::vk::sharpen::AMOUNT.load(Relaxed))),
+        format!("MouseSensitivity {} (in effect {:.2})", f("MouseSensitivity"), f32::from_bits(crate::input::PC_SENSITIVITY.load(Relaxed))),
+        format!("InvertMouseY {} (in effect {})", v("InvertMouseY"), crate::input::PC_INVERT_Y.load(Relaxed)),
+        format!("AudioOutput {} (in effect {})", v("AudioOutput"), crate::hle::libs::audio2::OUTPUT_CHOICE.load(Relaxed)),
+        format!("QualityPreset (shown {})", presets::current()),
+        format!("GeometryDetail {}", v("GeometryDetail")),
+        format!("TextureFiltering {} (anisotropy {})", v("TextureFiltering"), crate::gpu::images::ANISO.load(Relaxed)),
+        format!("AntiAliasing {:?} (upscaler {up:?})", store::raw_value("Setting_PC_AntiAliasing")),
+        format!("Bloom {} / Vignette {}", v("Bloom"), v("Vignette")),
+        format!("FrameRateLimit {} (frame cap {}, uncapped {})", v("FrameRateLimit"), crate::gpu::tune::frame_cap(), crate::gpu::tune::uncapped()),
+        format!("MouseMotionBlur {} (in effect {})", v("MouseMotionBlur"), MOUSE_BLUR.load(Relaxed)),
+        format!("UiSize {} (scale {:.2})", v("UiSize"), ui_size()),
+        format!("HudMargin {} (safe area {:?})", v("HudMargin"), safe_area()),
+        format!("ButtonPrompts {} (in effect {})", v("ButtonPrompts"), prompts::MODE.load(Relaxed)),
+        format!("SkipIntro {} / SaveFolder {} / ImportSaves {}", v("SkipIntro"), v("SaveFolder"), v("ImportSaves")),
+    ];
+    crate::info!("pc settings: state: {}", lines.join("; "));
+    convar::report();
+}
+
 /// A tab the port adds to the SETTINGS screen (a copy of DISPLAY's tab and page).
 pub struct Tab {
     /// Its copies' salt and the tab entity's name.

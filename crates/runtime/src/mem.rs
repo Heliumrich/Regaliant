@@ -1851,6 +1851,28 @@ pub fn host_calls_line() -> String {
     )
 }
 
+/// A commit Windows refused for want of memory (its commit limit: RAM and page file): tried
+/// again for about 3 s while memory frees up, then the game ends with a message (the title
+/// would fail on the refused mapping in a way the player cannot read). Other failures: false.
+fn commit_retry(a: u64, n: u64, prot: u32) -> bool {
+    const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
+    const ERROR_COMMITMENT_LIMIT: u32 = 1455;
+    let e = last_error();
+    if e != ERROR_NOT_ENOUGH_MEMORY && e != ERROR_COMMITMENT_LIMIT {
+        return false;
+    }
+    crate::warn!("mem: Windows refused to commit {n:#x} bytes at {a:#x} (error {e}: out of memory); trying again");
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if !unsafe { VirtualAlloc(a as _, n as usize, MEM_COMMIT, prot) }.is_null() {
+            crate::info!("mem: the commit at {a:#x} went through on a later try");
+            return true;
+        }
+    }
+    crate::error!("mem: Windows still refuses to commit {n:#x} bytes at {a:#x} (error {}): out of memory", last_error());
+    crate::fatal_exit(crate::EXIT_MEMORY, "out of memory")
+}
+
 fn host_commit(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
     let t0 = std::time::Instant::now();
     crate::gpu::track::remapped(addr, size, crate::gpu::track::REMAP_COMMIT);
@@ -1894,7 +1916,7 @@ fn host_commit(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
     let mut ok = true;
     // (View windows are committed with their views.)
     for (a, e) in host_pieces(addr, addr + size).filter(|&(a, _)| !view_window(a)) {
-        if unsafe { VirtualAlloc(a as _, (e - a) as usize, MEM_COMMIT, win_prot(prot)) }.is_null() {
+        if unsafe { VirtualAlloc(a as _, (e - a) as usize, MEM_COMMIT, win_prot(prot)) }.is_null() && !commit_retry(a, e - a, win_prot(prot)) {
             ok = false;
             break;
         }

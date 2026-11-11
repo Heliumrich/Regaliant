@@ -1,6 +1,6 @@
 [package]
 name = "launcher"
-version = "0.1.0"
+version.workspace = true
 description = "The Demon's Souls port's launcher: the game folder, shader preparation, saves and their backups, Play"
 edition.workspace = true
 license.workspace = true

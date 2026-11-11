@@ -3,6 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
+version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 rust-version = "1.85"
@@ -31,6 +32,15 @@ inherits = "release-lto"
 
 [profile.release-pgo]
 inherits = "release-lto"
+
+# The player package (scripts/package.ps1): release-lto without debug information, stripped,
+# built with the profile release-pgo uses (dsport) and the release flags (a static C runtime,
+# this machine's paths remapped).
+[profile.dist]
+inherits = "release-lto"
+debug = false
+strip = true
+incremental = false
 
 [profile.dev.package."*"]
 opt-level = 2

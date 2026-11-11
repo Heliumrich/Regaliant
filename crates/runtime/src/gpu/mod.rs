@@ -1137,8 +1137,8 @@ pub mod tune {
 
     /// Measurement only: draws (bit 0) and dispatches (bit 1) are not
     /// recorded while the command processors still execute their packets,
-    /// labels and writes: the title's own frame without our GPU work (the user's
-    /// other port's `skip_cmds`). Wrong pictures and GPU-written
+    /// labels and writes: the title's own frame without our GPU work. Wrong
+    /// pictures and GPU-written
     /// data the title reads stay stale.
     #[inline]
     pub fn skip_cmds() -> u64 {

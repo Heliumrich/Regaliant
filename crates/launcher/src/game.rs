@@ -96,6 +96,9 @@ pub fn check(app: &mut App, dir: &Path, keep: bool) {
                 }
             }
             let mut t = format!("Demon's Souls {} is ready.\nFound in {}.", g.version, ui::short(&g.app, 90));
+            if g.id != dsconfig::game::TITLE_ID {
+                t.push_str(&format!("\nThis is the {} release. The port was tested with {}.", g.id, dsconfig::game::TITLE_ID));
+            }
             match dsconfig::game::tested_executable(&g) {
                 Ok(true) => {}
                 Ok(false) => t.push_str("\nIts executable differs from the one this port was tested with. It may not work."),

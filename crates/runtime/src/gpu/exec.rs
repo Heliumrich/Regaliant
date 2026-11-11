@@ -66,6 +66,12 @@ pub fn lose_device() -> bool {
     let first = !DEVICE_LOST.swap(true, Ordering::SeqCst);
     if first {
         crate::keep_run("the GPU device was lost");
+        // Nothing is drawn any more: the game ends, the player told, once the device's own
+        // reports (fault, checkpoints) are logged.
+        let _ = std::thread::Builder::new().name("device-lost".into()).spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            crate::fatal_exit(crate::EXIT_DEVICE_LOST, "the GPU device was lost");
+        });
     }
     first
 }

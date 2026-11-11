@@ -20,9 +20,10 @@ enum Change {
 
 struct Fix {
     name: &'static str,
-    /// Module-relative address of `from` in the main executable.
+    /// Module-relative address of the instructions the fix expects in the main executable.
     offset: usize,
-    from: &'static [u8],
+    /// Their length and FNV-1a hash (the game's own bytes are not kept in the port's source).
+    from: (usize, u64),
     change: Change,
     kind: &'static str,
     why: &'static str,
@@ -55,7 +56,7 @@ const FIXES: &[Fix] = &[
         // 2026-10-19 night). The inserted code clears the index there, as the
         // destroy's own slot path does (eboot+0xd48f4).
         offset: 0xd5372,
-        from: &[0x48, 0x8b, 0x49, 0x28, 0x4c, 0x3b, 0xa3, 0x70, 0x02, 0x00, 0x00],
+        from: (11, 0xa66232c848f2b6bb),
         change: Change::Insert { at: 4, code: cmesh_unload_code },
         kind: "title bug",
         why: "components the collision mesh unload returns to the pending list lose their slot index",
@@ -66,7 +67,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "idle job workers sleep (wait)",
         offset: 0x83b6fd,
-        from: &[0xf3, 0x90, 0x4e, 0x8b, 0xbc, 0xf3, 0x10, 0x0e, 0x00, 0x00],
+        from: (10, 0x6404c4c949f860c6),
         change: Change::Hook { at: 0, handler: crate::jobidle::wait_hook },
         kind: "shared-PC adaptation, `tune job_idle`",
         why: "the title's 13 job workers poll for work on 13 logical CPUs at all times",
@@ -77,7 +78,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "idle job workers sleep (take)",
         offset: 0x83bf17,
-        from: &[0x49, 0x81, 0xc7, 0x20, 0x92, 0x00, 0x00],
+        from: (7, 0x71e3819aac9c152e),
         change: Change::Hook { at: 0, handler: crate::jobidle::take_hook },
         kind: "shared-PC adaptation, `tune job_idle`",
         why: "jobs whose conditions do not hold yet are taken and put back by every worker without pause",
@@ -88,7 +89,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "idle job workers sleep (run)",
         offset: 0x83b570,
-        from: &[0x48, 0x89, 0xdf, 0x4c, 0x89, 0xfe],
+        from: (6, 0xe2b7f7c3f95da47a),
         change: Change::Hook { at: 0, handler: crate::jobidle::run_hook },
         kind: "shared-PC adaptation, `tune job_idle`",
         why: "a worker that runs a job is busy again",
@@ -100,7 +101,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "raw mouse look (stick)",
         offset: 0x18bd99,
-        from: &[0x8b, 0x7b, 0x74, 0x48, 0x8b, 0x33],
+        from: (6, 0x6b3b326505e11815),
         change: Change::Hook { at: 0, handler: crate::camhook::stick_hook },
         kind: "PC controls, `mouse_look_raw`",
         why: "mouse look through the right stick inherits the stick's response curve and top speed",
@@ -112,7 +113,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "raw mouse look (angles)",
         offset: 0x18d1c4,
-        from: &[0x49, 0x8b, 0x07, 0x48, 0x3b, 0x45, 0xe0],
+        from: (7, 0xd82de55227e30b5e),
         change: Change::Hook { at: 0, handler: crate::camhook::apply_hook },
         kind: "PC controls, `mouse_look_raw`",
         why: "the mouse turns the camera by its counts, not through the stick",
@@ -123,7 +124,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "raw mouse look (bow aim)",
         offset: 0x176936,
-        from: &[0xc5, 0xfa, 0x10, 0x8b, 0x9c, 0x00, 0x00, 0x00],
+        from: (8, 0xd74d122ae79883ef),
         change: Change::Hook { at: 0, handler: crate::camhook::aim_hook },
         kind: "PC controls, `mouse_look_raw`",
         why: "the mouse aims the bow by its counts, not through the stick",
@@ -135,7 +136,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "camera rigs (diagnosis)",
         offset: 0x181b00,
-        from: &[0x55, 0x48, 0x89, 0xe5, 0x41, 0x57],
+        from: (6, 0x82d75a35aabe38aa),
         change: Change::Hook { at: 0, handler: crate::camhook::rig_hook },
         kind: "diagnosis",
         why: "the `cam` command lists the camera rigs and their controllers",
@@ -146,7 +147,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "TAA jitter noted",
         offset: 0x9ed8d0,
-        from: &[0x48, 0x8b, 0x47, 0x68, 0x83, 0xb8, 0xac, 0x0a, 0x00, 0x00, 0x00],
+        from: (11, 0x93065f1746a483d6),
         change: Change::Hook { at: 0, handler: crate::jitter::hook },
         kind: "PC settings: DLSS, FSR, XeSS",
         why: "the upscalers need each frame's jitter, which the title keeps in its projection",
@@ -158,7 +159,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "display mode held (render resolution)",
         offset: 0x9fe6a8,
-        from: &[0x85, 0xc9, 0x0f, 0x45, 0xf1],
+        from: (5, 0x64be9b4d9841022e),
         change: Change::Hook { at: 0, handler: crate::dispmode::hook_display },
         kind: "PC settings: Render Scale, `DS_DISPLAY_MODE`",
         why: "the title's render resolution follows its options (2560x1440 at the gate) and no PC setting",
@@ -169,7 +170,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "display mode held (effective mode)",
         offset: 0xb2606e,
-        from: &[0x85, 0xc9, 0x0f, 0x45, 0xf1],
+        from: (5, 0x64be9b4d9841022e),
         change: Change::Hook { at: 0, handler: crate::dispmode::hook_rax },
         kind: "PC settings, `DS_DISPLAY_MODE`",
         why: "the effective mode follows the options",
@@ -180,7 +181,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "display mode held (UI scale)",
         offset: 0xde88c0,
-        from: &[0x45, 0x85, 0xff, 0x48, 0x8b, 0x0a],
+        from: (6, 0x009edbe6ece0abb9),
         change: Change::Hook { at: 0, handler: crate::dispmode::hook_r15 },
         kind: "PC settings, `DS_DISPLAY_MODE`",
         why: "the UI's scale follows the options' mode (4K for modes 3-5)",
@@ -191,7 +192,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "display mode held (frame settings)",
         offset: 0xa4f2e9,
-        from: &[0xba, 0x01, 0x00, 0x00, 0x00],
+        from: (5, 0x5019e61086cedfec),
         change: Change::Hook { at: 0, handler: crate::dispmode::hook_snapshot },
         kind: "PC settings, `DS_DISPLAY_MODE`",
         why: "the frame's copy of the settings keeps the options' mode",
@@ -204,7 +205,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "render size",
         offset: 0x90a6fc,
-        from: &[0x48, 0x8d, 0xbb, 0xa8, 0x00, 0x00, 0x00],
+        from: (7, 0x1ff36c6035ccf317),
         change: Change::Hook { at: 0, handler: crate::dispmode::hook_render_size },
         kind: "PC settings, `DS_RENDER_SIZE`",
         why: "the title renders at its mode's size (2560x1440 at the gate) and no PC setting",
@@ -216,7 +217,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "output size (constructor)",
         offset: 0x90b278,
-        from: &[0x4c, 0x89, 0xfe, 0x48, 0x8b, 0x38],
+        from: (6, 0x2247b521bcdead6b),
         change: Change::Hook { at: 0, handler: crate::dispmode::hook_ctor_sizes },
         kind: "PC settings (Aspect Ratio), `DS_OUTPUT_SIZE`",
         why: "the title outputs 3840x2160 whatever the display",
@@ -227,7 +228,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "output size (display target 0)",
         offset: 0x90af7e,
-        from: &[0xba, 0x01, 0x00, 0x00, 0x00],
+        from: (5, 0x5019e61086cedfec),
         change: Change::Hook { at: 0, handler: crate::dispmode::hook_targets },
         kind: "PC settings (Aspect Ratio), `DS_OUTPUT_SIZE`",
         why: "the display targets are made at 3840x2160",
@@ -236,7 +237,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "output size (display target 1)",
         offset: 0x90b06b,
-        from: &[0xba, 0x01, 0x00, 0x00, 0x00],
+        from: (5, 0x5019e61086cedfec),
         change: Change::Hook { at: 0, handler: crate::dispmode::hook_targets },
         kind: "PC settings (Aspect Ratio), `DS_OUTPUT_SIZE`",
         why: "the display targets are made at 3840x2160",
@@ -247,7 +248,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "output size (size getter)",
         offset: 0x90ac57,
-        from: &[0x48, 0x89, 0x56, 0x0c, 0x44, 0x89, 0x4e, 0x14],
+        from: (8, 0xe366030876dbf04d),
         change: Change::Hook { at: 0, handler: crate::dispmode::hook_size_getter },
         kind: "PC settings (Aspect Ratio), `DS_OUTPUT_SIZE`",
         why: "the mode's sizes come from per-mode tables (the UI's target among their users)",
@@ -258,7 +259,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "output size (UI canvas)",
         offset: 0xde85db,
-        from: &[0x48, 0x8d, 0x75, 0xd0, 0x48, 0x89, 0xdf],
+        from: (7, 0xa7e4cfea432e97d5),
         change: Change::Hook { at: 0, handler: crate::dispmode::hook_ui_canvas },
         kind: "PC settings (Aspect Ratio), `DS_OUTPUT_SIZE`",
         why: "the UI is laid out on a 3840x2160 canvas in modes 3-5",
@@ -270,7 +271,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "setting changes (PC settings)",
         offset: 0xb4700,
-        from: &[0x55, 0x48, 0x89, 0xe5, 0x53, 0x50],
+        from: (6, 0x83070935aae6d2c9),
         change: Change::Hook { at: 0, handler: crate::pcsettings::changed_hook },
         kind: "PC settings",
         why: "the port applies its settings when the title's SETTINGS screen changes them",
@@ -284,7 +285,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "button prompts (glyphs)",
         offset: 0x150e645,
-        from: &[0x48, 0x8d, 0x8d, 0x70, 0xff, 0xff, 0xff],
+        from: (7, 0x5852fe0d91453bd2),
         change: Change::Hook { at: 0, handler: crate::pcsettings::prompts::glyph_hook },
         kind: "PC controls",
         why: "the title's text shows PlayStation buttons only: keyboard, mouse and Xbox glyphs stand in for them",
@@ -293,7 +294,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "PC settings (bool lookups)",
         offset: 0xc3a8e5,
-        from: &[0x49, 0x8b, 0x4d, 0x18, 0x49, 0x8b, 0x55, 0x20],
+        from: (8, 0xc752abb0241b5555),
         change: Change::Hook { at: 0, handler: crate::pcsettings::store::eval_bool_hook },
         kind: "PC settings",
         why: "the achievement pop-up is shown by a setting the title's store does not hold",
@@ -302,7 +303,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "PC settings (int lookups)",
         offset: 0xc24245,
-        from: &[0x49, 0x8b, 0x4d, 0x40, 0x49, 0x8b, 0x55, 0x48],
+        from: (8, 0xd03f73fd5c6e9315),
         change: Change::Hook { at: 0, handler: crate::pcsettings::store::eval_int_hook },
         kind: "PC settings",
         why: "the title's store holds only the settings it registers",
@@ -311,7 +312,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "PC settings (float lookups)",
         offset: 0xc24d15,
-        from: &[0x49, 0x8b, 0x85, 0x90, 0x00, 0x00, 0x00],
+        from: (7, 0x75b77c455c297c78),
         change: Change::Hook { at: 0, handler: crate::pcsettings::store::eval_float_hook },
         kind: "PC settings",
         why: "the title's store holds only the settings it registers",
@@ -321,7 +322,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "PC settings (int changes)",
         offset: 0xfa5cba,
-        from: &[0x48, 0xc7, 0x45, 0xb8, 0x00, 0x00, 0x00, 0x00],
+        from: (8, 0x484e6b386f04fc65),
         change: Change::Hook { at: 0, handler: crate::pcsettings::store::set_int_hook },
         kind: "PC settings",
         why: "the port keeps and applies the PC settings the menu changes",
@@ -330,7 +331,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "PC settings (float changes)",
         offset: 0xfa5ee5,
-        from: &[0x48, 0xc7, 0x45, 0xb8, 0x00, 0x00, 0x00, 0x00],
+        from: (8, 0x484e6b386f04fc65),
         change: Change::Hook { at: 0, handler: crate::pcsettings::store::set_float_hook },
         kind: "PC settings",
         why: "the port keeps and applies the PC settings the menu changes",
@@ -341,7 +342,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "engine map (frame allocators)",
         offset: 0x8114a0,
-        from: &[0xc6, 0x47, 0x08, 0x01, 0x48, 0x8d, 0x8f, 0xc8, 0x00, 0x00, 0x00],
+        from: (11, 0x2e28f44da0de2f7b),
         change: Change::Hook { at: 0, handler: crate::engine::frame_alloc_hook },
         kind: "engine map (read only)",
         why: "the port learns the frame allocators and the GPU arena (front end 4)",
@@ -352,7 +353,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "engine map (arena allocations)",
         offset: 0x8121b2,
-        from: &[0x4a, 0x8d, 0x4c, 0x20, 0x07],
+        from: (5, 0x041cfc8b570b0201),
         change: Change::Insert { at: 0, code: crate::engine::alloc_insert_code },
         kind: "engine map (read only)",
         why: "the port records the GPU arena's allocations per MiB (front end 4's allocation table)",
@@ -363,7 +364,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "engine map (arena tag frees)",
         offset: 0x7fe5d4,
-        from: &[0x49, 0x8b, 0x80, 0x28, 0x07, 0x00, 0x00],
+        from: (7, 0x9ea495a12cbad53e),
         change: Change::Hook { at: 0, handler: crate::engine::arena_free_hook },
         kind: "engine map (read only)",
         why: "the port marks the GPU arena's freed units (front end 4's allocation table)",
@@ -375,7 +376,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "engine map (arena allocation census)",
         offset: 0x8121b7,
-        from: &[0x31, 0xd2, 0x48, 0x83, 0xe1, 0xf8],
+        from: (6, 0x9f059237e9db26e6),
         change: Change::Hook { at: 0, handler: crate::engine::alloc_census_hook },
         kind: "engine map (read only)",
         why: "the port counts the GPU arena's allocations by their call site (census)",
@@ -387,7 +388,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "engine map (heap census)",
         offset: 0x802c2a,
-        from: &[0x48, 0x89, 0xd8, 0x48, 0x83, 0xc4, 0x28],
+        from: (7, 0xe655972d0f24a80f),
         change: Change::Hook { at: 0, handler: crate::engine::heap_census_hook },
         kind: "engine map (read only)",
         why: "the port counts the engine heaps' blocks by their call site (census)",
@@ -399,7 +400,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "engine map (readback census)",
         offset: 0x909970,
-        from: &[0x31, 0xc0, 0x83, 0x7f, 0x1c, 0x1f],
+        from: (6, 0x46dff7a8af79963b),
         change: Change::Hook { at: 0, handler: crate::engine::rb_census_hook },
         kind: "engine map (read only)",
         why: "the port counts the engine's readbacks of GPU memory by caller and allocator (census)",
@@ -411,7 +412,7 @@ const FIXES: &[Fix] = &[
     Fix {
         name: "engine map (command buffers)",
         offset: 0x1d0a4fb,
-        from: &[0xc7, 0x40, 0x30, 0x00, 0x00, 0x00, 0x00],
+        from: (7, 0xea3ec3f71d77b206),
         change: Change::Hook { at: 0, handler: crate::engine::cb_init_hook },
         kind: "engine map (read only)",
         why: "the port learns the command buffers' extents (the GPU arena's coherence census)",
@@ -420,6 +421,11 @@ const FIXES: &[Fix] = &[
 ];
 
 /// Whether the fix of this name was applied.
+/// FNV-1a (64-bit) of `b`: how a fix's expected instructions are recognized.
+fn fnv1a(b: &[u8]) -> u64 {
+    b.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &x| (h ^ x as u64).wrapping_mul(0x0100_0000_01b3))
+}
+
 pub fn applied(name: &str) -> bool {
     FIXES.iter().position(|f| f.name == name).is_some_and(|i| APPLIED[i].load(Ordering::Relaxed))
 }
@@ -449,7 +455,7 @@ pub fn apply(p: &mut crate::patch::Patcher, ranges: &[(u64, u64)]) {
         if f.only_with.is_some_and(|v| v.split('|').all(|n| std::env::var_os(n).is_none())) {
             continue;
         }
-        if p.image.get(f.offset..f.offset + f.from.len()) != Some(f.from) {
+        if p.image.get(f.offset..f.offset + f.from.0).map(fnv1a) != Some(f.from.1) {
             crate::warn!("title fix '{}': unexpected bytes at eboot+{:#x} (another title version?); not applied", f.name, f.offset);
             continue;
         }

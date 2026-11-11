@@ -45,8 +45,14 @@ const ID_RESET: i32 = 903;
 const ID_LOGS: i32 = 904;
 const ID_STATUS_BAR: i32 = 906;
 
-/// The game's exit code when its files cannot be used (it told the player already).
+/// The game's exit codes when it told the player itself: its files cannot be used, the GPU
+/// device was lost, the processor lacks what the game needs (and 0xD5xx, errors it caught).
 const EXIT_GAME_FILES: i32 = 3;
+const EXIT_DEVICE_LOST: i32 = 5;
+const EXIT_CPU: i32 = 8;
+const EXIT_RUNNING: i32 = 9;
+const EXIT_EARLY: i32 = 10;
+const EXIT_MEMORY: i32 = 7;
 
 pub struct App {
     pub hwnd: HWND,
@@ -227,6 +233,7 @@ fn game_exited(app: &mut App, code: i32) {
     match code {
         0 => app.set_status(""),
         EXIT_GAME_FILES => app.set_status("The game could not use its game files. The Game page shows why."),
+        EXIT_CPU | EXIT_DEVICE_LOST | EXIT_MEMORY | EXIT_RUNNING | EXIT_EARLY | 0xD500..=0xD5FF => app.set_status(&format!("The game stopped with an error (code {code:#x}). Open logs shows its log.")),
         _ => {
             let log = newest_log(&app.paths);
             let errs = log.as_deref().map(last_errors).unwrap_or_default();

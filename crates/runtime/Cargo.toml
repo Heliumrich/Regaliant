@@ -1,6 +1,6 @@
 [package]
 name = "dsport"
-version = "0.1.0"
+version.workspace = true
 description = "Native Windows x86-64 runtime for Demon's Souls (PS5, PPSA01341): PS5 HLE + native CPU execution"
 edition.workspace = true
 license.workspace = true

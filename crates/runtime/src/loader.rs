@@ -432,6 +432,8 @@ pub fn finalize(m: &LoadedModule) -> Result<PatchStats, String> {
         tramp_used: 0,
     };
     p.patch_functions(&ranges, &mut stats);
+    // A processor without SSE4A: the title's insertq instructions rewritten (`cpucheck`).
+    crate::cpucheck::sse4a_rewrite(&mut p, &ranges, &m.name);
     if m.code.1 > m.code.0 {
         p.patch_raw_fs_zero(m.code.1 - m.base, &mut stats);
     }
