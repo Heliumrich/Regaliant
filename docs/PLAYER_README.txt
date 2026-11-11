@@ -35,7 +35,7 @@ Getting started
    "More info", then "Run anyway". The programs are not code-signed.
 3. On the Game page, choose the game folder. The launcher checks it and says what is missing.
 4. Click Play. The first time, the launcher prepares the game's shaders before the game
-   starts. This takes about 15 to 45 minutes once. You can turn it off on the Shaders page.
+   starts. This takes about 20 to 60 minutes once. You can turn it off on the Shaders page.
 
 
 Controls
