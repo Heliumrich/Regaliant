@@ -2319,9 +2319,6 @@ impl Exec {
             self.delta.bind_gens = g;
         }
         for b in bounds.drain(..) {
-            for &(base, n) in &b.writes {
-                crate::gpu::track::gpu_write(base, n);
-            }
             if !b.sized_writes.is_empty() {
                 // A held executor notes them for itself.
                 if self.held {

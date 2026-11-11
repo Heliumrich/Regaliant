@@ -5581,6 +5581,44 @@ static BATCHES_CV: parking_lot::Condvar = parking_lot::Condvar::new();
 static NEXT_SEQ: AtomicU64 = AtomicU64::new(1);
 /// Highest completed sequence number (all earlier ones completed too).
 static DONE: Mutex<u64> = Mutex::new(0);
+/// Written ranges of submitted batches that may overlap write-tracked
+/// texture regions, by batch sequence: announced to `track` again once the
+/// batch completed (`completion_thread`, after its write-back stored them in
+/// guest memory). The announcement at recording comes before the GPU wrote
+/// anything: a texture used in between hashed guest memory without the
+/// write and lost the mark, and kept data from before it (2026-11-11: a 2-2
+/// map sampled all zero, `texcheck`'s "stale with no write marked").
+static TRACK_DONE: Mutex<Vec<(u64, Vec<(u64, u64)>)>> = Mutex::new(Vec::new());
+
+fn note_track_writes(seq: u64, writes: impl Iterator<Item = (u64, u64)>) {
+    let v: Vec<(u64, u64)> = writes.filter(|&(a, n)| super::track::may_have_region(a, n)).collect();
+    if !v.is_empty() {
+        TRACK_DONE.lock().push((seq, v));
+    }
+}
+
+/// `TRACK_DONE`: the announcements of batches up to `seq` (all completed).
+fn track_completed(seq: u64) {
+    let due: Vec<(u64, u64)> = {
+        let mut g = TRACK_DONE.lock();
+        if g.is_empty() {
+            return;
+        }
+        let mut due = Vec::new();
+        g.retain(|(s, v)| {
+            if *s <= seq {
+                due.extend_from_slice(v);
+                false
+            } else {
+                true
+            }
+        });
+        due
+    };
+    for (a, n) in due {
+        super::track::gpu_written(a, n);
+    }
+}
 /// DONE without its lock (every CP read check asks for it).
 static DONE_ATOMIC: AtomicU64 = AtomicU64::new(0);
 /// When the completion thread finished the last batch (profiling: GPU
@@ -6688,6 +6726,7 @@ fn completion_thread() {
             a();
         }
         super::cp::set_after_batch(0);
+        track_completed(b.seq);
         super::timeline::end("gpu-complete", tl, || format!("{} CP effect(s) of {} #{}", n, b.name, b.seq));
         ACTION_NS.fetch_add(ta.elapsed().as_nanos() as u64, Ordering::Relaxed);
         for ch in b.checks.iter_mut() {
@@ -10954,6 +10993,7 @@ impl Exec {
         let writes = std::mem::take(&mut self.pending);
         self.pending_log.clear();
         INFLIGHT.note_ranges(seq, &writes);
+        note_track_writes(seq, writes.iter());
         drop(note_gate);
         journal_note(&writes, &self.name);
         crate::hostcensus::gpu_wrote(seq, &writes);
@@ -13201,6 +13241,7 @@ impl Exec {
             if let Some(w) = write {
                 journal_note_one(w, &self.name);
                 INFLIGHT.note(self.last_seq, w);
+                note_track_writes(self.last_seq, std::iter::once(w));
                 if ordered {
                     CP_WRITES.note(self.last_seq, w);
                 }
@@ -13218,6 +13259,7 @@ impl Exec {
             if let Some(w) = write {
                 journal_note_one(w, &self.name);
                 INFLIGHT.note(seq, w);
+                note_track_writes(seq, std::iter::once(w));
                 if ordered {
                     CP_WRITES.note(seq, w);
                 }
@@ -14927,6 +14969,7 @@ impl Exec {
             super::precache::submitted(&b.shared, seq);
             super::resident::submitted(&b.res_pages, seq);
             INFLIGHT.note_ranges(seq, &b.writes);
+            note_track_writes(seq, b.writes.iter());
             drop(note_gate);
             journal_note(&b.writes, &self.name);
             crate::hostcensus::gpu_wrote(seq, &b.writes);
@@ -16286,7 +16329,6 @@ impl Exec {
                     if !zeroed.is_empty() {
                         self.clear_images_zero(&zeroed);
                     }
-                    super::track::gpu_write(base, len);
                     self.note_write(base, len);
                     if lazy_barriers() {
                         self.dispatched = true;
@@ -16829,9 +16871,6 @@ impl Exec {
             }
             NOTES_SKIPPED.fetch_add(1, Ordering::Relaxed);
         } else {
-            for &(b, n) in &writes_here {
-                super::track::gpu_write(b, n);
-            }
             self.noting = p.addr;
             for &(b, n) in &writes_here {
                 self.note_write(b, n);

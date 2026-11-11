@@ -5573,8 +5573,17 @@ pub fn c4_note_upload_skips(n: u64) {
     C4X[X_UP_SKIPPED].fetch_add(n, Ordering::Relaxed);
 }
 
-/// Pages of guest [a, a+n) are never held (CP targets, our labels).
-pub fn c4_no_hold(a: u64, n: u64) {
+/// Pages never held by the engine allocator owning them (`engine::owner`)
+/// and why: [our command processors' reads, CP and CPU-action targets,
+/// faults] (status line: what front end 4's next step would let C4 hold).
+static NO_HOLD_BY: [[AtomicU64; 3]; 256] = [const { [const { AtomicU64::new(0) }; 3] }; 256];
+pub const NO_HOLD_READ: usize = 0;
+pub const NO_HOLD_TARGET: usize = 1;
+pub const NO_HOLD_FAULT: usize = 2;
+
+/// Pages of guest [a, a+n) are never held (CP targets, our labels; `why`:
+/// NO_HOLD_*).
+pub fn c4_no_hold(a: u64, n: u64, why: usize) {
     if !c4_on() {
         return;
     }
@@ -5590,6 +5599,7 @@ pub fn c4_no_hold(a: u64, n: u64) {
         let w = &no_hold()[i / 32];
         if w.load(Ordering::Relaxed) & bit == 0 && w.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
             NO_HOLD_PAGES.fetch_add(1, Ordering::Relaxed);
+            NO_HOLD_BY[crate::engine::owner(p) as usize][why.min(2)].fetch_add(1, Ordering::Relaxed);
         }
         p += PAGE;
     }
@@ -5601,7 +5611,7 @@ pub fn c4_cp_target(a: u64, n: u64) {
     if !c4_on() {
         return;
     }
-    c4_no_hold(a, n);
+    c4_no_hold(a, n, NO_HOLD_TARGET);
     c4_release_sync(a, n, true);
 }
 
@@ -5613,7 +5623,7 @@ pub fn c4_release_reads(reads: &[(u64, u64)]) {
     for &(a, n) in reads {
         // (Pages our command processors read are not held: marked first, so
         // that a later selection leaves them out.)
-        c4_no_hold(a, n);
+        c4_no_hold(a, n, NO_HOLD_READ);
         if c4_any_held(a, a.saturating_add(n.max(1))) {
             c4_release_sync(a, n, false);
         }
@@ -5871,7 +5881,7 @@ fn c4_release_thread() {
                     pages.push(p);
                 }
                 if never {
-                    c4_no_hold(p, PAGE);
+                    c4_no_hold(p, PAGE, NO_HOLD_TARGET);
                 }
                 p += PAGE;
             }
@@ -5931,7 +5941,7 @@ fn c4_release_thread() {
             crate::engine::note_hold_fault_record(r.page, origin, r.write);
             // (A page the CPU touched is not held again; its arming level
             // raised as a fault's.)
-            c4_no_hold(r.page, PAGE);
+            c4_no_hold(r.page, PAGE, NO_HOLD_FAULT);
             if let Some(c) = chunk(r.page, false) {
                 let _ = c.level[idx(r.page)].fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some((v + 1).min(ARM_MAX_LEVEL)));
                 if r.write {
@@ -6231,6 +6241,16 @@ fn c4_line() -> String {
     );
     *l = (frame, now, dw, pg, all);
     drop(l);
+    // Pages never held by owning allocation and why.
+    let names: std::collections::HashMap<u8, String> = crate::engine::allocators().into_iter().map(|a| (a.id, a.name)).collect();
+    let mut by: Vec<(usize, [u64; 3])> = (0..256).map(|i| (i, std::array::from_fn(|k| NO_HOLD_BY[i][k].load(Ordering::Relaxed)))).filter(|x: &(usize, [u64; 3])| x.1.iter().sum::<u64>() > 0).collect();
+    by.sort_by_key(|x| std::cmp::Reverse(x.1.iter().sum::<u64>()));
+    let line = if by.is_empty() {
+        line
+    } else {
+        let parts: Vec<String> = by.iter().take(8).map(|(i, v)| format!("{} {} (our reads {}, targets {}, faults {})", names.get(&(*i as u8)).cloned().unwrap_or_else(|| format!("owner {i}")), v.iter().sum::<u64>(), v[0], v[1], v[2])).collect();
+        line + &format!("    front end 4's pages never held by engine allocator: {}\n", parts.join(", "))
+    };
     let mut rips: Vec<((u64, bool), u64)> = HOLD_RIPS.lock().take().map(|m| m.into_iter().collect()).unwrap_or_default();
     rips.sort_by(|a, b| b.1.cmp(&a.1));
     if rips.is_empty() {

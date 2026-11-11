@@ -159,8 +159,63 @@ fn note_region(base: u64, size: u64) {
     }
 }
 
-/// Whether a region may overlap [base, base+len) (false: certainly none).
-fn may_have_region(base: u64, len: u64) -> bool {
+/// Live regions per 64 KiB and per 4 MiB of the GPU span [LIVE_LO,
+/// LIVE_HI) (front end 2's mirror span), exact: counted when a region is
+/// added and uncounted when it is dropped (`unwatch`). The hashed filter
+/// above remembers every region ever made, so with a session's textures
+/// ~97% of the GPU writes announced at their batch's completion passed it
+/// with no region under them (12.3 s of the completion thread's actions in
+/// a walk boot against 0.7, -094423, 2026-11-11); it stays for regions
+/// outside the span.
+const LIVE_LO: u64 = super::resident::MIRROR_BASE;
+const LIVE_HI: u64 = super::resident::MIRROR_END;
+static LIVE_64K: [std::sync::atomic::AtomicU16; ((LIVE_HI - LIVE_LO) >> 16) as usize] = [const { std::sync::atomic::AtomicU16::new(0) }; ((LIVE_HI - LIVE_LO) >> 16) as usize];
+static LIVE_4M: [std::sync::atomic::AtomicU32; ((LIVE_HI - LIVE_LO) >> 22) as usize] = [const { std::sync::atomic::AtomicU32::new(0) }; ((LIVE_HI - LIVE_LO) >> 22) as usize];
+
+/// Counts a region in (`add`) or out of the live counts (its part in the span).
+fn live_count(base: u64, size: u64, add: bool) {
+    let (lo, hi) = (base.max(LIVE_LO), base.saturating_add(size.max(1)).min(LIVE_HI));
+    if lo >= hi {
+        return;
+    }
+    for p in ((lo - LIVE_LO) >> 16)..=((hi - 1 - LIVE_LO) >> 16) {
+        if add {
+            LIVE_64K[p as usize].fetch_add(1, Ordering::AcqRel);
+        } else {
+            LIVE_64K[p as usize].fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+    for c in ((lo - LIVE_LO) >> 22)..=((hi - 1 - LIVE_LO) >> 22) {
+        if add {
+            LIVE_4M[c as usize].fetch_add(1, Ordering::AcqRel);
+        } else {
+            LIVE_4M[c as usize].fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+/// Whether a region may overlap [base, base+len) (false: certainly none):
+/// exact inside the GPU span, the hashed filter outside it.
+pub(super) fn may_have_region(base: u64, len: u64) -> bool {
+    let len = len.max(1);
+    let end = base.saturating_add(len);
+    let (lo, hi) = (base.max(LIVE_LO), end.min(LIVE_HI));
+    if lo < hi {
+        for c in ((lo - LIVE_LO) >> 22)..=((hi - 1 - LIVE_LO) >> 22) {
+            if LIVE_4M[c as usize].load(Ordering::Acquire) == 0 {
+                continue;
+            }
+            let (clo, chi) = (lo.max(LIVE_LO + (c << 22)), hi.min(LIVE_LO + ((c + 1) << 22)));
+            if (((clo - LIVE_LO) >> 16)..=((chi - 1 - LIVE_LO) >> 16)).any(|p| LIVE_64K[p as usize].load(Ordering::Acquire) != 0) {
+                return true;
+            }
+        }
+    }
+    (base < LIVE_LO && hashed_may_have(base, end.min(LIVE_LO) - base)) || (end > LIVE_HI && hashed_may_have(base.max(LIVE_HI), end - base.max(LIVE_HI)))
+}
+
+/// The hashed filter's answer for [base, base+len).
+fn hashed_may_have(base: u64, len: u64) -> bool {
     let len = len.max(1);
     let (first, last) = (base >> 16, (base + len - 1) >> 16);
     if last - first < 64 {
@@ -173,6 +228,7 @@ fn may_have_region(base: u64, len: u64) -> bool {
 impl Tracker {
     fn add(&mut self, base: u64, size: u64) -> u32 {
         note_region(base, size);
+        live_count(base, size, true);
         RESET_GEN.fetch_add(1, Ordering::Release);
         let id = self.regions.len() as u32;
         // (Its generation's counter is leaked: 4 bytes per region ever made, read without the lock.)
@@ -282,6 +338,7 @@ pub fn unwatch(id: u32) {
     let Some(t) = g.as_mut() else { return };
     let Some(slot) = t.regions.get_mut(id as usize) else { return };
     let Some(r) = slot.take() else { return };
+    live_count(r.base, r.size, false);
     if let Some(v) = t.by_base.get_mut(&r.base) {
         v.retain(|&x| x != id);
         if v.is_empty() {
@@ -643,24 +700,37 @@ pub fn host_write(base: u64, len: u64) -> HostWrite {
     HostWrite(Some(id), base, len)
 }
 
-/// Announces a GPU write to [base, base+len): overlapping regions are dirty
-/// (their pages need no change).
-pub fn gpu_write(base: u64, len: u64) {
+/// Announces a GPU write to [base, base+len) once its batch completed (its
+/// data is in guest memory: `exec::track_completed`): overlapping regions
+/// are hashed again at their next use (their pages need no change). Not at
+/// recording: a use before the batch completed hashed guest memory without
+/// the write and took the mark (2026-11-11).
+pub fn gpu_written(base: u64, len: u64) {
     if !may_have_region(base, len) {
         return;
     }
-    note_event("GPU write (recorded)", base, len);
+    note_event("GPU write (completed)", base, len);
+    let t0 = std::time::Instant::now();
     let mut g = TRACK.lock();
     let Some(t) = g.as_mut() else { return };
+    let mut hit = 0u64;
     t.each_overlapping(base, len, |r| {
         if !r.gpu {
             changed(4);
             r.generation.fetch_add(1, Ordering::Release);
         }
+        hit += 1;
         r.gpu = true;
         r.why = Why::GpuWrite(base, len);
     });
+    drop(g);
+    GPU_WRITTEN[0].fetch_add(1, Ordering::Relaxed);
+    GPU_WRITTEN[1].fetch_add(hit, Ordering::Relaxed);
+    GPU_WRITTEN[2].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
 }
+
+/// `gpu_written`: [ranges announced, regions they marked, ns].
+static GPU_WRITTEN: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// DS_UPLOAD_CHECK=1: the writes announced over tracked regions, newest
 /// last ((when, what, base, len); diagnostics of changed texture parts).
@@ -748,13 +818,16 @@ pub fn status() -> String {
     let (q, l, mx) = g.as_ref().map(|t| (t.queries, t.looked, t.max_size)).unwrap_or(([0; 2], [0; 2], 0));
     let per = |k: usize| l[k] as f64 / q[k].max(1) as f64;
     format!(
-        "    write tracking: {regions} regions, {pages} pages, {} write faults; overlap queries since boot by 1 MiB buckets {} ({:.1} ids looked at each), of 1 GiB or more by bases from start - the largest region ({} MiB) {} ({:.1} each)\n",
+        "    write tracking: {regions} regions, {pages} pages, {} write faults; overlap queries since boot by 1 MiB buckets {} ({:.1} ids looked at each), of 1 GiB or more by bases from start - the largest region ({} MiB) {} ({:.1} each); GPU writes announced at their batch's completion {} ({} regions marked, {} ms)\n",
         FAULTS.load(Ordering::Relaxed),
         q[1],
         per(1),
         mx >> 20,
         q[0],
-        per(0)
+        per(0),
+        GPU_WRITTEN[0].load(Ordering::Relaxed),
+        GPU_WRITTEN[1].load(Ordering::Relaxed),
+        GPU_WRITTEN[2].load(Ordering::Relaxed) / 1_000_000
     )
 }
 
@@ -767,6 +840,23 @@ mod tests {
         t.each_overlapping(base, len, |r| v.push(r.base));
         v.sort_unstable();
         v
+    }
+
+    #[test]
+    fn live_filter_is_exact_in_the_span_and_forgets_dropped_regions() {
+        let mut t = Tracker::default();
+        // (An address no other test uses: the counts are global.)
+        let base = 0x17_8000_0000;
+        assert!(!may_have_region(base, 0x1000));
+        t.add(base + 0x2_0000, 0x1_0000);
+        assert!(may_have_region(base + 0x2_0000, 4));
+        assert!(may_have_region(base + 0x2_fffc, 4));
+        assert!(may_have_region(base, 0x100_0000));
+        assert!(!may_have_region(base, 0x1_0000));
+        assert!(!may_have_region(base + 0x3_0000, 0x40_0000));
+        live_count(base + 0x2_0000, 0x1_0000, false);
+        assert!(!may_have_region(base + 0x2_0000, 4));
+        assert!(!may_have_region(base, 0x100_0000));
     }
 
     #[test]
