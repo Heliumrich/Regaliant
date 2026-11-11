@@ -1425,6 +1425,9 @@ pub const EXIT_RUNNING: u32 = 9;
 pub const EXIT_EARLY: u32 = 10;
 /// Windows ran out of memory for the game (told by `fatal_exit`).
 pub const EXIT_MEMORY: u32 = 7;
+/// No usable Vulkan device at start (told by `fatal_exit`): a lost GPU that
+/// needs Windows restarted, a missing or old driver.
+pub const EXIT_NO_GPU: u32 = 11;
 
 /// Whether this run has no window (`--headless`): no message boxes then.
 pub static HEADLESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1450,6 +1453,7 @@ fn fatal_text(code: u32, reason: &str) -> String {
         EXIT_DEVICE_LOST => format!("The graphics card stopped responding, so the game has to close.\n\nUpdating the graphics driver may help. If it happens again, please report it and attach the log.{log}"),
         EXIT_MEMORY => format!("Windows ran out of memory for the game, so it has to close.\n\nClose other programs and start the game again. If it happens again, let Windows manage the page file size (Settings > System > About > Advanced system settings > Performance > Advanced > Virtual memory).{log}"),
         EXIT_START => format!("The game could not start ({reason}).\n\nPlease report it and attach the log.{log}"),
+        EXIT_NO_GPU => format!("The game could not start the graphics card ({reason}).\n\nIf Windows reported a graphics driver problem, restart Windows. Otherwise update the graphics driver: the game needs a Vulkan 1.3 graphics card.{log}"),
         _ => format!("The game met an error it cannot recover from and has to close.\n\nPlease report it and attach the log.{log}"),
     }
 }
@@ -1477,6 +1481,29 @@ fn single_instance(cfg: &Config) {
 
 /// Only the first thread that ends the game tells the player (others wait for the end).
 static ENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// No usable Vulkan device at start (`gpu::exec::enabled`): the player is told and the game
+/// ends with EXIT_NO_GPU. Not through `fatal_exit`: its thread summary reads the GPU front
+/// end's status, which needs the Vulkan context that is missing (that exit panicked inside
+/// itself and the process hung, 2026-11-11, with the GPU lost until a restart).
+pub fn no_gpu_exit(reason: &str) -> ! {
+    if ENDING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+    display::restore_on_exit();
+    session_ended();
+    crate::log::write(crate::log::Level::Error, format_args!("terminating: {reason}"));
+    crate::log::try_flush();
+    player_error(&fatal_text(EXIT_NO_GPU, reason));
+    unsafe {
+        windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), EXIT_NO_GPU);
+    }
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
 
 pub fn fatal_exit(code: u32, reason: &str) -> ! {
     if ENDING.swap(true, std::sync::atomic::Ordering::SeqCst) {

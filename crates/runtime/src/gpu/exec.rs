@@ -580,8 +580,10 @@ pub fn enabled() -> bool {
                 true
             }
             Err(e) => {
+                // (Running on without GPU work renders nothing and its quit
+                // panicked: the player is told and the game ends.)
                 crate::error!("gpu: DS_GPU=1 but Vulkan is unavailable: {e}");
-                false
+                crate::no_gpu_exit(&format!("Vulkan: {e}"))
             }
         }
     })

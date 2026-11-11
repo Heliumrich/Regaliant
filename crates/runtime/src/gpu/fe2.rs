@@ -5888,6 +5888,17 @@ pub fn c4_forgotten(base: u64, len: u64) {
     }
 }
 
+/// `DS_C4_WHY=1` (diagnosis): per allocation record of C4's target
+/// allocators (`engine::record_key`), its pages written back lately and not
+/// held, summed over the hold rounds: [all, never held (`NO_HOLD`), not
+/// armed by front end 2, not valid in the mirror, not armed by the host,
+/// written by the CPU within `DS_C4_QUIET` flips, candidates].
+fn c4_why() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_C4_WHY").ok().as_deref() == Some("1"))
+}
+static C4_WHY: parking_lot::Mutex<Option<std::collections::HashMap<(u64, u64, u8), [u64; 7]>>> = parking_lot::Mutex::new(None);
+
 /// Pages written back within the last two hold periods, summed over the
 /// hold rounds, by the engine allocator owning them (`c4_round`; status).
 static WB_BY_OWNER: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
@@ -5942,6 +5953,54 @@ fn c4_round() {
             v &= v - 1;
             let p = MIRROR_BASE + (i as u64 * 32 + b) * PAGE;
             WB_BY_OWNER[crate::engine::owner(p) as usize].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    if c4_why() {
+        let mut why: std::collections::HashMap<(u64, u64, u8), [u64; 7]> = std::collections::HashMap::new();
+        for i in 0..HELD_MAP_WORDS {
+            let mut v = recent[i].load(Ordering::Relaxed) & !held[i].load(Ordering::Acquire);
+            while v != 0 {
+                let bit = v.trailing_zeros() as u64;
+                v &= v - 1;
+                let p = MIRROR_BASE + (i as u64 * 32 + bit) * PAGE;
+                let key = crate::engine::record_key(p);
+                if !targets[key.2 as usize] {
+                    continue;
+                }
+                let e = why.entry(key).or_insert([0; 7]);
+                e[0] += 1;
+                if nh[i].load(Ordering::Relaxed) >> bit & 1 != 0 {
+                    e[1] += 1;
+                    continue;
+                }
+                let Some(c) = chunk(p, false) else {
+                    e[3] += 1;
+                    continue;
+                };
+                let (k, w) = (idx(p) % 64, idx(p) / 64);
+                if c.armed[w].load(Ordering::Acquire) >> k & 1 == 0 {
+                    e[2] += 1;
+                } else if c.valid[w].load(Ordering::Acquire) >> k & 1 == 0 {
+                    e[3] += 1;
+                } else if !crate::hosted::armed(p) {
+                    e[4] += 1;
+                } else {
+                    let wrote = c.wrote[idx(p)].load(Ordering::Acquire) as u64;
+                    if wrote != 0 && frame.saturating_sub(wrote - 1) < quiet {
+                        e[5] += 1;
+                    } else {
+                        e[6] += 1;
+                    }
+                }
+            }
+        }
+        let mut g = C4_WHY.lock();
+        let m = g.get_or_insert_with(std::collections::HashMap::new);
+        for (k, v) in why {
+            let e = m.entry(k).or_insert([0; 7]);
+            for j in 0..7 {
+                e[j] += v[j];
+            }
         }
     }
     let mut runs: Vec<(u64, u64)> = Vec::new();
@@ -6445,6 +6504,19 @@ fn c4_line() -> String {
     } else {
         let parts: Vec<String> = by.iter().take(8).map(|(i, v)| format!("{} {} (our reads {}, targets {}, faults {})", names.get(&(*i as u8)).cloned().unwrap_or_else(|| format!("owner {i}")), v.iter().sum::<u64>(), v[0], v[1], v[2])).collect();
         line + &format!("    front end 4's pages never held by engine allocator: {}\n", parts.join(", "))
+    };
+    let line = match C4_WHY.lock().as_ref() {
+        Some(m) if !m.is_empty() => {
+            let mut v: Vec<(&(u64, u64, u8), &[u64; 7])> = m.iter().collect();
+            v.sort_by_key(|x| std::cmp::Reverse(x.1[0]));
+            let parts: Vec<String> = v
+                .iter()
+                .take(8)
+                .map(|(k, c)| format!("{:#x}+{:#x} ({}): {} (never held {}, unarmed {}, invalid {}, host-unarmed {}, CPU-written lately {}, candidates {})", k.0, k.1, names.get(&k.2).cloned().unwrap_or_else(|| format!("owner {}", k.2)), c[0], c[1], c[2], c[3], c[4], c[5], c[6]))
+                .collect();
+            line + &format!("    C4's targets' pages written back lately and not held, by record (`DS_C4_WHY`, page-rounds): {}\n", parts.join("; "))
+        }
+        _ => line,
     };
     let rounds = WB_ROUNDS.load(Ordering::Relaxed);
     let mut wb: Vec<(usize, u64)> = (0..256).map(|i| (i, WB_BY_OWNER[i].load(Ordering::Relaxed))).filter(|x| x.1 > 0).collect();
