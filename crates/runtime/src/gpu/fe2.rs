@@ -116,11 +116,6 @@ struct Chunk {
     /// finds such a page written found a write the protection missed
     /// (`take_run`: a hole).
     varmed: [AtomicU64; WORDS],
-    /// The page's `wrote` stamp is an arming that ended without a write
-    /// found on the page (a word-mate's fault, a disarm, a mapping change):
-    /// its quiet time restarts, but `hot_run` does not take it for written
-    /// lately. Cleared by every write found on the page.
-    nowrite: [AtomicU64; WORDS],
     /// Written by GPU work (marked only with `DS_FE2_ARM_GPU=0`, unarmed). Bits
     /// are only ever set.
     gpu: [AtomicU64; WORDS],
@@ -1060,7 +1055,6 @@ fn make_chunk(slot: &'static AtomicPtr<Chunk>) -> &'static Chunk {
         valid: std::array::from_fn(|_| AtomicU64::new(0)),
         armed: std::array::from_fn(|_| AtomicU64::new(0)),
         varmed: std::array::from_fn(|_| AtomicU64::new(0)),
-        nowrite: std::array::from_fn(|_| AtomicU64::new(0)),
         gpu: std::array::from_fn(|_| AtomicU64::new(0)),
         gpu_all: AtomicBool::new(false),
         wclean: std::array::from_fn(|_| AtomicU32::new(0)),
@@ -2765,15 +2759,10 @@ fn hot_run(a: u64, b: u64, frame: u64) -> bool {
         return false;
     }
     let quiet = hot_quiet();
-    let word = super::tune::hot_word();
     let mut x = a;
     while x < b {
         let Some(c) = chunk(x, false) else { return false };
         let i = idx(x);
-        // (An arming that ended without a write found: not written lately.)
-        if word && c.nowrite[i / 64].load(Ordering::Relaxed) >> (i % 64) & 1 != 0 {
-            return false;
-        }
         let wrote = c.wrote[i].load(Ordering::Relaxed) as u64;
         let window = if quiet { HOT_FLIPS.max(ARM_QUIET << c.level[i].load(Ordering::Relaxed)) } else { HOT_FLIPS };
         if wrote == 0 || frame.saturating_sub(wrote - 1) >= window {
@@ -2859,9 +2848,6 @@ fn note_arming_ended(a: u64, b: u64) {
                     let _ = l.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some((v + 1).min(ARM_MAX_LEVEL)));
                     c.wrote[base + k].store(f, Ordering::Release);
                 }
-                // (No write found on them: the fault watcher clears the bit
-                // of a page whose own fault it reads.)
-                c.nowrite[w].fetch_or(gone, Ordering::AcqRel);
                 STATS[S_ARM_ENDED].fetch_add(gone.count_ones() as u64, Ordering::Relaxed);
             }
         }
@@ -3576,7 +3562,6 @@ fn watch() {
                 }
             }
             c.wrote[i].store(frame as u32 + 1, Ordering::Release);
-            c.nowrite[w].fetch_and(!bit, Ordering::AcqRel);
             c.uses[w].store(0, Ordering::Relaxed);
             let k = ((page - MIRROR_BASE) >> CHUNK_SHIFT) as usize;
             if counts[k] == 0 {
@@ -3626,7 +3611,6 @@ fn word_ended(wa: u64, level: u8, frame: u64) -> u64 {
         c.wrote[base + k].store(frame as u32 + 1, Ordering::Release);
         c.level[base + k].fetch_max(level, Ordering::AcqRel);
     }
-    c.nowrite[w].fetch_or(gone, Ordering::AcqRel);
     c.cgen.fetch_add(1, Ordering::AcqRel);
     gone.count_ones() as u64
 }
@@ -3971,7 +3955,6 @@ pub fn cpu_written(pages: &[u64]) {
         }
         c.wgen[w].fetch_add(1, Ordering::AcqRel);
         c.wrote[i].store(f, Ordering::Release);
-        c.nowrite[w].fetch_and(!bit, Ordering::AcqRel);
         c.pgen[i].fetch_add(1, Ordering::AcqRel);
         c.uses[w].store(0, Ordering::Relaxed);
         n += 1;
@@ -4009,7 +3992,6 @@ pub fn invalidate(base: u64, len: u64) {
                 c.wrote[k].store(f, Ordering::Release);
                 c.pgen[k].fetch_add(1, Ordering::AcqRel);
             }
-            c.nowrite[w].fetch_and(!mask, Ordering::AcqRel);
             c.uses[w].store(0, Ordering::Relaxed);
             x = e;
         } else {
@@ -6819,7 +6801,6 @@ fn c4_release_thread() {
                 let _ = c.level[idx(r.page)].fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some((v + 1).min(ARM_MAX_LEVEL)));
                 if r.write {
                     c.wrote[idx(r.page)].store(frame as u32 + 1, Ordering::Release);
-                    c.nowrite[idx(r.page) / 64].fetch_and(!(1u64 << (idx(r.page) % 64)), Ordering::AcqRel);
                     c.uses[idx(r.page) / 64].store(0, Ordering::Relaxed);
                 }
             }

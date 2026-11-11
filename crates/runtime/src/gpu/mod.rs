@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 171] = [
+    static ALL: [Tunable; 170] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -202,7 +202,6 @@ pub mod tune {
         Tunable { name: "submit_fuse", env: "DS_SUBMIT_FUSE", default: 2, value: AtomicU64::new(UNSET) },
         Tunable { name: "behind_quiet", env: "DS_BEHIND_QUIET", default: 2, value: AtomicU64::new(UNSET) },
         Tunable { name: "behind_us", env: "DS_BEHIND_US", default: 300, value: AtomicU64::new(UNSET) },
-        Tunable { name: "hot_word", env: "DS_HOT_WORD", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1359,16 +1358,6 @@ pub mod tune {
     /// The armer's time a round (2 ms apart) in us (default 300). Live.
     pub fn behind_us() -> u64 {
         get(169)
-    }
-
-    /// Front end 2's hot runs (`fe2::hot_run`: small runs written lately
-    /// uploaded without a take) leave out pages whose arming ended without
-    /// a write found on them (a word-mate's fault, a disarm, a mapping
-    /// change; default 1). 0: such pages count as written then, as before
-    /// 2026-11-11 night. Live.
-    #[inline]
-    pub fn hot_word() -> bool {
-        get(170) != 0
     }
 
     /// The title's convolution reverb computed (`hle::libs::acm_conv`,
