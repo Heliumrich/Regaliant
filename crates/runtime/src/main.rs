@@ -927,6 +927,17 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     Err(e) => Err(e),
                 }
             }
+            "armbehind" => {
+                // `armbehind off|on` (front end 2's arming behind the
+                // graphics CP and queue 0x50): off disarms what it armed.
+                match gpu::fe2::behind_control(parts.next().unwrap_or("")) {
+                    Ok(m) => {
+                        info!("control: armbehind: {m} at flip {flip}");
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
             "c4arm" => {
                 // `c4arm off|on` (front end 4's own arming): off releases
                 // the held pages its rounds armed and holds none of them.

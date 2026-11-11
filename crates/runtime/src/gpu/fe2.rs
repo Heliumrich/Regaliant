@@ -530,6 +530,7 @@ pub fn note_place_parts(map: u64, begin: u64, batch: u64, after: u64) {
 /// Clears the checks by caller (`profile reset`).
 pub fn reset_callers() {
     reset_up_census();
+    take_census_reset();
     for c in BY_CALLER.iter().flatten().chain(BY_CALLER_FIRST.iter().flatten()).chain(QUIET_TAKES.iter().flatten()).chain(BY_SOURCE.iter().flatten()) {
         c.store(0, Ordering::Relaxed);
     }
@@ -1892,6 +1893,121 @@ fn widen(a: u64, b: u64) -> (u64, u64) {
     (ta, tb)
 }
 
+/// `DS_FE2_TAKE_CENSUS=1` (diagnosis): the takes of the threads that take
+/// without arming (the graphics CP, queue 0x50's), by thread kind: [takes,
+/// pages, ns, pages found written, takes whose every page would pass front
+/// end 2's arming rules now (`armable_now`), their pages, their ns, pages
+/// armable in all takes, takes of at most 16 pages, their ns]; status line.
+fn take_census_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_FE2_TAKE_CENSUS").ok().as_deref() == Some("1"))
+}
+static TAKE_CENSUS: [[AtomicU64; 10]; 2] = [const { [const { AtomicU64::new(0) }; 10] }; 2];
+/// The armable pages by why the others were not: [no chunk, armed already,
+/// chunk held, too few clean epochs, written lately, outside settled import
+/// windows], by thread kind.
+static TAKE_CENSUS_NOT: [[AtomicU64; 6]; 2] = [const { [const { AtomicU64::new(0) }; 6] }; 2];
+
+/// The pages of [a, b) that `try_arm` would arm now (its per-page rules and
+/// the settled import windows), with the others' reasons added to `not`.
+fn armable_now(a: u64, b: u64, frame: u64, not: &mut [u64; 6]) -> u64 {
+    let mut ok = 0u64;
+    let mut x = a;
+    while x < b {
+        let e = word_end(x, b);
+        let n = (e - x) / PAGE;
+        let Some(c) = chunk(x, false) else {
+            not[0] += n;
+            x = e;
+            continue;
+        };
+        let w = idx(x) / 64;
+        let mask = word_mask(x, e);
+        let armed = c.armed[w].load(Ordering::Acquire) & mask;
+        not[1] += armed.count_ones() as u64;
+        let mut cand = mask & !armed;
+        if cand != 0 && frame < c.hold_until.load(Ordering::Acquire) {
+            not[2] += cand.count_ones() as u64;
+            cand = 0;
+        }
+        if cand != 0 && c.uses[w].load(Ordering::Relaxed) < ARM_USES {
+            not[3] += cand.count_ones() as u64;
+            cand = 0;
+        }
+        let base = w * 64;
+        let mut r = cand;
+        while r != 0 {
+            let k = r.trailing_zeros() as usize;
+            r &= r - 1;
+            let wrote = c.wrote[base + k].load(Ordering::Acquire) as u64;
+            let need = ARM_QUIET << c.level[base + k].load(Ordering::Acquire);
+            if wrote == 0 || frame.saturating_sub(wrote - 1) < need {
+                not[4] += 1;
+                cand &= !(1u64 << k);
+            }
+        }
+        ok += cand.count_ones() as u64;
+        x = e;
+    }
+    if ok > 0 && super::exec::fe2_settled_over(a, b) != Some(true) {
+        not[5] += ok;
+        return 0;
+    }
+    ok
+}
+
+/// The census's status line ("" when off).
+fn take_census_line() -> String {
+    if !take_census_on() {
+        return String::new();
+    }
+    let mut parts = Vec::new();
+    for (k, name) in ["the graphics CP", "queue 0x50's threads"].iter().enumerate() {
+        let v: [u64; 10] = std::array::from_fn(|j| TAKE_CENSUS[k][j].load(Ordering::Relaxed));
+        let n: [u64; 6] = std::array::from_fn(|j| TAKE_CENSUS_NOT[k][j].load(Ordering::Relaxed));
+        if v[0] == 0 {
+            continue;
+        }
+        parts.push(format!(
+            "{name}: {} takes ({} pages, {:.1} ms, {} pages found written), all pages armable {} ({} pages, {:.1} ms), pages armable {} (not: no chunk {}, armed {}, chunk held {}, too few clean epochs {}, written lately {}, outside settled windows {}), takes of at most 16 pages {} ({:.1} ms)",
+            v[0],
+            v[1],
+            v[2] as f64 / 1e6,
+            v[3],
+            v[4],
+            v[5],
+            v[6] as f64 / 1e6,
+            v[7],
+            n[0],
+            n[1],
+            n[2],
+            n[3],
+            n[4],
+            n[5],
+            v[8],
+            v[9] as f64 / 1e6
+        ));
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!("    front end 2's takes without arming (`DS_FE2_TAKE_CENSUS`, since boot or `profile reset`): {}\n", parts.join("; "))
+}
+
+/// `profile reset`: the take census starts again.
+pub fn take_census_reset() {
+    for t in TAKE_CENSUS.iter() {
+        for x in t.iter() {
+            x.store(0, Ordering::Relaxed);
+        }
+    }
+    for t in TAKE_CENSUS_NOT.iter() {
+        for x in t.iter() {
+            x.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Arms [a, b) (`arm`: hosted, where allowed) and takes [ta, tb) (around it:
 /// `widen`): pages written since their last take lose their valid bit.
 #[allow(clippy::too_many_arguments)]
@@ -1913,6 +2029,9 @@ fn take_run(a: u64, b: u64, ta: u64, tb: u64, frame: u64, arm: bool, armable: &A
             probe_add(P_ARM_NS, tp.elapsed().as_nanos() as u64);
         }
         caller_since(C_ARM, t);
+    } else if arm && crate::hosted::on() {
+        // (Armed behind them: `behind_thread`.)
+        behind_queue(a, b);
     }
     // The take: pages written since their last take lose their valid bit
     // (`marks_taken`, for any take's pages).
@@ -1953,6 +2072,35 @@ fn take_run(a: u64, b: u64, ta: u64, tb: u64, frame: u64, arm: bool, armable: &A
         }
     }
     STATS[S_TAKE_WRITTEN].fetch_add(written.len() as u64, Ordering::Relaxed);
+    if take_census_on() && crate::hosted::on() {
+        let role = super::prio::role();
+        if matches!(role, 0 | 2) {
+            let k = (role == 2) as usize;
+            let t = &TAKE_CENSUS[k];
+            let pages = (tb - ta) / PAGE;
+            t[0].fetch_add(1, Ordering::Relaxed);
+            t[1].fetch_add(pages, Ordering::Relaxed);
+            t[2].fetch_add(tns, Ordering::Relaxed);
+            t[3].fetch_add(written.len() as u64, Ordering::Relaxed);
+            let mut not = [0u64; 6];
+            let ok = armable_now(ta, tb, frame, &mut not);
+            if ok == pages {
+                t[4].fetch_add(1, Ordering::Relaxed);
+                t[5].fetch_add(pages, Ordering::Relaxed);
+                t[6].fetch_add(tns, Ordering::Relaxed);
+            }
+            t[7].fetch_add(ok, Ordering::Relaxed);
+            if pages <= 16 {
+                t[8].fetch_add(1, Ordering::Relaxed);
+                t[9].fetch_add(tns, Ordering::Relaxed);
+            }
+            for (j, &v) in not.iter().enumerate() {
+                if v != 0 {
+                    TAKE_CENSUS_NOT[k][j].fetch_add(v, Ordering::Relaxed);
+                }
+            }
+        }
+    }
     if super::fe2census::on() {
         super::fe2census::note_take(ta, tb, written, CALLER.with(|c| c.get()));
     }
@@ -3007,9 +3155,250 @@ static C4_NOT_ARMED: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 fn not_armed(k: usize, n: u64) {
     if C4_ARMING.with(|f| f.get()) {
         C4_NOT_ARMED[k].fetch_add(n, Ordering::Relaxed);
+    } else if BEHIND_ARMING.with(|f| f.get()) {
+        BEHIND_NOT_ARMED[k].fetch_add(n, Ordering::Relaxed);
     } else {
         NOT_ARMED[k].fetch_add(n, Ordering::Relaxed);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Arming behind the threads that take without arming (2026-11-11 night).
+// The graphics CP's and queue 0x50's checks take without arming (arming on
+// those threads cost them more than the takes it saved: FINDINGS.md
+// 2026-11-06, 2026-11-08 evening), so pages only they check were never
+// armed and every epoch's check of them took again: at Castlewall Front
+// ~1.6 ms a flip of the graphics CP's takes, 77% of them over pages that
+// pass front end 2's arming rules (`DS_FE2_TAKE_CENSUS`). Their checks now
+// queue the runs they took, and the `fe2-armer` thread arms them by front
+// end 2's own rules (`try_arm`); a later check finds them armed and takes
+// nothing.
+// ---------------------------------------------------------------------------
+
+/// Arming behind is wanted (`DS_ARM_BEHIND=0` off).
+fn arm_behind_wanted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_ARM_BEHIND").ok().as_deref() != Some("0"))
+}
+
+/// `armbehind off` (in-run A/Bs): nothing queued or armed, and the pages it
+/// armed disarmed.
+static BEHIND_OFF: AtomicBool = AtomicBool::new(false);
+/// The runs queued for the armer (at most BEHIND_MAX; more are dropped).
+static BEHIND_RUNS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+const BEHIND_MAX: usize = 16384;
+/// [runs queued, runs dropped (queue full), rounds, merged runs offered,
+/// pages offered, pages armed, us arming, pages disarmed by `armbehind off`,
+/// takes after an arming, pages they found written].
+static BEHIND: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+const AB_QUEUED: usize = 0;
+const AB_DROPPED: usize = 1;
+const AB_ROUNDS: usize = 2;
+const AB_RUNS: usize = 3;
+const AB_PAGES: usize = 4;
+const AB_ARMED: usize = 5;
+const AB_US: usize = 6;
+const AB_DISARMED: usize = 7;
+const AB_TAKES: usize = 8;
+const AB_TAKE_WRITTEN: usize = 9;
+/// Front end 2's reasons for the pages the armer offered and did not arm.
+static BEHIND_NOT_ARMED: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+thread_local! {
+    /// The armer's thread (`not_armed`, `arm_part` count for it).
+    static BEHIND_ARMING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The pages the armer armed (a bit per page of the mirror's span):
+/// `armbehind off` disarms those still armed.
+fn behind_map() -> &'static [AtomicU32] {
+    static M: std::sync::OnceLock<Box<[AtomicU32]>> = std::sync::OnceLock::new();
+    M.get_or_init(|| (0..HELD_MAP_WORDS).map(|_| AtomicU32::new(0)).collect())
+}
+
+/// A check of [a, b) on a thread that takes without arming took it: queued
+/// for the armer.
+fn behind_queue(a: u64, b: u64) {
+    if !arm_behind_wanted() || BEHIND_OFF.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut g = BEHIND_RUNS.lock();
+    if g.len() >= BEHIND_MAX {
+        drop(g);
+        BEHIND[AB_DROPPED].fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    g.push((a, b));
+    drop(g);
+    BEHIND[AB_QUEUED].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The armer (`fe2-armer`): every 2 ms the queued runs, sorted and merged,
+/// offered to `try_arm`.
+fn behind_thread() {
+    BEHIND_ARMING.with(|f| f.set(true));
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    let mut written: Vec<u64> = Vec::new();
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        std::mem::swap(&mut runs, &mut *BEHIND_RUNS.lock());
+        if runs.is_empty() {
+            continue;
+        }
+        if BEHIND_OFF.load(Ordering::Acquire) {
+            runs.clear();
+            continue;
+        }
+        runs.sort_unstable();
+        merged.clear();
+        for &(a, b) in &runs {
+            match merged.last_mut() {
+                Some(l) if a <= l.1 => l.1 = l.1.max(b),
+                _ => merged.push((a, b)),
+            }
+        }
+        runs.clear();
+        let frame = super::FRAMES.load(Ordering::Relaxed);
+        let t = std::time::Instant::now();
+        let mut pages = 0u64;
+        for &(a, b) in &merged {
+            pages += (b - a) / PAGE;
+            let before = BEHIND[AB_ARMED].load(Ordering::Relaxed);
+            try_arm(a, b, frame, &super::exec::fe2_armable);
+            if BEHIND[AB_ARMED].load(Ordering::Relaxed) != before {
+                // (As `take_run`: armed first, then taken. A CPU write after
+                // the check's take and before this arming is found here and
+                // its page made invalid (`marks_taken`), and the pages armed
+                // are taken since their arming (`hole_check`).)
+                hole_snapshot(a, b);
+                written.clear();
+                let r = super::precache::take_written_for(a, b - a, &mut written, None, crate::mem::WW_WHO_FE2);
+                if r.is_some() {
+                    hole_check(&written);
+                } else {
+                    invalidate(a, b - a);
+                }
+                BEHIND[AB_TAKES].fetch_add(1, Ordering::Relaxed);
+                BEHIND[AB_TAKE_WRITTEN].fetch_add(written.len() as u64, Ordering::Relaxed);
+            }
+        }
+        BEHIND[AB_ROUNDS].fetch_add(1, Ordering::Relaxed);
+        BEHIND[AB_RUNS].fetch_add(merged.len() as u64, Ordering::Relaxed);
+        BEHIND[AB_PAGES].fetch_add(pages, Ordering::Relaxed);
+        BEHIND[AB_US].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
+/// `arm_part` armed [x, y) on the armer's thread.
+fn behind_note_armed(x: u64, y: u64) {
+    let m = behind_map();
+    let (lo, hi) = (x.max(MIRROR_BASE), y.min(MIRROR_END));
+    let mut p = lo;
+    while p < hi {
+        let i = ((p - MIRROR_BASE) / PAGE) as usize;
+        m[i / 32].fetch_or(1 << (i % 32), Ordering::Relaxed);
+        p += PAGE;
+    }
+    BEHIND[AB_ARMED].fetch_add(hi.saturating_sub(lo) / PAGE, Ordering::Relaxed);
+}
+
+/// Disarms the pages the armer armed that are still armed (front end 2's
+/// bit and the host's), held pages apart: `armbehind off`.
+fn behind_disarm_all() -> u64 {
+    let m = behind_map();
+    let _readers = crate::mem::GUEST_READERS.read_recursive();
+    let _arming = super::resident::arm_guard();
+    // (No arming between a page's bit cleared and its protection gone: an
+    // arming in between would leave the bit clear over a protected page, or
+    // set over a writable one.)
+    let _lock = crate::hosted::arm_lock();
+    let mut n = 0u64;
+    let mut pend: Option<(u64, u64)> = None;
+    for (i, w) in m.iter().enumerate() {
+        let v = w.swap(0, Ordering::AcqRel);
+        let mut r = v;
+        while r != 0 {
+            let bit = r.trailing_zeros() as u64;
+            r &= r - 1;
+            let p = MIRROR_BASE + (i as u64 * 32 + bit) * PAGE;
+            let Some(c) = chunk(p, false) else { continue };
+            let (k, wi) = (idx(p) % 64, idx(p) / 64);
+            if c.armed[wi].load(Ordering::Acquire) >> k & 1 == 0 || c4_held(p) {
+                continue;
+            }
+            // (Front end 2's bit first, as a burst's disarm: a check that
+            // reads it set after the host's protection is gone only takes.)
+            if c.armed[wi].fetch_and(!(1u64 << k), Ordering::AcqRel) >> k & 1 == 0 {
+                continue;
+            }
+            c.cgen.fetch_add(1, Ordering::AcqRel);
+            n += 1;
+            pend = match pend {
+                Some((a, b)) if b == p => Some((a, p + PAGE)),
+                Some((a, b)) => {
+                    crate::hosted::disarm(a, b - a);
+                    Some((p, p + PAGE))
+                }
+                None => Some((p, p + PAGE)),
+            };
+        }
+    }
+    if let Some((a, b)) = pend {
+        crate::hosted::disarm(a, b - a);
+    }
+    BEHIND[AB_DISARMED].fetch_add(n, Ordering::Relaxed);
+    n
+}
+
+/// `armbehind off|on` (in-run A/Bs of arming behind).
+pub fn behind_control(what: &str) -> Result<String, String> {
+    if !on() || !crate::hosted::on() || !arm_behind_wanted() {
+        return Err("armbehind: not on (front end 2 hosted, `DS_ARM_BEHIND` not 0)".into());
+    }
+    match what {
+        "off" => {
+            BEHIND_OFF.store(true, Ordering::Release);
+            BEHIND_RUNS.lock().clear();
+            let n = behind_disarm_all();
+            Ok(format!("arming behind off, {n} pages it armed disarmed"))
+        }
+        "on" => {
+            BEHIND_OFF.store(false, Ordering::Release);
+            Ok("arming behind on".into())
+        }
+        _ => Err("usage: armbehind off|on".into()),
+    }
+}
+
+/// The armer's status line ("" when off).
+fn behind_line() -> String {
+    if !arm_behind_wanted() || !crate::hosted::on() {
+        return String::new();
+    }
+    let v: [u64; 10] = std::array::from_fn(|k| BEHIND[k].load(Ordering::Relaxed));
+    let na: [u64; 8] = std::array::from_fn(|k| BEHIND_NOT_ARMED[k].load(Ordering::Relaxed));
+    format!(
+        "    front end 2's arming behind the graphics CP and queue 0x50 (`armbehind`{}, since boot): {} runs queued ({} dropped), {} rounds, {} merged runs offered ({} pages), {} pages armed, {:.1} ms arming, {} takes after an arming ({} pages found written), {} disarmed by `armbehind off`; not armed: armed already {}, too few clean epochs {}, written lately {}, chunk held {}, no settled window {}, not plain read-write {}, import list busy {}\n",
+        if BEHIND_OFF.load(Ordering::Relaxed) { " off" } else { "" },
+        v[AB_QUEUED],
+        v[AB_DROPPED],
+        v[AB_ROUNDS],
+        v[AB_RUNS],
+        v[AB_PAGES],
+        v[AB_ARMED],
+        v[AB_US] as f64 / 1000.0,
+        v[AB_TAKES],
+        v[AB_TAKE_WRITTEN],
+        v[AB_DISARMED],
+        na[R_ARMED],
+        na[R_USES],
+        na[R_QUIET],
+        na[R_HELD],
+        na[R_WINDOW],
+        na[R_RW],
+        na[R_BUSY]
+    )
 }
 
 /// The faults `watch` read: [on pages of the span, those that ended an
@@ -3337,6 +3726,8 @@ fn arm_part(x: u64, y: u64, frame: u64) {
     STATS[S_ARMED].fetch_add((y - x) / PAGE, Ordering::Relaxed);
     if C4_ARMING.with(|f| f.get()) {
         c4_note_armed(x, y);
+    } else if BEHIND_ARMING.with(|f| f.get()) {
+        behind_note_armed(x, y);
     }
 }
 
@@ -4799,6 +5190,9 @@ pub fn init() {
                     crate::info!("fe2: front end 4's held pages on (`DS_C4=0` turns them off): GPU-written pages of the GPU page allocator's and heaps' records held in the mirror, released on a CPU access");
                 }
                 let _ = std::thread::Builder::new().name("fe2-faults".into()).spawn(watch);
+                if arm_behind_wanted() {
+                    let _ = std::thread::Builder::new().name("fe2-armer".into()).spawn(behind_thread);
+                }
             }
             crate::info!(
                 "fe2: front end 2 on ({made}; {s}; hosted arming {}{}; switched off: {}; compute runs recorded in parallel on 4 workers, from {} commands)",
@@ -5278,6 +5672,8 @@ pub fn status() -> String {
         + &wb_buckets_line()
         + &hold_line()
         + &c4_line()
+        + &behind_line()
+        + &take_census_line()
         + &wb_same_line()
         + &wb_probe_line()
 }
