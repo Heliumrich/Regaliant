@@ -84,9 +84,11 @@ if (-not $NoUpscalers) {
     if ($f.EndsWith('.dll') -and (Get-AuthenticodeSignature (Join-Path $upOut $f)).Status -ne 'Valid') { Write-Host "$f has no valid signature; not packaged"; exit 1 }
   }
 }
-# Paths and names of this machine must not be in the executables.
-$needles = @($root, $root.Replace('\', '/'), $cargoHome, $env:USERPROFILE, $env:COMPUTERNAME) | Where-Object { $_ }
+# Paths and names of this machine must not be in the executables. The computer's name counts as
+# a whole word only (a short one is found inside other text: PCV in the translator's "VopcVop3").
+$needles = @($root, $root.Replace('\', '/'), $cargoHome, $env:USERPROFILE) | Where-Object { $_ }
 if ($env:USERNAME -and $env:USERNAME.Length -ge 4) { $needles += "\$($env:USERNAME)\" }
+$words = @($env:COMPUTERNAME) | Where-Object { $_ }
 foreach ($f in 'dsport.exe', 'DemonsSoulsLauncher.exe') {
   $bytes = [IO.File]::ReadAllBytes((Join-Path $out $f))
   $text = [Text.Encoding]::GetEncoding(28591).GetString($bytes).ToLowerInvariant()
@@ -94,6 +96,10 @@ foreach ($f in 'dsport.exe', 'DemonsSoulsLauncher.exe') {
   foreach ($n in $needles) {
     $k = $n.ToLowerInvariant()
     if ($text.Contains($k) -or $wide.Contains($k)) { Write-Host "$f contains a path or name of this machine ($n); not packaged"; exit 1 }
+  }
+  foreach ($n in $words) {
+    $re = '(?<![a-z0-9])' + [regex]::Escape($n.ToLowerInvariant()) + '(?![a-z0-9])'
+    if ([regex]::IsMatch($text, $re) -or [regex]::IsMatch($wide, $re)) { Write-Host "$f contains the name of this machine ($n); not packaged"; exit 1 }
   }
 }
 # README.txt: the player README, the notices, the license (CRLF, UTF-8).
