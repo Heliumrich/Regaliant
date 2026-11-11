@@ -15,6 +15,8 @@ pub struct Gpu {
     /// Device-local memory in bytes.
     pub vram: u64,
     pub api: u32,
+    /// VK_KHR_fragment_shader_barycentric with its feature (the game's shaders need it).
+    pub barycentric: bool,
 }
 
 pub const VENDOR_NVIDIA: u32 = 0x10DE;
@@ -48,6 +50,13 @@ pub fn gpu() -> Result<Gpu, String> {
             if chosen.is_none() || discrete {
                 let m = instance.get_physical_device_memory_properties(pd);
                 let vram = m.memory_heaps[..m.memory_heap_count as usize].iter().filter(|h| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL)).map(|h| h.size).max().unwrap_or(0);
+                let has_ext = instance.enumerate_device_extension_properties(pd).unwrap_or_default().iter().any(|e| std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) == ash::khr::fragment_shader_barycentric::NAME);
+                let barycentric = has_ext && {
+                    let mut b = vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR::default();
+                    let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut b);
+                    instance.get_physical_device_features2(pd, &mut f2);
+                    b.fragment_shader_barycentric != 0
+                };
                 chosen = Some(Gpu {
                     name: std::ffi::CStr::from_ptr(p.device_name.as_ptr()).to_string_lossy().into_owned(),
                     driver: p.driver_version,
@@ -55,6 +64,7 @@ pub fn gpu() -> Result<Gpu, String> {
                     vendor: p.vendor_id,
                     vram,
                     api: p.api_version,
+                    barycentric,
                 });
             }
         }

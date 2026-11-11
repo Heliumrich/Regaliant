@@ -487,6 +487,12 @@ fn init_inner() -> Result<(), String> {
             instance.get_physical_device_features2(pdev, &mut f2);
         }
         let barycentric = has_bary_ext && bary_supported.fragment_shader_barycentric != 0 && gpu_compat() != Some("intel");
+        if !barycentric {
+            // The title interpolates packed 16-bit attributes itself from each vertex's value and
+            // the barycentric registers: without the extension every pixel gets vertex 0's value
+            // and surfaces look faceted (FINDINGS.md 2026-11-11).
+            crate::warn!("Vulkan: no fragment shader barycentrics (VK_KHR_fragment_shader_barycentric): surfaces whose shaders interpolate their own attributes will look faceted on this device");
+        }
         // Partitioned subgroup operations (write marks ORed per map word:
         // `rdna::translate::Spec::marks_part`).
         let partitioned = gpu_compat().is_none()
