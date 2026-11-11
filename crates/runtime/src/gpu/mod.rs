@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 165] = [
+    static ALL: [Tunable; 166] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -197,6 +197,7 @@ pub mod tune {
         Tunable { name: "unb_bound", env: "DS_UNB_BOUND", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "kco", env: "DS_KCO", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "r2", env: "DS_R2", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "past_subs", env: "DS_PAST_SUBS", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1294,6 +1295,17 @@ pub mod tune {
     #[inline]
     pub fn past_drop() -> bool {
         get(112) != 0
+    }
+
+    /// Recording past a parallel run goes on into the title's next
+    /// submission when it is already queued, as past a label wait, instead
+    /// of stopping at the end of the run's submission (2026-11-11: 73% of
+    /// the stops past runs at the walk's Castlewall Front, the CP then
+    /// waiting ~179 us for the chunks with the GPU mostly idle; in-run A/B
+    /// x1.0046, five of five cycles ahead, FINDINGS.md 2026-11-11); 0 off.
+    #[inline]
+    pub fn past_subs() -> bool {
+        get(165) != 0
     }
 
     /// The title's convolution reverb computed (`hle::libs::acm_conv`,
@@ -2473,7 +2485,9 @@ fn worker(q: &'static Queue, name: &str) {
         prio::set_compute(q.id);
     }
     cp.wait_flag = Some(&q.cp_waiting);
-    cp.more_follows = Some(Box::new(move || !q.pending.lock().is_empty()));
+    // (A title submission: never a replay's control entry, which a stretch
+    // held past a run or label wait must not run into.)
+    cp.more_follows = Some(Box::new(move || q.pending.lock().front().is_some_and(|b| b.ctl.is_none())));
     // Register states kept for a frame replay (`Ctl::Save`).
     let mut saved: [Option<cp::ChunkState>; 2] = [None, None];
     // Submissions a stretch past a label wait runs through.

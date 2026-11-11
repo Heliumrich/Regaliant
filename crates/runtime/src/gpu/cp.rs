@@ -2076,15 +2076,15 @@ impl Cp {
     /// stretches held work back from the GPU; removed on 2026-11-01.)
     fn past_goes_on(&self) -> bool {
         let more = || self.more_follows.as_ref().is_some_and(|f| f());
-        self.depth == 1 && (self.past.as_ref().is_some_and(|p| p.across && self.next_in_submission) || (self.past_wait.is_some() && (self.next_in_submission || more())))
+        self.depth == 1 && (self.past.as_ref().is_some_and(|p| p.across && (self.next_in_submission || (super::tune::past_subs() && more()))) || (self.past_wait.is_some() && (self.next_in_submission || more())))
     }
 
     /// Whether what this command processor records now may be recorded
     /// again from an earlier title submission (a stretch past a label
-    /// wait): the queue's worker keeps the submissions it runs through
-    /// meanwhile (`take_rewind_sub`).
+    /// wait, or past a run with `tune past_subs`): the queue's worker keeps
+    /// the submissions it runs through meanwhile (`take_rewind_sub`).
     pub fn holds_across(&self) -> bool {
-        self.past_wait.is_some()
+        self.past_wait.is_some() || (super::tune::past_subs() && self.past.is_some())
     }
 
     pub fn chunk_state(&self) -> ChunkState {
@@ -3777,8 +3777,8 @@ impl Cp {
             }
         };
         // The run ended in an earlier command buffer: the worker goes back
-        // (into an earlier title submission: stretches past runs no longer
-        // cross submissions since `tune past_subs` was removed).
+        // (into an earlier title submission: a stretch past a run that went
+        // on into later submissions, `tune past_subs`).
         let buf = if stopped_buf.is_some() { stopped_buf.unwrap() } else { last_buf };
         if run_sub != self.sub_index {
             static N: AtomicU64 = AtomicU64::new(0);
