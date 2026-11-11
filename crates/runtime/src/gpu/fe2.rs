@@ -116,6 +116,11 @@ struct Chunk {
     /// finds such a page written found a write the protection missed
     /// (`take_run`: a hole).
     varmed: [AtomicU64; WORDS],
+    /// The page's `wrote` stamp is an arming that ended without a write
+    /// found on the page (a word-mate's fault, a disarm, a mapping change):
+    /// its quiet time restarts, but `hot_run` does not take it for written
+    /// lately. Cleared by every write found on the page.
+    nowrite: [AtomicU64; WORDS],
     /// Written by GPU work (marked only with `DS_FE2_ARM_GPU=0`, unarmed). Bits
     /// are only ever set.
     gpu: [AtomicU64; WORDS],
@@ -1055,6 +1060,7 @@ fn make_chunk(slot: &'static AtomicPtr<Chunk>) -> &'static Chunk {
         valid: std::array::from_fn(|_| AtomicU64::new(0)),
         armed: std::array::from_fn(|_| AtomicU64::new(0)),
         varmed: std::array::from_fn(|_| AtomicU64::new(0)),
+        nowrite: std::array::from_fn(|_| AtomicU64::new(0)),
         gpu: std::array::from_fn(|_| AtomicU64::new(0)),
         gpu_all: AtomicBool::new(false),
         wclean: std::array::from_fn(|_| AtomicU32::new(0)),
@@ -2759,10 +2765,15 @@ fn hot_run(a: u64, b: u64, frame: u64) -> bool {
         return false;
     }
     let quiet = hot_quiet();
+    let word = super::tune::hot_word();
     let mut x = a;
     while x < b {
         let Some(c) = chunk(x, false) else { return false };
         let i = idx(x);
+        // (An arming that ended without a write found: not written lately.)
+        if word && c.nowrite[i / 64].load(Ordering::Relaxed) >> (i % 64) & 1 != 0 {
+            return false;
+        }
         let wrote = c.wrote[i].load(Ordering::Relaxed) as u64;
         let window = if quiet { HOT_FLIPS.max(ARM_QUIET << c.level[i].load(Ordering::Relaxed)) } else { HOT_FLIPS };
         if wrote == 0 || frame.saturating_sub(wrote - 1) >= window {
@@ -2848,6 +2859,9 @@ fn note_arming_ended(a: u64, b: u64) {
                     let _ = l.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some((v + 1).min(ARM_MAX_LEVEL)));
                     c.wrote[base + k].store(f, Ordering::Release);
                 }
+                // (No write found on them: the fault watcher clears the bit
+                // of a page whose own fault it reads.)
+                c.nowrite[w].fetch_or(gone, Ordering::AcqRel);
                 STATS[S_ARM_ENDED].fetch_add(gone.count_ones() as u64, Ordering::Relaxed);
             }
         }
@@ -2931,6 +2945,10 @@ fn host_writing(a: u64, b: u64) -> bool {
 fn try_arm(a: u64, b: u64, frame: u64, armable: &Armable) {
     let arm_gpu = arm_gpu();
     let arm_gpu_os = arm_gpu_os();
+    // (The armer behind the graphics CP asks for longer quiet times: its
+    // pages are the ones only the non-arming threads check, and in the walk
+    // the title streams into them.)
+    let quiet_shift = if BEHIND_ARMING.with(|f| f.get()) { super::tune::behind_quiet() as u8 } else { 0 };
     // A word at a time, the pages not armed counted here and added once
     // (until 2026-10-28 page by page, each such page a shared atomic add:
     // ~170,000 pages of held chunks a flip at the gate). A page's reason is
@@ -2979,7 +2997,7 @@ fn try_arm(a: u64, b: u64, frame: u64, armable: &Armable) {
             let k = r.trailing_zeros() as usize;
             r &= r - 1;
             let wrote = c.wrote[base + k].load(Ordering::Acquire) as u64;
-            let need = ARM_QUIET << c.level[base + k].load(Ordering::Acquire);
+            let need = ARM_QUIET << (c.level[base + k].load(Ordering::Acquire) + quiet_shift).min(16);
             if wrote == 0 || frame.saturating_sub(wrote - 1) < need {
                 not[R_QUIET] += 1;
                 cand &= !(1u64 << k);
@@ -3189,8 +3207,11 @@ static BEHIND_RUNS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 const BEHIND_MAX: usize = 16384;
 /// [runs queued, runs dropped (queue full), rounds, merged runs offered,
 /// pages offered, pages armed, us arming, pages disarmed by `armbehind off`,
-/// takes after an arming, pages they found written].
-static BEHIND: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+/// takes after an arming, pages they found written, runs skipped as offered
+/// lately, rounds that ran out of their time].
+static BEHIND: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+/// A run offered within this many flips is not offered again (`behind_thread`).
+const BEHIND_AGAIN: u64 = 30;
 const AB_QUEUED: usize = 0;
 const AB_DROPPED: usize = 1;
 const AB_ROUNDS: usize = 2;
@@ -3201,6 +3222,8 @@ const AB_US: usize = 6;
 const AB_DISARMED: usize = 7;
 const AB_TAKES: usize = 8;
 const AB_TAKE_WRITTEN: usize = 9;
+const AB_SKIPPED: usize = 10;
+const AB_OVER: usize = 11;
 /// Front end 2's reasons for the pages the armer offered and did not arm.
 static BEHIND_NOT_ARMED: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
@@ -3237,9 +3260,18 @@ fn behind_queue(a: u64, b: u64) {
 /// offered to `try_arm`.
 fn behind_thread() {
     BEHIND_ARMING.with(|f| f.set(true));
+    // (Below the recording threads: its work is never on their path.)
+    unsafe {
+        windows_sys::Win32::System::Threading::SetThreadPriority(windows_sys::Win32::System::Threading::GetCurrentThread(), windows_sys::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL);
+    }
     let mut runs: Vec<(u64, u64)> = Vec::new();
     let mut merged: Vec<(u64, u64)> = Vec::new();
     let mut written: Vec<u64> = Vec::new();
+    // The runs offered lately, by a hash of their start: (start, end, flip).
+    // A run offered within BEHIND_AGAIN flips is skipped: the checks queue
+    // the same runs every epoch, and pages that were not armable then are
+    // rarely armable a moment later.
+    let mut offered: Vec<(u64, u64, u64)> = vec![(0, 0, 0); 1 << 14];
     loop {
         std::thread::sleep(std::time::Duration::from_millis(2));
         std::mem::swap(&mut runs, &mut *BEHIND_RUNS.lock());
@@ -3251,6 +3283,22 @@ fn behind_thread() {
             continue;
         }
         runs.sort_unstable();
+        runs.dedup();
+        // (Runs offered within BEHIND_AGAIN flips skipped: the checks queue
+        // the same runs every epoch.)
+        let frame = super::FRAMES.load(Ordering::Relaxed);
+        let before_filter = runs.len();
+        runs.retain(|&(a, b)| {
+            let h = (((a >> 12) ^ (b >> 12).rotate_left(17)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 50) as usize;
+            let e = offered[h];
+            if e.0 == a && e.1 == b && frame.saturating_sub(e.2) < BEHIND_AGAIN {
+                false
+            } else {
+                offered[h] = (a, b, frame);
+                true
+            }
+        });
+        BEHIND[AB_SKIPPED].fetch_add((before_filter - runs.len()) as u64, Ordering::Relaxed);
         merged.clear();
         for &(a, b) in &runs {
             match merged.last_mut() {
@@ -3259,10 +3307,18 @@ fn behind_thread() {
             }
         }
         runs.clear();
-        let frame = super::FRAMES.load(Ordering::Relaxed);
         let t = std::time::Instant::now();
+        let budget = std::time::Duration::from_micros(super::tune::behind_us().max(1));
         let mut pages = 0u64;
+        let mut offered_now = 0u64;
         for &(a, b) in &merged {
+            // (A round's time is bounded: the rest are queued again by
+            // their next checks.)
+            if t.elapsed() > budget {
+                BEHIND[AB_OVER].fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            offered_now += 1;
             pages += (b - a) / PAGE;
             let before = BEHIND[AB_ARMED].load(Ordering::Relaxed);
             try_arm(a, b, frame, &super::exec::fe2_armable);
@@ -3284,7 +3340,7 @@ fn behind_thread() {
             }
         }
         BEHIND[AB_ROUNDS].fetch_add(1, Ordering::Relaxed);
-        BEHIND[AB_RUNS].fetch_add(merged.len() as u64, Ordering::Relaxed);
+        BEHIND[AB_RUNS].fetch_add(offered_now, Ordering::Relaxed);
         BEHIND[AB_PAGES].fetch_add(pages, Ordering::Relaxed);
         BEHIND[AB_US].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
@@ -3376,16 +3432,20 @@ fn behind_line() -> String {
     if !arm_behind_wanted() || !crate::hosted::on() {
         return String::new();
     }
-    let v: [u64; 10] = std::array::from_fn(|k| BEHIND[k].load(Ordering::Relaxed));
+    let v: [u64; 12] = std::array::from_fn(|k| BEHIND[k].load(Ordering::Relaxed));
     let na: [u64; 8] = std::array::from_fn(|k| BEHIND_NOT_ARMED[k].load(Ordering::Relaxed));
     format!(
-        "    front end 2's arming behind the graphics CP and queue 0x50 (`armbehind`{}, since boot): {} runs queued ({} dropped), {} rounds, {} merged runs offered ({} pages), {} pages armed, {:.1} ms arming, {} takes after an arming ({} pages found written), {} disarmed by `armbehind off`; not armed: armed already {}, too few clean epochs {}, written lately {}, chunk held {}, no settled window {}, not plain read-write {}, import list busy {}\n",
+        "    front end 2's arming behind the graphics CP and queue 0x50 (`armbehind`{}, since boot; `tune behind_quiet` {}, `behind_us` {}): {} runs queued ({} dropped), {} rounds ({} out of time), {} merged runs offered ({} pages; {} skipped as offered lately), {} pages armed, {:.1} ms arming, {} takes after an arming ({} pages found written), {} disarmed by `armbehind off`; not armed: armed already {}, too few clean epochs {}, written lately {}, chunk held {}, no settled window {}, not plain read-write {}, import list busy {}\n",
         if BEHIND_OFF.load(Ordering::Relaxed) { " off" } else { "" },
+        super::tune::behind_quiet(),
+        super::tune::behind_us(),
         v[AB_QUEUED],
         v[AB_DROPPED],
         v[AB_ROUNDS],
+        v[AB_OVER],
         v[AB_RUNS],
         v[AB_PAGES],
+        v[AB_SKIPPED],
         v[AB_ARMED],
         v[AB_US] as f64 / 1000.0,
         v[AB_TAKES],
@@ -3516,6 +3576,7 @@ fn watch() {
                 }
             }
             c.wrote[i].store(frame as u32 + 1, Ordering::Release);
+            c.nowrite[w].fetch_and(!bit, Ordering::AcqRel);
             c.uses[w].store(0, Ordering::Relaxed);
             let k = ((page - MIRROR_BASE) >> CHUNK_SHIFT) as usize;
             if counts[k] == 0 {
@@ -3565,6 +3626,7 @@ fn word_ended(wa: u64, level: u8, frame: u64) -> u64 {
         c.wrote[base + k].store(frame as u32 + 1, Ordering::Release);
         c.level[base + k].fetch_max(level, Ordering::AcqRel);
     }
+    c.nowrite[w].fetch_or(gone, Ordering::AcqRel);
     c.cgen.fetch_add(1, Ordering::AcqRel);
     gone.count_ones() as u64
 }
@@ -3909,6 +3971,7 @@ pub fn cpu_written(pages: &[u64]) {
         }
         c.wgen[w].fetch_add(1, Ordering::AcqRel);
         c.wrote[i].store(f, Ordering::Release);
+        c.nowrite[w].fetch_and(!bit, Ordering::AcqRel);
         c.pgen[i].fetch_add(1, Ordering::AcqRel);
         c.uses[w].store(0, Ordering::Relaxed);
         n += 1;
@@ -3946,6 +4009,7 @@ pub fn invalidate(base: u64, len: u64) {
                 c.wrote[k].store(f, Ordering::Release);
                 c.pgen[k].fetch_add(1, Ordering::AcqRel);
             }
+            c.nowrite[w].fetch_and(!mask, Ordering::AcqRel);
             c.uses[w].store(0, Ordering::Relaxed);
             x = e;
         } else {
@@ -6755,6 +6819,7 @@ fn c4_release_thread() {
                 let _ = c.level[idx(r.page)].fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some((v + 1).min(ARM_MAX_LEVEL)));
                 if r.write {
                     c.wrote[idx(r.page)].store(frame as u32 + 1, Ordering::Release);
+                    c.nowrite[idx(r.page) / 64].fetch_and(!(1u64 << (idx(r.page) % 64)), Ordering::AcqRel);
                     c.uses[idx(r.page) / 64].store(0, Ordering::Relaxed);
                 }
             }
