@@ -91,9 +91,20 @@ pub fn stage_inputs(tr: &mut T) -> R<()> {
                             let c = e(tr.b.composite_extract(tr.t.f32, None, src, [k + 1]))?;
                             tr.to_u(c)?
                         }
-                        8..=11 => {
+                        8..=10 => {
                             let c = e(tr.b.composite_extract(tr.t.f32, None, fcv, [(bit - 8) as u32]))?;
                             tr.to_u(c)?
+                        }
+                        // POS_W_FLOAT holds the clip-space W (the view depth
+                        // the title's soft particles and fog lookups read; AMD's
+                        // own drivers take its reciprocal for gl_FragCoord.w),
+                        // while FragCoord.w is 1/W: with 1/W the particles'
+                        // depth fade never hid them behind walls (2026-11-11).
+                        11 => {
+                            let c = e(tr.b.composite_extract(tr.t.f32, None, fcv, [3]))?;
+                            let one = tr.f(1.0);
+                            let w = e(tr.b.f_div(tr.t.f32, None, one, c))?;
+                            tr.to_u(w)?
                         }
                         12 => {
                             let f = e(tr.b.load(tr.t.bool_, None, ff, None, []))?;
