@@ -6246,19 +6246,41 @@ pub fn c4_cp_target(a: u64, n: u64) {
     c4_release_sync(a, n, true);
 }
 
+thread_local! {
+    /// Page ranges this thread's reads marked never held and found unheld
+    /// (`c4_release_reads`), the last RECENT_READS of them: a read inside
+    /// one needs neither again (a never-held mark is never cleared, and a
+    /// hold that raced the mark ends by the read's fault as before). The
+    /// preparations' reads repeat their pages draw after draw (the marking
+    /// was ~0.8% of the graphics CP's busy samples and ~1.4% of its
+    /// workers' at Castlewall Front, 2026-11-11).
+    static READ_MARKED: std::cell::RefCell<([(u64, u64); RECENT_READS], usize)> = const { std::cell::RefCell::new(([(0, 0); RECENT_READS], 0)) };
+}
+const RECENT_READS: usize = 16;
+
 /// Our command processors read `reads` on the CPU: held pages released first.
 pub fn c4_release_reads(reads: &[(u64, u64)]) {
     if !c4_on() {
         return;
     }
-    for &(a, n) in reads {
-        // (Pages our command processors read are not held: marked first, so
-        // that a later selection leaves them out.)
-        c4_no_hold(a, n, NO_HOLD_READ);
-        if c4_any_held(a, a.saturating_add(n.max(1))) {
-            c4_release_sync(a, n, false);
+    READ_MARKED.with(|m| {
+        let mut m = m.borrow_mut();
+        for &(a, n) in reads {
+            let (lo, hi) = (a & !(PAGE - 1), a.saturating_add(n.max(1)).next_multiple_of(PAGE));
+            if m.0.iter().any(|&(x, y)| x <= lo && hi <= y) {
+                continue;
+            }
+            // (Pages our command processors read are not held: marked first,
+            // so that a later selection leaves them out.)
+            c4_no_hold(a, n, NO_HOLD_READ);
+            if c4_any_held(a, a.saturating_add(n.max(1))) {
+                c4_release_sync(a, n, false);
+            }
+            let k = m.1;
+            m.0[k] = (lo, hi);
+            m.1 = (k + 1) % RECENT_READS;
         }
-    }
+    });
 }
 
 /// Releases the held pages of guest [base, base+len) and waits (5 s at
@@ -6482,7 +6504,7 @@ fn c4_round() {
                     continue;
                 };
                 let (k, w) = (idx(p) % 64, idx(p) / 64);
-                if c.armed[w].load(Ordering::Acquire) >> k & 1 == 0 {
+                if (c.armed[w].load(Ordering::Acquire) & c.varmed[w].load(Ordering::Acquire)) >> k & 1 == 0 {
                     e[2] += 1;
                 } else if c.valid[w].load(Ordering::Acquire) >> k & 1 == 0 {
                     e[3] += 1;
@@ -6537,7 +6559,15 @@ fn c4_round() {
             if arm_off && c4_armed_by_round(p) {
                 continue;
             }
-            if c.valid[w].load(Ordering::Acquire) >> k & 1 == 0 || !crate::hosted::armed(p) {
+            // (Valid, and taken since its arming (`Chunk::varmed`): a CPU
+            // write between the page's last take and its arming is found by
+            // the take after the arming and the page made invalid. A page
+            // held with such a write missing from the mirror would lose it
+            // at its release, which copies the whole page from the mirror:
+            // C4's own arming took nothing after arming until 2026-11-11
+            // night, and a walk boot crashed in the engine's heap allocator
+            // code that reads held pages.)
+            if c.valid[w].load(Ordering::Acquire) >> k & 1 == 0 || c.varmed[w].load(Ordering::Acquire) >> k & 1 == 0 || !crate::hosted::armed(p) {
                 continue;
             }
             // (Pages the CPU wrote within `c4_quiet` flips are left alone:
@@ -6562,8 +6592,24 @@ fn c4_round() {
     if !aruns.is_empty() {
         C4X[X_ARM_TRIED].fetch_add(aruns.iter().map(|r| (r.1 - r.0) / PAGE).sum::<u64>(), Ordering::Relaxed);
         C4_ARMING.with(|f| f.set(true));
+        let mut written: Vec<u64> = Vec::new();
         for &(p, q) in &aruns {
+            let before = C4X[X_ARM_DONE].load(Ordering::Relaxed);
             try_arm(p, q, frame, &super::exec::fe2_armable);
+            if C4X[X_ARM_DONE].load(Ordering::Relaxed) != before {
+                // (As `take_run`: armed, then taken. A CPU write after the
+                // page's last take and before this arming is found here and
+                // the page made invalid; the pages armed are taken since
+                // their arming, which a hold requires.)
+                hole_snapshot(p, q);
+                written.clear();
+                let r = super::precache::take_written_for(p, q - p, &mut written, None, crate::mem::WW_WHO_FE2);
+                if r.is_some() {
+                    hole_check(&written);
+                } else {
+                    invalidate(p, q - p);
+                }
+            }
         }
         C4_ARMING.with(|f| f.set(false));
     }
