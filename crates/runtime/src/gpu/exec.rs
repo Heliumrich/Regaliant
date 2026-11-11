@@ -2304,7 +2304,7 @@ fn import_narrow(base: u64, size: u64) -> bool {
 /// `fe2_settled_over` again under the arm lock, and an import holds its
 /// pages unarmed from before its driver call until it is listed
 /// (`fe2::hold`).
-fn fe2_armable(a: u64, b: u64, arm: &mut dyn FnMut(u64, u64)) -> bool {
+pub(super) fn fe2_armable(a: u64, b: u64, arm: &mut dyn FnMut(u64, u64)) -> bool {
     let Some(parts) = settled_parts(a, b) else { return false };
     for (p, q) in parts {
         arm(p, q);

@@ -2868,7 +2868,7 @@ fn try_arm(a: u64, b: u64, frame: u64, armable: &Armable) {
     }
     for (k, &n) in not.iter().enumerate() {
         if n != 0 {
-            NOT_ARMED[k].fetch_add(n, Ordering::Relaxed);
+            not_armed(k, n);
         }
     }
 }
@@ -2999,6 +2999,18 @@ const R_WINDOW: usize = 4;
 const R_RW: usize = 5;
 const R_HELD: usize = 6;
 const R_BUSY: usize = 7;
+
+/// The same reasons for C4's own arming (`c4_round`: the pages it offered).
+static C4_NOT_ARMED: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// Counts `n` pages not armed for reason `k` (C4's own arming apart).
+fn not_armed(k: usize, n: u64) {
+    if C4_ARMING.with(|f| f.get()) {
+        C4_NOT_ARMED[k].fetch_add(n, Ordering::Relaxed);
+    } else {
+        NOT_ARMED[k].fetch_add(n, Ordering::Relaxed);
+    }
+}
 
 /// The faults `watch` read: [on pages of the span, those that ended an
 /// arming of ours (its level raised there), bursts, pages they disarmed,
@@ -3246,9 +3258,9 @@ fn arm_run(x: u64, y: u64, frame: u64, armable: &Armable) {
         arm_part(p, q, frame);
     });
     if !listed {
-        NOT_ARMED[R_BUSY].fetch_add((y - x) / PAGE, Ordering::Relaxed);
+        not_armed(R_BUSY, (y - x) / PAGE);
     } else if inside < y - x {
-        NOT_ARMED[R_WINDOW].fetch_add((y - x - inside) / PAGE, Ordering::Relaxed);
+        not_armed(R_WINDOW, (y - x - inside) / PAGE);
     }
 }
 
@@ -3266,15 +3278,15 @@ fn arm_part(x: u64, y: u64, frame: u64) {
     if super::tune::r2() {
         // (A page front end 4 holds is no-access: not plain read-write.)
         if host_writing(x, y) || c4_any_held(x, y) {
-            NOT_ARMED[R_RW].fetch_add((y - x) / PAGE, Ordering::Relaxed);
+            not_armed(R_RW, (y - x) / PAGE);
             return;
         }
         if super::exec::fe2_settled_over(x, y) != Some(true) {
-            NOT_ARMED[R_WINDOW].fetch_add((y - x) / PAGE, Ordering::Relaxed);
+            not_armed(R_WINDOW, (y - x) / PAGE);
             return;
         }
         if held(x, y, frame) {
-            NOT_ARMED[R_HELD].fetch_add((y - x) / PAGE, Ordering::Relaxed);
+            not_armed(R_HELD, (y - x) / PAGE);
             return;
         }
     }
@@ -3285,17 +3297,17 @@ fn arm_part(x: u64, y: u64, frame: u64) {
     let _arming = super::resident::arm_guard();
     let _lock = crate::hosted::arm_lock();
     if host_writing(x, y) || !plain_rw(x, y - x) {
-        NOT_ARMED[R_RW].fetch_add((y - x) / PAGE, Ordering::Relaxed);
+        not_armed(R_RW, (y - x) / PAGE);
         return;
     }
     // (Still inside settled imports: the caller looked without the arm lock,
     // and an import listed since is young.)
     if super::exec::fe2_settled_over(x, y) != Some(true) {
-        NOT_ARMED[R_WINDOW].fetch_add((y - x) / PAGE, Ordering::Relaxed);
+        not_armed(R_WINDOW, (y - x) / PAGE);
         return;
     }
     if held(x, y, frame) {
-        NOT_ARMED[R_HELD].fetch_add((y - x) / PAGE, Ordering::Relaxed);
+        not_armed(R_HELD, (y - x) / PAGE);
         return;
     }
     if hold_census() && HELD_MAP.get().is_some() {
@@ -3323,6 +3335,9 @@ fn arm_part(x: u64, y: u64, frame: u64) {
         p = e;
     }
     STATS[S_ARMED].fetch_add((y - x) / PAGE, Ordering::Relaxed);
+    if C4_ARMING.with(|f| f.get()) {
+        c4_note_armed(x, y);
+    }
 }
 
 /// `arm_part` under the hold census (its checks passed, the locks held):
@@ -5604,7 +5619,7 @@ static C4_ALL: AtomicBool = AtomicBool::new(false);
 static C4_SYNC: parking_lot::Mutex<Vec<(u64, u64, bool, std::sync::Arc<AtomicBool>)>> = parking_lot::Mutex::new(Vec::new());
 
 /// C4's counts (since boot).
-static C4X: [AtomicU64; 26] = [const { AtomicU64::new(0) }; 26];
+static C4X: [AtomicU64; 28] = [const { AtomicU64::new(0) }; 28];
 const X_HELD: usize = 0;
 const X_RUNS: usize = 1;
 const X_FAILED: usize = 2;
@@ -5630,10 +5645,103 @@ const X_CPU_PAGES: usize = 24;
 /// Runs the host refused: a page of them took a write fault (or was
 /// disarmed) since it was looked at.
 const X_UNDONE: usize = 25;
+/// C4's own arming: pages its rounds offered to front end 2's rules, and
+/// those armed.
+const X_ARM_TRIED: usize = 26;
+const X_ARM_DONE: usize = 27;
 
 thread_local! {
     /// The release thread (it never waits for itself).
     static C4_RELEASER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The hold round arming for C4 (`c4_round`): `arm_part` notes what it
+    /// armed, `not_armed` counts apart.
+    static C4_ARMING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// C4's own arming (`DS_C4_ARM=0` off): target pages written back lately
+/// that front end 2 has not armed are armed by the hold round itself, by
+/// front end 2's rules (`try_arm`: quiet, found clean in enough epochs,
+/// inside settled import windows), so a later round can hold them. Front
+/// end 2 arms only at its checks, and the graphics CP's checks take without
+/// arming: pages only the graphics CP's work reads were never armed, so
+/// never held (the 8 MiB per-view buffer at the swamp, 581,235 of its
+/// 585,727 page-rounds written back lately and not held; `DS_C4_WHY`,
+/// 2026-11-11 evening).
+fn c4_arm_wanted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_C4_ARM").ok().as_deref() != Some("0"))
+}
+
+/// `c4arm off` (in-run A/Bs): the rounds arm nothing, and the pages they
+/// armed are released and not held again until `c4arm on`.
+static C4_ARM_OFF: AtomicBool = AtomicBool::new(false);
+
+/// The pages C4's rounds armed (a bit per page of the mirror's span, as the
+/// held map's).
+fn c4_armed_map() -> &'static [AtomicU32] {
+    static M: std::sync::OnceLock<Box<[AtomicU32]>> = std::sync::OnceLock::new();
+    M.get_or_init(|| (0..HELD_MAP_WORDS).map(|_| AtomicU32::new(0)).collect())
+}
+
+/// `arm_part` armed [x, y) in C4's round (`C4_ARMING`).
+fn c4_note_armed(x: u64, y: u64) {
+    let m = c4_armed_map();
+    let (lo, hi) = (x.max(MIRROR_BASE), y.min(MIRROR_END));
+    let mut p = lo;
+    while p < hi {
+        let i = ((p - MIRROR_BASE) / PAGE) as usize;
+        m[i / 32].fetch_or(1 << (i % 32), Ordering::Relaxed);
+        p += PAGE;
+    }
+    C4X[X_ARM_DONE].fetch_add(hi.saturating_sub(lo) / PAGE, Ordering::Relaxed);
+}
+
+/// Whether C4's rounds armed page `p` (`c4_note_armed`).
+fn c4_armed_by_round(p: u64) -> bool {
+    let i = ((p - MIRROR_BASE) / PAGE) as usize;
+    c4_armed_map()[i / 32].load(Ordering::Relaxed) >> (i % 32) & 1 != 0
+}
+
+/// `c4arm off|on` (in-run A/Bs of C4's own arming): off releases the held
+/// pages its rounds armed (through the release thread, not waited for) and
+/// holds none of them; on arms and holds them again from the next rounds.
+pub fn c4_arm_control(what: &str) -> Result<String, String> {
+    if !c4_on() || !c4_arm_wanted() {
+        return Err("c4arm: not on (front end 4 on, `DS_C4_ARM` not 0)".into());
+    }
+    match what {
+        "off" => {
+            C4_ARM_OFF.store(true, Ordering::Release);
+            let Some(m) = HELD_MAP.get() else { return Ok("the rounds' arming off".into()) };
+            // SAFETY: as `held_mark`.
+            let held = unsafe { std::slice::from_raw_parts(m.words as *const AtomicU32, HELD_MAP_WORDS) };
+            let a = c4_armed_map();
+            let mut runs: Vec<(u64, u64)> = Vec::new();
+            for i in 0..HELD_MAP_WORDS {
+                let mut v = held[i].load(Ordering::Acquire) & a[i].load(Ordering::Relaxed);
+                while v != 0 {
+                    let bit = v.trailing_zeros() as u64;
+                    v &= v - 1;
+                    let p = MIRROR_BASE + (i as u64 * 32 + bit) * PAGE;
+                    match runs.last_mut() {
+                        Some(l) if l.1 == p => l.1 = p + PAGE,
+                        _ => runs.push((p, p + PAGE)),
+                    }
+                }
+            }
+            let n: u64 = runs.iter().map(|r| (r.1 - r.0) / PAGE).sum();
+            let mut g = C4_SYNC.lock();
+            for (p, q) in runs {
+                g.push((p, q, false, std::sync::Arc::new(AtomicBool::new(false))));
+            }
+            Ok(format!("the rounds' arming off, {n} held pages it armed released"))
+        }
+        "on" => {
+            C4_ARM_OFF.store(false, Ordering::Release);
+            Ok("the rounds' arming on".into())
+        }
+        _ => Err("usage: c4arm off|on".into()),
+    }
 }
 
 /// Whether a page of guest [lo, hi) is held (the bitmap; false without C4).
@@ -6005,6 +6113,11 @@ fn c4_round() {
     }
     let mut runs: Vec<(u64, u64)> = Vec::new();
     let mut cands = 0u64;
+    // (C4's own arming: the unarmed pages, offered to front end 2's rules
+    // after the holds; with `c4arm off` the pages it armed are left alone.)
+    let arm_off = c4_arm_wanted() && C4_ARM_OFF.load(Ordering::Acquire);
+    let arm_rounds = c4_arm_wanted() && !arm_off;
+    let mut aruns: Vec<(u64, u64)> = Vec::new();
     for i in 0..HELD_MAP_WORDS {
         let mut v = recent[i].load(Ordering::Relaxed) & !held[i].load(Ordering::Acquire) & !nh[i].load(Ordering::Relaxed);
         while v != 0 {
@@ -6016,7 +6129,19 @@ fn c4_round() {
             }
             let Some(c) = chunk(p, false) else { continue };
             let (k, w) = (idx(p) % 64, idx(p) / 64);
-            if c.armed[w].load(Ordering::Acquire) >> k & 1 == 0 || c.valid[w].load(Ordering::Acquire) >> k & 1 == 0 || !crate::hosted::armed(p) {
+            if c.armed[w].load(Ordering::Acquire) >> k & 1 == 0 {
+                if arm_rounds {
+                    match aruns.last_mut() {
+                        Some(l) if l.1 == p => l.1 = p + PAGE,
+                        _ => aruns.push((p, p + PAGE)),
+                    }
+                }
+                continue;
+            }
+            if arm_off && c4_armed_by_round(p) {
+                continue;
+            }
+            if c.valid[w].load(Ordering::Acquire) >> k & 1 == 0 || !crate::hosted::armed(p) {
                 continue;
             }
             // (Pages the CPU wrote within `c4_quiet` flips are left alone:
@@ -6035,6 +6160,17 @@ fn c4_round() {
     }
     C4X[X_CANDIDATES].fetch_add(cands, Ordering::Relaxed);
     c4_hold_runs(&runs);
+    // C4's own arming, after the holds: a page armed now is held a round
+    // later at the earliest (a CPU write meanwhile ends its arming as any
+    // other's, with front end 2's backoff).
+    if !aruns.is_empty() {
+        C4X[X_ARM_TRIED].fetch_add(aruns.iter().map(|r| (r.1 - r.0) / PAGE).sum::<u64>(), Ordering::Relaxed);
+        C4_ARMING.with(|f| f.set(true));
+        for &(p, q) in &aruns {
+            try_arm(p, q, frame, &super::exec::fe2_armable);
+        }
+        C4_ARMING.with(|f| f.set(false));
+    }
 }
 
 /// Holds `runs` (sorted guest ranges): through the host, which protects
@@ -6440,9 +6576,9 @@ fn c4_line() -> String {
     if !c4_on() || HELD_MAP.get().is_none() {
         return String::new();
     }
-    static LAST: parking_lot::Mutex<(u64, [u64; 26], u64, u64, u64)> = parking_lot::Mutex::new((0, [0; 26], 0, 0, 0));
+    static LAST: parking_lot::Mutex<(u64, [u64; 28], u64, u64, u64)> = parking_lot::Mutex::new((0, [0; 28], 0, 0, 0));
     let frame = super::FRAMES.load(Ordering::Relaxed);
-    let now: [u64; 26] = std::array::from_fn(|k| C4X[k].load(Ordering::Relaxed));
+    let now: [u64; 28] = std::array::from_fn(|k| C4X[k].load(Ordering::Relaxed));
     let (dw, pg, all) = (WB64[2].load(Ordering::Relaxed), WB64[3].load(Ordering::Relaxed), WB64[1].load(Ordering::Relaxed));
     let mut l = LAST.lock();
     let flips = frame.saturating_sub(l.0).max(1) as f64;
@@ -6495,6 +6631,24 @@ fn c4_line() -> String {
     );
     *l = (frame, now, dw, pg, all);
     drop(l);
+    let line = if c4_arm_wanted() {
+        let na: [u64; 8] = std::array::from_fn(|k| C4_NOT_ARMED[k].load(Ordering::Relaxed));
+        line + &format!(
+            "    C4's own arming{} (since boot): {} pages offered, {} armed; not armed: armed already {}, too few clean epochs {}, written lately {}, chunk held {}, no settled window {}, not plain read-write {}, import list busy {}\n",
+            if C4_ARM_OFF.load(Ordering::Relaxed) { " (off)" } else { "" },
+            now[X_ARM_TRIED],
+            now[X_ARM_DONE],
+            na[R_ARMED],
+            na[R_USES],
+            na[R_QUIET],
+            na[R_HELD],
+            na[R_WINDOW],
+            na[R_RW],
+            na[R_BUSY]
+        )
+    } else {
+        line
+    };
     // Pages never held by owning allocation and why.
     let names: std::collections::HashMap<u8, String> = crate::engine::allocators().into_iter().map(|a| (a.id, a.name)).collect();
     let mut by: Vec<(usize, [u64; 3])> = (0..256).map(|i| (i, std::array::from_fn(|k| NO_HOLD_BY[i][k].load(Ordering::Relaxed)))).filter(|x: &(usize, [u64; 3])| x.1.iter().sum::<u64>() > 0).collect();

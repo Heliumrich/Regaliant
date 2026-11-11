@@ -927,6 +927,17 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     Err(e) => Err(e),
                 }
             }
+            "c4arm" => {
+                // `c4arm off|on` (front end 4's own arming): off releases
+                // the held pages its rounds armed and holds none of them.
+                match gpu::fe2::c4_arm_control(parts.next().unwrap_or("")) {
+                    Ok(m) => {
+                        info!("control: c4arm: {m} at flip {flip}");
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
             "c5" => {
                 // `c5 off|on` (front end 4's C5): stores into held pages
                 // marked again, or not.
