@@ -107,7 +107,7 @@ pub mod tune {
         Tunable { name: "ww_probe", env: "DS_WW_PROBE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "cmdbuf_merge", env: "DS_CMDBUF_MERGE", default: 2, value: AtomicU64::new(UNSET) },
         Tunable { name: "par_spins", env: "DS_PAR_SPINS", default: 512, value: AtomicU64::new(UNSET) },
-        Tunable { name: "slots_gfx", env: "DS_GPU_SLOTS_GFX", default: 4, value: AtomicU64::new(UNSET) },
+        Tunable { name: "slots_gfx", env: "DS_GPU_SLOTS_GFX", default: 8, value: AtomicU64::new(UNSET) },
         Tunable { name: "split_every", env: "DS_SPLIT_EVERY", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "plan_check", env: "DS_PLAN_CHECK", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "homes_watch", env: "DS_HOMES_WATCH", default: 1, value: AtomicU64::new(UNSET) },
@@ -923,8 +923,9 @@ pub mod tune {
 
     /// Batch slots of the graphics queue's command processor (`slots` for
     /// the others): its batches wait for a slot when the GPU is behind. 8
-    /// against 4: +0.9% flips/s (noise level), more video memory in use
-    /// (FINDINGS.md 2026-10-16): 4.
+    /// against 4: level until 2026-11-12 (TRIED.md); 8 since then, once the
+    /// SGPR rings moved to video memory (Castlewall Front x1.008, the swamp
+    /// x1.017, FINDINGS.md 2026-11-12 midday).
     #[inline]
     pub fn slots_gfx() -> u64 {
         get(75)
