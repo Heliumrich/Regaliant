@@ -14483,7 +14483,10 @@ impl Exec {
         if !self.recording || !super::vk::labels_on() {
             return;
         }
-        let cmd = self.cmd();
+        // (Not `cmd()`: a label is no recorded work, so a batched program's
+        // next command still joins the open batched dispatch; the batched
+        // dispatch's time then shows under its first command's label.)
+        let cmd = self.slots[self.cur].cmd;
         if self.label_open {
             super::vk::label_end(cmd);
         }
