@@ -4385,6 +4385,20 @@ fn global_barrier(cmd: vk::CommandBuffer) {
 
 /// SGPR data ring space per slot.
 const RING_SEG: u64 = 4 << 20;
+/// A slot's SGPR data ring in video memory (`tune ring_vram`): its size,
+/// the most this process holds of them in the CPU-visible heap (its room
+/// kept at BAR_RESERVE, as the snapshots' is), and how much it holds.
+const RING_VRAM_SEG: u64 = 512 << 10;
+const BAR_RING_CAP: u64 = 32 << 20;
+static BAR_RING_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Commands whose SGPR data went to the system-memory ring because the
+/// slot's video-memory ring had no room left (`tune ring_vram`).
+static RING_FALLBACK: AtomicU64 = AtomicU64::new(0);
+
+/// The size of ring `which` (0 system memory, 1 video memory).
+fn ring_seg(which: usize) -> u64 {
+    if which == 1 { RING_VRAM_SEG } else { RING_SEG }
+}
 /// Descriptor pool of a slot: sets, then descriptors of each POOL_TYPES type.
 const POOL_LIMITS: [u32; 6] = [4096, 32768, 8192, 2048, 8192, 4096];
 const POOL_TYPES: [vk::DescriptorType; 5] = [vk::DescriptorType::STORAGE_BUFFER, vk::DescriptorType::SAMPLED_IMAGE, vk::DescriptorType::STORAGE_IMAGE, vk::DescriptorType::SAMPLER, vk::DescriptorType::UNIFORM_BUFFER];
@@ -7368,7 +7382,7 @@ fn slot_mem_line() -> String {
         .map(|(k, n)| format!("{n} {}/{} KiB", SEG_MAX[k][0].load(Ordering::Relaxed) >> 10, SEG_MAX[k][1].load(Ordering::Relaxed) >> 10))
         .collect();
     format!(
-        "    batch slots: {} ({} MiB of video memory: shadows {}, batch-start copy segments {}, snapshots {}, SGPR rings {}; {} MiB of host rings and staging, {} MiB of snapshots in system memory; the CPU-visible video heap's room {}); most a batch used of its shadow/copy segment: {}; slot waits {} ({:.0} ms), {} of them ({:.0} ms) with the GPU done with their batch at their start
+        "    batch slots: {} ({} MiB of video memory: shadows {}, batch-start copy segments {}, snapshots {}, SGPR rings {} ({} commands' data in system memory for want of room there); {} MiB of host rings and staging, {} MiB of snapshots in system memory; the CPU-visible video heap's room {}); most a batch used of its shadow/copy segment: {}; slot waits {} ({:.0} ms), {} of them ({:.0} ms) with the GPU done with their batch at their start
 ",
         v[0],
         device >> 20,
@@ -7376,6 +7390,7 @@ fn slot_mem_line() -> String {
         v[2] >> 20,
         v[3] >> 20,
         v[4] >> 20,
+        RING_FALLBACK.load(Ordering::Relaxed),
         v[5] >> 20,
         v[6] >> 20,
         ctx().bar_room().map(|r| format!("{} MiB", r >> 20)).unwrap_or_else(|| "unknown".into()),
@@ -9849,6 +9864,8 @@ pub static BATCHABLE_AHEAD: AtomicU64 = AtomicU64::new(0);
 /// Workgroups one batched dispatch may hold (its table in the SGPR ring:
 /// `BATCH_ENTRY_DWORDS` each).
 const BATCH_MAX_GROUPS: u32 = 4096;
+/// A batched dispatch's arguments and table in the ring.
+const BATCH_TABLE_BYTES: u64 = 16 + 4 * (rdna::translate::BATCH_ENTRY_DWORDS * BATCH_MAX_GROUPS) as u64;
 
 /// A batched dispatch open for more commands of its program (`Spec::batched`):
 /// recorded as an indirect dispatch whose group count, in the SGPR ring,
@@ -14811,7 +14828,7 @@ impl Exec {
 
     /// `ring_alloc` at a multiple of `align`.
     fn ring_alloc_at(&mut self, which: usize, bytes: u64, align: u64) -> Option<u64> {
-        let seg = RING_SEG;
+        let seg = ring_seg(which);
         let off = self.ring_used[which].next_multiple_of(align);
         if off + bytes > seg {
             return None;
@@ -14868,8 +14885,9 @@ impl Exec {
                 }
             }
         }
-        let seg = RING_SEG;
-        let fits = self.ring_used.iter().all(|u| u.next_multiple_of(self.ring_align) + ring <= seg)
+        // (The system-memory ring decides: a command goes there when the
+        // video-memory one has no room left, `bind_sgpr`.)
+        let fits = self.ring_used[0].next_multiple_of(self.ring_align) + ring <= RING_SEG
             && (0..6).all(|k| self.pool_use[k] + need[k] <= POOL_LIMITS[k])
             && (shadow == 0 || self.shadow_used + shadow <= self.slots[self.cur].shadow_cap || self.shadow_room(self.shadow_used + shadow));
         if !fits {
@@ -16174,18 +16192,34 @@ impl Exec {
             _ => false,
         };
         if vram && self.slots[self.cur].rings[1].is_none() && !self.vram_ring_failed {
-            match ctx().bar_buffer(RING_SEG, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDIRECT_BUFFER) {
-                Ok((b, _m, p)) => {
-                    SLOT_MEM[4].fetch_add(RING_SEG, Ordering::Relaxed);
+            // (Within the budget: at most BAR_RING_CAP of the CPU-visible
+            // heap, its room kept at BAR_RESERVE; past it this executor's
+            // slots keep their system-memory rings.)
+            let before = BAR_RING_BYTES.fetch_add(RING_VRAM_SEG, Ordering::Relaxed);
+            let room = before + RING_VRAM_SEG <= BAR_RING_CAP && ctx().bar_room().is_none_or(|r| r >= RING_VRAM_SEG + BAR_RESERVE);
+            match room.then(|| ctx().bar_buffer(RING_VRAM_SEG, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDIRECT_BUFFER)) {
+                Some(Ok((b, _m, p))) => {
+                    SLOT_MEM[4].fetch_add(RING_VRAM_SEG, Ordering::Relaxed);
                     self.slots[self.cur].rings[1] = Some((b, p))
                 }
-                Err(e) => {
+                Some(Err(e)) => {
+                    BAR_RING_BYTES.fetch_sub(RING_VRAM_SEG, Ordering::Relaxed);
                     crate::warn!("gpu[{}]: no SGPR data ring in video memory ({e})", self.name);
+                    self.vram_ring_failed = true;
+                }
+                None => {
+                    BAR_RING_BYTES.fetch_sub(RING_VRAM_SEG, Ordering::Relaxed);
                     self.vram_ring_failed = true;
                 }
             }
         }
-        let which = if vram && self.slots[self.cur].rings[1].is_some() { 1 } else { 0 };
+        // (The video-memory ring while this command's data, rounded and
+        // aligned, and a batched dispatch's table still fit in it.)
+        let fits_vram = self.ring_used[1].next_multiple_of(self.ubo_align.max(self.ring_align)) + 4 * p.sgpr_data.len() as u64 + 16 + BATCH_TABLE_BYTES <= RING_VRAM_SEG;
+        let which = if vram && self.slots[self.cur].rings[1].is_some() && fits_vram { 1 } else { 0 };
+        if vram && self.slots[self.cur].rings[1].is_some() && !fits_vram {
+            RING_FALLBACK.fetch_add(1, Ordering::Relaxed);
+        }
         let Some((ring, ring_ptr)) = self.slots[self.cur].rings[which] else { return Err("no SGPR data ring".into()) };
         // A uniform buffer (`Spec::sgpr_ubo`) is bound at its alignment, with
         // the translation's whole uvec4 array (16-byte rounding).
@@ -16199,12 +16233,12 @@ impl Exec {
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ring_ptr.add(off as usize), bytes.len()) };
         // With `Spec::sgpr_pc` the whole ring, the stage adding its offset
         // (the binding then stays the same for the batch).
-        let (at, range) = if pc.is_some() { (0, RING_SEG) } else { (off, len) };
+        let (at, range) = if pc.is_some() { (0, ring_seg(which)) } else { (off, len) };
         // The open batched run's window when this command's data lies inside
         // it (its descriptors then match the run's), else one from here on.
         let wb = match &self.cs_run {
             Some(r) if window && r.batch == self.batch_count && r.ring == ring && r.window <= off && off + len <= r.window + SGPR_WINDOW_BYTES => r.window,
-            _ if window => self.window_at(off),
+            _ if window => self.window_at(which, off),
             _ => 0,
         };
         for b in &p.tr.out.bindings {
@@ -16225,9 +16259,9 @@ impl Exec {
 
     /// A uniform window of the ring that holds offset `off` (`Bound::window`):
     /// from `off` down to the uniform alignment, inside the ring segment.
-    fn window_at(&self, off: u64) -> u64 {
+    fn window_at(&self, which: usize, off: u64) -> u64 {
         let a = self.ubo_align;
-        (off / a * a).min((RING_SEG - SGPR_WINDOW_BYTES) / a * a)
+        (off / a * a).min((ring_seg(which) - SGPR_WINDOW_BYTES) / a * a)
     }
 
     /// Moves a command's uniform window (`Bound::window`) to `wb`.
@@ -17205,14 +17239,14 @@ impl Exec {
             }
             // A new batched dispatch: its arguments and table in the ring.
             let which = if self.slots[self.cur].rings[1].is_some_and(|r| r.0 == ring) { 1 } else { 0 };
-            let table_bytes = 16 + 4 * (rdna::translate::BATCH_ENTRY_DWORDS * BATCH_MAX_GROUPS) as u64;
+            let table_bytes = BATCH_TABLE_BYTES;
             let mut run_at = if simple { self.ring_alloc(which, table_bytes) } else { None };
             // The table inside the uniform window: else the window moves to
             // this command's data (the table follows it), or the dispatch
             // runs on its own.
             if let (Some(wb), Some(t)) = (bound.window, run_at) {
                 if t + table_bytes > wb + SGPR_WINDOW_BYTES {
-                    let nb = self.window_at(at);
+                    let nb = self.window_at(which, at);
                     if t + table_bytes <= nb + SGPR_WINDOW_BYTES {
                         Self::move_window(&mut bound, nb);
                         item = ((at - nb) / 4) as u32;
