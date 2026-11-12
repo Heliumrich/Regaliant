@@ -1632,6 +1632,9 @@ fn op_name(opcode: u32) -> String {
 /// unsubmitted writes, submitting the batch before the run, making the run,
 /// waking the workers].
 static PLAN_PHASES: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+/// The chunk start states' and the end state's clones inside `PLAN_PHASES[4]`
+/// (ns; `tune cp_classes`).
+static PLAN_CLONE_NS: AtomicU64 = AtomicU64::new(0);
 /// Runs planned while the batch being recorded had writes (`tune
 /// cp_classes`): [such runs, runs whose writes the forwarded copies all
 /// cover, the written ranges, the ranges' pieces not covered].
@@ -1669,6 +1672,7 @@ fn class_end(k: usize, t: Option<(Instant, u64)>) {
 
 /// Clears the packet classes (`profile reset`).
 pub fn reset_classes() {
+    PLAN_CLONE_NS.store(0, Ordering::Relaxed);
     for c in CP_CLASSES.iter().flatten().chain(ACB_OPS.iter().flatten()).chain(STRETCH_OPS.iter().flatten()).chain(IDRAW_PARTS.iter().flatten()).chain(SERIAL_WHY.iter()).chain(SERIAL_WHY_ACB.iter()).chain(HS_CENSUS.iter()).chain(PLAN_PHASES.iter()).chain(PLAN_MAIN_WRITES.iter()).chain(RUN_EPOCHS.iter()).chain(CB_CENSUS.iter().flatten()) {
         c.store(0, Ordering::Relaxed);
     }
@@ -1778,7 +1782,7 @@ pub fn classes_line() -> String {
     let ph: Vec<u64> = PLAN_PHASES.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let us = |ns: u64, n: u64| ns as f64 / n.max(1) as f64 / 1e3;
     s.push_str(&format!(
-        "    planning per flip: {:.1} runs left serial at {:.1} us each; {:.1} runs split at {:.1} us each (scan {:.1}, setup {:.1}, chunk start states {:.1}, starting workers {:.1}: getting them and the unsubmitted writes {:.1}, submitting the batch before the run {:.1}, making the run {:.1}, waking them {:.1}, the rest {:.1})\n",
+        "    planning per flip: {:.1} runs left serial at {:.1} us each; {:.1} runs split at {:.1} us each (scan {:.1}, setup {:.1}, chunk start states {:.1} (clones {:.1}; register files' high-water marks {}/{}/{} dwords), starting workers {:.1}: getting them and the unsubmitted writes {:.1}, submitting the batch before the run {:.1}, making the run {:.1}, waking them {:.1}, the rest {:.1})\n",
         ph[1] as f64 / flips,
         us(ph[0], ph[1]),
         ph[6] as f64 / flips,
@@ -1786,6 +1790,10 @@ pub fn classes_line() -> String {
         us(ph[2], ph[6]),
         us(ph[3], ph[6]),
         us(ph[4], ph[6]),
+        us(PLAN_CLONE_NS.load(Ordering::Relaxed), ph[6]),
+        high(Space::Ctx, CTX_DWORDS),
+        high(Space::Sh, SH_DWORDS),
+        high(Space::Uc, UC_DWORDS),
         us(ph[5] + ph[7] + ph[8] + ph[9] + ph[10], ph[6]),
         us(ph[7], ph[6]),
         us(ph[8], ph[6]),
@@ -3241,13 +3249,24 @@ impl Cp {
             if let Some(st2) = check.as_ref() {
                 plan_check_states(&st, st2, s);
             }
-            states.push(Box::new(st.clone()));
+            if lap.0.is_some() {
+                let tc = Instant::now();
+                states.push(Box::new(st.clone()));
+                PLAN_CLONE_NS.fetch_add(tc.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            } else {
+                states.push(Box::new(st.clone()));
+            }
         }
         // The state at the run's end (`tune past_runs`: the graphics command
         // processor goes on from there before collecting the chunks).
         let mut end_unknown: Vec<u32> = Vec::new();
+        let timing = lap.0.is_some();
         let end_state = (super::tune::past_runs() && self.main_gfx).then(|| {
+            let tc = timing.then(Instant::now);
             let mut st = st.clone();
+            if let Some(tc) = tc {
+                PLAN_CLONE_NS.fetch_add(tc.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
             let mut c = c;
             while c < run_end {
                 let h = f.rd(c);
