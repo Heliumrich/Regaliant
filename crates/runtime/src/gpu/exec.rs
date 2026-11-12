@@ -17258,6 +17258,7 @@ pub fn status() -> String {
         + &super::pcache::status()
         + &super::trcache::status()
         + &super::images::scrub_status()
+        + &super::images::stream_status()
         + &super::homes::status()
         + &super::resident::status()
         + &super::fe2::status()

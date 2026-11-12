@@ -382,6 +382,19 @@ const FIXES: &[Fix] = &[
         why: "the port counts the GPU arena's allocations by their call site (census)",
         only_with: Some("DS_ALLOC_CENSUS"),
     },
+    // The title's texture streaming: CTexture::SetCurrentStreamingChunk after
+    // its memcpy into the texture's memory (eboot+0x901465, `mov
+    // [r14+0B8h],ebx`: r14 the texture, ebx the chunk index; the `je` at
+    // eboot+0x9013c5 goes past it to eboot+0x90146c).
+    Fix {
+        name: "engine map (texture streaming)",
+        offset: 0x901465,
+        from: (7, 0xe317909174e15e3b),
+        change: Change::Hook { at: 0, handler: crate::engine::tex_chunk_hook },
+        kind: "engine map (read only)",
+        why: "the port learns when a streamed texture chunk's data is complete (census)",
+        only_with: Some("DS_TEX_STREAM"),
+    },
     // The heaps' allocate's one epilogue (eboot+0x802c2a, `mov rax,rbx; add
     // rsp,28h`, a branch target: rbx the block or 0, r12 the heap or the
     // heap + 0x20, [rbp-0x40] the size asked for, rbp its frame).

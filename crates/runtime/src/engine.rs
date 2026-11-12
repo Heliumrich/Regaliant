@@ -361,6 +361,32 @@ fn rd64(a: u64) -> Option<u64> {
     (a != 0 && crate::mem::readable(a, 8)).then(|| unsafe { std::ptr::read_volatile(a as *const u64) })
 }
 
+/// A u32 of guest memory when readable.
+fn rd32(a: u64) -> Option<u32> {
+    (a != 0 && crate::mem::readable(a, 4)).then(|| unsafe { std::ptr::read_volatile(a as *const u32) })
+}
+
+/// The title's texture streaming (`DS_TEX_STREAM=1`): CTexture::SetCurrentStreamingChunk
+/// (eboot+0x901330) raising a texture's resident chunk has committed the chunk's part of the
+/// texture's memory and copied its data in (a memcpy); right after (eboot+0x901465, `mov
+/// [r14+0B8h],ebx`: r14 the texture, ebx the chunk index) the chunk's guest range holds its
+/// final data: [texture+0x98] plus the chunk's offset, its size (the chunk table at
+/// [texture+0x70], 0x48 bytes an entry: +4 the size, +8 the offset).
+pub extern "sysv64" fn tex_chunk_hook(regs: *const u64, _arg: u32) {
+    let r = |i: usize| unsafe { *regs.add(i) };
+    let (this, chunk) = (r(14), r(3) as u32 as i32);
+    if chunk < 0 {
+        return;
+    }
+    let Some(chunks) = rd64(this + 0x70) else { return };
+    let entry = chunks + chunk as u64 * 0x48;
+    let (Some(size), Some(off), Some(base)) = (rd32(entry + 4), rd64(entry + 8), rd64(this + 0x98)) else { return };
+    if size == 0 || base == 0 {
+        return;
+    }
+    crate::gpu::images::stream_chunk_done(base + off, size as u64);
+}
+
 /// A NUL-terminated printable string of guest memory (at most 120 bytes).
 fn rdstr(a: u64) -> Option<String> {
     if a == 0 || !crate::mem::readable(a, 1) {

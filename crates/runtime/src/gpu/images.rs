@@ -2515,6 +2515,148 @@ pub fn finish_refreshes() -> Result<(), String> {
 }
 
 /// One deferred re-upload: prepared outside the lock, committed under it.
+/// The title's streamed texture chunks completed (`engine::tex_chunk_hook`,
+/// `DS_TEX_STREAM=1`): their guest ranges and when, the last STREAM_KEEP.
+static STREAMED: Mutex<std::collections::VecDeque<(u64, u64, std::time::Instant)>> = Mutex::new(std::collections::VecDeque::new());
+const STREAM_KEEP: usize = 8192;
+/// [chunks, bytes]; the uploads made where a binding needs them by how long
+/// before them a chunk over their range completed: [first uploads, re-uploads]
+/// x [< 1 ms, 1-5, 5-20, 20-100, 100-1000, 1 s or more, none], with their
+/// ns of upload time.
+static STREAM_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+static STREAM_UPLOADS: [[[std::sync::atomic::AtomicU64; 2]; 7]; 2] = [const { [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 7] }; 2];
+
+/// A streamed texture chunk's guest range holds its final data now.
+pub fn stream_chunk_done(a: u64, n: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    STREAM_STATS[0].fetch_add(1, Relaxed);
+    STREAM_STATS[1].fetch_add(n, Relaxed);
+    {
+        let mut g = STREAMED.lock();
+        if g.len() >= STREAM_KEEP {
+            g.pop_front();
+        }
+        g.push_back((a, a + n, std::time::Instant::now()));
+    }
+    if super::tune::tex_stream_ahead() {
+        static START: std::sync::Once = std::sync::Once::new();
+        START.call_once(|| {
+            let _ = std::thread::Builder::new().name("gpu-texstream".into()).spawn(stream_ahead_thread);
+        });
+        let mut q = AHEAD.lock();
+        if q.len() < 4096 {
+            q.push((a, a + n));
+        }
+        drop(q);
+        AHEAD_CV.notify_one();
+    }
+}
+
+/// Completed chunks waiting for the helper (`stream_ahead_thread`).
+static AHEAD: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+static AHEAD_CV: parking_lot::Condvar = parking_lot::Condvar::new();
+/// [rounds, chunks, images refreshed ahead (dirty or not), ns under the
+/// cache's lock, ns in all].
+static AHEAD_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// The helper (`tune tex_stream_ahead`): each completed chunk's images
+/// refreshed as their next binding would (`refresh`, its CPU-detiled
+/// re-uploads after the cache's lock: `finish_refreshes`), so the bindings
+/// that follow find them clean.
+fn stream_ahead_thread() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    loop {
+        {
+            let mut q = AHEAD.lock();
+            while q.is_empty() {
+                AHEAD_CV.wait_for(&mut q, std::time::Duration::from_millis(50));
+            }
+            std::mem::swap(&mut ranges, &mut *q);
+        }
+        if super::shutting_down() {
+            ranges.clear();
+            continue;
+        }
+        let t0 = std::time::Instant::now();
+        let frame = super::FRAMES.load(Relaxed);
+        defer_refreshes();
+        let (n, tl) = with(|im| {
+            let tl = std::time::Instant::now();
+            let keys: Vec<(ImageKey, Tsharp)> = im
+                .map
+                .iter()
+                .filter(|(k, img)| !img.gpu_written && img.source.is_some() && img.span > 0 && ranges.iter().any(|&(a, b)| k.base < b && a < k.base + img.span))
+                .filter_map(|(k, img)| img.layout.map(|t| (*k, t)))
+                .collect();
+            for (k, t) in &keys {
+                let _ = im.refresh(*k, t, frame);
+            }
+            (keys.len() as u64, tl.elapsed().as_nanos() as u64)
+        });
+        let _ = finish_refreshes();
+        AHEAD_STATS[0].fetch_add(1, Relaxed);
+        AHEAD_STATS[1].fetch_add(ranges.len() as u64, Relaxed);
+        AHEAD_STATS[2].fetch_add(n, Relaxed);
+        AHEAD_STATS[3].fetch_add(tl, Relaxed);
+        AHEAD_STATS[4].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+        ranges.clear();
+    }
+}
+
+/// The census of an upload of guest [a, a+n) taking `ns` (`run_refresh`).
+fn stream_census(first: bool, a: u64, n: u64, ns: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if STREAM_STATS[0].load(Relaxed) == 0 {
+        return;
+    }
+    let age = {
+        let g = STREAMED.lock();
+        g.iter().rev().find(|e| e.0 < a + n && a < e.1).map(|e| e.2.elapsed())
+    };
+    let k = match age.map(|d| d.as_micros()) {
+        Some(us) if us < 1_000 => 0,
+        Some(us) if us < 5_000 => 1,
+        Some(us) if us < 20_000 => 2,
+        Some(us) if us < 100_000 => 3,
+        Some(us) if us < 1_000_000 => 4,
+        Some(_) => 5,
+        None => 6,
+    };
+    let s = &STREAM_UPLOADS[!first as usize][k];
+    s[0].fetch_add(1, Relaxed);
+    s[1].fetch_add(ns, Relaxed);
+}
+
+/// The texture streaming census's line ("" before a chunk).
+pub fn stream_status() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let chunks = STREAM_STATS[0].load(Relaxed);
+    if chunks == 0 {
+        return String::new();
+    }
+    let names = ["< 1 ms", "1-5 ms", "5-20 ms", "20-100 ms", "0.1-1 s", "1 s or more", "none"];
+    let part = |w: usize| -> String {
+        names.iter().enumerate().map(|(k, n)| {
+            let s = &STREAM_UPLOADS[w][k];
+            format!("{n} {} ({:.0} ms)", s[0].load(Relaxed), s[1].load(Relaxed) as f64 / 1e6)
+        }).collect::<Vec<_>>().join(", ")
+    };
+    let a: [u64; 5] = std::array::from_fn(|k| AHEAD_STATS[k].load(Relaxed));
+    format!(
+        "    texture streaming (`DS_TEX_STREAM`): {chunks} chunks completed ({} MiB); uploads where a binding needed them by how long before a chunk over their range completed: first uploads {}; re-uploads {}; ahead (`tune tex_stream_ahead` {}): {} rounds, {} chunks, {} images refreshed, {:.0} ms under the cache's lock, {:.0} ms in all\n",
+        STREAM_STATS[1].load(Relaxed) >> 20,
+        part(0),
+        part(1),
+        super::tune::tex_stream_ahead() as u8,
+        a[0],
+        a[1],
+        a[2],
+        a[3] as f64 / 1e6,
+        a[4] as f64 / 1e6
+    )
+}
+
 fn run_refresh(job: RefreshJob) -> Result<(), String> {
     use std::sync::atomic::Ordering::Relaxed;
     let t0 = std::time::Instant::now();
@@ -2536,6 +2678,7 @@ fn run_refresh(job: RefreshJob) -> Result<(), String> {
     } else {
         REFRESH_OUT[4].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
     }
+    stream_census(job.first, job.range.0, job.range.1, t0.elapsed().as_nanos() as u64);
     let r = with(|im| im.commit_refresh(&job, prepared, hashes, t0));
     *job.wait.done.lock() = true;
     job.wait.cv.notify_all();
