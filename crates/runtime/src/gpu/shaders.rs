@@ -1966,7 +1966,17 @@ const PER_LANE_PROGRAMS: &[(u64, &str, bool)] = &[
     // no depth). Its EXEC branches are decided per 32-lane subgroup
     // (`Spec::lane_votes`; the tiled passes' would cost them ~20%).
     (0xcb83_739f_ea04_1817, "froxel fog cs 0x100892b200", true),
+    // Two more passes of the tiled kind in the deferred lighting batch (cs
+    // 0x1008a08e00, 0x1008a0f200 at InsideL Village and the swamp, lockstep
+    // until 2026-11-12 night): two cluster masks each OR-reduced across the
+    // wave (DPP rows, v_permlanex16, v_readlane of lanes 31 and 63) and
+    // walked with s_ff1, no LDS; their two first-lane reads take uniform
+    // values (an SGPR's reciprocal, a load at a fixed index). Per lane: the
+    // swamp x1.011, GPU busy 12.7 -> 11.7 ms a frame (FINDINGS.md).
+    (0x61c6_38df_4c69_edb5, "tiled pass cs 0x1008a08e00", false),
+    (0xa91a_ab21_188b_3a2a, "tiled pass cs 0x1008a0f200", false),
 ];
+
 
 /// Compute programs translated without lockstep mode (`Spec::lockstep_off`),
 /// by FNV-1a of their words up to the first s_endpgm (as PER_LANE_PROGRAMS),
