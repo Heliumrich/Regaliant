@@ -1857,6 +1857,41 @@ fn wb_census() -> bool {
     *ON.get_or_init(|| std::env::var("DS_WB_CENSUS").ok().as_deref() == Some("1"))
 }
 
+/// `DS_WB_EMPTY_CENSUS=1` (diagnosis): the close write-backs by whether every
+/// written range of the batch lay in held pages when placed (C5: such stores
+/// set no marks, so the write-back would store nothing).
+fn wb_empty_census() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_WB_EMPTY_CENSUS").ok().as_deref() == Some("1"))
+}
+
+/// `wb_empty_census`: [class (0 the graphics CP, 1 its workers, 2 the compute
+/// CPs, 3 their workers)] x [closes with a write-back, of those with every
+/// written range held]; and the others by the owner of their first range
+/// not held.
+static WB_EMPTY: [[AtomicU64; 2]; 4] = [const { [const { AtomicU64::new(0) }; 2] }; 4];
+static WB_UNHELD_BY: Mutex<Option<HashMap<u64, u64>>> = Mutex::new(None);
+
+/// `wb_empty_census`'s status line ("" when off).
+fn wb_empty_line() -> String {
+    if !wb_empty_census() {
+        return String::new();
+    }
+    let names: HashMap<u8, String> = crate::engine::allocators().into_iter().map(|a| (a.id, format!("{}#{} t{}", a.name, a.id, a.mtype))).collect();
+    let mut by: Vec<(u64, u64)> = WB_UNHELD_BY.lock().as_ref().map(|m| m.iter().map(|(&k, &v)| (k, v)).collect()).unwrap_or_default();
+    by.sort_by_key(|x| std::cmp::Reverse(x.1));
+    let parts: Vec<String> = by
+        .iter()
+        .take(14)
+        .map(|(mask, n)| {
+            let owners: Vec<String> = (0..64u8).filter(|b| mask >> b & 1 != 0).map(|o| names.get(&o).cloned().unwrap_or_else(|| format!("owner {o}"))).collect();
+            format!("[{}] {n}", owners.join(" + "))
+        })
+        .collect();
+    let cls: Vec<String> = ["graphics CP", "its workers", "compute CPs", "their workers"].iter().enumerate().map(|(k, n)| format!("{n} {} ({} all held)", WB_EMPTY[k][0].load(Ordering::Relaxed), WB_EMPTY[k][1].load(Ordering::Relaxed))).collect();
+    format!("    close write-backs by whether every written range was held (`DS_WB_EMPTY_CENSUS`): {}; the others by the owners (name#id t memory type) of their ranges not held: {}\n", cls.join(", "), parts.join(", "))
+}
+
 fn note_written_binding(base: u64, bytes: u64) {
     let addr = super::images::BINDING_SHADER.with(|s| s.get());
     {
@@ -9414,6 +9449,9 @@ pub struct Exec {
     /// Scratch: the runs of an upload this batch claimed (`fe2::run_claim`).
     fe2_claimed: Vec<(u64, u64)>,
     fe2_marked: bool,
+    /// `wb_empty_census`: the owners (a bit per engine allocator id) of the
+    /// batch's written ranges not all held when placed.
+    wb_unheld: u64,
     /// `DS_FE2_CALLERS`: the ranges (base, size, written) this batch placed
     /// and the epoch of the latest (`fe2::note_place_repeat`).
     fe2_memo: std::collections::HashMap<(u64, u64, bool), u32>,
@@ -10564,6 +10602,7 @@ impl Exec {
                 fe2_mine: Default::default(),
                 fe2_claimed: Vec::new(),
                 fe2_marked: false,
+                wb_unheld: 0,
                 fe2_memo: Default::default(),
                 place_memo: Box::new([PlaceMemo::default(); PLACE_MEMO_SLOTS]),
                 fe2_gens: Vec::new(),
@@ -11159,6 +11198,24 @@ impl Exec {
         // guest memory before the batch completes; the checks its bindings
         // deferred are made now, their uploads into its prologue.
         let scatters_before = self.ops[OP_FE2_SCATTERS];
+        if self.fe2_marked && wb_empty_census() {
+            let class = match (self.compute_cp, self.par_worker) {
+                (false, false) => 0,
+                (false, true) => 1,
+                (true, false) => 2,
+                (true, true) => 3,
+            };
+            WB_EMPTY[class][0].fetch_add(1, Ordering::Relaxed);
+            match self.wb_unheld {
+                0 => {
+                    WB_EMPTY[class][1].fetch_add(1, Ordering::Relaxed);
+                }
+                m => {
+                    *WB_UNHELD_BY.lock().get_or_insert_with(HashMap::new).entry(m).or_default() += 1;
+                }
+            }
+        }
+        self.wb_unheld = 0;
         if self.fe2_marked {
             SCATTER_SITES[1].fetch_add(1, Ordering::Relaxed);
             if self.pending_promises.is_empty() && self.actions.is_empty() {
@@ -11923,6 +11980,9 @@ impl Exec {
                 // 2026-11-06).
                 if written {
                     self.fe2_marked = true;
+                    if wb_empty_census() && !super::fe2::c4_all_held(base, base + size) {
+                        self.wb_unheld |= 1u64 << crate::engine::owner(base).min(63);
+                    }
                 }
                 place_memo_count(true);
                 if watch_range().is_some() {
@@ -12065,6 +12125,9 @@ impl Exec {
             self.fe2_marked = true;
             if wb_census() {
                 note_written_binding(base, hi - lo);
+            }
+            if wb_empty_census() && !super::fe2::c4_all_held(lo, hi) {
+                self.wb_unheld |= 1u64 << crate::engine::owner(lo).min(63);
             }
         }
         let t2 = tsc();
@@ -12534,6 +12597,7 @@ impl Exec {
             self.barrier();
         }
         self.fe2_marked = false;
+        self.wb_unheld = 0;
         recorded
     }
 
@@ -17461,6 +17525,7 @@ pub fn status() -> String {
         + &held_own_line()
         + &super::forward::status_line()
         + &super::par::status()
+        + &wb_empty_line()
         + &format!(
             "    batches submitted together (`tune submit_coalesce` {}): {} calls with {} batches; fused into one command buffer (`tune submit_fuse` {}): {} submissions with {} batches, {} groups' first batch alone (the main queue idle)
 ",

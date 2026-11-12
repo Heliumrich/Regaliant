@@ -6211,6 +6211,28 @@ pub fn c4_any_held(lo: u64, hi: u64) -> bool {
     false
 }
 
+/// Whether every page of guest [lo, hi) is held (the bitmap; false without
+/// C4 or for an empty range).
+pub fn c4_all_held(lo: u64, hi: u64) -> bool {
+    if !c4_on() || lo >= hi || lo < MIRROR_BASE || hi > MIRROR_END {
+        return false;
+    }
+    let Some(m) = HELD_MAP.get() else { return false };
+    let (a, b) = (((lo - MIRROR_BASE) / PAGE) as usize, ((hi - MIRROR_BASE).div_ceil(PAGE)) as usize);
+    // SAFETY: HELD_MAP_WORDS host-memory words, mapped for the process's life.
+    let words = unsafe { std::slice::from_raw_parts(m.words as *const AtomicU32, HELD_MAP_WORDS) };
+    let mut i = a;
+    while i < b {
+        let n = (32 - i % 32).min(b - i);
+        let mask = if n >= 32 { u32::MAX } else { (1u32 << n) - 1 };
+        if (words[i / 32].load(Ordering::Acquire) >> (i % 32)) & mask != mask {
+            return false;
+        }
+        i += n;
+    }
+    true
+}
+
 /// Whether page `p` is held (the bitmap).
 fn c4_held(p: u64) -> bool {
     c4_any_held(p, p + PAGE)
