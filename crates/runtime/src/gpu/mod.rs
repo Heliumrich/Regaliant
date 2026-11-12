@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 171] = [
+    static ALL: [Tunable; 172] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -203,6 +203,7 @@ pub mod tune {
         Tunable { name: "behind_quiet", env: "DS_BEHIND_QUIET", default: 2, value: AtomicU64::new(UNSET) },
         Tunable { name: "behind_us", env: "DS_BEHIND_US", default: 300, value: AtomicU64::new(UNSET) },
         Tunable { name: "seamless", env: "DS_SEAMLESS", default: 2, value: AtomicU64::new(UNSET) },
+        Tunable { name: "seam_pre", env: "DS_SEAM_PRE", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1372,6 +1373,14 @@ pub mod tune {
     #[inline]
     pub fn seamless() -> u64 {
         get(170).min(2)
+    }
+
+    /// Merged prologues (with `seamless`): a fused group's hoisted prologues
+    /// without the barriers between them, the group's first batch without
+    /// its leading one (`exec::seamless_replay`; default 1). Live.
+    #[inline]
+    pub fn seam_pre() -> bool {
+        get(171) != 0
     }
 
     /// The title's convolution reverb computed (`hle::libs::acm_conv`,

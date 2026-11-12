@@ -508,18 +508,17 @@ pub const SEAM_LEAD: usize = 1;
 pub const SEAM_TAIL: usize = 2;
 
 /// The ops of `cb`'s batch's part `kind` begin (`begin`) or end here in its
-/// command list (nothing when this thread records `cb` through the driver).
+/// command list (its commands' or its prologue's; nothing when this thread
+/// records `cb` through the driver).
 pub fn seam_mark(cb: vk::CommandBuffer, kind: usize, begin: bool) {
-    if claimed(cb) != Some(0) {
-        return;
-    }
+    let Some(i) = claimed(cb) else { return };
     LISTS.with(|l| {
-        if let Some(main) = l.borrow_mut()[0].as_mut() {
-            let n = main.ops.len() as u32;
+        if let Some(list) = l.borrow_mut()[i].as_mut() {
+            let n = list.ops.len() as u32;
             if begin {
-                main.seams[kind] = (n, n);
+                list.seams[kind] = (n, n);
             } else {
-                main.seams[kind].1 = n;
+                list.seams[kind].1 = n;
             }
         }
     });
@@ -557,6 +556,12 @@ impl Lists {
     /// The batch's prologue buffer when its list holds commands (0: none).
     pub fn pre_raw(&self) -> u64 {
         if self.0[1].1.as_ref().is_some_and(|l| !l.ops.is_empty()) { self.0[1].0 } else { 0 }
+    }
+
+    /// The batch's prologue's marked barriers (`seam_mark`: SEAM_LEAD its
+    /// leading one, SEAM_TAIL its trailing one).
+    pub fn pre_seams(&self) -> [bool; 3] {
+        self.0[1].1.as_ref().map_or([false; 3], |l| l.seams.map(|s| s.1 > s.0))
     }
 
     /// The batch's seams (`seam_mark`, `set_pure`).
