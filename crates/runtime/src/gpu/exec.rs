@@ -4389,8 +4389,10 @@ const RING_SEG: u64 = 4 << 20;
 /// the most this process holds of them in the CPU-visible heap (its room
 /// kept at BAR_RESERVE, as the snapshots' is), and how much it holds.
 const RING_VRAM_SEG: u64 = 512 << 10;
-const BAR_RING_CAP: u64 = 32 << 20;
-static BAR_RING_BYTES: AtomicU64 = AtomicU64::new(0);
+/// (By class: [the graphics queue's executors, the compute queues'], so
+/// neither takes the other's share whichever starts first.)
+const BAR_RING_CAP: [u64; 2] = [24 << 20, 16 << 20];
+static BAR_RING_BYTES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// Commands whose SGPR data went to the system-memory ring because the
 /// slot's video-memory ring had no room left (`tune ring_vram`).
 static RING_FALLBACK: AtomicU64 = AtomicU64::new(0);
@@ -16195,20 +16197,21 @@ impl Exec {
             // (Within the budget: at most BAR_RING_CAP of the CPU-visible
             // heap, its room kept at BAR_RESERVE; past it this executor's
             // slots keep their system-memory rings.)
-            let before = BAR_RING_BYTES.fetch_add(RING_VRAM_SEG, Ordering::Relaxed);
-            let room = before + RING_VRAM_SEG <= BAR_RING_CAP && ctx().bar_room().is_none_or(|r| r >= RING_VRAM_SEG + BAR_RESERVE);
+            let class = self.compute_cp as usize;
+            let before = BAR_RING_BYTES[class].fetch_add(RING_VRAM_SEG, Ordering::Relaxed);
+            let room = before + RING_VRAM_SEG <= BAR_RING_CAP[class] && ctx().bar_room().is_none_or(|r| r >= RING_VRAM_SEG + BAR_RESERVE);
             match room.then(|| ctx().bar_buffer(RING_VRAM_SEG, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDIRECT_BUFFER)) {
                 Some(Ok((b, _m, p))) => {
                     SLOT_MEM[4].fetch_add(RING_VRAM_SEG, Ordering::Relaxed);
                     self.slots[self.cur].rings[1] = Some((b, p))
                 }
                 Some(Err(e)) => {
-                    BAR_RING_BYTES.fetch_sub(RING_VRAM_SEG, Ordering::Relaxed);
+                    BAR_RING_BYTES[class].fetch_sub(RING_VRAM_SEG, Ordering::Relaxed);
                     crate::warn!("gpu[{}]: no SGPR data ring in video memory ({e})", self.name);
                     self.vram_ring_failed = true;
                 }
                 None => {
-                    BAR_RING_BYTES.fetch_sub(RING_VRAM_SEG, Ordering::Relaxed);
+                    BAR_RING_BYTES[class].fetch_sub(RING_VRAM_SEG, Ordering::Relaxed);
                     self.vram_ring_failed = true;
                 }
             }
