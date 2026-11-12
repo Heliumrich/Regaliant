@@ -121,6 +121,8 @@ fn translate_one(shader_dir: &std::path::Path, addr: u64, u: &Use) -> Result<Out
         dump: None,
         force_dispatcher: false,
         dispatcher_for_loops: false,
+        // RDNA_DOM_NEST=1: blocks nested in their dominators' regions.
+        dom_nest: std::env::var("RDNA_DOM_NEST").ok().as_deref() == Some("1"),
         reg_vars: true,
         // RDNA_LANE_GUARDS=0: a select per register write (the earlier form).
         lane_guards: std::env::var("RDNA_LANE_GUARDS").ok().as_deref() != Some("0"),
@@ -139,6 +141,8 @@ fn translate_one(shader_dir: &std::path::Path, addr: u64, u: &Use) -> Result<Out
         sg_appends: std::env::var("RDNA_SG_APPENDS").ok().as_deref() != Some("0") && u.stage == Stage::Compute && crate::translate::has_append(&insts),
         // RDNA_KNOWN_ACTIVE=0: without the known-active analysis.
         known_active: std::env::var("RDNA_KNOWN_ACTIVE").ok().as_deref() != Some("0"),
+        // RDNA_HW_BOUNDS=1: scalar buffer loads unchecked (the device's robustness).
+        hw_bounds: std::env::var("RDNA_HW_BOUNDS").ok().as_deref() == Some("1"),
         base_instance_sgpr: None,
         // RDNA_SGPR_PC=1: SGPR data at a push-constant offset (validation).
         sgpr_pc: std::env::var_os("RDNA_SGPR_PC").is_some().then(|| crate::translate::sgpr_pc_offset(u.stage)),

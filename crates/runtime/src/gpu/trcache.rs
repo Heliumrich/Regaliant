@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
-const MAGIC: &[u8; 8] = b"DSTRANS3";
+const MAGIC: &[u8; 8] = b"DSTRANS4";
 
 /// Environment switches the translator reads (`rdna`; the dumps write files
 /// while translating): any of them set keeps the store off.
@@ -276,6 +276,7 @@ fn encode(o: &Output, plan_key: u64, spec_hash: u64) -> Vec<u8> {
     w.push(o.sg_waves as u8);
     u32s(&mut w, o.sg_appends);
     u32s(&mut w, o.known_active);
+    w.extend_from_slice(&o.unchecked_res.to_le_bytes());
     u32s(&mut w, o.in_mask);
     // (`Spec::bary_gs`: its per-vertex locations and barycentrics.)
     match &o.bary_gs {
@@ -361,6 +362,7 @@ fn decode(b: &[u8], plan_key: u64, spec_hash: u64) -> Option<Output> {
     let sg_waves = r.u8()? != 0;
     let sg_appends = r.u32()?;
     let known_active = r.u32()?;
+    let unchecked_res = r.u64()?;
     let in_mask = r.u32()?;
     let bary_gs = if r.u8()? != 0 {
         let n = r.u32()? as usize;
@@ -391,6 +393,7 @@ fn decode(b: &[u8], plan_key: u64, spec_hash: u64) -> Option<Output> {
         sg_waves,
         sg_appends,
         known_active,
+        unchecked_res,
         in_mask,
         bary_gs,
     })
@@ -418,6 +421,7 @@ mod tests {
             sg_waves: true,
             sg_appends: 2,
             known_active: 99,
+            unchecked_res: 0b101,
             in_mask: 0b1011,
             bary_gs: Some(rdna::translate::gs::BaryIo { per_vertex: vec![(1, [4, 5])], bary: [6, 7] }),
         };

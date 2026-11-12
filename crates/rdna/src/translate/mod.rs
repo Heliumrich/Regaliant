@@ -73,7 +73,7 @@ use crate::{Enc, Inst};
 use rspirv::binary::Assemble;
 use rspirv::dr::{Builder, Operand};
 use rspirv::spirv::{self, BuiltIn, Capability, Decoration, ExecutionMode, ExecutionModel, StorageClass, Word};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use crate::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -261,6 +261,11 @@ pub struct Spec {
     /// for every program, or for programs with loops only (A/B comparisons).
     pub force_dispatcher: bool,
     pub dispatcher_for_loops: bool,
+    /// Structured control flow with each block inside the guarded region of
+    /// its immediate dominator (`emit_nested`): its guard is tested only in
+    /// passes where the dominator ran, instead of every block's guard on
+    /// every pass.
+    pub dom_nest: bool,
     /// One variable per register (programs without relative addressing),
     /// else the register files as arrays (the earlier form, for A/B).
     pub reg_vars: bool,
@@ -349,6 +354,13 @@ pub struct Spec {
     /// ([`active::known_active`]), register writes are plain (no select, no
     /// lane guard) and stores unguarded.
     pub known_active: bool,
+    /// Scalar buffer loads (`s_buffer_load`, a dynamic `s_load` through a
+    /// binding) of buffers that only scalar loads read, without a range check
+    /// of each dword (`Output::unchecked_res`): the device reads 0 past a
+    /// binding's range (robustness2's robustBufferAccess2), and the runtime
+    /// binds such a buffer to end where the checks did, and an empty or
+    /// unmapped resource as a null descriptor.
+    pub hw_bounds: bool,
     /// Vertex stage of a draw whose arguments the GPU reads (indexed
     /// indirect draws, see the runtime's `DrawArgs::gpu_args`): this SGPR
     /// receives the start instance (`gl_BaseInstance`), as the command
@@ -544,6 +556,12 @@ impl std::hash::Hash for Spec {
         }
         if self.sg_waves {
             0x5347_5756u32.hash(state);
+        }
+        if self.hw_bounds {
+            0x4842_4E44u32.hash(state);
+        }
+        if self.dom_nest {
+            0x444F_4D4Eu32.hash(state);
         }
         if let Some(s) = self.base_instance_sgpr {
             s.hash(state);
@@ -780,6 +798,11 @@ pub struct Output {
     pub sg_appends: u32,
     /// Instructions known active (`Spec::known_active`).
     pub known_active: u32,
+    /// Buffer resources (bit n: resource n) whose scalar loads have no range
+    /// check (`Spec::hw_bounds`): bound with a range ending where the checks
+    /// did, dword (bias + o) / 4 in range exactly when o < size, for any bias
+    /// (the binding's bias rounded down to a dword plus the size rounded up).
+    pub unchecked_res: u64,
     /// The input Locations the stage declares (bit n = Location n; a pixel
     /// stage's: a rect-list draw's geometry shader outputs each of them).
     pub in_mask: u32,
@@ -1015,6 +1038,10 @@ pub(crate) struct T<'a> {
     /// (`Spec::known_active`), and the instruction being translated.
     pub known_active: crate::HashSet<u32>,
     pub cur_pc: u32,
+    /// Buffers only scalar loads read (`Spec::hw_bounds`), and those whose
+    /// loads went unchecked (`Output::unchecked_res`).
+    pub scalar_only: u64,
+    pub unchecked_res: u64,
     /// Input Locations declared (`Output::in_mask`).
     pub in_locs: u32,
     /// Wave-mask mode (see the module documentation).
@@ -2744,6 +2771,8 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         sg,
         leader: None,
         known_active: crate::HashSet::default(),
+        scalar_only: 0,
+        unchecked_res: 0,
         cur_pc: 0,
         in_locs: 0,
         wave_masks,
@@ -3214,6 +3243,28 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         tr.workgroup_barrier()?;
     }
 
+    // Buffers only scalar loads read (`Spec::hw_bounds`: their loads go
+    // unchecked; a buffer vector instructions also access keeps its checks,
+    // as one binding's range cannot end where both kinds' checks do when
+    // its base is off a dword boundary).
+    if spec.hw_bounds {
+        let (mut scalar, mut other) = (0u64, 0u64);
+        for ins in code {
+            if let Some(&(r, _)) = plan.inst_res.get(&ins.pc) {
+                if r >= 64 {
+                    continue;
+                }
+                let load = ins.enc == Enc::Smem && ins.name().is_some_and(|n| n.starts_with("s_buffer_load_dword") || n.starts_with("s_load_dword"));
+                if load {
+                    scalar |= 1u64 << r;
+                } else {
+                    other |= 1u64 << r;
+                }
+            }
+        }
+        tr.scalar_only = scalar & !other;
+    }
+
     // Body.
     let starts = block_starts(code);
     if starts.len() == 1 {
@@ -3277,7 +3328,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     // offsets come from a table): the runtime takes that from `sgpr_pc`.
     let batched = spec.batched;
     let sgpr_pc = if batched { Some(sgpr_pc_offset(spec.stage)) } else { spec.sgpr_pc };
-    Ok(Output { spirv, bindings: tr.bindings, params: tr.params, mrt_mask: tr.mrt_mask, param_mask, writes_depth: tr.out_depth.is_some(), warnings: tr.warnings, sgpr_pc, batched, masked_skips: tr.masked_skips, lockstep: tr.lockstep, wave_masks: tr.wave_masks, sg_waves: tr.sg_waves, sg_appends: tr.sg.leaders.len() as u32, known_active: tr.known_active.len() as u32, in_mask: tr.in_locs, bary_gs: tr.bary_io })
+    Ok(Output { spirv, bindings: tr.bindings, params: tr.params, mrt_mask: tr.mrt_mask, param_mask, writes_depth: tr.out_depth.is_some(), warnings: tr.warnings, sgpr_pc, batched, masked_skips: tr.masked_skips, lockstep: tr.lockstep, wave_masks: tr.wave_masks, sg_waves: tr.sg_waves, sg_appends: tr.sg.leaders.len() as u32, known_active: tr.known_active.len() as u32, unchecked_res: tr.unchecked_res, in_mask: tr.in_locs, bary_gs: tr.bary_io })
 }
 
 /// Wave-mask mode for the shader at `addr` (diagnosis: `DS_WAVEMASK=0`
@@ -3815,6 +3866,9 @@ fn emit_structured(tr: &mut T, code: &[Inst], starts: &BTreeSet<u32>, loops: &[(
 /// Blocks `lo..hi` of `starts`; `inside`: the header of the loop being
 /// emitted (its own range is not a nested loop).
 fn emit_range(tr: &mut T, code: &[Inst], starts: &[u32], loops: &[(u32, u32)], lo: usize, hi: usize, inside: Option<u32>) -> R<()> {
+    if tr.spec.dom_nest {
+        return emit_nested(tr, code, starts, loops, lo, hi, inside);
+    }
     let mut i = lo;
     while i < hi {
         let s = starts[i];
@@ -3836,6 +3890,241 @@ fn emit_range(tr: &mut T, code: &[Inst], starts: &[u32], loops: &[(u32, u32)], l
         ok(tr.b.branch(merge))?;
         e(tr.b.begin_block(Some(merge)))?;
         i += 1;
+    }
+    Ok(())
+}
+
+/// The addresses block [s, e) may store as the next one, as
+/// `emit_block_body` stores them: its branch's target and, for a
+/// conditional branch, the next instruction's (PC_EXIT past the program);
+/// PC_EXIT after s_endpgm; else the next block (PC_EXIT for the last).
+fn block_succs(code: &[Inst], s: u32, e: u32) -> Vec<u32> {
+    let first = code.partition_point(|i| i.pc < s);
+    for (k, ins) in code.iter().enumerate().skip(first) {
+        if ins.pc >= e {
+            break;
+        }
+        if ins.is_endpgm() {
+            return vec![PC_EXIT];
+        }
+        if let Some(t) = ins.branch_target() {
+            let mut out = vec![t];
+            if ins.name() != Some("s_branch") {
+                out.push(code.get(k + 1).map_or(PC_EXIT, |n| n.pc));
+            }
+            return out;
+        }
+    }
+    vec![if e == u32::MAX { PC_EXIT } else { e }]
+}
+
+/// A node of a range's forward graph (`emit_nested`): one block (`lo`), or
+/// a nested loop over blocks `lo..hi` entered only at its header.
+struct Node {
+    lo: usize,
+    hi: usize,
+    start: u32,
+    header: Option<u32>,
+}
+
+/// A range's forward graph and dominator tree (`emit_nested`).
+struct Graph {
+    nodes: Vec<Node>,
+    /// Dominated nodes of each node in address order; `kids[n]`: the
+    /// virtual root's.
+    kids: Vec<Vec<usize>>,
+    /// Forward edges to the range's nodes.
+    succ: Vec<Vec<usize>>,
+    /// The node may leave the pass otherwise: a back edge, a target outside
+    /// the range, the end of the program, or (a loop) the loop watchdog.
+    exits: Vec<bool>,
+    /// Pre-order position in the dominator tree and the subtree's size.
+    pre: Vec<usize>,
+    size: Vec<usize>,
+    /// Nodes in pre-order (a subtree is `order[pre[k]..pre[k] + size[k]]`).
+    order: Vec<usize>,
+}
+
+/// Nesting depth of guarded regions beyond which a block's dominated
+/// blocks follow its region instead of nesting in it (a long chain of
+/// joins would nest as deep as it is long).
+const MAX_NEST: u32 = 24;
+
+/// Blocks `lo..hi` of `starts` (`Spec::dom_nest`), each emitted inside the
+/// guarded region of its immediate dominator over the range's forward edges
+/// (back edges end a pass; exits leave it): a block can run in a pass only
+/// after its dominator ran in it, so its guard is tested only then. Address
+/// order is a topological order of forward edges, and emitting siblings in
+/// it, each with its dominated blocks, keeps every block after all its
+/// predecessors (they are all dominated by its dominator). A block every
+/// path from its dominator's region reaches (an if's join) needs no guard
+/// (`emit_tree`). Blocks no forward edge reaches hang off a virtual root and
+/// stay at the range's level.
+fn emit_nested(tr: &mut T, code: &[Inst], starts: &[u32], loops: &[(u32, u32)], lo: usize, hi: usize, inside: Option<u32>) -> R<()> {
+    let mut nodes: Vec<Node> = Vec::new();
+    let mut i = lo;
+    while i < hi {
+        let s = starts[i];
+        if let Some(&(h, end)) = loops.iter().find(|&&(h, _)| h == s && Some(h) != inside) {
+            let j = starts.iter().position(|&x| x >= end).unwrap_or(starts.len()).min(hi);
+            nodes.push(Node { lo: i, hi: j, start: s, header: Some(h) });
+            i = j;
+        } else {
+            nodes.push(Node { lo: i, hi: i + 1, start: s, header: None });
+            i += 1;
+        }
+    }
+    let n = nodes.len();
+    let at: HashMap<u32, usize> = nodes.iter().enumerate().map(|(k, x)| (x.start, k)).collect();
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut exits = vec![false; n];
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (k, node) in nodes.iter().enumerate() {
+        let span_end = starts.get(node.hi).copied().unwrap_or(u32::MAX);
+        exits[k] = node.header.is_some();
+        for b in node.lo..node.hi {
+            let (s, e) = (starts[b], starts.get(b + 1).copied().unwrap_or(u32::MAX));
+            for t in block_succs(code, s, e) {
+                // A nested loop's own edges stay inside it.
+                if node.header.is_some() && t >= node.start && t < span_end {
+                    continue;
+                }
+                match at.get(&t) {
+                    Some(&m) if m > k => {
+                        if !succ[k].contains(&m) {
+                            succ[k].push(m);
+                            preds[m].push(k);
+                        }
+                    }
+                    _ => exits[k] = true,
+                }
+            }
+        }
+    }
+    // Immediate dominators (Cooper, Harvey and Kennedy over the topological
+    // order; `n` is the virtual root).
+    let root = n;
+    let mut idom = vec![root; n];
+    for k in 1..n {
+        let mut d: Option<usize> = None;
+        for &p in &preds[k] {
+            d = Some(match d {
+                None => p,
+                Some(mut a) => {
+                    let mut b = p;
+                    while a != b {
+                        if a == root || b == root {
+                            a = root;
+                            break;
+                        }
+                        if a > b {
+                            a = idom[a];
+                        } else {
+                            b = idom[b];
+                        }
+                    }
+                    a
+                }
+            });
+        }
+        idom[k] = d.unwrap_or(root);
+    }
+    let mut kids: Vec<Vec<usize>> = vec![Vec::new(); n + 1];
+    for k in 0..n {
+        kids[idom[k]].push(k);
+    }
+    // Pre-order numbering (iterative).
+    let (mut pre, mut size, mut order) = (vec![0; n], vec![1; n], Vec::with_capacity(n));
+    let mut stack: Vec<(usize, bool)> = kids[root].iter().rev().map(|&k| (k, false)).collect();
+    while let Some((k, done)) = stack.pop() {
+        if done {
+            size[k] = 1 + kids[k].iter().map(|&c| size[c]).sum::<usize>();
+            continue;
+        }
+        pre[k] = order.len();
+        order.push(k);
+        stack.push((k, true));
+        for &c in kids[k].iter().rev() {
+            stack.push((c, false));
+        }
+    }
+    let g = Graph { nodes, kids, succ, exits, pre, size, order };
+    let top = g.kids[root].clone();
+    emit_tree(tr, code, starts, loops, &g, top, None, 0)
+}
+
+/// Nodes `list` (siblings in address order) of `emit_nested`, each with
+/// the nodes it dominates: inside its guarded region, or after it (a loop,
+/// or at `MAX_NEST`). With `parent` (the list is its dominated nodes),
+/// a node whose every way in from the parent's region so far leads to it
+/// (no exits, no loops, every edge of the parent and of the earlier
+/// siblings' subtrees into those or to it) runs without a guard: the next
+/// address is certainly its own there.
+fn emit_tree(tr: &mut T, code: &[Inst], starts: &[u32], loops: &[(u32, u32)], g: &Graph, list: Vec<usize>, parent: Option<usize>, depth: u32) -> R<()> {
+    // The parent's region so far: its members, their edges leaving it, and
+    // whether one may exit.
+    let mut members: crate::HashSet<usize> = crate::HashSet::default();
+    let mut out: crate::HashSet<usize> = crate::HashSet::default();
+    let mut bad = true;
+    if let Some(p) = parent {
+        members.insert(p);
+        out.extend(g.succ[p].iter().copied());
+        bad = g.exits[p];
+    }
+    let direct: crate::HashSet<usize> = list.iter().copied().collect();
+    let mut queue: VecDeque<usize> = list.into();
+    while let Some(k) = queue.pop_front() {
+        let node = &g.nodes[k];
+        let certain = parent.is_some() && direct.contains(&k) && !bad && out.iter().all(|&t| t == k);
+        if parent.is_some() && direct.contains(&k) {
+            // The parent's region grows by this node's subtree (emitted
+            // before the next sibling, from the queue or nested).
+            for &m in &g.order[g.pre[k]..g.pre[k] + g.size[k]] {
+                members.insert(m);
+                bad |= g.exits[m];
+                out.extend(g.succ[m].iter().copied());
+            }
+            out.retain(|t| !members.contains(t));
+        }
+        if let Some(h) = node.header {
+            emit_loop(tr, code, starts, loops, node.lo, node.hi, h)?;
+            for &c in g.kids[k].iter().rev() {
+                queue.push_front(c);
+            }
+            continue;
+        }
+        let s = node.start;
+        let end = starts.get(node.lo + 1).copied().unwrap_or(u32::MAX);
+        let nested = depth < MAX_NEST;
+        if certain {
+            emit_block_body(tr, code, s, end)?;
+            if nested && !g.kids[k].is_empty() {
+                emit_tree(tr, code, starts, loops, g, g.kids[k].clone(), Some(k), depth + 1)?;
+            } else {
+                for &c in g.kids[k].iter().rev() {
+                    queue.push_front(c);
+                }
+            }
+            continue;
+        }
+        let pc = e(tr.b.load(tr.t.u32, None, tr.pc_var, None, []))?;
+        let ks = tr.u(s);
+        let here = e(tr.b.i_equal(tr.t.bool_, None, pc, ks))?;
+        let (body, merge) = (tr.b.id(), tr.b.id());
+        ok(tr.b.selection_merge(merge, spirv::SelectionControl::NONE))?;
+        ok(tr.b.branch_conditional(here, body, merge, []))?;
+        e(tr.b.begin_block(Some(body)))?;
+        emit_block_body(tr, code, s, end)?;
+        if nested && !g.kids[k].is_empty() {
+            emit_tree(tr, code, starts, loops, g, g.kids[k].clone(), Some(k), depth + 1)?;
+        }
+        ok(tr.b.branch(merge))?;
+        e(tr.b.begin_block(Some(merge)))?;
+        if !nested {
+            for &c in g.kids[k].iter().rev() {
+                queue.push_front(c);
+            }
+        }
     }
     Ok(())
 }
@@ -4190,6 +4479,7 @@ mod tests {
             dump: None,
             force_dispatcher: false,
             dispatcher_for_loops: false,
+            dom_nest: false,
             reg_vars: true,
             lane_guards: true,
             mip_views: true,
@@ -4203,6 +4493,7 @@ mod tests {
             sg_waves: false,
             sg_appends: false,
             known_active: false,
+            hw_bounds: false,
             base_instance_sgpr: None,
             sgpr_pc: None,
             addresses: false,

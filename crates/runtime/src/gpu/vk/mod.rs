@@ -74,6 +74,10 @@ pub struct Ctx {
     /// bufferDeviceAddress enabled: guest imports and video-memory homes get
     /// GPU addresses that fault reports name (`note_gpu_range`).
     pub device_addresses: bool,
+    /// robustBufferAccess2 and nullDescriptor enabled: loads past a storage
+    /// buffer binding's range read 0, and a null buffer binds as all zeros
+    /// (`tune hw_bounds`).
+    pub robust2_null: bool,
     /// drawIndirectCount enabled: batched draws grow after recording
     /// (`exec::draw` draw runs).
     pub draw_indirect_count: bool,
@@ -817,6 +821,7 @@ fn init_inner() -> Result<(), String> {
             labels: labels_on.then(|| ash::ext::debug_utils::Device::new(&instance, &device)),
             names: validation.then(|| ash::ext::debug_utils::Device::new(&instance, &device)),
             device_addresses,
+            robust2_null: r2_supported.robust_buffer_access2 != 0 && r2_supported.null_descriptor != 0,
             draw_indirect_count,
             sparse_buffers,
             draw_parameters: draw_parameters && first_instance,

@@ -5670,6 +5670,10 @@ pub const MAX_SLOTS: usize = 8;
 const UNIMPORTABLE_SNAP_MAX: u64 = 64 << 10;
 /// Bindings served that way.
 static UNIMPORTABLE_SNAPS: AtomicU64 = AtomicU64::new(0);
+/// Bindings of buffers whose scalar loads go unchecked
+/// (`Output::unchecked_res`) narrowed to end where the checks did (their
+/// base off a dword boundary).
+static HW_BOUNDS_NARROWED: AtomicU64 = AtomicU64::new(0);
 
 /// Command-processor effect performed after GPU work completes.
 pub type Action = Box<dyn FnOnce() + Send>;
@@ -15995,6 +15999,23 @@ impl Exec {
                                 crate::info!("place: {:?} shader {:#x} resource {i} {base:#x}+{size:#x} ({what}){}: {placement:?}", p.stage, p.addr, if found.tr.plan.resources[i].written { " written" } else { "" });
                             }
                         }
+                        // `Spec::hw_bounds`: loads past the binding's range read 0 on
+                        // the device. An empty or unmapped resource binds a null
+                        // descriptor (the dummy buffer may hold data); a buffer whose
+                        // scalar loads go unchecked (`Output::unchecked_res`) ends
+                        // where their checks did: dword (bias + o) / 4 is in range
+                        // exactly when o < size, whatever the bias.
+                        if found.tr.spec.hw_bounds {
+                            if info.buffer == fx.dummy {
+                                info = vk::DescriptorBufferInfo { buffer: vk::Buffer::null(), offset: 0, range: vk::WHOLE_SIZE };
+                            } else if i < 64 && found.tr.out.unchecked_res & (1u64 << i) != 0 {
+                                let exact = (bias & !3) + bound_size.next_multiple_of(4);
+                                if exact < info.range {
+                                    HW_BOUNDS_NARROWED.fetch_add(1, Ordering::Relaxed);
+                                    info.range = exact;
+                                }
+                            }
+                        }
                         let ri = res_info + RES_INFO_DWORDS as usize * i;
                         p.sgpr_data[ri] = bias as u32;
                         p.sgpr_data[ri + 1] = stride;
@@ -16007,12 +16028,13 @@ impl Exec {
                             p.sgpr_data[ai + 3] = if placement == Placement::Mirrored && found.tr.plan.resources[i].written { (info.offset / 128) as u32 } else { u32::MAX };
                         }
                         if matches!(b.kind, BindingKind::Address(_)) {
-                            // The descriptor's range as an address and size.
-                            let va = ctx().buffer_address(info.buffer) + info.offset;
+                            // The descriptor's range as an address and size (a null
+                            // one: the zero page, nothing in range).
+                            let (va, range) = if info.buffer == vk::Buffer::null() { (fx.zero_va, 0) } else { (ctx().buffer_address(info.buffer) + info.offset, info.range) };
                             let ai = addr_at + (rdna::translate::ADDR_HEADER_DWORDS + rdna::translate::ADDR_INFO_DWORDS * i as u32) as usize;
                             p.sgpr_data[ai] = va as u32;
                             p.sgpr_data[ai + 1] = (va >> 32) as u32;
-                            p.sgpr_data[ai + 2] = info.range.min(u32::MAX as u64) as u32;
+                            p.sgpr_data[ai + 2] = range.min(u32::MAX as u64) as u32;
                             ADDRESSED.fetch_add(1, Ordering::Relaxed);
                         } else {
                             bound.bufs.push((b.binding, info));
@@ -17698,6 +17720,10 @@ pub fn status() -> String {
         + &in_place_line()
         + &journal_line()
         + &sync_why_status()
+        + &match HW_BOUNDS_NARROWED.load(Ordering::Relaxed) {
+            0 => String::new(),
+            n => format!("    unchecked scalar loads' bindings narrowed to end where their checks did: {n} (bases off a dword boundary; `tune hw_bounds`)\n"),
+        }
         + &format!(
             "    buffer snapshots in VRAM: {} ({} MiB), {} reused, {} not for lack of space, {} for memory that cannot be imported; draws with snapshotted indices {} ({} MiB); batch-start copies {} ({} MiB), {} reused, {} not for lack of space; on the copy queue {} ({} MiB)\n",
             SNAPS.load(Ordering::Relaxed),

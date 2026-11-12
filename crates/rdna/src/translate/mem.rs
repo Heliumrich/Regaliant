@@ -816,7 +816,15 @@ pub fn smem(tr: &mut T, ins: &Inst) -> R<()> {
             return Ok(());
         }
         let bias = tr.res_info(r, 0)?;
-        let size = tr.res_info(r, 2)?;
+        // Out-of-range dwords read 0: checked here, or by the device past the
+        // binding's range (`Spec::hw_bounds`, a buffer only scalar loads
+        // read: the runtime binds it to end where these checks would,
+        // `Output::unchecked_res`).
+        let unchecked = tr.spec.hw_bounds && r < 64 && tr.scalar_only & (1u64 << r) != 0;
+        if unchecked {
+            tr.unchecked_res |= 1u64 << r;
+        }
+        let size = if unchecked { None } else { Some(tr.res_info(r, 2)?) };
         let addr = e(tr.b.i_add(u, None, off, bias))?;
         let two = tr.u(2);
         let idx0 = e(tr.b.shift_right_logical(u, None, addr, two))?;
@@ -824,12 +832,16 @@ pub fn smem(tr: &mut T, ins: &Inst) -> R<()> {
             let kj = tr.u(j);
             let idx = e(tr.b.i_add(u, None, idx0, kj))?;
             let v = load_dword(tr, var, idx)?;
-            // Out-of-range dwords read 0.
-            let kb = tr.u(4 * j);
-            let o = e(tr.b.i_add(u, None, off, kb))?;
-            let inr = e(tr.b.u_less_than(tr.t.bool_, None, o, size))?;
-            let z = tr.u(0);
-            let v = e(tr.b.select(u, None, inr, v, z))?;
+            let v = match size {
+                Some(size) => {
+                    let kb = tr.u(4 * j);
+                    let o = e(tr.b.i_add(u, None, off, kb))?;
+                    let inr = e(tr.b.u_less_than(tr.t.bool_, None, o, size))?;
+                    let z = tr.u(0);
+                    e(tr.b.select(u, None, inr, v, z))?
+                }
+                None => v,
+            };
             tr.set_sreg(d + j, v)?;
         }
         return Ok(());
