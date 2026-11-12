@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 172] = [
+    static ALL: [Tunable; 173] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -204,6 +204,7 @@ pub mod tune {
         Tunable { name: "behind_us", env: "DS_BEHIND_US", default: 300, value: AtomicU64::new(UNSET) },
         Tunable { name: "seamless", env: "DS_SEAMLESS", default: 2, value: AtomicU64::new(UNSET) },
         Tunable { name: "seam_pre", env: "DS_SEAM_PRE", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "held_cpu_wait", env: "DS_HELD_CPU_WAIT", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1384,6 +1385,15 @@ pub mod tune {
     #[inline]
     pub fn seam_pre() -> bool {
         get(171) != 0
+    }
+
+    /// A held batch (the graphics CP recording past a label wait) waits on
+    /// the GPU for an earlier batch's CPU effects its CP writes follow, as
+    /// unheld ones do, instead of the CP waiting on the CPU before
+    /// submitting it (`Exec::order_after_cpu`; default 1). Live.
+    #[inline]
+    pub fn held_cpu_wait() -> bool {
+        get(172) != 0
     }
 
     /// The title's convolution reverb computed (`hle::libs::acm_conv`,

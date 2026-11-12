@@ -6573,6 +6573,9 @@ pub static CPU_WAITS_GPU: AtomicU64 = AtomicU64::new(0);
 /// is above the second, every completion signals its sequence.
 static CPU_WAIT_REQ: AtomicU64 = AtomicU64::new(0);
 static CPU_SIGNALED: AtomicU64 = AtomicU64::new(0);
+/// Held batches that waited on the GPU for an earlier batch's CPU effects
+/// (`tune held_cpu_wait`).
+pub static HELD_CPU_WAITS: AtomicU64 = AtomicU64::new(0);
 /// Recent batches that waited for effects: (batch, the effects' batch).
 static CPU_WAIT_LOG: Mutex<std::collections::VecDeque<(u64, u64)>> = Mutex::new(std::collections::VecDeque::new());
 
@@ -10458,6 +10461,9 @@ struct Closed {
     shared: Vec<(u64, u64, u64, bool)>,
     /// `Exec::copy_wait` of the batch.
     copy_wait: u64,
+    /// The batch whose deferred CPU effects it waits for on the GPU
+    /// (`Exec::cpu_wait`: a held batch's, `tune held_cpu_wait`; 0: none).
+    cpu_wait: u64,
     /// `Exec::shared_kept` of the batch.
     kept: Vec<u64>,
     /// `ops_line` of the batch.
@@ -11377,7 +11383,7 @@ impl Exec {
             let cpu = self.span_cpu();
             super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why}{cpu})", self.batch_shaders.len()));
             let lists = std::mem::take(&mut self.batch_lists).then(super::vk::defer::release);
-            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises, fe2_up: Vec::new(), fe2_spans: Vec::new(), lists, xq: (self.xq_dep, self.xq_why, self.xq_img), on_c: self.batch_c });
+            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, cpu_wait: std::mem::take(&mut self.cpu_wait), kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises, fe2_up: Vec::new(), fe2_spans: Vec::new(), lists, xq: (self.xq_dep, self.xq_why, self.xq_img), on_c: self.batch_c });
             (self.xq_dep, self.xq_why, self.xq_img) = (0, 0, false);
             self.res_mine.clear();
             if let Some(b) = self.closed.last_mut() {
@@ -14492,7 +14498,9 @@ impl Exec {
     /// deferred executors submit it only after them, waiting on the CPU
     /// (`submit_after`).
     fn order_after_cpu(&mut self, cpu: u64) {
-        if !self.held && !self.deferred {
+        // (A held batch carries the wait to its submission too, `tune
+        // held_cpu_wait`: `Closed::cpu_wait`, `submit_closed_list`.)
+        if (!self.held && !self.deferred) || (self.held && super::tune::held_cpu_wait()) {
             self.cpu_wait = self.cpu_wait.max(cpu);
         } else {
             self.submit_after = self.submit_after.max(cpu);
@@ -15466,6 +15474,18 @@ impl Exec {
             }
             let lists = b.lists;
             let on_c = b.on_c;
+            // (Its wait for an earlier batch's CPU effects, on the GPU: as
+            // `submit_for` registers it.)
+            let mut cpu_wait = b.cpu_wait;
+            if cpu_wait > 0 {
+                CPU_WAIT_REQ.fetch_max(cpu_wait, Ordering::SeqCst);
+                if DONE_ATOMIC.load(Ordering::SeqCst) >= cpu_wait {
+                    cpu_wait = 0;
+                } else {
+                    CPU_WAITS_GPU.fetch_add(1, Ordering::Relaxed);
+                    HELD_CPU_WAITS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             let xq = xq_tracking().then_some(XqBatch { compute: self.xq_c, on_c, acb: acb_id(&self.name), writes: &b.writes, ups: &b.fe2_up, dep: b.xq.0, why: b.xq.1, images: b.xq.2 });
             let note_gate = super::fe2::c4_on().then(|| NOTE_GATE.read_recursive());
             let seq = push_batch(fence, queries, bq, b.eager_action.into_iter().collect(), b.checks, b.shaders, &self.name, Vec::new(), b.ops, b.segs, reset, on_c, xq, move |_| {
@@ -15473,8 +15493,15 @@ impl Exec {
                     return None;
                 }
                 // (Deferred recording: `submit_specs` plays the lists.)
-                Some(SubmitSpec { xpre: None, pre, cmd, lists, wait: copy_wait, on_c, xwait: 0, cpu_wait: 0, name })
+                Some(SubmitSpec { xpre: None, pre, cmd, lists, wait: copy_wait, on_c, xwait: 0, cpu_wait, name })
             });
+            if cpu_wait > 0 {
+                let mut l = CPU_WAIT_LOG.lock();
+                if l.len() >= 64 {
+                    l.pop_front();
+                }
+                l.push_back((seq, cpu_wait));
+            }
             self.slots[b.slot].seq = seq;
             if !b.fe2_up.is_empty() {
                 super::fe2::uploaded(&b.fe2_up, &self.fe2_gens, fe2_ep);
@@ -17615,7 +17642,7 @@ pub fn status() -> String {
             FUSED[2].load(Ordering::Relaxed)
         )
         + &format!(
-            "    seamless chunks (`tune seamless` {}): {} fused groups replayed so, {} prologues moved first, {} seams between a run's pure parts, {} write-backs left to a later batch, {} pure batches, {} seams across submissions, {} host barriers of pure parts without a write-back cut outside groups; merged prologues (`tune seam_pre` {}): {} pairs, {} groups' first batches without their leading barrier; run parts {} checked, {} pure, not pure by (mid-batch write-backs, CP writes, waited CP writes, timestamps, shadows in, merges, fills, fast clears, home write-backs, actions, promises, mirror mode, held/past/stamps) {:?}; consecutive parts in a fused group left apart by (earlier impure, later impure, later's barrier unmarked, earlier's write-back kept) {:?}; consecutive main-queue parts of one run in one submission {}, in different ones {} (both pure {}, the earlier without a write-back {})\n",
+            "    seamless chunks (`tune seamless` {}): {} fused groups replayed so, {} prologues moved first, {} seams between a run's pure parts, {} write-backs left to a later batch, {} pure batches, {} seams across submissions, {} host barriers of pure parts without a write-back cut outside groups; merged prologues (`tune seam_pre` {}): {} pairs, {} groups' first batches without their leading barrier; held batches waiting on the GPU for an earlier batch's CPU effects (`tune held_cpu_wait` {}): {}; run parts {} checked, {} pure, not pure by (mid-batch write-backs, CP writes, waited CP writes, timestamps, shadows in, merges, fills, fast clears, home write-backs, actions, promises, mirror mode, held/past/stamps) {:?}; consecutive parts in a fused group left apart by (earlier impure, later impure, later's barrier unmarked, earlier's write-back kept) {:?}; consecutive main-queue parts of one run in one submission {}, in different ones {} (both pure {}, the earlier without a write-back {})\n",
             super::tune::seamless(),
             SEAMS[0].load(Ordering::Relaxed),
             SEAMS[1].load(Ordering::Relaxed),
@@ -17627,6 +17654,8 @@ pub fn status() -> String {
             super::tune::seam_pre() as u8,
             SEAMS[7].load(Ordering::Relaxed),
             SEAMS[8].load(Ordering::Relaxed),
+            super::tune::held_cpu_wait() as u8,
+            HELD_CPU_WAITS.load(Ordering::Relaxed),
             SEAM_BLOCK[13].load(Ordering::Relaxed),
             SEAM_BLOCK[14].load(Ordering::Relaxed),
             SEAM_BLOCK[..13].iter().map(|c| c.load(Ordering::Relaxed)).collect::<Vec<u64>>(),
