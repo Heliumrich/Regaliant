@@ -1830,8 +1830,19 @@ fn back_in(m: &Mirror, base: u64, len: u64, count: &AtomicU64) -> Result<(), Str
         binds_here += 1;
         pages_here += binds.len() as u64;
     }
+    // (Census, `DS_BACK_CENSUS=1`: by the engine allocation owning the
+    // range, whether the granule before it was backed already (a region
+    // growing in order), with the pages and time.)
+    let seq = g0 > 0 && (m.backed[((g0 - 1) / 64) as usize].load(Ordering::Acquire) >> ((g0 - 1) % 64)) & 1 != 0;
     drop(g);
     let all_ns = t0.elapsed().as_nanos() as u64;
+    if binds_here > 0 && back_census_on() {
+        let mut c = BACK_CENSUS.lock();
+        let e = c.get_or_insert_with(std::collections::HashMap::new).entry((crate::engine::owner(base), seq)).or_insert([0; 3]);
+        e[0] += 1;
+        e[1] += pages_here;
+        e[2] += all_ns;
+    }
     for (k, v) in [binds_here, pages_here, alloc_ns, bind_ns, all_ns, 0, 1].into_iter().enumerate() {
         BACKING[k].fetch_add(v, Ordering::Relaxed);
     }
@@ -1859,6 +1870,30 @@ fn back_granule() -> u64 {
         }
         g => g.clamp(1, 4096).next_power_of_two(),
     }
+}
+
+/// `DS_BACK_CENSUS=1` (diagnosis): the mirror's backings that bound by
+/// (engine allocation owning the range, the granule before it backed already)
+/// -> [calls, pages bound, ns]; status line `mirror backings by allocation`.
+fn back_census_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_BACK_CENSUS").ok().as_deref() == Some("1"))
+}
+static BACK_CENSUS: parking_lot::Mutex<Option<std::collections::HashMap<(u8, bool), [u64; 3]>>> = parking_lot::Mutex::new(None);
+
+/// The backing census's status line ("" when off or empty).
+pub fn back_census_line() -> String {
+    if !back_census_on() {
+        return String::new();
+    }
+    let g = BACK_CENSUS.lock();
+    let Some(m) = g.as_ref() else { return String::new() };
+    let names: std::collections::HashMap<u8, String> = crate::engine::allocators().into_iter().map(|a| (a.id, a.name)).collect();
+    let mut v: Vec<(&(u8, bool), &[u64; 3])> = m.iter().collect();
+    v.sort_by_key(|x| std::cmp::Reverse(x.1[2]));
+    let parts: Vec<String> = v.iter().take(14).map(|((o, seq), c)| format!("{}{} {} calls, {} pages, {:.0} ms", names.get(o).cloned().unwrap_or_else(|| format!("owner {o}")), if *seq { " (in order)" } else { "" }, c[0], c[1], c[2] as f64 / 1e6)).collect();
+    format!("    mirror backings by allocation (`DS_BACK_CENSUS`, since boot): {}
+", parts.join("; "))
 }
 
 /// The mirror's backings (`back_in`): [binds, pages bound, allocation ns,

@@ -17259,6 +17259,7 @@ pub fn status() -> String {
         + &super::trcache::status()
         + &super::images::scrub_status()
         + &super::images::stream_status()
+        + &super::resident::back_census_line()
         + &super::homes::status()
         + &super::resident::status()
         + &super::fe2::status()
