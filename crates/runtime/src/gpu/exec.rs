@@ -4025,7 +4025,7 @@ pub static COALESCED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// groups whose first batch went alone because the main queue was idle
 /// (`submit_fuse` 2)].
 pub static FUSED: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-/// Seamless chunks (`tune seamless`, `seamless_replay`): [fused groups
+/// Seamless chunks (`seamless_replay`): [fused groups
 /// replayed so, prologues moved into the first one's buffer, seams between
 /// a run's pure parts, write-backs left to a later batch, pure batches].
 pub static SEAMS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
@@ -4040,8 +4040,8 @@ pub static SEAMS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 /// barrier cut (the last batch's covers the submission), and the later one's
 /// leading full barrier cut (`light`: an attachment-only barrier by region
 /// in its place). The group's prologue buffer returned (None: none).
-fn seamless_replay(mut lists: Vec<super::vk::defer::Lists>, first_cmd: vk::CommandBuffer, mode: u64) -> Option<vk::CommandBuffer> {
-    let light = mode == 2;
+fn seamless_replay(mut lists: Vec<super::vk::defer::Lists>, first_cmd: vk::CommandBuffer) -> Option<vk::CommandBuffer> {
+    let light = true;
     use super::vk::defer::{Cut, SEAM_LEAD, SEAM_TAIL, SEAM_WB, SKIP_BEGIN, SKIP_END, end_fused};
     use ash::vk::Handle;
     SEAMS[0].fetch_add(1, Ordering::Relaxed);
@@ -4049,18 +4049,17 @@ fn seamless_replay(mut lists: Vec<super::vk::defer::Lists>, first_cmd: vk::Comma
     let mut pre_cb = None;
     if let Some(h) = host {
         let hcb = vk::CommandBuffer::from_raw(lists[h].pre_raw());
-        // (`tune seam_pre`: between consecutive prologues neither the
+        // (Merged prologues: between consecutive prologues neither the
         // earlier one's trailing barrier nor the later one's leading one.)
-        let merge = super::tune::seam_pre();
         let pres: Vec<usize> = (h..lists.len()).filter(|&k| lists[k].pre_raw() != 0).collect();
         let marks: Vec<[bool; 3]> = pres.iter().map(|&k| lists[k].pre_seams()).collect();
         for (j, &k) in pres.iter().enumerate() {
             let mut cuts: Vec<Cut> = Vec::with_capacity(2);
-            if merge && j + 1 < pres.len() && marks[j][SEAM_TAIL] && marks[j + 1][SEAM_LEAD] {
+            if j + 1 < pres.len() && marks[j][SEAM_TAIL] && marks[j + 1][SEAM_LEAD] {
                 cuts.push(Cut { kind: SEAM_TAIL, light: false });
                 SEAMS[7].fetch_add(1, Ordering::Relaxed);
             }
-            if merge && j > 0 && marks[j - 1][SEAM_TAIL] && marks[j][SEAM_LEAD] {
+            if j > 0 && marks[j - 1][SEAM_TAIL] && marks[j][SEAM_LEAD] {
                 cuts.push(Cut { kind: SEAM_LEAD, light: false });
             }
             if j == 0 {
@@ -4132,7 +4131,7 @@ fn seamless_replay(mut lists: Vec<super::vk::defer::Lists>, first_cmd: vk::Comma
         }
         // (The group's first batch after its hoisted prologues: the last
         // one's trailing barrier already holds all earlier work before it.)
-        if k == 0 && host.is_some() && super::tune::seam_pre() && seams[0].has[SEAM_LEAD] {
+        if k == 0 && host.is_some() && seams[0].has[SEAM_LEAD] {
             cuts.push(Cut { kind: SEAM_LEAD, light: false });
             SEAMS[8].fetch_add(1, Ordering::Relaxed);
         }
@@ -4164,7 +4163,7 @@ pub static SEAM_ORDER: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// The last main-queue batch handed over: (run, pure, its write-back marked).
 static LAST_RUN: Mutex<(u64, bool, bool)> = Mutex::new((0, false, false));
 
-/// Seamless chunks across submissions (`tune seamless` 1, 2): whether the
+/// Seamless chunks across submissions: whether the
 /// batch handed over first in its submission meets its run's previous part
 /// without a barrier: that part was the last main-queue batch handed over,
 /// pure and without a write-back (whose kernel would race this one's marks),
@@ -4177,23 +4176,21 @@ fn cross_seam(s: &super::vk::defer::Seams) -> bool {
 }
 
 /// A main-queue batch handed over on its own (or coalesced with others into
-/// one submission): its lists replayed, with seamless chunks' cuts (`tune
-/// seamless` 1, 2): its host barrier when it is a pure part without a
-/// write-back, its leading barrier when `cross_seam` and it has no prologue.
+/// one submission): its lists replayed, with seamless chunks' cuts: its host
+/// barrier when it is a pure part without a write-back, its leading barrier
+/// (an attachment-only one by region in its place) when `cross_seam` and it
+/// has no prologue.
 fn replay_main(l: super::vk::defer::Lists, has_pre: bool) {
     use super::vk::defer::{Cut, SEAM_LEAD, SEAM_TAIL, SEAM_WB};
     let s = l.seams();
-    let mode = super::tune::seamless();
     let mut cuts: Vec<Cut> = Vec::new();
-    if matches!(mode, 1 | 2) {
-        if s.pure_run != 0 && !s.has[SEAM_WB] && s.has[SEAM_TAIL] {
-            cuts.push(Cut { kind: SEAM_TAIL, light: false });
-            SEAMS[6].fetch_add(1, Ordering::Relaxed);
-        }
-        if !has_pre && cross_seam(&s) {
-            cuts.push(Cut { kind: SEAM_LEAD, light: mode == 2 });
-            SEAMS[5].fetch_add(1, Ordering::Relaxed);
-        }
+    if s.pure_run != 0 && !s.has[SEAM_WB] && s.has[SEAM_TAIL] {
+        cuts.push(Cut { kind: SEAM_TAIL, light: false });
+        SEAMS[6].fetch_add(1, Ordering::Relaxed);
+    }
+    if !has_pre && cross_seam(&s) {
+        cuts.push(Cut { kind: SEAM_LEAD, light: true });
+        SEAMS[5].fetch_add(1, Ordering::Relaxed);
     }
     note_run_order(&[s]);
     if cuts.is_empty() {
@@ -4303,20 +4300,11 @@ fn submit_specs(mut specs: Vec<(u64, SubmitSpec)>) {
         let copied_now = ctx().copy.as_ref().map_or(u64::MAX, |q| unsafe { ctx().device.get_semaphore_counter_value(q.copied) }.unwrap_or(0));
         if super::tune::submit_fuse() && specs[i..j].iter().all(|(_, s)| s.lists.as_ref().is_some_and(|l| l.has_main())) && specs[i + 1..j].iter().all(|(_, s)| s.xwait <= cdone_now && s.wait <= copied_now) {
             let first_cmd = specs[i].1.cmd;
-            // (`tune seamless`: every prologue first, into the first one's
+            // (Seamless chunks: every prologue first, into the first one's
             // buffer, then the batches' commands with the seams between a
             // run's pure parts cut: `seamless_replay`.)
-            let mut group_pre: Option<Option<vk::CommandBuffer>> = None;
-            if super::tune::seamless() != 0 {
-                let lists: Vec<super::vk::defer::Lists> = (i..j).map(|k| specs[k].1.lists.take().expect("lists")).collect();
-                group_pre = Some(seamless_replay(lists, first_cmd, super::tune::seamless()));
-            } else {
-                specs[i].1.lists.take().expect("lists").replay_open();
-                for k in i + 1..j {
-                    specs[k].1.lists.take().expect("lists").replay_into(first_cmd);
-                }
-                super::vk::defer::end_fused(first_cmd);
-            }
+            let lists: Vec<super::vk::defer::Lists> = (i..j).map(|k| specs[k].1.lists.take().expect("lists")).collect();
+            let group_pre: Option<Option<vk::CommandBuffer>> = Some(seamless_replay(lists, first_cmd));
             let c = ctx();
             if let Err(e) = super::pagetable::submit_pending(c, XQ_SUBMITTED.load(Ordering::Acquire)) {
                 fail(e, &specs[i].1.name);
@@ -6574,7 +6562,7 @@ pub static CPU_WAITS_GPU: AtomicU64 = AtomicU64::new(0);
 static CPU_WAIT_REQ: AtomicU64 = AtomicU64::new(0);
 static CPU_SIGNALED: AtomicU64 = AtomicU64::new(0);
 /// Held batches that waited on the GPU for an earlier batch's CPU effects
-/// (`tune held_cpu_wait`).
+/// (`Exec::order_after_cpu`).
 pub static HELD_CPU_WAITS: AtomicU64 = AtomicU64::new(0);
 /// Recent batches that waited for effects: (batch, the effects' batch).
 static CPU_WAIT_LOG: Mutex<std::collections::VecDeque<(u64, u64)>> = Mutex::new(std::collections::VecDeque::new());
@@ -10462,7 +10450,7 @@ struct Closed {
     /// `Exec::copy_wait` of the batch.
     copy_wait: u64,
     /// The batch whose deferred CPU effects it waits for on the GPU
-    /// (`Exec::cpu_wait`: a held batch's, `tune held_cpu_wait`; 0: none).
+    /// (`Exec::cpu_wait`: a held batch's; 0: none).
     cpu_wait: u64,
     /// `Exec::shared_kept` of the batch.
     kept: Vec<u64>,
@@ -11122,7 +11110,7 @@ impl Exec {
         self.wb_counted = 0;
         self.last_fill = None;
         if super::tune::skip_barriers() & 64 == 0 {
-            // (Seamless chunks: the barrier's ops marked, `tune seamless`;
+            // (Seamless chunks: the barrier's ops marked;
             // not when the touched list's fill above needs its order.)
             let mark = self.batch_lists && super::fe2::scatter_resets() && !seg_stamps();
             if mark {
@@ -11274,7 +11262,7 @@ impl Exec {
                 super::vk::defer::seam_mark(self.cmd(), super::vk::defer::SEAM_WB, false);
             }
         }
-        // Seamless chunks (`tune seamless`): a part of a parallel run with
+        // Seamless chunks: a part of a parallel run with
         // nothing in it that its neighbours' order or its own completion
         // matters to is pure: the fused replay may run it back to back with
         // the run's next part.
@@ -11884,8 +11872,8 @@ impl Exec {
         }
         let (pre, bq) = (self.slots[self.cur].pre, self.slots[self.cur].bq);
         record_copies(pre, &mut self.pre_copies);
-        // (Its trailing barrier marked for merged prologues, `tune seam_pre`,
-        // when no copies follow a middle barrier of its own.)
+        // (Its trailing barrier marked for merged prologues when no copies
+        // follow a middle barrier of its own.)
         let mark = self.batch_lists && !seg_stamps() && self.pre_after.is_empty();
         if !self.pre_after.is_empty() {
             global_barrier(pre);
@@ -14069,8 +14057,7 @@ impl Exec {
                 super::vk::label_begin(pre, &format!("{} prologue", self.name));
             }
             // After all earlier submitted work (`tune skip_barriers` 128:
-            // left out, timing only). (Marked for merged prologues: `tune
-            // seam_pre`.)
+            // left out, timing only). (Marked for merged prologues.)
             if super::tune::skip_barriers() & 128 == 0 {
                 let mark = self.batch_lists && !seg_stamps();
                 if mark {
@@ -14494,13 +14481,13 @@ impl Exec {
     /// effects: the graphics CP's GetLodStats once a frame): the batch waits
     /// for them on the GPU (`cpu_done`, signalled by the completion thread
     /// once they ran), the command processor going on (it waited ~0.5-0.7
-    /// ms a frame before: +1.0% at Doran, FINDINGS.md 2026-11-06); held and
-    /// deferred executors submit it only after them, waiting on the CPU
-    /// (`submit_after`).
+    /// ms a frame before: +1.0% at Doran, FINDINGS.md 2026-11-06), held
+    /// batches too (carried to their submission: `Closed::cpu_wait`,
+    /// `submit_closed_list`; since 2026-11-12, Castlewall Front x1.026);
+    /// other deferred executors submit it only after them, waiting on the
+    /// CPU (`submit_after`).
     fn order_after_cpu(&mut self, cpu: u64) {
-        // (A held batch carries the wait to its submission too, `tune
-        // held_cpu_wait`: `Closed::cpu_wait`, `submit_closed_list`.)
-        if (!self.held && !self.deferred) || (self.held && super::tune::held_cpu_wait()) {
+        if self.held || !self.deferred {
             self.cpu_wait = self.cpu_wait.max(cpu);
         } else {
             self.submit_after = self.submit_after.max(cpu);
@@ -17642,8 +17629,7 @@ pub fn status() -> String {
             FUSED[2].load(Ordering::Relaxed)
         )
         + &format!(
-            "    seamless chunks (`tune seamless` {}): {} fused groups replayed so, {} prologues moved first, {} seams between a run's pure parts, {} write-backs left to a later batch, {} pure batches, {} seams across submissions, {} host barriers of pure parts without a write-back cut outside groups; merged prologues (`tune seam_pre` {}): {} pairs, {} groups' first batches without their leading barrier; held batches waiting on the GPU for an earlier batch's CPU effects (`tune held_cpu_wait` {}): {}; run parts {} checked, {} pure, not pure by (mid-batch write-backs, CP writes, waited CP writes, timestamps, shadows in, merges, fills, fast clears, home write-backs, actions, promises, mirror mode, held/past/stamps) {:?}; consecutive parts in a fused group left apart by (earlier impure, later impure, later's barrier unmarked, earlier's write-back kept) {:?}; consecutive main-queue parts of one run in one submission {}, in different ones {} (both pure {}, the earlier without a write-back {})\n",
-            super::tune::seamless(),
+            "    seamless chunks: {} fused groups replayed so, {} prologues moved first, {} seams between a run's pure parts, {} write-backs left to a later batch, {} pure batches, {} seams across submissions, {} host barriers of pure parts without a write-back cut outside groups; merged prologues: {} pairs, {} groups' first batches without their leading barrier; held batches waiting on the GPU for an earlier batch's CPU effects: {}; run parts {} checked, {} pure, not pure by (mid-batch write-backs, CP writes, waited CP writes, timestamps, shadows in, merges, fills, fast clears, home write-backs, actions, promises, mirror mode, held/past/stamps) {:?}; consecutive parts in a fused group left apart by (earlier impure, later impure, later's barrier unmarked, earlier's write-back kept) {:?}; consecutive main-queue parts of one run in one submission {}, in different ones {} (both pure {}, the earlier without a write-back {})\n",
             SEAMS[0].load(Ordering::Relaxed),
             SEAMS[1].load(Ordering::Relaxed),
             SEAMS[2].load(Ordering::Relaxed),
@@ -17651,10 +17637,8 @@ pub fn status() -> String {
             SEAMS[4].load(Ordering::Relaxed),
             SEAMS[5].load(Ordering::Relaxed),
             SEAMS[6].load(Ordering::Relaxed),
-            super::tune::seam_pre() as u8,
             SEAMS[7].load(Ordering::Relaxed),
             SEAMS[8].load(Ordering::Relaxed),
-            super::tune::held_cpu_wait() as u8,
             HELD_CPU_WAITS.load(Ordering::Relaxed),
             SEAM_BLOCK[13].load(Ordering::Relaxed),
             SEAM_BLOCK[14].load(Ordering::Relaxed),
@@ -17703,6 +17687,7 @@ pub fn status() -> String {
         + &super::images::scrub_status()
         + &super::images::stream_status()
         + &super::resident::back_census_line()
+        + &super::resident::back_ahead_line()
         + &super::homes::status()
         + &super::resident::status()
         + &super::fe2::status()

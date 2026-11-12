@@ -1681,6 +1681,83 @@ pub fn back(base: u64, len: u64) -> Result<(), String> {
     back_in(MIRROR.get().ok_or("no mirror")?, base, len, &STATS[S_BACKED])
 }
 
+/// Backing ahead: a recording thread's backing that bound granules right
+/// after a backed one (a region growing in order: ~40% of the walk's backing
+/// time) has the next `BACK_AHEAD` granules bound by a helper thread, so the
+/// next first use finds them bound (2026-11-12: the walk x1.015, ~100 MiB
+/// more of the mirror backed by its end).
+const BACK_AHEAD: u64 = 4;
+/// Ranges a recording thread's in-order backing queued for the helper:
+/// [granule ranges queued, backed by the helper, found backed already, the
+/// helper's ns].
+static AHEAD_Q: parking_lot::Mutex<Vec<(u64, u64)>> = parking_lot::Mutex::new(Vec::new());
+static AHEAD_CV: parking_lot::Condvar = parking_lot::Condvar::new();
+static AHEAD: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+thread_local! {
+    /// This thread is the helper (its backings queue nothing ahead).
+    static IN_AHEAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Queues [base, base + len) for the helper (`back_ahead_thread`).
+fn back_ahead_queue(base: u64, len: u64) {
+    static START: std::sync::Once = std::sync::Once::new();
+    START.call_once(|| {
+        let _ = std::thread::Builder::new().name("gpu-backahead".into()).spawn(back_ahead_thread);
+    });
+    let mut q = AHEAD_Q.lock();
+    if q.len() < 256 && !q.iter().any(|e| e.0 == base) {
+        q.push((base, len));
+        AHEAD[0].fetch_add(1, Ordering::Relaxed);
+    }
+    drop(q);
+    AHEAD_CV.notify_one();
+}
+
+/// The helper: backs what in-order growth queued (`back_in`, the same
+/// synchronous bind), skipping ranges bound meanwhile.
+fn back_ahead_thread() {
+    IN_AHEAD.with(|f| f.set(true));
+    let mut work: Vec<(u64, u64)> = Vec::new();
+    loop {
+        {
+            let mut q = AHEAD_Q.lock();
+            while q.is_empty() {
+                AHEAD_CV.wait_for(&mut q, std::time::Duration::from_millis(100));
+            }
+            std::mem::swap(&mut work, &mut *q);
+        }
+        if super::shutting_down() {
+            work.clear();
+            continue;
+        }
+        let Some(m) = MIRROR.get() else {
+            work.clear();
+            continue;
+        };
+        for &(base, len) in &work {
+            let t = std::time::Instant::now();
+            let before = STATS[S_BACKED].load(Ordering::Relaxed);
+            let _ = back_in(m, base, len, &STATS[S_BACKED]);
+            if STATS[S_BACKED].load(Ordering::Relaxed) > before {
+                AHEAD[1].fetch_add(1, Ordering::Relaxed);
+            } else {
+                AHEAD[2].fetch_add(1, Ordering::Relaxed);
+            }
+            AHEAD[3].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        work.clear();
+    }
+}
+
+/// Backing ahead's status line ("" before any).
+pub fn back_ahead_line() -> String {
+    let v: Vec<u64> = AHEAD.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    if v[0] == 0 {
+        return String::new();
+    }
+    format!("    mirror backings ahead of in-order growth ({} granules): {} ranges queued, {} backed by the helper, {} found backed already, {:.0} ms of the helper\n", BACK_AHEAD, v[0], v[1], v[2], v[3] as f64 / 1e6)
+}
+
 fn back_in(m: &Mirror, base: u64, len: u64, count: &AtomicU64) -> Result<(), String> {
     if base < MIRROR_BASE || base + len > MIRROR_END {
         return Err(format!("{base:#x}+{len:#x} is outside the mirror"));
@@ -1835,6 +1912,13 @@ fn back_in(m: &Mirror, base: u64, len: u64, count: &AtomicU64) -> Result<(), Str
     // growing in order), with the pages and time.)
     let seq = g0 > 0 && (m.backed[((g0 - 1) / 64) as usize].load(Ordering::Acquire) >> ((g0 - 1) % 64)) & 1 != 0;
     drop(g);
+    // (Backing ahead: a recording thread's bind that grew a region in order
+    // has the next granules bound ahead by the helper.)
+    if binds_here > 0 && seq && !IN_AHEAD.with(|f| f.get()) && g1 + 1 < pages {
+        let next = g1 + 1;
+        let n = (BACK_AHEAD * gran).min(pages - next);
+        back_ahead_queue(MIRROR_BASE + next * m.page, n * m.page);
+    }
     let all_ns = t0.elapsed().as_nanos() as u64;
     if binds_here > 0 && back_census_on() {
         let mut c = BACK_CENSUS.lock();

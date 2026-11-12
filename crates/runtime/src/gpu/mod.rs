@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 173] = [
+    static ALL: [Tunable; 170] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -202,9 +202,6 @@ pub mod tune {
         Tunable { name: "submit_fuse", env: "DS_SUBMIT_FUSE", default: 2, value: AtomicU64::new(UNSET) },
         Tunable { name: "behind_quiet", env: "DS_BEHIND_QUIET", default: 2, value: AtomicU64::new(UNSET) },
         Tunable { name: "behind_us", env: "DS_BEHIND_US", default: 300, value: AtomicU64::new(UNSET) },
-        Tunable { name: "seamless", env: "DS_SEAMLESS", default: 2, value: AtomicU64::new(UNSET) },
-        Tunable { name: "seam_pre", env: "DS_SEAM_PRE", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "held_cpu_wait", env: "DS_HELD_CPU_WAIT", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1364,36 +1361,6 @@ pub mod tune {
     /// The armer's time a round (2 ms apart) in us (default 300). Live.
     pub fn behind_us() -> u64 {
         get(169)
-    }
-
-    /// Seamless chunks (`exec::seamless_replay`, `exec::replay_main`): a
-    /// parallel run's consecutive pure parts run back to back, in a fused
-    /// group with their prologues first and the earlier one's write-back left
-    /// to a later batch, its host barrier cut, and the later one's leading full
-    /// barrier cut (1) or made an attachment-only barrier by region (2, the
-    /// default since 2026-11-12: Castlewall Front x1.004-1.008, the swamp
-    /// x1.003-1.005, the vista level); across submissions when the earlier
-    /// part has no write-back and the later no prologue; 0: off. Live.
-    #[inline]
-    pub fn seamless() -> u64 {
-        get(170).min(2)
-    }
-
-    /// Merged prologues (with `seamless`): a fused group's hoisted prologues
-    /// without the barriers between them, the group's first batch without
-    /// its leading one (`exec::seamless_replay`; default 1). Live.
-    #[inline]
-    pub fn seam_pre() -> bool {
-        get(171) != 0
-    }
-
-    /// A held batch (the graphics CP recording past a label wait) waits on
-    /// the GPU for an earlier batch's CPU effects its CP writes follow, as
-    /// unheld ones do, instead of the CP waiting on the CPU before
-    /// submitting it (`Exec::order_after_cpu`; default 1). Live.
-    #[inline]
-    pub fn held_cpu_wait() -> bool {
-        get(172) != 0
     }
 
     /// The title's convolution reverb computed (`hle::libs::acm_conv`,

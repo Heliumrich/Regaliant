@@ -461,40 +461,6 @@ impl Lists {
         (ops, words)
     }
 
-    /// Fusion's first batch (`tune submit_fuse`): `replay`, its commands'
-    /// buffer left open (not ended) for the next batches' commands.
-    pub fn replay_open(self) {
-        self.replay_with(|i| if i == 0 { SKIP_END } else { 0 }, None);
-    }
-
-    /// Fusion's later batches: their prologue's commands, then their own,
-    /// played into `into` (the first batch's open buffer) without their
-    /// begins and ends.
-    pub fn replay_into(self, into: vk::CommandBuffer) {
-        self.replay_with(|_| SKIP_BEGIN | SKIP_END, Some(into));
-    }
-
-    fn replay_with(self, skip: impl Fn(usize) -> u8, into: Option<vk::CommandBuffer>) {
-        let t = std::time::Instant::now();
-        let (mut ops, mut words) = (0u64, 0u64);
-        let [main, pre] = self.0;
-        // (The prologue first: into one buffer the order is the submission's.)
-        for (i, (raw, l)) in [(1usize, pre), (0, main)] {
-            let Some(mut l) = l else { continue };
-            if raw != 0 && !l.ops.is_empty() {
-                ops += l.ops.len() as u64;
-                words += l.arena.len() as u64;
-                let cb = into.unwrap_or(vk::CommandBuffer::from_raw(raw));
-                unsafe { play_list(cb, &mut l, skip(i)) };
-            }
-            recycle(l);
-        }
-        STATS[S_BATCHES].fetch_add(1, Ordering::Relaxed);
-        STATS[S_OPS].fetch_add(ops, Ordering::Relaxed);
-        STATS[S_WORDS].fetch_add(words, Ordering::Relaxed);
-        STATS[S_NS].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    }
-
     /// Whether the batch's lists hold its commands (fusion needs them).
     pub fn has_main(&self) -> bool {
         self.0[0].0 != 0 && self.0[0].1.is_some()
