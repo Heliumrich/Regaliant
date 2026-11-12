@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 171] = [
+    static ALL: [Tunable; 170] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -40,7 +40,7 @@ pub mod tune {
         Tunable { name: "ring_lo", env: "DS_RING_LO", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "ring_hi", env: "DS_RING_HI", default: u64::MAX >> 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_keep", env: "DS_SHADOW_KEEP", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "block_chain", env: "DS_BLOCK_CHAIN", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "block_chain", env: "DS_BLOCK_CHAIN", default: 3, value: AtomicU64::new(UNSET) },
         Tunable { name: "gpu_indirect", env: "DS_GPU_INDIRECT", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy_wait_submit", env: "DS_LAZY_WAIT_SUBMIT", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "slots", env: "DS_GPU_SLOTS", default: 4, value: AtomicU64::new(UNSET) },
@@ -202,7 +202,6 @@ pub mod tune {
         Tunable { name: "submit_fuse", env: "DS_SUBMIT_FUSE", default: 2, value: AtomicU64::new(UNSET) },
         Tunable { name: "behind_quiet", env: "DS_BEHIND_QUIET", default: 2, value: AtomicU64::new(UNSET) },
         Tunable { name: "behind_us", env: "DS_BEHIND_US", default: 300, value: AtomicU64::new(UNSET) },
-        Tunable { name: "hw_bounds", env: "DS_HW_BOUNDS", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -283,11 +282,12 @@ pub mod tune {
         get(7) != 0
     }
 
-    /// Structured control flow instead of the translator's dispatcher: 1 for
-    /// every shader, 2 for loop-free ones only, 0 never, 3 for every shader
-    /// with each block nested in its dominator's region
-    /// (`rdna::translate::Spec::dom_nest`); switching translates shaders
-    /// anew.
+    /// Structured control flow instead of the translator's dispatcher: 3 (the
+    /// default since 2026-11-12 night) for every shader with each block
+    /// nested in its dominator's region and joins unguarded
+    /// (`rdna::translate::Spec::dom_nest`), 1 for every shader as a flat
+    /// chain of guarded blocks (before), 2 for loop-free ones only, 0 never;
+    /// switching translates shaders anew.
     #[inline]
     pub fn block_chain() -> u64 {
         get(8)
@@ -1366,20 +1366,13 @@ pub mod tune {
         get(169)
     }
 
-    /// Scalar buffer loads without a check of each dword
-    /// (`rdna::translate::Spec::hw_bounds`): the device's robustness2 reads 0
-    /// past a binding's exact range; empty or unmapped resources bind a null
-    /// descriptor. 0 off, 1 on where robustBufferAccess2 and null descriptors
-    /// are enabled. Live (new specs: pipelines made again).
-    #[inline]
-    pub fn hw_bounds() -> u64 {
-        get(170)
-    }
-
-    /// Whether translations made now get `Spec::hw_bounds`.
+    /// Whether translations get `rdna::translate::Spec::hw_bounds` (scalar
+    /// loads of buffers only they read without a check of each dword): where
+    /// robustBufferAccess2 and null descriptors are enabled (since 2026-11-12
+    /// night; FINDINGS.md).
     #[inline]
     pub fn hw_bounds_on() -> bool {
-        hw_bounds() != 0 && super::vk::ctx().robust2_null
+        super::vk::ctx().robust2_null
     }
 
     /// The title's convolution reverb computed (`hle::libs::acm_conv`,
