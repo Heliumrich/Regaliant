@@ -3876,7 +3876,9 @@ fn finish_main(cmd: vk::CommandBuffer, bq: vk::QueryPool, has_pre: bool) {
             }
         }
         let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
+        super::vk::defer::seam_mark(cmd, super::vk::defer::SEAM_TAIL, true);
         c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+        super::vk::defer::seam_mark(cmd, super::vk::defer::SEAM_TAIL, false);
         c.device.end_command_buffer(cmd).ok();
     }
 }
@@ -3988,6 +3990,187 @@ pub static COALESCED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// groups whose first batch went alone because the main queue was idle
 /// (`submit_fuse` 2)].
 pub static FUSED: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// Seamless chunks (`tune seamless`, `seamless_replay`): [fused groups
+/// replayed so, prologues moved into the first one's buffer, seams between
+/// a run's pure parts, write-backs left to a later batch, pure batches].
+pub static SEAMS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// A fused group's replay with seamless chunks: every prologue first (into
+/// the first prologue's buffer: no upload lands between the batches'
+/// commands, and a run's later parts rely on its earlier parts' uploads),
+/// then the batches' commands into `first_cmd`, where two consecutive pure
+/// parts of one parallel run (`Exec::submit_for`) meet: the earlier one's
+/// close write-back left to a later batch of the group (the touched list is
+/// global: the last write-back stores all; one must follow), its host
+/// barrier cut (the last batch's covers the submission), and the later one's
+/// leading full barrier cut (`light`: an attachment-only barrier by region
+/// in its place). The group's prologue buffer returned (None: none).
+fn seamless_replay(mut lists: Vec<super::vk::defer::Lists>, first_cmd: vk::CommandBuffer, mode: u64) -> Option<vk::CommandBuffer> {
+    let light = mode == 2;
+    use super::vk::defer::{Cut, SEAM_LEAD, SEAM_TAIL, SEAM_WB, SKIP_BEGIN, SKIP_END, end_fused};
+    use ash::vk::Handle;
+    SEAMS[0].fetch_add(1, Ordering::Relaxed);
+    let host = lists.iter().position(|l| l.pre_raw() != 0);
+    let mut pre_cb = None;
+    if let Some(h) = host {
+        let hcb = vk::CommandBuffer::from_raw(lists[h].pre_raw());
+        lists[h].play_part(1, None, SKIP_END, &[]);
+        for l in lists[h + 1..].iter_mut() {
+            if l.pre_raw() != 0 {
+                l.play_part(1, Some(hcb), SKIP_BEGIN | SKIP_END, &[]);
+                SEAMS[1].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        end_fused(hcb);
+        pre_cb = Some(hcb);
+    }
+    let n = lists.len();
+    let seams: Vec<super::vk::defer::Seams> = lists.iter().map(|l| l.seams()).collect();
+    // (The group's first batch after its run's previous part handed over
+    // earlier: `cross_seam`; not when a prologue, with its own leading
+    // barrier, comes first.)
+    let cross = host.is_none() && cross_seam(&seams[0]);
+    note_run_order(&seams);
+    SEAMS[4].fetch_add(seams.iter().filter(|s| s.pure_run != 0).count() as u64, Ordering::Relaxed);
+    // Write-backs left to a later one: a pure batch's, when a later batch of
+    // the group writes back.
+    let last_wb = seams.iter().rposition(|s| s.has[SEAM_WB]);
+    let cut_wb: Vec<bool> = (0..n).map(|k| seams[k].pure_run != 0 && seams[k].has[SEAM_WB] && last_wb.is_some_and(|w| w > k)).collect();
+    // A seam after batch k: it and the next are pure parts of one run, the
+    // next marked its leading barrier, and k leaves no write-back of its own.
+    let seam: Vec<bool> = (0..n)
+        .map(|k| {
+            k + 1 < n
+                && seams[k].pure_run != 0
+                && seams[k].pure_run == seams[k + 1].pure_run
+                && seams[k + 1].has[SEAM_LEAD]
+                && (!seams[k].has[SEAM_WB] || cut_wb[k])
+        })
+        .collect();
+    // (Census: consecutive parts of one run left apart, by why.)
+    for k in 0..n.saturating_sub(1) {
+        let (a, b) = (&seams[k], &seams[k + 1]);
+        if a.run == 0 || a.run != b.run || seam[k] {
+            continue;
+        }
+        let why = if a.pure_run == 0 {
+            0
+        } else if b.pure_run == 0 {
+            1
+        } else if !b.has[SEAM_LEAD] {
+            2
+        } else {
+            3
+        };
+        SEAM_APART[why].fetch_add(1, Ordering::Relaxed);
+    }
+    for (k, l) in lists.iter_mut().enumerate() {
+        let mut cuts: Vec<Cut> = Vec::with_capacity(3);
+        if cut_wb[k] {
+            cuts.push(Cut { kind: SEAM_WB, light: false });
+            SEAMS[3].fetch_add(1, Ordering::Relaxed);
+        }
+        if seams[k].has[SEAM_TAIL] && (seam[k] || (seams[k].pure_run != 0 && !seams[k].has[SEAM_WB])) {
+            cuts.push(Cut { kind: SEAM_TAIL, light: false });
+        }
+        if k > 0 && seam[k - 1] {
+            cuts.push(Cut { kind: SEAM_LEAD, light });
+            SEAMS[2].fetch_add(1, Ordering::Relaxed);
+        }
+        if k == 0 && cross {
+            cuts.push(Cut { kind: SEAM_LEAD, light });
+            SEAMS[5].fetch_add(1, Ordering::Relaxed);
+        }
+        if k == 0 {
+            l.play_part(0, None, SKIP_END, &cuts);
+        } else {
+            l.play_part(0, Some(first_cmd), SKIP_BEGIN | SKIP_END, &cuts);
+        }
+    }
+    end_fused(first_cmd);
+    pre_cb
+}
+
+/// Seamless chunks' census (`Exec::submit_for`): run parts recorded into
+/// lists that were not pure, by reason [mid-batch write-backs, CP writes,
+/// waited CP writes, timestamps, shadow copies in, shadow merges, fills,
+/// fast clears, home write-backs, completion actions, promises, mirror
+/// mode's work, held, past a wait or segment stamps], then [parts checked,
+/// pure parts].
+pub static SEAM_BLOCK: [AtomicU64; 15] = [const { AtomicU64::new(0) }; 15];
+/// Consecutive parts of one run in a fused group left apart (`seamless_replay`):
+/// [the earlier impure, the later impure, the later's leading barrier not
+/// marked, the earlier keeps its write-back (no later one in the group)].
+pub static SEAM_APART: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Consecutive main-queue batches of one run (`note_run_order`): [in one
+/// submission, in different submissions, of those both pure with the later's
+/// leading barrier marked, and of those the earlier without a write-back].
+pub static SEAM_ORDER: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// The last main-queue batch handed over: (run, pure, its write-back marked).
+static LAST_RUN: Mutex<(u64, bool, bool)> = Mutex::new((0, false, false));
+
+/// Seamless chunks across submissions (`tune seamless` 1, 2): whether the
+/// batch handed over first in its submission meets its run's previous part
+/// without a barrier: that part was the last main-queue batch handed over,
+/// pure and without a write-back (whose kernel would race this one's marks),
+/// and this one is pure with its leading barrier marked (call before
+/// `note_run_order` notes it).
+fn cross_seam(s: &super::vk::defer::Seams) -> bool {
+    use super::vk::defer::SEAM_LEAD;
+    let g = LAST_RUN.lock();
+    s.run != 0 && s.run == g.0 && g.1 && !g.2 && s.pure_run != 0 && s.has[SEAM_LEAD]
+}
+
+/// A main-queue batch handed over on its own (or coalesced with others into
+/// one submission): its lists replayed, with seamless chunks' cuts (`tune
+/// seamless` 1, 2): its host barrier when it is a pure part without a
+/// write-back, its leading barrier when `cross_seam` and it has no prologue.
+fn replay_main(l: super::vk::defer::Lists, has_pre: bool) {
+    use super::vk::defer::{Cut, SEAM_LEAD, SEAM_TAIL, SEAM_WB};
+    let s = l.seams();
+    let mode = super::tune::seamless();
+    let mut cuts: Vec<Cut> = Vec::new();
+    if matches!(mode, 1 | 2) {
+        if s.pure_run != 0 && !s.has[SEAM_WB] && s.has[SEAM_TAIL] {
+            cuts.push(Cut { kind: SEAM_TAIL, light: false });
+            SEAMS[6].fetch_add(1, Ordering::Relaxed);
+        }
+        if !has_pre && cross_seam(&s) {
+            cuts.push(Cut { kind: SEAM_LEAD, light: mode == 2 });
+            SEAMS[5].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    note_run_order(&[s]);
+    if cuts.is_empty() {
+        l.replay();
+    } else {
+        l.replay_cut(&cuts);
+    }
+}
+
+/// Seamless chunks' census: main-queue batches as they are handed over in
+/// order, one submission's at a time (`seams`).
+fn note_run_order(seams: &[super::vk::defer::Seams]) {
+    use super::vk::defer::{SEAM_LEAD, SEAM_WB};
+    let mut g = LAST_RUN.lock();
+    for (k, s) in seams.iter().enumerate() {
+        if s.run != 0 && s.run == g.0 {
+            if k == 0 {
+                SEAM_ORDER[1].fetch_add(1, Ordering::Relaxed);
+                if g.1 && s.pure_run != 0 && s.has[SEAM_LEAD] {
+                    SEAM_ORDER[2].fetch_add(1, Ordering::Relaxed);
+                    if !g.2 {
+                        SEAM_ORDER[3].fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            } else {
+                SEAM_ORDER[0].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        *g = (s.run, s.pure_run != 0, s.has[SEAM_WB]);
+    }
+}
+
 /// The last main-queue batch handed to Vulkan (`submit_specs`): the queue
 /// is idle while the batch timeline is there.
 static LAST_MAIN_SUBMITTED: AtomicU64 = AtomicU64::new(0);
@@ -4021,7 +4204,11 @@ fn submit_specs(mut specs: Vec<(u64, SubmitSpec)>) {
         }
         if j - i == 1 {
             if let Some(l) = specs[i].1.lists.take() {
-                l.replay();
+                if !specs[i].1.on_c {
+                    replay_main(l, specs[i].1.pre.is_some() || specs[i].1.xpre.is_some());
+                } else {
+                    l.replay();
+                }
             }
             let (seq, s) = &specs[i];
             if let Err(e) = submit_batch(*seq, s.xpre, s.pre, s.cmd, s.wait, s.on_c, s.xwait, s.cpu_wait) {
@@ -4037,7 +4224,7 @@ fn submit_specs(mut specs: Vec<(u64, SubmitSpec)>) {
         // goes alone now: the GPU need not wait for the others' replay.)
         if super::tune::submit_fuse_mode() == 2 && ctx().batch_value() >= LAST_MAIN_SUBMITTED.load(Ordering::Relaxed) {
             if let Some(l) = specs[i].1.lists.take() {
-                l.replay();
+                replay_main(l, specs[i].1.pre.is_some());
             }
             let (seq, s) = &specs[i];
             if let Err(e) = submit_batch(*seq, s.xpre, s.pre, s.cmd, s.wait, s.on_c, s.xwait, s.cpu_wait) {
@@ -4061,11 +4248,20 @@ fn submit_specs(mut specs: Vec<(u64, SubmitSpec)>) {
         let copied_now = ctx().copy.as_ref().map_or(u64::MAX, |q| unsafe { ctx().device.get_semaphore_counter_value(q.copied) }.unwrap_or(0));
         if super::tune::submit_fuse() && specs[i..j].iter().all(|(_, s)| s.lists.as_ref().is_some_and(|l| l.has_main())) && specs[i + 1..j].iter().all(|(_, s)| s.xwait <= cdone_now && s.wait <= copied_now) {
             let first_cmd = specs[i].1.cmd;
-            specs[i].1.lists.take().expect("lists").replay_open();
-            for k in i + 1..j {
-                specs[k].1.lists.take().expect("lists").replay_into(first_cmd);
+            // (`tune seamless`: every prologue first, into the first one's
+            // buffer, then the batches' commands with the seams between a
+            // run's pure parts cut: `seamless_replay`.)
+            let mut group_pre: Option<Option<vk::CommandBuffer>> = None;
+            if super::tune::seamless() != 0 {
+                let lists: Vec<super::vk::defer::Lists> = (i..j).map(|k| specs[k].1.lists.take().expect("lists")).collect();
+                group_pre = Some(seamless_replay(lists, first_cmd, super::tune::seamless()));
+            } else {
+                specs[i].1.lists.take().expect("lists").replay_open();
+                for k in i + 1..j {
+                    specs[k].1.lists.take().expect("lists").replay_into(first_cmd);
+                }
+                super::vk::defer::end_fused(first_cmd);
             }
-            super::vk::defer::end_fused(first_cmd);
             let c = ctx();
             if let Err(e) = super::pagetable::submit_pending(c, XQ_SUBMITTED.load(Ordering::Acquire)) {
                 fail(e, &specs[i].1.name);
@@ -4073,7 +4269,10 @@ fn submit_specs(mut specs: Vec<(u64, SubmitSpec)>) {
             }
             super::images::flush_uploads();
             let cdone = if c.compute.is_some() { c.batch_value_c() } else { 0 };
-            let cmds: Vec<vk::CommandBuffer> = specs[i].1.pre.into_iter().chain([first_cmd]).collect();
+            let cmds: Vec<vk::CommandBuffer> = match group_pre {
+                Some(p) => p.into_iter().chain([first_cmd]).collect(),
+                None => specs[i].1.pre.into_iter().chain([first_cmd]).collect(),
+            };
             let wait = specs[i..j].iter().map(|(_, s)| s.wait).max().unwrap_or(0);
             let xwait = specs[i..j].iter().map(|(_, s)| s.xwait).max().unwrap_or(0);
             let last = specs[j - 1].0;
@@ -4089,7 +4288,8 @@ fn submit_specs(mut specs: Vec<(u64, SubmitSpec)>) {
         }
         for (_, s) in specs[i..j].iter_mut() {
             if let Some(l) = s.lists.take() {
-                l.replay();
+                let has_pre = s.pre.is_some();
+                replay_main(l, has_pre);
             }
         }
         let c = ctx();
@@ -10838,7 +11038,16 @@ impl Exec {
         self.wb_counted = 0;
         self.last_fill = None;
         if super::tune::skip_barriers() & 64 == 0 {
+            // (Seamless chunks: the barrier's ops marked, `tune seamless`;
+            // not when the touched list's fill above needs its order.)
+            let mark = self.batch_lists && super::fe2::scatter_resets() && !seg_stamps();
+            if mark {
+                super::vk::defer::seam_mark(self.cmd(), super::vk::defer::SEAM_LEAD, true);
+            }
             self.barrier();
+            if mark {
+                super::vk::defer::seam_mark(self.cmd(), super::vk::defer::SEAM_LEAD, false);
+            }
         }
         self.barrier_wanted = false;
         self.dispatched = false;
@@ -10949,12 +11158,53 @@ impl Exec {
         // Front end 2: what the batch's work wrote into the mirror goes to
         // guest memory before the batch completes; the checks its bindings
         // deferred are made now, their uploads into its prologue.
+        let scatters_before = self.ops[OP_FE2_SCATTERS];
         if self.fe2_marked {
             SCATTER_SITES[1].fetch_add(1, Ordering::Relaxed);
             if self.pending_promises.is_empty() && self.actions.is_empty() {
                 SCATTER_SITES[2].fetch_add(1, Ordering::Relaxed);
             }
+            if self.batch_lists {
+                super::vk::defer::seam_mark(self.cmd(), super::vk::defer::SEAM_WB, true);
+            }
             self.fe2_scatter_at(1);
+            if self.batch_lists {
+                super::vk::defer::seam_mark(self.cmd(), super::vk::defer::SEAM_WB, false);
+            }
+        }
+        // Seamless chunks (`tune seamless`): a part of a parallel run with
+        // nothing in it that its neighbours' order or its own completion
+        // matters to is pure: the fused replay may run it back to back with
+        // the run's next part.
+        if self.batch_lists && self.fe2_run.0 != 0 {
+            let o = &self.ops;
+            // (What keeps it from being pure, by `SEAM_BLOCK`'s index.)
+            let block = [
+                scatters_before != 0,
+                o[OP_CP_WRITES] != 0,
+                o[OP_CP_WRITES_WAITED] != 0,
+                o[OP_TIMESTAMPS] != 0,
+                o[OP_SHADOWS_IN] != 0,
+                o[OP_MERGES] != 0,
+                o[OP_FILLS] != 0,
+                o[OP_FAST_CLEARS] != 0,
+                o[OP_WRITE_BACK_BYTES] != 0,
+                !self.actions.is_empty(),
+                !self.pending_promises.is_empty(),
+                !self.mm_cp.is_empty() || !self.owned.is_empty(),
+                self.held || self.past || seg_stamps(),
+            ];
+            let pure = !block.iter().any(|&b| b);
+            SEAM_BLOCK[13].fetch_add(1, Ordering::Relaxed);
+            for (k, &b) in block.iter().enumerate() {
+                if b {
+                    SEAM_BLOCK[k].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            if pure {
+                SEAM_BLOCK[14].fetch_add(1, Ordering::Relaxed);
+            }
+            super::vk::defer::set_part(self.fe2_run.0, pure);
         }
         // Mirror mode: pages deferred CP writes changed are copied into the
         // mirror again (those writes were waited for above), and the dwords
@@ -17221,6 +17471,25 @@ pub fn status() -> String {
             FUSED[0].load(Ordering::Relaxed),
             FUSED[1].load(Ordering::Relaxed),
             FUSED[2].load(Ordering::Relaxed)
+        )
+        + &format!(
+            "    seamless chunks (`tune seamless` {}): {} fused groups replayed so, {} prologues moved first, {} seams between a run's pure parts, {} write-backs left to a later batch, {} pure batches, {} seams across submissions, {} host barriers of pure parts without a write-back cut outside groups; run parts {} checked, {} pure, not pure by (mid-batch write-backs, CP writes, waited CP writes, timestamps, shadows in, merges, fills, fast clears, home write-backs, actions, promises, mirror mode, held/past/stamps) {:?}; consecutive parts in a fused group left apart by (earlier impure, later impure, later's barrier unmarked, earlier's write-back kept) {:?}; consecutive main-queue parts of one run in one submission {}, in different ones {} (both pure {}, the earlier without a write-back {})\n",
+            super::tune::seamless(),
+            SEAMS[0].load(Ordering::Relaxed),
+            SEAMS[1].load(Ordering::Relaxed),
+            SEAMS[2].load(Ordering::Relaxed),
+            SEAMS[3].load(Ordering::Relaxed),
+            SEAMS[4].load(Ordering::Relaxed),
+            SEAMS[5].load(Ordering::Relaxed),
+            SEAMS[6].load(Ordering::Relaxed),
+            SEAM_BLOCK[13].load(Ordering::Relaxed),
+            SEAM_BLOCK[14].load(Ordering::Relaxed),
+            SEAM_BLOCK[..13].iter().map(|c| c.load(Ordering::Relaxed)).collect::<Vec<u64>>(),
+            SEAM_APART.iter().map(|c| c.load(Ordering::Relaxed)).collect::<Vec<u64>>(),
+            SEAM_ORDER[0].load(Ordering::Relaxed),
+            SEAM_ORDER[1].load(Ordering::Relaxed),
+            SEAM_ORDER[2].load(Ordering::Relaxed),
+            SEAM_ORDER[3].load(Ordering::Relaxed)
         )
         + &format!(
             "    end-of-pipe writes without a full barrier: {} labels; {} waits ordered the work after them; {} CP writes right after front end 2's write-back with no barrier before them; CP writes without end of pipe the GPU performed, graphics / compute queues, by (neither, after a flush or acquire, held past a label wait, both): {:?} / {:?}; after a flush by what asked for it: graphics {}; compute queues {}\n",

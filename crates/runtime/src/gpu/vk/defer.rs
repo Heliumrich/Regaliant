@@ -126,6 +126,14 @@ pub struct List {
     arena: Vec<u64>,
     /// Host code recorded as commands (`Op::External`), taken at replay.
     externals: Vec<Option<ExternalFn>>,
+    /// Seamless chunks (`seam_mark`): the ops [begin, end) of the batch
+    /// close's write-back (SEAM_WB), its leading full barrier (SEAM_LEAD) and
+    /// its host barrier (SEAM_TAIL).
+    seams: [(u32, u32); 3],
+    /// The parallel run the batch is a pure part of (`set_part`; 0: not one).
+    pure_run: u64,
+    /// The parallel run the batch is a part of, pure or not (0: none).
+    run: u64,
 }
 
 impl List {
@@ -350,6 +358,9 @@ fn recycle(mut l: Box<List>) {
     l.ops.clear();
     l.arena.clear();
     l.externals.clear();
+    l.seams = [(0, 0); 3];
+    l.pure_run = 0;
+    l.run = 0;
     let mut f = FREE.lock();
     if f.len() < 32 {
         f.push(l);
@@ -428,6 +439,13 @@ impl Lists {
         STATS[S_MAX_OPS].fetch_max(ops, Ordering::Relaxed);
     }
 
+    /// `replay` with the commands' list played without the marked parts
+    /// `cuts` (seamless chunks).
+    pub fn replay_cut(mut self, cuts: &[Cut]) {
+        self.play_part(1, None, 0, &[]);
+        self.play_part(0, None, 0, cuts);
+    }
+
     /// Plays each list into its buffer: commands and arena words played.
     fn play(self) -> (u64, u64) {
         let (mut ops, mut words) = (0, 0);
@@ -483,6 +501,105 @@ impl Lists {
     }
 }
 
+/// Seamless chunks: a batch's close write-back, leading full barrier and host
+/// barrier (`List::seams`).
+pub const SEAM_WB: usize = 0;
+pub const SEAM_LEAD: usize = 1;
+pub const SEAM_TAIL: usize = 2;
+
+/// The ops of `cb`'s batch's part `kind` begin (`begin`) or end here in its
+/// command list (nothing when this thread records `cb` through the driver).
+pub fn seam_mark(cb: vk::CommandBuffer, kind: usize, begin: bool) {
+    if claimed(cb) != Some(0) {
+        return;
+    }
+    LISTS.with(|l| {
+        if let Some(main) = l.borrow_mut()[0].as_mut() {
+            let n = main.ops.len() as u32;
+            if begin {
+                main.seams[kind] = (n, n);
+            } else {
+                main.seams[kind].1 = n;
+            }
+        }
+    });
+}
+
+/// This thread's batch is a part of parallel run `run`, pure or not
+/// (seamless chunks: `Exec::submit_for`).
+pub fn set_part(run: u64, pure: bool) {
+    LISTS.with(|l| {
+        if let Some(main) = l.borrow_mut()[0].as_mut() {
+            main.run = run;
+            main.pure_run = if pure { run } else { 0 };
+        }
+    });
+}
+
+/// A batch's seams for the fused replay: whether its write-back, leading
+/// barrier and host barrier were marked, and the run it is a pure part of.
+#[derive(Clone, Copy, Default)]
+pub struct Seams {
+    pub has: [bool; 3],
+    pub pure_run: u64,
+    pub run: u64,
+}
+
+/// A cut of a list's ops at replay: the ops' range of a part (`SEAM_*`), and
+/// whether an attachment-only barrier (by region) stands in for them.
+#[derive(Clone, Copy)]
+pub struct Cut {
+    pub kind: usize,
+    pub light: bool,
+}
+
+impl Lists {
+    /// The batch's prologue buffer when its list holds commands (0: none).
+    pub fn pre_raw(&self) -> u64 {
+        if self.0[1].1.as_ref().is_some_and(|l| !l.ops.is_empty()) { self.0[1].0 } else { 0 }
+    }
+
+    /// The batch's seams (`seam_mark`, `set_pure`).
+    pub fn seams(&self) -> Seams {
+        self.0[0].1.as_ref().map_or(Seams::default(), |l| Seams { has: l.seams.map(|s| s.1 > s.0), pure_run: l.pure_run, run: l.run })
+    }
+
+    /// Plays one of the batch's lists (0 its commands, 1 its prologue) into
+    /// `into` (None: its own buffer) with `skip` (`SKIP_BEGIN`,
+    /// `SKIP_END`), without the marked parts `cuts` name.
+    pub fn play_part(&mut self, which: usize, into: Option<vk::CommandBuffer>, skip: u8, cuts: &[Cut]) {
+        let (raw, slot) = &mut self.0[which];
+        let Some(mut l) = slot.take() else { return };
+        let t = std::time::Instant::now();
+        if *raw != 0 && !l.ops.is_empty() {
+            let cb = into.unwrap_or(vk::CommandBuffer::from_raw(*raw));
+            let mut ranges: [(u32, u32, bool); 3] = [(0, 0, false); 3];
+            for (k, c) in cuts.iter().enumerate().take(3) {
+                let s = l.seams[c.kind];
+                ranges[k] = (s.0, s.1, c.light);
+            }
+            STATS[S_OPS].fetch_add(l.ops.len() as u64, Ordering::Relaxed);
+            STATS[S_WORDS].fetch_add(l.arena.len() as u64, Ordering::Relaxed);
+            unsafe { play_list_cut(cb, &mut l, skip, &ranges[..cuts.len().min(3)]) };
+        }
+        if which == 0 {
+            STATS[S_BATCHES].fetch_add(1, Ordering::Relaxed);
+        }
+        STATS[S_NS].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        recycle(l);
+    }
+}
+
+/// Seamless chunks' attachment-only barrier (`Cut::light`): earlier
+/// attachment writes before later attachment accesses, by region.
+unsafe fn light_barrier(cb: vk::CommandBuffer) {
+    let st = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS;
+    let mb = vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
+        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE);
+    unsafe { (real().fp_v1_0().cmd_pipeline_barrier)(cb, st, st, vk::DependencyFlags::BY_REGION, 1, &mb, 0, null(), 0, null()) };
+}
+
 /// Fusion's end: the first batch's buffer ended after the last batch's
 /// commands.
 pub fn end_fused(cb: vk::CommandBuffer) {
@@ -492,8 +609,8 @@ pub fn end_fused(cb: vk::CommandBuffer) {
 }
 
 /// `play_list`'s skips.
-const SKIP_BEGIN: u8 = 1;
-const SKIP_END: u8 = 2;
+pub const SKIP_BEGIN: u8 = 1;
+pub const SKIP_END: u8 = 2;
 
 /// An arena word + 1 (0: none) as a pointer into the arena at `base`.
 unsafe fn rebase<T>(v: usize, base: *const u64) -> *const T {
@@ -503,13 +620,28 @@ unsafe fn rebase<T>(v: usize, base: *const u64) -> *const T {
 /// Records `l` into `cb` through the driver (`skip`: SKIP_BEGIN and
 /// SKIP_END leave out its begin and end, fusion).
 unsafe fn play_list(cb: vk::CommandBuffer, l: &mut List, skip: u8) {
+    unsafe { play_list_cut(cb, l, skip, &[]) }
+}
+
+/// `play_list` without the ops of `cuts` ([begin, end), an attachment-only
+/// barrier in their place when marked so: seamless chunks).
+unsafe fn play_list_cut(cb: vk::CommandBuffer, l: &mut List, skip: u8, cuts: &[(u32, u32, bool)]) {
     let d = real();
     let (f0, f1, f2, f3) = (d.fp_v1_0(), d.fp_v1_1(), d.fp_v1_2(), d.fp_v1_3());
     let c = super::ctx();
     let base = l.arena.as_mut_ptr();
     let at = move |s: Span| -> *const u64 { if s.n == 0 { null() } else { unsafe { base.add(s.at as usize).cast_const() } } };
     let one = move |i: u32| -> *const u64 { if i == NONE { null() } else { unsafe { base.add(i as usize).cast_const() } } };
-    for op in &l.ops {
+    for (k, op) in l.ops.iter().enumerate() {
+        if !cuts.is_empty() {
+            let k = k as u32;
+            if let Some(c) = cuts.iter().find(|c| k >= c.0 && k < c.1) {
+                if c.2 && k == c.0 {
+                    unsafe { light_barrier(cb) };
+                }
+                continue;
+            }
+        }
         unsafe {
             match *op {
                 Op::Begin(flags) => {
