@@ -10015,6 +10015,64 @@ fn replay_census(p: &Prepared, deferred: bool) {
     }
 }
 
+/// `DS_CPW_CENSUS=1` (diagnosis): GPU-performed CP writes after marked
+/// work, by target: (address) -> [written back before, skipped (a label our
+/// CPs wait on), end of pipe, the recording queue's name hash]. Status line
+/// `CP writes after marked work`; `profile reset` clears it.
+pub fn cpw_census_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_CPW_CENSUS").ok().as_deref() == Some("1"))
+}
+static CPW_CENSUS: Mutex<Option<HashMap<u64, ([u64; 3], String)>>> = Mutex::new(None);
+
+fn cpw_census_note(a: u64, end_of_pipe: bool, written_back: bool, queue: &str) {
+    let mut g = CPW_CENSUS.lock();
+    let m = g.get_or_insert_with(HashMap::new);
+    if m.len() > 1 << 16 && !m.contains_key(&a) {
+        return;
+    }
+    let e = m.entry(a).or_insert_with(|| ([0; 3], queue.to_string()));
+    e.0[if written_back { 0 } else { 1 }] += 1;
+    if end_of_pipe {
+        e.0[2] += 1;
+    }
+}
+
+pub fn cpw_census_reset() {
+    *CPW_CENSUS.lock() = None;
+}
+
+/// The CP-write census's status line ("" when off).
+pub fn cpw_census_line() -> String {
+    if !cpw_census_on() {
+        return String::new();
+    }
+    let g = CPW_CENSUS.lock();
+    let Some(m) = g.as_ref() else { return String::new() };
+    let names: HashMap<u8, String> = crate::engine::allocators().into_iter().map(|a| (a.id, a.name)).collect();
+    let (mut wb, mut sk) = (0u64, 0u64);
+    let mut by_owner: HashMap<u8, [u64; 2]> = HashMap::new();
+    for (&a, (c, _)) in m.iter() {
+        wb += c[0];
+        sk += c[1];
+        let o = by_owner.entry(crate::engine::owner(a)).or_insert([0; 2]);
+        o[0] += c[0];
+        o[1] += c[1];
+    }
+    let mut owners: Vec<(u8, [u64; 2])> = by_owner.into_iter().collect();
+    owners.sort_by_key(|x| std::cmp::Reverse(x.1[0]));
+    let ow: Vec<String> = owners.iter().take(10).map(|(o, c)| format!("{} {} / {}", names.get(o).cloned().unwrap_or_else(|| format!("owner {o}")), c[0], c[1])).collect();
+    let mut top: Vec<(&u64, &([u64; 3], String))> = m.iter().filter(|(_, c)| c.0[0] > 0).collect();
+    top.sort_by_key(|x| std::cmp::Reverse(x.1 .0[0]));
+    let tp: Vec<String> = top.iter().take(32).map(|(a, (c, q))| format!("{a:#x} {} ({} eop, {q}, {})", c[0], c[2], names.get(&crate::engine::owner(**a)).cloned().unwrap_or_default())).collect();
+    format!(
+        "    CP writes after marked work (`DS_CPW_CENSUS`): {} addresses; written back before {wb}, skipped as labels our CPs wait on {sk}; by engine allocation (written back / skipped): {}; the most written back before: {}\n",
+        m.len(),
+        ow.join(", "),
+        tp.join("; ")
+    )
+}
+
 /// The census's status line ("" when off).
 pub fn replay_census_line() -> String {
     if !replay_census_on() {
@@ -13948,8 +14006,14 @@ impl Exec {
             }
             if super::tune::fe2_cpw_close() || (waited && super::tune::fe2_cpw_waited()) {
                 SCATTER_SITES[4].fetch_add(1, Ordering::Relaxed);
+                if cpw_census_on() {
+                    cpw_census_note(a, end_of_pipe, false, &self.name);
+                }
             } else {
                 SCATTER_SITES[0].fetch_add(1, Ordering::Relaxed);
+                if cpw_census_on() {
+                    cpw_census_note(a, end_of_pipe, true, &self.name);
+                }
                 after_scatter = self.fe2_scatter_at(2);
             }
         }
@@ -17198,6 +17262,7 @@ pub fn status() -> String {
         + &super::resident::status()
         + &super::fe2::status()
         + &replay_census_line()
+        + &cpw_census_line()
         + &super::kco::status()
         + &import_sites_line()
         + &in_place_line()

@@ -3103,6 +3103,7 @@ pub fn reset_profile() {
     cp::reset_classes();
     exec::wb_census_reset();
     exec::replay_census_reset();
+    exec::cpw_census_reset();
     pm4_census_reset();
     fe3_probe::reset();
     kco::reset();
