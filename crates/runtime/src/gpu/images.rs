@@ -2531,77 +2531,11 @@ pub fn stream_chunk_done(a: u64, n: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     STREAM_STATS[0].fetch_add(1, Relaxed);
     STREAM_STATS[1].fetch_add(n, Relaxed);
-    {
-        let mut g = STREAMED.lock();
-        if g.len() >= STREAM_KEEP {
-            g.pop_front();
-        }
-        g.push_back((a, a + n, std::time::Instant::now()));
+    let mut g = STREAMED.lock();
+    if g.len() >= STREAM_KEEP {
+        g.pop_front();
     }
-    if super::tune::tex_stream_ahead() {
-        static START: std::sync::Once = std::sync::Once::new();
-        START.call_once(|| {
-            let _ = std::thread::Builder::new().name("gpu-texstream".into()).spawn(stream_ahead_thread);
-        });
-        let mut q = AHEAD.lock();
-        if q.len() < 4096 {
-            q.push((a, a + n));
-        }
-        drop(q);
-        AHEAD_CV.notify_one();
-    }
-}
-
-/// Completed chunks waiting for the helper (`stream_ahead_thread`).
-static AHEAD: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
-static AHEAD_CV: parking_lot::Condvar = parking_lot::Condvar::new();
-/// [rounds, chunks, images refreshed ahead (dirty or not), ns under the
-/// cache's lock, ns in all].
-static AHEAD_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
-
-/// The helper (`tune tex_stream_ahead`): each completed chunk's images
-/// refreshed as their next binding would (`refresh`, its CPU-detiled
-/// re-uploads after the cache's lock: `finish_refreshes`), so the bindings
-/// that follow find them clean.
-fn stream_ahead_thread() {
-    use std::sync::atomic::Ordering::Relaxed;
-    let mut ranges: Vec<(u64, u64)> = Vec::new();
-    loop {
-        {
-            let mut q = AHEAD.lock();
-            while q.is_empty() {
-                AHEAD_CV.wait_for(&mut q, std::time::Duration::from_millis(50));
-            }
-            std::mem::swap(&mut ranges, &mut *q);
-        }
-        if super::shutting_down() {
-            ranges.clear();
-            continue;
-        }
-        let t0 = std::time::Instant::now();
-        let frame = super::FRAMES.load(Relaxed);
-        defer_refreshes();
-        let (n, tl) = with(|im| {
-            let tl = std::time::Instant::now();
-            let keys: Vec<(ImageKey, Tsharp)> = im
-                .map
-                .iter()
-                .filter(|(k, img)| !img.gpu_written && img.source.is_some() && img.span > 0 && ranges.iter().any(|&(a, b)| k.base < b && a < k.base + img.span))
-                .filter_map(|(k, img)| img.layout.map(|t| (*k, t)))
-                .collect();
-            for (k, t) in &keys {
-                let _ = im.refresh(*k, t, frame);
-            }
-            (keys.len() as u64, tl.elapsed().as_nanos() as u64)
-        });
-        let _ = finish_refreshes();
-        AHEAD_STATS[0].fetch_add(1, Relaxed);
-        AHEAD_STATS[1].fetch_add(ranges.len() as u64, Relaxed);
-        AHEAD_STATS[2].fetch_add(n, Relaxed);
-        AHEAD_STATS[3].fetch_add(tl, Relaxed);
-        AHEAD_STATS[4].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
-        ranges.clear();
-    }
+    g.push_back((a, a + n, std::time::Instant::now()));
 }
 
 /// The census of an upload of guest [a, a+n) taking `ns` (`run_refresh`).
@@ -2642,18 +2576,12 @@ pub fn stream_status() -> String {
             format!("{n} {} ({:.0} ms)", s[0].load(Relaxed), s[1].load(Relaxed) as f64 / 1e6)
         }).collect::<Vec<_>>().join(", ")
     };
-    let a: [u64; 5] = std::array::from_fn(|k| AHEAD_STATS[k].load(Relaxed));
     format!(
-        "    texture streaming (`DS_TEX_STREAM`): {chunks} chunks completed ({} MiB); uploads where a binding needed them by how long before a chunk over their range completed: first uploads {}; re-uploads {}; ahead (`tune tex_stream_ahead` {}): {} rounds, {} chunks, {} images refreshed, {:.0} ms under the cache's lock, {:.0} ms in all\n",
+        "    texture streaming (`DS_TEX_STREAM`): {chunks} chunks completed ({} MiB); uploads where a binding needed them by how long before a chunk over their range completed: first uploads {}; re-uploads {}
+",
         STREAM_STATS[1].load(Relaxed) >> 20,
         part(0),
-        part(1),
-        super::tune::tex_stream_ahead() as u8,
-        a[0],
-        a[1],
-        a[2],
-        a[3] as f64 / 1e6,
-        a[4] as f64 / 1e6
+        part(1)
     )
 }
 
