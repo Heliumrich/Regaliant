@@ -51,8 +51,21 @@ pub fn dynamic_range() -> u32 {
     let at = CHECKED_MS.load(Ordering::Relaxed);
     if at == 0 || now.saturating_sub(at) >= 2000 {
         CHECKED_MS.store(now.max(1), Ordering::Relaxed);
-        let hdr = crate::pcsettings::hdr_allowed() && crate::gpu::vk::window::current_monitor().and_then(|(_, dev)| crate::display::hdr_now(&dev)).is_some();
+        let monitor = crate::gpu::vk::window::current_monitor();
+        let hdr = crate::pcsettings::hdr_allowed() && monitor.as_ref().and_then(|(_, dev)| crate::display::hdr_now(dev)).is_some();
         let v = if hdr { RANGE_HDR } else { RANGE_SDR };
+        // The monitor's signal as Windows drives it, logged when it changes (a washed-out
+        // picture can be a YCbCr or limited signal the driver chose for a mode).
+        if let Some((_, dev)) = monitor {
+            static SIGNAL: parking_lot::Mutex<Option<(String, &'static str, u32)>> = parking_lot::Mutex::new(None);
+            if let Some((enc, bits)) = dsconfig::display::signal(&dev) {
+                let mut g = SIGNAL.lock();
+                if g.as_ref() != Some(&(dev.clone(), enc, bits)) {
+                    crate::info!("display: {dev} receives {enc} at {bits} bits per channel");
+                    *g = Some((dev, enc, bits));
+                }
+            }
+        }
         if LAST.swap(v, Ordering::Relaxed) != v || at == 0 {
             crate::info!("videoout: output reported as {}", if hdr { "HDR" } else { "SDR" });
         }

@@ -104,25 +104,18 @@ pub fn dump_nodes(dir: &std::path::Path, tag: &str) -> Result<String, String> {
 fn dump_by_vtable(dir: &std::path::Path, name: &str, vtable: u64, words_n: u64) -> Result<String, String> {
     let b = checked().ok_or("no UI manager layout for this executable")?;
     let vt = b + vtable;
-    let spans: Vec<(u64, u64)> = crate::mem::MEM.lock().vmas.values().filter(|m| m.kind != crate::mem::VmaKind::Reserved && m.prot & 1 != 0).map(|m| (m.start, m.end())).collect();
     let t0 = std::time::Instant::now();
     let mut out = String::new();
     let mut n = 0;
-    for (lo, hi) in spans {
-        let mut a = (lo + 7) & !7;
-        while a + words_n * 4 <= hi {
-            if unsafe { *(a as *const u64) } == vt {
-                let words: Vec<u32> = (0..words_n).map(|i| unsafe { *((a + i * 4) as *const u32) }).collect();
-                out += &format!("{a:#x}");
-                for w in &words {
-                    out += &format!(" {w:08x}");
-                }
-                out += "\n";
-                n += 1;
-            }
-            a += 8;
+    sweep(vt, words_n * 4, |a, _| {
+        let words: Vec<u32> = (0..words_n).map(|i| unsafe { std::ptr::read_volatile((a + i * 4) as *const u32) }).collect();
+        out += &format!("{a:#x}");
+        for w in &words {
+            out += &format!(" {w:08x}");
         }
-    }
+        out += "\n";
+        n += 1;
+    });
     let path = dir.join(format!("{name}.txt"));
     std::fs::write(&path, out).map_err(|e| e.to_string())?;
     Ok(format!("{name}: {n} objects in {} ms -> {}", t0.elapsed().as_millis(), path.display()))
@@ -149,7 +142,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub struct Tree {
     pub nodes: Vec<u64>,
     pub children: HashMap<u64, Vec<u64>>,
+    /// The guest ranges the nodes lie in (their objects merged, within the mapping each was
+    /// found in): checked mapped before nodes are read (`guarded`).
+    pub spans: Vec<(u64, u64)>,
 }
+
+/// A node object's bytes the port reads (its fields up to the size at +0x308).
+const NODE_BYTES: u64 = 0x310;
 
 static TREE: Mutex<Option<Arc<Tree>>> = Mutex::new(None);
 static SCANNING: AtomicBool = AtomicBool::new(false);
@@ -198,28 +197,118 @@ pub fn rescan() {
     start_scan();
 }
 
-fn scan() -> Tree {
-    let Some(b) = checked() else { return Tree { nodes: Vec::new(), children: HashMap::new() } };
-    let vt = b + NODE_VTABLE;
-    let spans: Vec<(u64, u64)> = crate::mem::MEM.lock().vmas.values().filter(|m| m.kind != crate::mem::VmaKind::Reserved && m.prot & 1 != 0).map(|m| (m.start, m.end())).collect();
-    let mut nodes = Vec::new();
-    for (lo, hi) in spans {
-        let mut a = (lo + 7) & !7;
-        while a + 0x310 <= hi {
-            if unsafe { std::ptr::read_volatile(a as *const u64) } == vt {
-                nodes.push(a);
+/// Calls `f(a, mapping)` for each 8-byte aligned guest address `a` of the readable mappings whose
+/// first word is `word` and whose `len` bytes lie in its mapping (`mapping`: that mapping's
+/// [start, end) when the sweep began). Memory is read in pieces of 1 MiB, each checked in the
+/// mapping table and read under the guest-reader lock with no mapping change in between: the
+/// title unmaps memory while the sweep runs (two of the user's sessions ended on a read of a page
+/// unmapped 0.2-0.6 s before, 2026-11-13). A piece no longer mapped is passed over. `f` runs
+/// under the lock: it must not take the mapping table's (`mem::readable`, `mem::MEM`).
+fn sweep(word: u64, len: u64, mut f: impl FnMut(u64, (u64, u64))) {
+    use std::sync::atomic::Ordering::SeqCst;
+    const PIECE: u64 = 1 << 20;
+    let maps: Vec<(u64, u64)> = crate::mem::MEM.lock().vmas.values().filter(|m| m.kind != crate::mem::VmaKind::Reserved && m.prot & 1 != 0).map(|m| (m.start, m.end())).collect();
+    for (lo, hi) in maps {
+        let mut c = (lo + 7) & !7;
+        let mut tries = 0;
+        while c + len <= hi {
+            let end = (c + PIECE).min(hi);
+            // The piece and the bytes its last candidates reach.
+            let reach = (end + len).min(hi);
+            let g0 = crate::mem::MAP_GEN.load(SeqCst);
+            if !crate::mem::host_readable(c, reach - c) {
+                c = end;
+                tries = 0;
+                continue;
             }
-            a += 8;
+            let readers = crate::mem::GUEST_READERS.read();
+            if !crate::mem::table_view_held(g0) {
+                drop(readers);
+                tries += 1;
+                if tries > 64 {
+                    c = end;
+                    tries = 0;
+                }
+                continue;
+            }
+            let mut a = c;
+            while a < end && a + len <= hi {
+                if unsafe { std::ptr::read_volatile(a as *const u64) } == word {
+                    f(a, (lo, hi));
+                }
+                a += 8;
+            }
+            drop(readers);
+            c = end;
+            tries = 0;
         }
     }
-    let mut children: HashMap<u64, Vec<u64>> = HashMap::new();
-    for &n in &nodes {
-        let p = parent(n);
-        if p != 0 {
-            children.entry(p).or_default().push(n);
+}
+
+fn scan() -> Tree {
+    let Some(b) = checked() else { return Tree { nodes: Vec::new(), children: HashMap::new(), spans: Vec::new() } };
+    let vt = b + NODE_VTABLE;
+    let mut found: Vec<(u64, (u64, u64))> = Vec::new();
+    sweep(vt, NODE_BYTES, |a, m| found.push((a, m)));
+    // The pools: node objects merged within the mapping each was found in (a page's gap at most).
+    let mut spans: Vec<(u64, u64)> = Vec::new();
+    let mut last_map = (0, 0);
+    for &(a, m) in &found {
+        match spans.last_mut() {
+            Some(s) if m == last_map && a <= s.1 + 0x1000 => s.1 = s.1.max(a + NODE_BYTES),
+            _ => spans.push((a, a + NODE_BYTES)),
+        }
+        last_map = m;
+    }
+    let nodes: Vec<u64> = found.into_iter().map(|(a, _)| a).collect();
+    let mut t = Tree { nodes, children: HashMap::new(), spans };
+    let children = guarded(&t, || {
+        let mut children: HashMap<u64, Vec<u64>> = HashMap::new();
+        for &n in &t.nodes {
+            let p = parent(n);
+            if p != 0 {
+                children.entry(p).or_default().push(n);
+            }
+        }
+        children
+    });
+    match children {
+        Some(c) => t.children = c,
+        // The pools changed while the sweep ran: an empty index (scanned again on the next use).
+        None => {
+            crate::warn!("uistate: the UI's node pools changed during the scan: scanned again later");
+            t.nodes.clear();
+            t.spans.clear();
         }
     }
-    Tree { nodes, children }
+    t
+}
+
+/// Runs `f` with the node pools held mapped: each pool checked in the mapping table, then `f`
+/// under the guest-reader lock when no mapping changed in between (`mem::table_view_held`;
+/// the title unmaps memory at any time). None: a pool is no longer mapped (a new scan starts)
+/// or the mappings kept changing; the caller tries again later. `f` must not take the mapping
+/// table's lock (`mem::readable`, `mem::MEM`, `rescan`): decommits hold it while they wait here.
+pub fn guarded<R>(t: &Tree, f: impl FnOnce() -> R) -> Option<R> {
+    use std::sync::atomic::Ordering::SeqCst;
+    for _ in 0..4 {
+        let g0 = crate::mem::MAP_GEN.load(SeqCst);
+        if let Some(&(s, e)) = t.spans.iter().find(|&&(s, e)| !crate::mem::host_readable(s, e - s)) {
+            static GONE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if GONE.fetch_add(1, Ordering::Relaxed) < 8 {
+                crate::info!("uistate: a node pool [{s:#x}, {e:#x}) is no longer mapped: the nodes are scanned again");
+            }
+            *TREE.lock() = None;
+            return None;
+        }
+        let readers = crate::mem::GUEST_READERS.read_recursive();
+        if crate::mem::table_view_held(g0) {
+            let r = f();
+            drop(readers);
+            return Some(r);
+        }
+    }
+    None
 }
 
 fn rdf(a: u64) -> f32 {
@@ -241,10 +330,11 @@ pub const SELECTED: u32 = 0x1;
 /// that list's item when the focus arrived with the screen or the list.
 pub const FOCUS_PATH: u32 = 0x40;
 
-/// A node's definition (its UIElement) and the definition's design width and height.
+/// A node's definition (its UIElement) and the definition's design width and height. Under
+/// `guarded` (its page asked of the operating system: the table's lock is not taken there).
 pub fn definition_size(n: u64) -> Option<(f32, f32)> {
     let d = unsafe { std::ptr::read_volatile((n + 0x110) as *const u64) };
-    if d < 0x1000 || !crate::mem::readable(d + 0xB0, 8) {
+    if d < 0x1000 || !crate::mem::os_readable(d + 0xB0, 8) {
         return None;
     }
     Some((rdf(d + 0xB0), rdf(d + 0xB4)))

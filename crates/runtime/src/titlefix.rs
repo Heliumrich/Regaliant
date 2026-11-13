@@ -282,6 +282,19 @@ const FIXES: &[Fix] = &[
     // The button prompts (`pcsettings::prompts`): the text renderer's inline-image draw
     // (eboot+0x150e380) after its map from a text's button hash to a glyph entity's name hash
     // (r15d), before the entity's lookup: `lea rcx,[rbp-90h]`.
+    // The menu pointer (`pcsettings::pointer`): the menu list's selection change
+    // (UIBehaviorMenuList, eboot+0xe2a8d0: xmm0 the move's direction, rdi the list, esi an
+    // item index used when the direction is zero, as the list's own focus handler calls it),
+    // at its entry: `push rbp; mov rbp,rsp; push r15`.
+    Fix {
+        name: "menu pointer selects directly",
+        offset: 0xe2a8d0,
+        from: (6, 0x82d75a35aabe38aa),
+        change: Change::Hook { at: 0, handler: crate::pcsettings::pointer::select_hook },
+        kind: "PC controls",
+        why: "the mouse pointer selects the item under it at once instead of stepping toward it",
+        only_with: None,
+    },
     Fix {
         name: "button prompts (glyphs)",
         offset: 0x150e645,

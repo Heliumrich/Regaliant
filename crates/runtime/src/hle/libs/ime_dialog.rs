@@ -1,12 +1,18 @@
-//! System IME dialog (libSceImeDialog): text entry such as the character
-//! name. The console's on-screen keyboard is replaced by a native Windows text
-//! box; automated runs supply the text with `DS_IME_TEXT` or the `ime <text>`
-//! control command. The entered text is written to the title's UTF-16 buffer
-//! when it next polls the dialog status.
+//! System IME dialog (libSceImeDialog): text entry such as the character name. The console's
+//! on-screen keyboard is replaced by a text box the port draws in the game's own window
+//! (`crate::textbox`, put on each frame by the presenter): the window gives its keys to the box
+//! while it is open (`char_typed`, `key_down`), Enter confirms, Escape cancels, Backspace erases,
+//! Ctrl+V pastes; a controller's A confirms and B cancels (`pad_input`). The game sees no input
+//! meanwhile, as on the console while its keyboard shows. (Until 2026-11-13 a separate Windows
+//! text box took the foreground: the game left exclusive fullscreen for the desktop.) Automated
+//! runs supply the text with `DS_IME_TEXT` or the `ime <text>` control command. The entered text
+//! is written to the title's UTF-16 buffer when it next polls the dialog status.
 
 use crate::hle::Registry;
 use crate::{reg, sysv};
 use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::time::Instant;
 
 const STATUS_NONE: i32 = 0;
 const STATUS_RUNNING: i32 = 1;
@@ -23,13 +29,18 @@ struct Dialog {
     end: i32,
     text: Option<Vec<u16>>,
     delivered: bool,
-    /// Native text box window (0 = none).
-    hwnd: isize,
+    /// The text being typed, the title and placeholder the box shows, when it opened.
+    edit: Vec<u16>,
+    title: String,
+    placeholder: String,
+    opened: Instant,
 }
 
 static DIALOG: Mutex<Option<Dialog>> = Mutex::new(None);
 /// Text supplied through the control channel (`ime <text>`).
 pub static CONTROL_TEXT: Mutex<Option<String>> = Mutex::new(None);
+/// Edits since start (the box is drawn again when they or the caret change).
+static EDITS: AtomicU32 = AtomicU32::new(0);
 
 unsafe fn read_u16z(p: u64, max: usize) -> Vec<u16> {
     let mut v = Vec::new();
@@ -53,6 +64,134 @@ fn finish(d: &mut Dialog, text: Option<Vec<u16>>, end: i32) {
     }
     d.end = end;
     d.status = STATUS_FINISHED;
+    EDITS.fetch_add(1, Relaxed);
+}
+
+/// The box is open (the window's keys and the pad are its).
+pub fn active() -> bool {
+    DIALOG.lock().as_ref().is_some_and(|d| d.status == STATUS_RUNNING)
+}
+
+/// A character typed in the game's window (WM_CHAR): true when the box took it.
+pub fn char_typed(c: u16) -> bool {
+    let mut g = DIALOG.lock();
+    let Some(d) = g.as_mut().filter(|d| d.status == STATUS_RUNNING) else { return false };
+    if c >= 0x20 && c != 0x7F && (d.edit.len() as u32) < d.max_len.max(1) {
+        d.edit.push(c);
+        EDITS.fetch_add(1, Relaxed);
+    }
+    true
+}
+
+/// A key pressed in the game's window (WM_KEYDOWN; `repeat`: held down): true when the box took
+/// it (every key while it is open: the game sees none).
+pub fn key_down(vk: u8, repeat: bool, ctrl: bool) -> bool {
+    let mut g = DIALOG.lock();
+    let Some(d) = g.as_mut().filter(|d| d.status == STATUS_RUNNING) else { return false };
+    match vk {
+        // Backspace (Ctrl: the last word).
+        0x08 => {
+            if ctrl {
+                while d.edit.last() == Some(&(b' ' as u16)) {
+                    d.edit.pop();
+                }
+                while d.edit.last().is_some_and(|&c| c != b' ' as u16) {
+                    d.edit.pop();
+                }
+            } else {
+                d.edit.pop();
+            }
+            EDITS.fetch_add(1, Relaxed);
+        }
+        0x0D if !repeat => {
+            let t = d.edit.clone();
+            crate::info!("ime dialog: confirmed in the game's window");
+            finish(d, Some(t), END_OK);
+        }
+        0x1B if !repeat => {
+            crate::info!("ime dialog: canceled in the game's window");
+            finish(d, None, END_CANCELED);
+        }
+        b'V' if ctrl => {
+            if let Some(t) = clipboard_text() {
+                for c in t.encode_utf16().take_while(|&c| c != b'\r' as u16 && c != b'\n' as u16) {
+                    if c >= 0x20 && c != 0x7F && (d.edit.len() as u32) < d.max_len.max(1) {
+                        d.edit.push(c);
+                    }
+                }
+                EDITS.fetch_add(1, Relaxed);
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
+/// The pad's buttons (bit i: `input::PAD_BUTTONS[i]`, A 0, B 1) while the box is open: A
+/// confirms, B cancels (each on its press; the button is then kept from the game until it is
+/// released). True while the box is open (the pad is its alone).
+pub fn pad_input(phys: u32) -> bool {
+    static LAST: AtomicU32 = AtomicU32::new(0);
+    let was = LAST.swap(phys, Relaxed);
+    let mut g = DIALOG.lock();
+    let Some(d) = g.as_mut().filter(|d| d.status == STATUS_RUNNING) else { return false };
+    let pressed = phys & !was;
+    if pressed & 1 != 0 {
+        let t = d.edit.clone();
+        crate::info!("ime dialog: confirmed with the controller");
+        finish(d, Some(t), END_OK);
+        crate::input::swallow_pad(1);
+    } else if pressed & 2 != 0 {
+        crate::info!("ime dialog: canceled with the controller");
+        finish(d, None, END_CANCELED);
+        crate::input::swallow_pad(2);
+    }
+    true
+}
+
+/// What the box shows now and a generation that changes with it (None: no box).
+pub fn overlay() -> Option<(u64, crate::textbox::Content)> {
+    let g = DIALOG.lock();
+    let d = g.as_ref().filter(|d| d.status == STATUS_RUNNING)?;
+    // The caret blinks every 530 ms (Windows' default).
+    let phase = (d.opened.elapsed().as_millis() / 530) as u64;
+    let pad = crate::input::last_device() == crate::input::DEVICE_PAD;
+    let content = crate::textbox::Content {
+        title: if d.title.is_empty() { "Enter Text".into() } else { d.title.clone() },
+        text: String::from_utf16_lossy(&d.edit),
+        placeholder: d.placeholder.clone(),
+        max_len: d.max_len,
+        caret: phase % 2 == 0,
+        hint: if pad { "Type with the keyboard.   (A) Confirm   (B) Cancel".into() } else { "Enter  Confirm      Esc  Cancel".into() },
+    };
+    let generation = (EDITS.load(Relaxed) as u64) << 33 | (phase & 1) << 32 | pad as u64;
+    Some((generation, content))
+}
+
+fn clipboard_text() -> Option<String> {
+    use windows_sys::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    const CF_UNICODETEXT: u32 = 13;
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return None;
+        }
+        let h = GetClipboardData(CF_UNICODETEXT);
+        let mut out = None;
+        if !h.is_null() {
+            let p = GlobalLock(h as _) as *const u16;
+            if !p.is_null() {
+                let mut n = 0;
+                while n < 4096 && *p.add(n) != 0 {
+                    n += 1;
+                }
+                out = Some(String::from_utf16_lossy(std::slice::from_raw_parts(p, n)));
+                GlobalUnlock(h as _);
+            }
+        }
+        CloseClipboard();
+        out
+    }
 }
 
 sysv! {
@@ -66,24 +205,27 @@ sysv! {
         let title = *(param.add(0x48) as *const u64);
         let s = |v: Vec<u16>| String::from_utf16_lossy(&v);
         let title_s = s(read_u16z(title, 256));
+        let placeholder_s = s(read_u16z(placeholder, 256));
         let initial = read_u16z(buf, max_len.min(1024) as usize);
-        crate::info!(
-            "ime dialog: title '{}', placeholder '{}', initial '{}', max {} chars",
-            title_s,
-            s(read_u16z(placeholder, 256)),
-            s(initial.clone()),
-            max_len
-        );
-        let mut d = Dialog { buf, max_len, status: STATUS_RUNNING, end: END_CANCELED, text: None, delivered: false, hwnd: 0 };
+        crate::info!("ime dialog: title '{}', placeholder '{}', initial '{}', max {} chars", title_s, placeholder_s, s(initial.clone()), max_len);
+        let mut d = Dialog {
+            buf,
+            max_len,
+            status: STATUS_RUNNING,
+            end: END_CANCELED,
+            text: None,
+            delivered: false,
+            edit: initial,
+            title: title_s,
+            placeholder: placeholder_s,
+            opened: Instant::now(),
+        };
         if let Ok(t) = std::env::var("DS_IME_TEXT") {
             crate::info!("ime dialog: text supplied by DS_IME_TEXT");
             finish(&mut d, Some(t.encode_utf16().collect()), END_OK);
         } else {
-            let init = String::from_utf16_lossy(&initial);
-            std::thread::Builder::new()
-                .name("ime".into())
-                .spawn(move || native::prompt(&title_s, &init, max_len))
-                .ok();
+            crate::info!("ime dialog: a text box in the game's window (Enter confirms, Esc cancels)");
+            EDITS.fetch_add(1, Relaxed);
         }
         *DIALOG.lock() = Some(d);
         0
@@ -94,7 +236,6 @@ sysv! {
         if d.status == STATUS_RUNNING {
             if let Some(t) = CONTROL_TEXT.lock().take() {
                 crate::info!("ime dialog: text supplied by control command");
-                native::close(d.hwnd);
                 finish(d, Some(t.encode_utf16().collect()), END_OK);
             }
         }
@@ -119,179 +260,15 @@ sysv! {
         0
     }
     fn sceImeDialogTerm() -> i32 {
-        if let Some(d) = DIALOG.lock().take() {
-            native::close(d.hwnd);
-        }
+        DIALOG.lock().take();
+        EDITS.fetch_add(1, Relaxed);
         0
     }
     fn sceImeDialogAbort() -> i32 {
         if let Some(d) = DIALOG.lock().as_mut() {
-            native::close(d.hwnd);
             finish(d, None, END_ABORTED);
         }
         0
-    }
-}
-
-/// Called by the native text box when the user confirms or cancels.
-fn native_done(text: Option<String>) {
-    if let Some(d) = DIALOG.lock().as_mut() {
-        if d.status == STATUS_RUNNING {
-            match text {
-                Some(t) => finish(d, Some(t.encode_utf16().collect()), END_OK),
-                None => finish(d, None, END_CANCELED),
-            }
-        }
-    }
-}
-
-fn set_hwnd(hwnd: isize) {
-    if let Some(d) = DIALOG.lock().as_mut() {
-        d.hwnd = hwnd;
-    }
-}
-
-mod native {
-    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows_sys::Win32::UI::WindowsAndMessaging::*;
-
-    const ID_EDIT: isize = 100;
-    const ID_OK: isize = 1;
-    const ID_CANCEL: isize = 2;
-    const EM_LIMITTEXT: u32 = 0x00C5;
-    const ES_AUTOHSCROLL: u32 = 0x0080;
-
-    fn wide(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(std::iter::once(0)).collect()
-    }
-
-    pub fn close(hwnd: isize) {
-        if hwnd != 0 {
-            unsafe { PostMessageW(hwnd as HWND, WM_CLOSE, 0, 0) };
-        }
-    }
-
-    unsafe fn text_of(hwnd: HWND) -> String {
-        unsafe {
-            let edit = GetDlgItem(hwnd, ID_EDIT as i32);
-            let mut buf = [0u16; 512];
-            let n = GetWindowTextW(edit, buf.as_mut_ptr(), buf.len() as i32).max(0) as usize;
-            String::from_utf16_lossy(&buf[..n])
-        }
-    }
-
-    unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-        unsafe {
-            match msg {
-                WM_COMMAND => {
-                    let id = (wp & 0xFFFF) as isize;
-                    if id == ID_OK {
-                        super::native_done(Some(text_of(hwnd)));
-                        DestroyWindow(hwnd);
-                        return 0;
-                    }
-                    if id == ID_CANCEL {
-                        super::native_done(None);
-                        DestroyWindow(hwnd);
-                        return 0;
-                    }
-                    DefWindowProcW(hwnd, msg, wp, lp)
-                }
-                WM_CLOSE => {
-                    super::native_done(None);
-                    DestroyWindow(hwnd);
-                    0
-                }
-                WM_DESTROY => {
-                    PostQuitMessage(0);
-                    0
-                }
-                _ => DefWindowProcW(hwnd, msg, wp, lp),
-            }
-        }
-    }
-
-    /// Shows a small top-most text box and runs its message loop until it closes.
-    pub fn prompt(title: &str, initial: &str, max_len: u32) {
-        crate::log::set_thread_name("ime");
-        unsafe {
-            let hinst = GetModuleHandleW(std::ptr::null());
-            let class = wide("dsport_ime");
-            let wc = WNDCLASSEXW {
-                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-                style: 0,
-                lpfnWndProc: Some(wndproc),
-                cbClsExtra: 0,
-                cbWndExtra: 0,
-                hInstance: hinst,
-                hIcon: std::ptr::null_mut(),
-                hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
-                hbrBackground: 16 as _, // COLOR_BTNFACE + 1
-                lpszMenuName: std::ptr::null(),
-                lpszClassName: class.as_ptr(),
-                hIconSm: std::ptr::null_mut(),
-            };
-            RegisterClassExW(&wc);
-            let caption = wide(if title.is_empty() { "Text entry" } else { title });
-            let hwnd = CreateWindowExW(
-                WS_EX_TOPMOST | WS_EX_DLGMODALFRAME,
-                class.as_ptr(),
-                caption.as_ptr(),
-                WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                440,
-                130,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                hinst,
-                std::ptr::null(),
-            );
-            if hwnd.is_null() {
-                crate::error!("ime dialog: could not create the text box window");
-                super::native_done(None);
-                return;
-            }
-            super::set_hwnd(hwnd as isize);
-            let edit_class = wide("EDIT");
-            let button = wide("BUTTON");
-            let init = wide(initial);
-            let edit = CreateWindowExW(
-                WS_EX_CLIENTEDGE,
-                edit_class.as_ptr(),
-                init.as_ptr(),
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                12,
-                12,
-                400,
-                24,
-                hwnd,
-                ID_EDIT as _,
-                hinst,
-                std::ptr::null(),
-            );
-            SendMessageW(edit, EM_LIMITTEXT, max_len.max(1) as usize, 0);
-            let ok = wide("OK");
-            let cancel = wide("Cancel");
-            CreateWindowExW(0, button.as_ptr(), ok.as_ptr(), WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON as u32, 236, 50, 84, 28, hwnd, ID_OK as _, hinst, std::ptr::null());
-            CreateWindowExW(0, button.as_ptr(), cancel.as_ptr(), WS_CHILD | WS_VISIBLE | WS_TABSTOP, 328, 50, 84, 28, hwnd, ID_CANCEL as _, hinst, std::ptr::null());
-            SetForegroundWindow(hwnd);
-            windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(edit);
-            let mut msg: MSG = std::mem::zeroed();
-            while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
-                // Enter / Escape in the edit box act on the buttons.
-                if msg.message == WM_KEYDOWN && (msg.wParam == 0x0D || msg.wParam == 0x1B) {
-                    let id = if msg.wParam == 0x0D { ID_OK } else { ID_CANCEL };
-                    SendMessageW(hwnd, WM_COMMAND, id as usize, 0);
-                    continue;
-                }
-                if IsDialogMessageW(hwnd, &msg) == 0 {
-                    TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
-                }
-            }
-        }
     }
 }
 

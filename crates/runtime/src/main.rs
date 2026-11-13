@@ -37,6 +37,7 @@ mod engine;
 mod thread;
 mod titlefix;
 mod titlemem;
+mod textbox;
 mod uistate;
 mod tls;
 
@@ -477,6 +478,13 @@ fn poll_control(path: &Path, offset: &mut u64) {
             "shot" => {
                 let name: String = parts.next().unwrap_or("x").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect();
                 *hle::libs::videoout::SHOT_REQUEST.lock() = Some(name);
+                Ok(())
+            }
+            "framewatch" => {
+                // `framewatch 1|0`: the presenter's one-frame flash watch (`gpu::vk::framewatch`).
+                let on = parts.next() != Some("0");
+                gpu::vk::framewatch::ON.store(on, std::sync::atomic::Ordering::Relaxed);
+                info!("control: frame watch {}", if on { "on" } else { "off" });
                 Ok(())
             }
             "burst" => {

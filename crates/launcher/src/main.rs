@@ -13,6 +13,7 @@
 
 #![windows_subsystem = "windows"]
 
+mod display;
 mod game;
 mod saves;
 mod shaders;
@@ -71,6 +72,7 @@ pub struct App {
     pub status: HWND,
     pub play: HWND,
     pub game: game::Page,
+    pub display: display::Page,
     pub shaders: shaders::Page,
     pub saves: saves::Page,
     /// The game's process id while it runs.
@@ -125,6 +127,7 @@ impl App {
     pub fn update_play(&self) {
         unsafe { ui::enable(self.play, self.game.ok && self.running.is_none()) };
         saves::update(self);
+        display::update(self);
     }
 
     fn relayout(&mut self, dpi: u32) {
@@ -228,6 +231,8 @@ fn game_exited(app: &mut App, code: i32) {
     let _ = std::fs::remove_file(app.paths.running_marker());
     app.update_play();
     saves::refresh(app);
+    // (The game may have changed its display settings.)
+    display::refresh(app);
     unsafe {
         ShowWindow(app.hwnd, SW_RESTORE);
         SetForegroundWindow(app.hwnd);
@@ -304,6 +309,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 100..=199 => game::command(app, id, code),
                 200..=299 => shaders::command(app, id, code),
                 300..=399 => saves::command(app, id, code),
+                400..=499 => display::command(app, id, code),
                 _ => {}
             })
             .is_some()
@@ -434,11 +440,12 @@ fn main() {
             paths,
             launch,
             tabs: std::ptr::null_mut(),
-            pages: vec![Vec::new(); 3],
+            pages: vec![Vec::new(); 4],
             page: 0,
             status: std::ptr::null_mut(),
             play: std::ptr::null_mut(),
             game: game::Page::default(),
+            display: display::Page::default(),
             shaders: shaders::Page::default(),
             saves: saves::Page::default(),
             running: None,
@@ -447,7 +454,7 @@ fn main() {
         let rt = (12, 10, 756, 30);
         let tabs = b.add("SysTabControl32", "", WS_TABSTOP | WS_CLIPSIBLINGS, 0, rt, ID_TABS);
         app.tabs = app.put(usize::MAX, tabs, rt);
-        for (i, t) in ["Game", "Shaders", "Saves"].iter().enumerate() {
+        for (i, t) in ["Game", "Display", "Shaders", "Saves"].iter().enumerate() {
             let mut w = wide(t);
             let item = TCITEMW { mask: TCIF_TEXT, pszText: w.as_mut_ptr(), ..Default::default() };
             SendMessageW(tabs, TCM_INSERTITEMW, i, &item as *const _ as LPARAM);
@@ -464,8 +471,9 @@ fn main() {
         // (Saves first: the Game page's check refreshes them.)
         saves::build(&mut app);
         game::build(&mut app);
+        display::build(&mut app);
         shaders::build(&mut app);
-        let first = arg("--page").and_then(|n| n.parse::<usize>().ok()).unwrap_or(0).min(2);
+        let first = arg("--page").and_then(|n| n.parse::<usize>().ok()).unwrap_or(0).min(3);
         SendMessageW(app.tabs, TCM_SETCURSEL, first, 0);
         app.show_page(first);
         app.update_play();
@@ -481,7 +489,7 @@ fn main() {
         ShowWindow(hwnd, SW_SHOW);
         ui::redraw(hwnd);
         if let Some(file) = shot {
-            for n in 0..3 {
+            for n in 0..4 {
                 with_app(|app| {
                     SendMessageW(app.tabs, TCM_SETCURSEL, n, 0);
                     app.show_page(n);

@@ -50,6 +50,131 @@ struct Presenter {
     hdr: bool,
     /// The frames shown are HDR (the title's display buffers' format; the next swapchain's).
     want_hdr: bool,
+    /// The frame watch (`framewatch`: one-frame flashes), made on first use.
+    watch: Option<super::framewatch::Watch>,
+    watch_failed: bool,
+    /// The system text box drawn over the frame (`crate::textbox`), made on first use.
+    text_box: Option<TextBox>,
+}
+
+/// The system text box's image (BGRA8 UNORM), its staging buffers (one per presenter slot) and
+/// the content it holds (the dialog's generation, the frame height and HDR it was drawn for).
+struct TextBox {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    w: u32,
+    h: u32,
+    staging: Vec<(vk::Buffer, vk::DeviceMemory, *mut u8)>,
+    key: Option<(u64, u32, bool)>,
+}
+
+impl TextBox {
+    unsafe fn destroy(self) {
+        let c = ctx();
+        unsafe {
+            for (b, m, _) in self.staging {
+                c.device.destroy_buffer(b, None);
+                c.device.unmap_memory(m);
+                c.device.free_memory(m, None);
+            }
+            c.device.destroy_image(self.image, None);
+            c.device.free_memory(self.memory, None);
+        }
+    }
+}
+
+/// Draws the system text box (the character's name: `hle::libs::ime_dialog`) over the frame in
+/// `dst` (TRANSFER_DST_OPTIMAL), centred across the picture at 38% of its height.
+unsafe fn draw_text_box(p: &mut Presenter, cmd: vk::CommandBuffer, slot: usize, dst: vk::Image, picture: (u32, u32, u32, u32)) {
+    let Some((generation, content)) = crate::hle::libs::ime_dialog::overlay() else { return };
+    let c = ctx();
+    let (rx, ry, rw, rh) = picture;
+    let (w, h) = crate::textbox::size(rh);
+    if w > rw || h > rh {
+        return;
+    }
+    unsafe {
+        if p.text_box.as_ref().is_none_or(|t| (t.w, t.h) != (w, h)) {
+            // (The other slot may still read the old one.)
+            let others: Vec<vk::Fence> = p.fences.iter().enumerate().filter(|&(i, _)| i != slot).map(|(_, &f)| f).collect();
+            c.device.wait_for_fences(&others, true, u64::MAX).ok();
+            if let Some(old) = p.text_box.take() {
+                old.destroy();
+            }
+            let ici = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::B8G8R8A8_UNORM)
+                .extent(vk::Extent3D { width: w, height: h, depth: 1 })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC);
+            let Ok(image) = c.device.create_image(&ici, None) else { return };
+            let Ok(memory) = c.alloc(c.device.get_image_memory_requirements(image), vk::MemoryPropertyFlags::DEVICE_LOCAL) else {
+                c.device.destroy_image(image, None);
+                return;
+            };
+            if c.device.bind_image_memory(image, memory, 0).is_err() {
+                c.device.destroy_image(image, None);
+                c.device.free_memory(memory, None);
+                return;
+            }
+            let mut staging = Vec::new();
+            for _ in 0..FRAMES {
+                match c.host_buffer((w * h * 4) as u64, vk::BufferUsageFlags::TRANSFER_SRC) {
+                    Ok(b) => staging.push(b),
+                    Err(e) => {
+                        crate::warn!("text box: no staging buffer ({e})");
+                        TextBox { image, memory, w, h, staging, key: None }.destroy();
+                        return;
+                    }
+                }
+            }
+            p.text_box = Some(TextBox { image, memory, w, h, staging, key: None });
+        }
+        let hdr = p.hdr;
+        let t = p.text_box.as_mut().unwrap();
+        let key = (generation, rh, hdr);
+        if t.key != Some(key) {
+            let (mut px, _, _) = crate::textbox::render(&content, rh);
+            if hdr {
+                crate::textbox::to_pq(&mut px, 203.0);
+            }
+            std::ptr::copy_nonoverlapping(px.as_ptr(), t.staging[slot].2, px.len());
+            let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+            let to_dst = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(t.image)
+                .subresource_range(range);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_dst]);
+            let copy = vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 })
+                .image_extent(vk::Extent3D { width: w, height: h, depth: 1 });
+            c.device.cmd_copy_buffer_to_image(cmd, t.staging[slot].0, t.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[copy]);
+            let to_src = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(t.image)
+                .subresource_range(range);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_src]);
+            t.key = Some(key);
+        }
+        // Over the frame just blitted to `dst`.
+        barrier(c, cmd, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+        let x = rx + (rw - w) / 2;
+        let y = (ry + rh * 38 / 100).saturating_sub(h / 2).max(ry);
+        blit(c, cmd, t.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, (0, 0, w, h), dst, (x, y, w, h));
+    }
 }
 
 unsafe impl Send for Presenter {}
@@ -95,8 +220,10 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
             });
         }
         // Display buffers hold display-encoded values (the title applies its
-        // own transfer function): UNORM swapchain formats show them as is,
-        // 10-bit first (the title's display buffers are 10:10:10:2).
+        // own transfer function): UNORM swapchain formats show them as is. SDR goes to 8 bits
+        // per channel as PC games present (until 2026-11-13 10-bit first, the title's buffers
+        // being 10:10:10:2: the user saw a grey picture and NVIDIA overlay in exclusive
+        // fullscreen); `DS_PRESENT_10BIT=1` keeps 10-bit SDR (diagnosis). HDR10 is 10-bit.
         let srgb_space = |f: &&vk::SurfaceFormatKHR| f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR;
         // The title's HDR output (PQ-encoded BT.2020 in 10:10:10:2 display buffers) goes to an
         // HDR10 swapchain as it is, where the display offers one.
@@ -109,9 +236,12 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| crate::warn!("present: the frames are HDR but the display offers no HDR10 format: shown as SDR values"));
         }
+        let ten = std::env::var("DS_PRESENT_10BIT").is_ok_and(|v| v == "1");
         let fmt = hdr_fmt
-            .or_else(|| formats.iter().filter(srgb_space).find(|f| f.format == vk::Format::A2B10G10R10_UNORM_PACK32).copied())
+            .or_else(|| formats.iter().filter(srgb_space).find(|f| ten && f.format == vk::Format::A2B10G10R10_UNORM_PACK32).copied())
             .or_else(|| formats.iter().filter(srgb_space).find(|f| f.format == vk::Format::B8G8R8A8_UNORM).copied())
+            .or_else(|| formats.iter().filter(srgb_space).find(|f| f.format == vk::Format::R8G8B8A8_UNORM).copied())
+            .or_else(|| formats.iter().filter(srgb_space).find(|f| f.format == vk::Format::A2B10G10R10_UNORM_PACK32).copied())
             .or_else(|| formats.first().copied())
             .ok_or("no surface format")?;
         let mut extent = caps.current_extent;
@@ -253,7 +383,11 @@ pub fn init(title: &str) -> Result<(), String> {
             exclusive: None,
             hdr: false,
             want_hdr: false,
+            watch: None,
+            watch_failed: false,
+            text_box: None,
         };
+        super::framewatch::init_from_env();
         create_swapchain(&mut p)?;
         *PRESENTER.lock() = Some(p);
     }
@@ -280,7 +414,15 @@ fn barrier(c: &super::Ctx, cmd: vk::CommandBuffer, img: vk::Image, old: vk::Imag
 pub fn present(src: Source) -> bool {
     let c = ctx();
     let mut g = PRESENTER.lock();
-    let Some(p) = g.as_mut() else { return false };
+    let Some(p) = g.as_mut() else {
+        // Without a window: the frame watch still sees each frame (`framewatch::headless`).
+        if let Source::Image { image, layout, width, height, .. } = src {
+            drop(g);
+            super::framewatch::init_from_env();
+            super::framewatch::headless(image, layout, width, height);
+        }
+        return false;
+    };
     unsafe {
         // HDR frames from SDR ones or back (the title's display buffers' format): a new swapchain.
         if let Source::Image { hdr, .. } = &src {
@@ -303,6 +445,9 @@ pub fn present(src: Source) -> bool {
         let f = p.frame % FRAMES;
         p.frame += 1;
         c.device.wait_for_fences(&[p.fences[f]], true, u64::MAX).ok();
+        if let Some(w) = p.watch.as_mut() {
+            w.collect(f);
+        }
         let (idx, _) = match c.swapchain_d.acquire_next_image(p.swapchain, u64::MAX, p.acquire[f], vk::Fence::null()) {
             Ok(r) => r,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => {
@@ -401,6 +546,23 @@ pub fn present(src: Source) -> bool {
         if !sharpened {
             blit(c, cmd, from, from_layout, (0, 0, fw, fh), dst, (rx, ry, rw, rh));
         }
+        // The frame watch's copy of the frame as shown (before the window's scaling).
+        if super::framewatch::ON.load(std::sync::atomic::Ordering::Relaxed) && !p.watch_failed {
+            if p.watch.is_none() {
+                match super::framewatch::Watch::new(FRAMES) {
+                    Ok(w) => p.watch = Some(w),
+                    Err(e) => {
+                        crate::warn!("frame watch: unavailable ({e})");
+                        p.watch_failed = true;
+                    }
+                }
+            }
+            if let Some(w) = p.watch.as_mut() {
+                w.record(cmd, f, from, from_layout, fw, fh);
+            }
+        }
+        // The system text box (the character's name) over the frame.
+        draw_text_box(p, cmd, f, dst, (rx, ry, rw, rh));
         if p.logged != (sw, sh, p.extent.width, p.extent.height) {
             p.logged = (sw, sh, p.extent.width, p.extent.height);
             crate::info!("present: {sw}x{sh} frame into a {}x{} window at {rw}x{rh}+{rx}+{ry}: {level} halving(s), then {fw}x{fh} -> {rw}x{rh}", p.extent.width, p.extent.height);

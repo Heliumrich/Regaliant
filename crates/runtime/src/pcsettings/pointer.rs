@@ -1,9 +1,12 @@
 //! The menu pointer: while a menu of the title is open (its UI manager's menu stack, `uistate`)
 //! and the keyboard and mouse are the device in use, the window frees the cursor and shows the
-//! port's pointer; moving it over an item of the focused list or grid moves the title's focus
-//! there with the title's own navigation (d-pad presses toward it, so its sounds, scrolling and
-//! rules apply), a left click on an item selects it (Cross, after the focus reached it), a right
-//! click goes back (Circle), the wheel moves the focus (Up/Down).
+//! port's pointer; moving it over an item of the focused list moves the title's selection there
+//! at once: one d-pad press toward it makes the title's list navigation run, and a hook at that
+//! navigation's entry (`select_hook`) turns the move into the list's own jump to the item (its
+//! highlight, scrolling and one navigation sound). Lists the hook does not serve (grids) step
+//! toward the item with d-pad presses as before. A left click on an item selects it (Cross,
+//! after the selection reached it), a right click goes back (Circle), the wheel moves the
+//! selection (Up/Down).
 //!
 //! The items: the focused node and its siblings (the children of its parent: a list's rows, a
 //! grid's slots, the SETTINGS tabs), each covering its subtree's placed rectangles on the
@@ -89,9 +92,72 @@ struct State {
     queue: std::collections::VecDeque<&'static str>,
     moves_seen: u32,
     logged: u32,
+    /// The target a direct jump was asked for (once per target).
+    direct_tried: Option<u64>,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+
+/// The item the pointer asks the title's next list move to jump to (`select_hook`), and since
+/// when (a request the title did not take within `DIRECT_WAIT` falls back to stepping).
+static DIRECT: Mutex<Option<(u64, Instant)>> = Mutex::new(None);
+const DIRECT_WAIT: Duration = Duration::from_millis(250);
+/// Direct jumps made, and lists the hook did not find the item in.
+static DIRECT_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The title's menu list selection change (eboot+0xe2a8d0, `titlefix`), at its entry with the
+/// call's registers (`patch::Patcher::hook`: rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8 .. r15,
+/// written back after the handler; the vector registers in the FXSAVE area below them, restored
+/// from there). When the pointer waits for a jump to an item of this list (rdi) the move becomes
+/// the list's own jump to that item: no direction (xmm0 zero), its index in esi, the other
+/// arguments as the list's focus handler passes them (0).
+pub extern "sysv64" fn select_hook(regs: *const u64, _arg: u32) {
+    let mut g = DIRECT.lock();
+    let Some((target, since)) = *g else { return };
+    if since.elapsed() > DIRECT_WAIT {
+        *g = None;
+        return;
+    }
+    let regs = regs as *mut u64;
+    unsafe {
+        let list = *regs.add(7);
+        if list < 0x10000 {
+            return;
+        }
+        // The list's items: entries of three words, the item's node first (`items` at +0x158,
+        // their end at +0x160).
+        let (begin, end) = (*((list + 0x158) as *const u64), *((list + 0x160) as *const u64));
+        if begin == 0 || end < begin || (end - begin) % 0x18 != 0 || end - begin > 0x18 * 4096 {
+            return;
+        }
+        let n = (end - begin) / 0x18;
+        let Some(i) = (0..n).find(|&i| *((begin + i * 0x18) as *const u64) == target) else {
+            DIRECT_STATS[1].fetch_add(1, Relaxed);
+            return;
+        };
+        *g = None;
+        *regs.add(6) = i;
+        *regs.add(2) = 0;
+        *regs.add(1) = 0;
+        *regs.add(8) = 0;
+        // xmm0: the trampoline saved the flags at regs - 8, aligned the stack down to 16 and put
+        // the FXSAVE area 512 bytes below; XMM0 is at byte 160 of it.
+        let fx = ((regs as u64 - 8) & !15) - 512;
+        std::ptr::write_bytes((fx + 160) as *mut u8, 0, 16);
+    }
+    if DIRECT_STATS[0].fetch_add(1, Relaxed) < 4 {
+        crate::info!("pointer: the title's list jumps to the item under the pointer");
+    }
+}
+
+/// Status: direct jumps made and moves in lists the hook did not serve.
+pub fn direct_line() -> String {
+    let (a, b) = (DIRECT_STATS[0].load(Relaxed), DIRECT_STATS[1].load(Relaxed));
+    if a == 0 && b == 0 {
+        return String::new();
+    }
+    format!("    menu pointer: {a} direct jumps to the item under the pointer, {b} list moves without the item\n")
+}
 
 /// The pointer on the canvas (None: outside the frame, or unknown).
 fn canvas_pos() -> Option<(f32, f32)> {
@@ -189,6 +255,16 @@ pub fn tick() {
         return;
     }
     let Some(tree) = uistate::tree() else { return };
+    // The nodes are read with their pools held mapped (`uistate::guarded`; a skipped vblank
+    // when the title's mappings change meanwhile); a new scan is asked for after it.
+    if uistate::guarded(&tree, || tick_nodes(&tree, want)) == Some(true) {
+        uistate::rescan();
+    }
+}
+
+/// `tick`'s part that reads the UI nodes (under `uistate::guarded`): true when the index
+/// misses the focused item (a new scan wanted).
+fn tick_nodes(tree: &std::sync::Arc<uistate::Tree>, want: bool) -> bool {
     let mut g = STATE.lock();
     let s = g.get_or_insert_with(|| State {
         target: None,
@@ -201,18 +277,19 @@ pub fn tick() {
         queue: Default::default(),
         moves_seen: MOVES.load(Relaxed),
         logged: 0,
+        direct_tried: None,
     });
-    let found = focused(&tree);
+    let found = focused(tree);
     if found != s.focused {
         for &n in found.iter().filter(|n| !s.focused.contains(n)) {
             if s.logged < 60 {
                 s.logged += 1;
-                crate::info!("pointer: focus on node {n:#x} at {:?}{}", uistate::bounds(&tree, n), if want { "" } else { " (followed, the pointer off)" });
+                crate::info!("pointer: focus on node {n:#x} at {:?}{}", uistate::bounds(tree, n), if want { "" } else { " (followed, the pointer off)" });
             }
         }
         s.focused = found.clone();
     }
-    super::bindings::tick(&tree, &found);
+    super::bindings::tick(tree, &found);
     // A horizontal press that did not move its list: that list takes L1/R1.
     if let Some((group, before, when)) = s.tried {
         let now_sel = found.iter().copied().find(|&n| uistate::parent(n) == group);
@@ -230,7 +307,7 @@ pub fn tick() {
         s.click = false;
         s.queue.clear();
         s.moves_seen = MOVES.load(Relaxed);
-        return;
+        return false;
     }
     let events: Vec<Event> = std::mem::take(&mut *EVENTS.lock());
     let moves = MOVES.load(Relaxed);
@@ -238,7 +315,6 @@ pub fn tick() {
     s.moves_seen = moves;
     if found.is_empty() {
         // No focused item (a screen without a list, or one the index misses: scanned again).
-        uistate::rescan();
         for e in events {
             match e {
                 Event::Right => s.queue.push_back("circle"),
@@ -247,7 +323,7 @@ pub fn tick() {
             }
         }
         pump(s);
-        return;
+        return true;
     }
     // The items: each focused item's list (its parent's children), where they cover the pointer:
     // the one whose centre is nearest (an item's glow or frame may reach into its neighbours').
@@ -263,7 +339,7 @@ pub fn tick() {
                 let group = uistate::parent(f);
                 tree.children.get(&group).map(|v| v.as_slice()).unwrap_or(&[]).iter().map(move |&n| (group, n))
             })
-            .filter_map(|(group, n)| uistate::bounds(&tree, n).map(|r| (group, n, r)))
+            .filter_map(|(group, n)| uistate::bounds(tree, n).map(|r| (group, n, r)))
             .filter(|(_, _, r)| x >= r.0 && x < r.2 && y >= r.1 && y < r.3)
             .min_by(|a, b| dist(a.2).total_cmp(&dist(b.2)))
             .map(|(group, n, _)| (group, n))
@@ -278,7 +354,7 @@ pub fn tick() {
     for e in events {
         match e {
             Event::Left => match hovered {
-                Some((group, h)) if focused_in(group) == Some(h) => s.queue.push_back(pos.and_then(|p| value_side(&tree, h, p)).unwrap_or("cross")),
+                Some((group, h)) if focused_in(group) == Some(h) => s.queue.push_back(pos.and_then(|p| value_side(tree, h, p)).unwrap_or("cross")),
                 Some((group, h)) => {
                     s.target = Some(h);
                     s.target_group = group;
@@ -298,7 +374,7 @@ pub fn tick() {
     }
     if !s.queue.is_empty() {
         pump(s);
-        return;
+        return false;
     }
     // Toward the target, one press at a time, from its list's selected item.
     if let Some(t) = s.target {
@@ -306,13 +382,23 @@ pub fn tick() {
         match focused_in(group) {
             Some(f) if f == t => {
                 s.target = None;
+                s.direct_tried = None;
+                *DIRECT.lock() = None;
+                s.next_press = s.next_press.min(Instant::now() + Duration::from_millis(40));
                 if std::mem::take(&mut s.click) {
-                    s.queue.push_back(pos.and_then(|p| value_side(&tree, t, p)).unwrap_or("cross"));
+                    s.queue.push_back(pos.and_then(|p| value_side(tree, t, p)).unwrap_or("cross"));
                     pump(s);
                 }
             }
             Some(f) if Instant::now() >= s.next_press && s.tried.is_none() => {
-                if let (Some(a), Some(b)) = (uistate::bounds(&tree, f), uistate::bounds(&tree, t)) {
+                // A jump the title's list takes in one move (`select_hook`): asked once per
+                // target; a request it did not take within DIRECT_WAIT steps as before.
+                let direct = crate::titlefix::applied("menu pointer selects directly") && s.direct_tried != Some(t);
+                if direct {
+                    s.direct_tried = Some(t);
+                    *DIRECT.lock() = Some((t, Instant::now()));
+                }
+                if let (Some(a), Some(b)) = (uistate::bounds(tree, f), uistate::bounds(tree, t)) {
                     let ((ax, ay), (bx, by)) = (center(a), center(b));
                     let dir = if (by - ay).abs() >= (bx - ax).abs() {
                         if by > ay { "down" } else { "up" }
@@ -329,7 +415,7 @@ pub fn tick() {
                         }
                     };
                     press(dir);
-                    s.next_press = Instant::now() + Duration::from_millis(110);
+                    s.next_press = Instant::now() + if direct { DIRECT_WAIT } else { Duration::from_millis(110) };
                 } else {
                     s.target = None;
                 }
@@ -342,6 +428,7 @@ pub fn tick() {
             }
         }
     }
+    false
 }
 
 /// The next queued press, when its turn has come.

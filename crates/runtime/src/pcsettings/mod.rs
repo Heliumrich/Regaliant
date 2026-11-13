@@ -132,7 +132,10 @@ impl Item {
 /// 1-9; option 0, the default, is the title's own render size (the Visual Mode's).
 pub const RENDER_SCALES: [u32; 9] = [50, 60, 67, 75, 85, 100, 125, 150, 200];
 
-/// The PC tab's items, in order (each one works: what it changes is in `apply`).
+/// The PC tab's items, in order (each one works: what it changes is in `apply`). The tab shows
+/// 11 rows (rows past them are reached but never drawn: the four list openers were, 2026-11-13):
+/// these 7, then the openers of the Graphics & Display, Controls, Sound & Saves, Key Bindings
+/// and Controller Bindings lists.
 pub fn items() -> Vec<Item> {
     let s = |v: &str| v.to_string();
     vec![
@@ -143,34 +146,10 @@ pub fn items() -> Vec<Item> {
             kind: ItemKind::Choice(vec![s("Windowed"), s("Borderless Fullscreen"), s("Fullscreen")], 0),
         },
         Item {
-            id: s("Monitor"),
-            label: s("Monitor"),
-            tooltip: s("The monitor the game shows on."),
-            kind: ItemKind::Display(0),
-        },
-        Item {
             id: s("Resolution"),
             label: s("Resolution"),
             tooltip: s("The screen's resolution in Fullscreen mode."),
             kind: ItemKind::Display(1),
-        },
-        Item {
-            id: s("RefreshRate"),
-            label: s("Refresh Rate"),
-            tooltip: s("The screen's refresh rate in Fullscreen mode."),
-            kind: ItemKind::Display(2),
-        },
-        Item {
-            id: s("HdrOutput"),
-            label: s("HDR"),
-            tooltip: s("HDR when Windows' HDR is on. Display Adjustment sets its brightness."),
-            kind: ItemKind::Choice(vec![s("Automatic"), s("Off")], 0),
-        },
-        Item {
-            id: s("AspectRatio"),
-            label: s("Aspect Ratio"),
-            tooltip: s("The picture's shape, from the next start."),
-            kind: ItemKind::Choice(vec![s("Automatic"), s("16:9"), s("16:10"), s("21:9"), s("32:9")], 1),
         },
         Item {
             id: s("RenderScale"),
@@ -179,10 +158,22 @@ pub fn items() -> Vec<Item> {
             kind: ItemKind::Choice(std::iter::once(s("Visual Mode")).chain(RENDER_SCALES.iter().map(|p| format!("{p}%"))).collect(), 0),
         },
         Item {
-            id: s("Sharpening"),
-            label: s("Sharpening"),
-            tooltip: s("Sharpens the image. 0 is off, as in the original."),
-            kind: ItemKind::Slider { min: 0.0, max: 1.0, default: 0.0 },
+            id: s("AntiAliasing"),
+            label: s("Anti-Aliasing / Upscaler"),
+            tooltip: s("The game's TAA, or DLSS, FSR or XeSS in its place."),
+            kind: ItemKind::AntiAliasing,
+        },
+        Item {
+            id: s("FrameRateLimit"),
+            label: s("Frame Rate Limit"),
+            tooltip: s("60 FPS is the original. Uncapped shows frames as soon as they are ready."),
+            kind: ItemKind::Choice(vec![s("30 FPS"), s("60 FPS"), s("Uncapped")], 1),
+        },
+        Item {
+            id: s("MouseMotionBlur"),
+            label: s("Motion Blur Fix"),
+            tooltip: s("On keeps plants sharp while the camera moves. Off uses the game's Motion Blur."),
+            kind: ItemKind::Choice(vec![s("Off"), s("Reduced Blur"), s("On")], 2),
         },
         Item {
             id: s("MouseSensitivity"),
@@ -190,22 +181,13 @@ pub fn items() -> Vec<Item> {
             tooltip: s("How far the camera turns per mouse movement."),
             kind: ItemKind::Slider { min: 0.1, max: 3.0, default: 1.0 },
         },
-        Item {
-            id: s("AudioOutput"),
-            label: s("Audio Output"),
-            tooltip: s("Headphones, speakers, surround or spatial sound."),
-            kind: ItemKind::Choice(vec![s("Automatic"), s("Headphones"), s("Stereo Speakers"), s("5.1 Surround"), s("7.1 Surround"), s("Windows Sonic / Atmos")], 0),
-        },
-        Item {
-            id: s("AudioDevice"),
-            label: s("Audio Device"),
-            tooltip: s("The device the sound plays on."),
-            kind: ItemKind::AudioDevice,
-        },
     ]
 }
 
-/// The Graphics list's items (a scrolling list opened from the PC tab: `GRAPHICS_LIST`).
+/// Sharpness's amounts per option (the presenter's pass; 0 off, as the original).
+pub const SHARPNESS: [f32; 5] = [0.0, 0.25, 0.5, 0.75, 1.0];
+
+/// The Graphics & Display list's items (a scrolling list opened from the PC tab: `GRAPHICS_LIST`).
 pub fn graphics_items() -> Vec<Item> {
     let s = |v: &str| v.to_string();
     let toggle = |id: &str, label: &str, tooltip: &str, on| Item { id: s(id), label: s(label), tooltip: s(tooltip), kind: ItemKind::Toggle(on) };
@@ -229,18 +211,36 @@ pub fn graphics_items() -> Vec<Item> {
             kind: ItemKind::Choice(vec![s("As Original"), s("8x Anisotropic"), s("16x Anisotropic")], 0),
         },
         Item {
-            id: s("AntiAliasing"),
-            label: s("Anti-Aliasing"),
-            tooltip: s("Smooths jagged edges. DLSS, FSR and XeSS replace the game's TAA."),
-            kind: ItemKind::AntiAliasing,
+            id: s("Sharpness"),
+            label: s("Sharpening"),
+            tooltip: s("Sharpens the image. Off is the original."),
+            kind: ItemKind::Choice(vec![s("Off"), s("25%"), s("50%"), s("75%"), s("100%")], 0),
         },
         toggle("Bloom", "Bloom", "The glow around bright lights.", true),
         toggle("Vignette", "Vignette", "The darkening toward the image's edges.", true),
         Item {
-            id: s("FrameRateLimit"),
-            label: s("Frame Rate Limit"),
-            tooltip: s("60 FPS is the original. Uncapped shows frames as soon as they are ready."),
-            kind: ItemKind::Choice(vec![s("30 FPS"), s("60 FPS"), s("Uncapped")], 1),
+            id: s("HdrOutput"),
+            label: s("HDR"),
+            tooltip: s("HDR when Windows' HDR is on. Display Adjustment sets its brightness."),
+            kind: ItemKind::Choice(vec![s("Automatic"), s("Off")], 0),
+        },
+        Item {
+            id: s("AspectRatio"),
+            label: s("Aspect Ratio"),
+            tooltip: s("The picture's shape, from the next start."),
+            kind: ItemKind::Choice(vec![s("Automatic"), s("16:9"), s("16:10"), s("21:9"), s("32:9")], 1),
+        },
+        Item {
+            id: s("Monitor"),
+            label: s("Monitor"),
+            tooltip: s("The monitor the game shows on."),
+            kind: ItemKind::Display(0),
+        },
+        Item {
+            id: s("RefreshRate"),
+            label: s("Refresh Rate"),
+            tooltip: s("The screen's refresh rate in Fullscreen mode."),
+            kind: ItemKind::Display(2),
         },
     ]
 }
@@ -251,18 +251,12 @@ pub fn graphics_items() -> Vec<Item> {
 pub const GEOMETRY_DETAIL: [Option<(f32, f32, f32)>; 6] =
     [None, Some((5.0, 9.0, 0.05)), Some((8.0, 12.0, 0.04)), Some((13.0, 13.0, 0.04)), Some((18.0, 15.0, 0.02)), Some((24.0, 18.0, 0.015))];
 
-/// The Game & Controls list's items (`GAME_LIST`).
+/// The Controls, Sound & Saves list's items (`GAME_LIST`).
 pub fn game_items() -> Vec<Item> {
     let s = |v: &str| v.to_string();
     let toggle = |id: &str, label: &str, tooltip: &str, on| Item { id: s(id), label: s(label), tooltip: s(tooltip), kind: ItemKind::Toggle(on) };
     vec![
         toggle("InvertMouseY", "Invert Mouse Y", "Moving the mouse forward looks down.", false),
-        Item {
-            id: s("MouseMotionBlur"),
-            label: s("Mouse Look Blur"),
-            tooltip: s("Motion blur with mouse and keyboard. A controller uses the game's own."),
-            kind: ItemKind::Choice(vec![s("As Game Setting"), s("Reduced"), s("Off")], 2),
-        },
         Item {
             id: s("UiSize"),
             label: s("Menu & HUD Size"),
@@ -281,8 +275,20 @@ pub fn game_items() -> Vec<Item> {
             tooltip: s("Which buttons the game shows. Automatic follows the device you use."),
             kind: ItemKind::Choice(vec![s("Automatic"), s("PlayStation"), s("Xbox"), s("Keyboard & Mouse")], 0),
         },
-        toggle("SkipIntro", "Skip Intro Logos", "Skips the logos when the game starts.", false),
+        Item {
+            id: s("AudioOutput"),
+            label: s("Audio Output"),
+            tooltip: s("Headphones, speakers, surround or spatial sound."),
+            kind: ItemKind::Choice(vec![s("Automatic"), s("Headphones"), s("Stereo Speakers"), s("5.1 Surround"), s("7.1 Surround"), s("Windows Sonic / Atmos")], 0),
+        },
+        Item {
+            id: s("AudioDevice"),
+            label: s("Audio Device"),
+            tooltip: s("The device the sound plays on."),
+            kind: ItemKind::AudioDevice,
+        },
         toggle("PadSpeaker", "Pad Speaker", "Plays the controller speaker's sounds with the game's.", false),
+        toggle("SkipIntro", "Skip Intro Logos", "Skips the logos when the game starts.", false),
         Item {
             id: s("SaveFolder"),
             label: s("Save Folder"),
@@ -311,7 +317,7 @@ pub fn apply() {
     crate::gpu::images::ANISO.store(aniso, std::sync::atomic::Ordering::Relaxed);
     // Sharpening: the presenter's pass (amount x2: 1.00 moves a pixel twice its difference
     // from its neighbours' mean, within their range).
-    let sharpen = get("Sharpening").map(f32::from_bits).filter(|v| v.is_finite() && *v > 0.001).unwrap_or(0.0);
+    let sharpen = SHARPNESS.get(get("Sharpness").unwrap_or(0) as usize).copied().unwrap_or(0.0);
     crate::gpu::vk::sharpen::AMOUNT.store((sharpen * 2.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
     let sens = get("MouseSensitivity").map(f32::from_bits).filter(|v| v.is_finite() && *v > 0.0).unwrap_or(1.0);
     crate::input::PC_SENSITIVITY.store(sens.to_bits(), std::sync::atomic::Ordering::Relaxed);
@@ -365,21 +371,21 @@ pub fn apply() {
     }
 }
 
-/// Mouse Look Blur: 0 the game's setting, 1 Reduced (MOUSE_BLUR_REDUCED of it), 2 Off (the
-/// default: at the default a mouse turn of 1,500 counts a second kept 10% of a still frame's
-/// detail, a tenth of the blur 49%, none 54%; at 4,000 a second 9%, 16% and 63%: FINDINGS.md 2026-11-07).
+/// Motion Blur Fix (`MouseMotionBlur`): 0 Off (the game's own Motion Blur), 1 Reduced Blur
+/// (MOUSE_BLUR_REDUCED of it), 2 On (no motion blur: the default; at the game's default a mouse
+/// turn of 1,500 counts a second kept 10% of a still frame's detail, a tenth of the blur 49%,
+/// none 54%; at 4,000 a second 9%, 16% and 63%: FINDINGS.md 2026-11-07). With every device since
+/// 2026-11-13 night (the user: on by default with a controller too; mouse and keyboard only before).
 pub static MOUSE_BLUR: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
-/// Reduced: the share of the game's Motion Blur kept while mouse and keyboard are in use.
+/// Reduced Blur: the share of the game's Motion Blur kept.
 pub const MOUSE_BLUR_REDUCED: f32 = 0.1;
 
-/// Each flip (the vblank thread, before `convar::tick`): the game's motion blur scaled while
-/// mouse and keyboard are the device in use (`input::last_device`), the game's own otherwise.
+/// Each flip (the vblank thread, before `convar::tick`): the game's motion blur scaled by the
+/// Motion Blur Fix, whatever the device in use.
 pub fn mouse_blur_tick() {
     use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
     static LAST: AtomicU8 = AtomicU8::new(u8::MAX);
-    let kbm = crate::input::last_device() == crate::input::DEVICE_KBM;
-    let choice = MOUSE_BLUR.load(Relaxed);
-    let state = if kbm { choice } else { 0 };
+    let state = MOUSE_BLUR.load(Relaxed);
     if LAST.swap(state, Relaxed) == state {
         return;
     }
@@ -390,13 +396,12 @@ pub fn mouse_blur_tick() {
     };
     convar::want_scaled("r_motionBlurAmount", factor);
     crate::info!(
-        "pc settings: motion blur {} ({})",
+        "pc settings: motion blur {} (Motion Blur Fix)",
         match state {
             1 => "reduced",
             2 => "off",
             _ => "as the game's setting",
-        },
-        if kbm { "mouse and keyboard in use" } else { "the pad or nothing in use" }
+        }
     );
 }
 
@@ -467,7 +472,7 @@ pub fn state_report() {
         format!("HdrOutput {} (HDR allowed {}, output range {})", v("HdrOutput"), hdr_allowed(), crate::hle::libs::videoout::dynamic_range()),
         format!("AspectRatio {} (output {:?})", v("AspectRatio"), crate::dispmode::output_size()),
         format!("RenderScale {} (scale {}%)", v("RenderScale"), crate::dispmode::SCALE_PCT.load(Relaxed)),
-        format!("Sharpening {} (amount {:.2})", f("Sharpening"), f32::from_bits(crate::gpu::vk::sharpen::AMOUNT.load(Relaxed))),
+        format!("Sharpness {} (amount {:.2})", v("Sharpness"), f32::from_bits(crate::gpu::vk::sharpen::AMOUNT.load(Relaxed))),
         format!("MouseSensitivity {} (in effect {:.2})", f("MouseSensitivity"), f32::from_bits(crate::input::PC_SENSITIVITY.load(Relaxed))),
         format!("InvertMouseY {} (in effect {})", v("InvertMouseY"), crate::input::PC_INVERT_Y.load(Relaxed)),
         format!("AudioOutput {} (in effect {})", v("AudioOutput"), crate::hle::libs::audio2::OUTPUT_CHOICE.load(Relaxed)),
@@ -1270,8 +1275,8 @@ fn text(orig: &[u8]) -> Vec<u8> {
         }
     }
     for (names, open, tip, heading, items) in [
-        (&GRAPHICS_LIST, "Graphics", "Graphics quality and frame rate.", "GRAPHICS", graphics_items()),
-        (&GAME_LIST, "Game & Controls", "Mouse, buttons and saves.", "GAME & CONTROLS", game_items()),
+        (&GRAPHICS_LIST, "Graphics & Display", "Quality, effects, HDR, aspect ratio and monitor.", "GRAPHICS & DISPLAY", graphics_items()),
+        (&GAME_LIST, "Controls, Sound & Saves", "Mouse, HUD, prompts, sound and saves.", "CONTROLS, SOUND & SAVES", game_items()),
     ] {
         lines.push((names.open_key.into(), open.into()));
         lines.push((names.tip_key.into(), tip.into()));

@@ -1,6 +1,7 @@
 //! Vulkan device context shared by the renderer and the presenter.
 
 pub mod defer;
+pub mod framewatch;
 pub mod pbin;
 pub mod present;
 pub mod sharpen;

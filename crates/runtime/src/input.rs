@@ -383,6 +383,10 @@ fn xinput(st: &mut PadState) {
             phys |= 1 << i;
         }
     }
+    // The system text box (the character's name): the pad is its alone while it is open.
+    if crate::hle::libs::ime_dialog::pad_input(phys) {
+        return;
+    }
     // A controller binding being captured: the pad is the menu's alone (`pcsettings::bindings`);
     // a button held when it ended reaches the game once released and pressed again.
     if crate::pcsettings::bindings::pad_input(phys) {
@@ -1282,6 +1286,11 @@ pub fn cross_presses() -> u32 {
 pub fn pad_state() -> PadState {
     let mut st = PadState::default();
     xinput(&mut st);
+    // The system text box is open: the game sees no input (as on the console while its
+    // keyboard shows); its keys and buttons are the box's (`ime_dialog`).
+    if crate::hle::libs::ime_dialog::active() {
+        return PadState::default();
+    }
     keyboard_mouse(&mut st);
     scripted(&mut st, crate::gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
     if st.l2 > 30 {

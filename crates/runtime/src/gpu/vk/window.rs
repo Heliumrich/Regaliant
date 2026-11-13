@@ -510,6 +510,9 @@ unsafe fn raw_input(lp: LPARAM) {
     }
 }
 
+/// The key that closed the system text box (`ime_dialog`), kept from the game until released.
+static IME_SWALLOW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_CLOSE => {
@@ -614,6 +617,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 // Alt+F4 closes the window.
                 return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
             }
+            // The system text box (the character's name, `ime_dialog`) takes the keys while it
+            // is open; the key that closed it is kept from the game until it is released.
+            let repeat = (lp >> 30) & 1 != 0;
+            if msg == WM_KEYDOWN {
+                if repeat && IME_SWALLOW.load(Ordering::Relaxed) == wp as u32 {
+                    return 0;
+                }
+                let ctrl = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x11) } < 0;
+                if crate::hle::libs::ime_dialog::key_down(wp as u8, repeat, ctrl) {
+                    crate::input::note_device(crate::input::DEVICE_KBM);
+                    if !crate::hle::libs::ime_dialog::active() {
+                        IME_SWALLOW.store(wp as u32, Ordering::Relaxed);
+                    }
+                    return 0;
+                }
+            }
             if (wp as u16 == VK_RETURN_CODE && msg == WM_SYSKEYDOWN) || wp as u16 == VK_F11_CODE {
                 // Alt+Enter, F11: windowed / the last fullscreen mode.
                 if (lp >> 30) & 1 == 0 {
@@ -648,10 +667,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_KEYUP | WM_SYSKEYUP => {
+            if IME_SWALLOW.load(Ordering::Relaxed) == wp as u32 {
+                IME_SWALLOW.store(0, Ordering::Relaxed);
+            }
             set_key(wp, lp, false);
             crate::pcsettings::bindings::key_up(wp as u8, sided(wp, lp));
             0
         }
+        // Typed characters go to the system text box while it is open.
+        WM_CHAR if crate::hle::libs::ime_dialog::char_typed(wp as u16) => 0,
         // Alt with a key (Alt is walk): no menu mnemonic and its beep; Alt+Space
         // still opens the window menu.
         WM_SYSCHAR if wp != b' ' as WPARAM => 0,

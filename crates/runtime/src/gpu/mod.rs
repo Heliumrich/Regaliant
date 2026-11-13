@@ -3282,6 +3282,8 @@ pub fn profile_report() -> String {
     }
     s.push_str(&exec::async_line());
     s.push_str(&shaders::fmt_line());
+    s.push_str(&vk::framewatch::line());
+    s.push_str(&crate::pcsettings::pointer::direct_line());
     s.push_str(&exec::import_window_line());
     s.push_str(&crate::mem::host_calls_line());
     s.push_str(&xwait::status());

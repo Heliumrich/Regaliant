@@ -60,23 +60,23 @@ pub fn build(app: &mut App) {
     let b: Builder = app.builder();
     unsafe {
         let r = (16, 67, 100, 20);
-        app.put(2, b.label("Save folder:", r, -1), r);
+        app.put(3, b.label("Save folder:", r, -1), r);
         let r = (116, 64, 544, 24);
-        app.saves.folder = app.put(2, b.field("", r, -1), r) as usize;
+        app.saves.folder = app.put(3, b.field("", r, -1), r) as usize;
         let r = (668, 63, 96, 26);
-        app.put(2, b.button("Open", r, ID_OPEN_SAVES), r);
+        app.put(3, b.button("Open", r, ID_OPEN_SAVES), r);
         let r = (16, 102, 748, 20);
-        app.put(2, b.label("Backups, made before a session first changes a save. The newest are kept.", r, -1), r);
+        app.put(3, b.label("Backups, made before a session first changes a save. The newest are kept.", r, -1), r);
         let r = (16, 124, 748, 230);
-        app.saves.list = app.put(2, ui::list_view(&b, r, ID_LIST, &[("Save", 200), ("Made", 200), ("Why", 300)]), r) as usize;
+        app.saves.list = app.put(3, ui::list_view(&b, r, ID_LIST, &[("Save", 200), ("Made", 200), ("Why", 300)]), r) as usize;
         let r = (16, 362, 140, 28);
-        app.saves.restore = app.put(2, b.button("Restore...", r, ID_RESTORE), r) as usize;
+        app.saves.restore = app.put(3, b.button("Restore...", r, ID_RESTORE), r) as usize;
         let r = (164, 362, 180, 28);
-        app.put(2, b.button("Open backups folder", r, ID_OPEN_BACKUPS), r);
+        app.put(3, b.button("Open backups folder", r, ID_OPEN_BACKUPS), r);
         let r = (16, 404, 560, 44);
-        app.put(2, b.label("To import a decrypted PS5 save, put it in the PS5 Saves folder. Then turn on Import PS5 Saves in the game's PC settings and restart the game.", r, -1), r);
+        app.put(3, b.label("To import a decrypted PS5 save, put it in the PS5 Saves folder. Then turn on Import PS5 Saves in the game's PC settings and restart the game.", r, -1), r);
         let r = (584, 410, 180, 28);
-        app.put(2, b.button("Open PS5 Saves folder", r, ID_OPEN_IMPORT), r);
+        app.put(3, b.button("Open PS5 Saves folder", r, ID_OPEN_IMPORT), r);
     }
     refresh(app);
 }

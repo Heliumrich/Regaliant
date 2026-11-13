@@ -140,17 +140,17 @@ pub fn build(app: &mut App) {
     let b: Builder = app.builder();
     unsafe {
         let r = (16, 62, 748, 62);
-        app.put(1, b.label("The game compiles each shader the first time it needs it, which makes play stutter. Preparing them here once takes about 20 to 60 minutes and makes the longest stutters much shorter. Some stutter remains on first visits. Nothing of it shows while you play.", r, -1), r);
+        app.put(2, b.label("The game compiles each shader the first time it needs it, which makes play stutter. Preparing them here once takes about 20 to 60 minutes and makes the longest stutters much shorter. Some stutter remains on first visits. Nothing of it shows while you play.", r, -1), r);
         let r = (16, 134, 748, 40);
-        app.shaders.status = app.put(1, b.label("", r, -1), r) as usize;
+        app.shaders.status = app.put(2, b.label("", r, -1), r) as usize;
         let r = (16, 178, 748, 20);
-        app.shaders.bar = app.put(1, b.progress(r, -1), r) as usize;
+        app.shaders.bar = app.put(2, b.progress(r, -1), r) as usize;
         let r = (16, 210, 140, 30);
-        app.shaders.prepare = app.put(1, b.button("Prepare now", r, ID_PREPARE), r) as usize;
+        app.shaders.prepare = app.put(2, b.button("Prepare now", r, ID_PREPARE), r) as usize;
         let r = (164, 210, 100, 30);
-        app.shaders.stop = app.put(1, b.button("Stop", r, ID_STOP), r) as usize;
+        app.shaders.stop = app.put(2, b.button("Stop", r, ID_STOP), r) as usize;
         let r = (16, 256, 748, 40);
-        app.shaders.auto = app.put(1, b.check("Prepare the shaders when Play is pressed and they are not prepared yet.", r, ID_AUTO), r) as usize;
+        app.shaders.auto = app.put(2, b.check("Prepare the shaders when Play is pressed and they are not prepared yet.", r, ID_AUTO), r) as usize;
         ui::set_check(h(app.shaders.auto), app.launch.prepare_shaders);
         let where_ = format!(
             "Prepared shaders are kept in {}. They take up to 4 GB. Preparing uses {} of this PC's {} processor threads.",
@@ -159,7 +159,7 @@ pub fn build(app: &mut App) {
             sys::threads()
         );
         let r = (16, 306, 748, 60);
-        app.put(1, b.label(&where_, r, -1), r);
+        app.put(2, b.label(&where_, r, -1), r);
     }
     refresh(app);
 }
