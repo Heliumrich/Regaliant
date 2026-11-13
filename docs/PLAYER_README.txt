@@ -138,10 +138,10 @@ Estimated, not tested:
 
 Known issues
 ------------
-- The frame rate is below 60 in most places. On the tested PC it is about 30 to 45 fps.
-- The first visit to an area can still stutter while shaders compile, even with prepared
-  shaders. The first session's first load can pause for many seconds behind the loading
-  screen. Later visits do not compile them again.
+- The frame rate is below 60 in most places. On the tested PC it is about 35 to 55 fps.
+- On a first visit some objects can be missing for a moment while their shaders compile, and
+  some compiles still stutter, even with prepared shaders. A level's first load can pause for
+  a few seconds behind the loading screen. Later visits do not compile them again.
 - Areas, bosses and the story were reached by the developer's shortcuts in testing. A full
   playthrough has not been made.
 - World 8-3 sometimes loads too dark. Restarting the game fixes it.
