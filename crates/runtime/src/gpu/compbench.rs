@@ -525,9 +525,142 @@ fn memtest(n: usize) -> i32 {
     0
 }
 
+/// `DS_CB_SHAPES=1`: no compiles; the game's compute programs (particle
+/// bundles and engine shader files) grouped by their code with constants
+/// left out: L1 without literal dwords, L2 also without inline constants and
+/// SOPK immediates. How many pipelines would serve them if constants were
+/// read at run time, by count and by instructions (compile time follows
+/// program size), and the largest groups.
+fn shapes_report(app: &std::path::Path) -> i32 {
+    use std::collections::HashMap;
+    let mut files: Vec<(std::path::PathBuf, bool)> = Vec::new();
+    let pdir = app.join("particles").join("!cookedparticleshaders").join("version01").join("_ps5");
+    files.extend(std::fs::read_dir(&pdir).into_iter().flatten().flatten().map(|e| (e.path(), true)));
+    let mut stack = vec![app.join("coredata").join("enginesupport").join("shaders").join("_ps5")];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                files.push((p, false));
+            }
+        }
+    }
+    let fnv = |h: &mut u64, v: u64| {
+        *h ^= v;
+        *h = h.wrapping_mul(0x100_0000_01b3);
+    };
+    // Per class (particle, engine): programs, instructions, and per level the
+    // shapes with their member count and instructions.
+    let mut seen = std::collections::HashSet::new();
+    let mut tot = [(0u64, 0u64); 2];
+    let mut shapes: [[HashMap<u64, (u64, u64)>; 2]; 2] = Default::default();
+    let mut lits = [0u64; 2];
+    for (f, particle) in files.iter().filter(|(p, _)| p.extension().is_some_and(|x| x == "csdr")) {
+        let Some(v) = std::fs::read(f).ok().and_then(|b| super::particles::bundle_programs(&b)) else { continue };
+        for p in v.into_iter().filter(|p| p.stage == 0) {
+            if !seen.insert(p.hash) {
+                continue;
+            }
+            let Ok(insts) = rdna::decode_program(&p.code) else { continue };
+            let c = (!*particle) as usize;
+            let n = insts.len() as u64;
+            tot[c].0 += 1;
+            tot[c].1 += n;
+            let (mut h1, mut h2) = (0xcbf2_9ce4_8422_2325u64, 0xcbf2_9ce4_8422_2325u64);
+            for i in &insts {
+                let ext = match i.ext {
+                    rdna::Ext::None => 0u64,
+                    rdna::Ext::Dpp16(d) => 1 << 40 | d as u64,
+                    rdna::Ext::Dpp8(d, fi) => 2 << 40 | (fi as u64) << 32 | d as u64,
+                    rdna::Ext::Sdwa(d) => 3 << 40 | d as u64,
+                };
+                if i.lit.is_some() {
+                    lits[c] += 1;
+                }
+                let base = (i.enc as u64) << 48 | (i.op as u64) << 32;
+                fnv(&mut h1, base | i.w0 as u64);
+                fnv(&mut h1, i.w1 as u64);
+                fnv(&mut h1, ext);
+                // L2: constant operands (inline constants and the literal,
+                // 128..=255) as one marker; SOPK immediates of the moves,
+                // adds and multiplies left out.
+                let is_const = |o: u32| (128..=255).contains(&o);
+                let (mut w0, mut w1) = (i.w0, i.w1);
+                match i.enc {
+                    rdna::Enc::Vop3 | rdna::Enc::Vop3p => {
+                        for k in 0..3 {
+                            if is_const((w1 >> (9 * k)) & 0x1FF) {
+                                w1 = (w1 & !(0x1FF << (9 * k))) | (128 << (9 * k));
+                            }
+                        }
+                    }
+                    rdna::Enc::Vop1 | rdna::Enc::Vop2 | rdna::Enc::Vopc => {
+                        if is_const(w0 & 0x1FF) && !matches!(w0 & 0x1FF, 233 | 234 | 249 | 250) {
+                            w0 = (w0 & !0x1FF) | 128;
+                        }
+                    }
+                    rdna::Enc::Sop2 | rdna::Enc::Sopc => {
+                        for k in 0..2 {
+                            if is_const((w0 >> (8 * k)) & 0xFF) {
+                                w0 = (w0 & !(0xFF << (8 * k))) | (128 << (8 * k));
+                            }
+                        }
+                    }
+                    rdna::Enc::Sop1 => {
+                        if is_const(w0 & 0xFF) {
+                            w0 = (w0 & !0xFF) | 128;
+                        }
+                    }
+                    rdna::Enc::Sopk => {
+                        // s_movk_i32, s_cmovk_i32, s_addk_i32, s_mulk_i32.
+                        if matches!(i.op, 0 | 2 | 15 | 16) {
+                            w0 &= !0xFFFF;
+                        }
+                    }
+                    _ => {}
+                }
+                fnv(&mut h2, base | w0 as u64);
+                fnv(&mut h2, w1 as u64);
+                fnv(&mut h2, ext);
+            }
+            for (lvl, h) in [h1, h2].into_iter().enumerate() {
+                let e = shapes[lvl][c].entry(h).or_insert((0, 0));
+                e.0 += 1;
+                e.1 = n;
+            }
+        }
+    }
+    for (c, name) in ["particle", "engine"].iter().enumerate() {
+        crate::info!("shapes: {name} programs {} ({} instructions, {} with a literal)", tot[c].0, tot[c].1, lits[c]);
+        for lvl in 0..2 {
+            let m = &shapes[lvl][c];
+            let insts: u64 = m.values().map(|v| v.1).sum();
+            let singles = m.values().filter(|v| v.0 == 1).count();
+            crate::info!(
+                "shapes: {name} L{}: {} shapes ({:.1}% of programs), {} instructions to compile ({:.1}%), {singles} programs alone in theirs",
+                lvl + 1,
+                m.len(),
+                100.0 * m.len() as f64 / tot[c].0.max(1) as f64,
+                insts,
+                100.0 * insts as f64 / tot[c].1.max(1) as f64
+            );
+            let mut big: Vec<(u64, u64)> = m.values().copied().collect();
+            big.sort_by(|a, b| (b.0 * b.1).cmp(&(a.0 * a.1)));
+            let top: Vec<String> = big.iter().take(12).map(|(k, n)| format!("{k}x{n}")).collect();
+            crate::info!("shapes: {name} L{} largest groups (members x instructions): {}", lvl + 1, top.join(" "));
+        }
+    }
+    0
+}
+
 pub fn run(args: &[String], app: &std::path::Path) -> i32 {
     if std::env::var("DS_CB_GUESS").ok().as_deref() == Some("1") {
         return guess_report(app);
+    }
+    if std::env::var("DS_CB_SHAPES").ok().as_deref() == Some("1") {
+        return shapes_report(app);
     }
     if let Some(n) = std::env::var("DS_CB_MEMTEST").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0) {
         return memtest(n);

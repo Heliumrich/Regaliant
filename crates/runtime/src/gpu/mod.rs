@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 170] = [
+    static ALL: [Tunable; 172] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -202,6 +202,8 @@ pub mod tune {
         Tunable { name: "submit_fuse", env: "DS_SUBMIT_FUSE", default: 2, value: AtomicU64::new(UNSET) },
         Tunable { name: "behind_quiet", env: "DS_BEHIND_QUIET", default: 2, value: AtomicU64::new(UNSET) },
         Tunable { name: "behind_us", env: "DS_BEHIND_US", default: 300, value: AtomicU64::new(UNSET) },
+        Tunable { name: "async_gfx", env: "DS_ASYNC_GFX", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "async_gfx_workers", env: "DS_ASYNC_GFX_WORKERS", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1364,6 +1366,25 @@ pub mod tune {
     /// The armer's time a round (2 ms apart) in us (default 300). Live.
     pub fn behind_us() -> u64 {
         get(169)
+    }
+
+    /// Graphics pipelines missing at a draw compiled in the background
+    /// (`exec::draw` `async_gfx`): 1 (default) a draw that may be left out
+    /// meanwhile is (no memory writes, no depth or stencil clear, every target
+    /// it writes drawn into in 3 of the 4 frames before); 0 every draw waits
+    /// for its pipeline (as before 2026-11-13). Live.
+    #[inline]
+    pub fn async_gfx() -> u64 {
+        get(170)
+    }
+
+    /// Threads that compile `async_gfx`'s pipelines (normal priority); 0: a
+    /// sixth of the logical CPUs, at least 2.
+    pub fn async_gfx_workers() -> usize {
+        match get(171) {
+            0 => (std::thread::available_parallelism().map_or(8, |n| n.get()) / 6).max(2),
+            n => (n as usize).min(16),
+        }
     }
 
     /// Whether translations get `rdna::translate::Spec::hw_bounds` (scalar

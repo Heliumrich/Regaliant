@@ -696,6 +696,140 @@ fn rect_gs_mask(vs_mask: u32, ps_inputs: u32) -> u32 {
     vs_mask | ps_inputs
 }
 
+/// Graphics pipelines compiled in the background (`tune async_gfx`): the
+/// keys queued or being made, those whose creation failed there (their draws
+/// wait as before and report the error), and the jobs (pipelines the store
+/// holds first: made in milliseconds).
+#[derive(Default)]
+struct AsyncGfx {
+    pending: std::collections::HashSet<u64>,
+    failed: std::collections::HashSet<u64>,
+    jobs: std::collections::VecDeque<GfxJob>,
+}
+
+struct GfxJob {
+    key: GfxKey,
+    hkey: u64,
+    vs: (std::sync::Arc<super::super::shaders::Translated>, u64),
+    ps: Option<(std::sync::Arc<super::super::shaders::Translated>, u64)>,
+    push_mode: bool,
+    stored: bool,
+    queued: std::time::Instant,
+}
+
+static ASYNC_GFX: parking_lot::Mutex<Option<AsyncGfx>> = parking_lot::Mutex::new(None);
+static ASYNC_GFX_CV: parking_lot::Condvar = parking_lot::Condvar::new();
+static ASYNC_GFX_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// [draws left out, pipelines queued, of them from the store, made, their
+/// creation ns, ns from queued to made, the longest of those ns, failed].
+pub static ASYNC_GFX_STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// Draws that waited for their pipeline although `async_gfx` is on, by why:
+/// [memory writes, depth or stencil clear, a target not drawn into in 3 of
+/// the 4 frames before, (measuring LOD statistics: left out, its textures
+/// carried), a GPU-resolved pair's draw, a mode that records every draw
+/// (sync, capture, verify, replay)].
+pub static ASYNC_GFX_WAITED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// Leaves a draw out while its pipeline is made in the background: true when
+/// it is (queued now or before), false when the draw must make or wait for
+/// it itself (its creation failed in the background, or it is made now).
+fn async_gfx_submit(key: &GfxKey, hkey: u64, vs: &Prepared, ps: Option<&Prepared>, push_mode: bool) -> bool {
+    let stored = crate::gpu::pcache::stored_cheap('g', hkey);
+    {
+        let mut g = ASYNC_GFX.lock();
+        let st = g.get_or_insert_with(AsyncGfx::default);
+        if st.failed.contains(&hkey) {
+            return false;
+        }
+        if !st.pending.contains(&hkey) {
+            // (Made since the draw looked.)
+            if gfx_pipe(hkey).is_some() {
+                return false;
+            }
+            st.pending.insert(hkey);
+            let job = GfxJob { key: *key, hkey, vs: (vs.tr.0.clone(), vs.addr), ps: ps.map(|p| (p.tr.0.clone(), p.addr)), push_mode, stored, queued: std::time::Instant::now() };
+            if stored {
+                st.jobs.push_front(job);
+            } else {
+                st.jobs.push_back(job);
+            }
+            ASYNC_GFX_STATS[1].fetch_add(1, Ordering::Relaxed);
+            if stored {
+                ASYNC_GFX_STATS[2].fetch_add(1, Ordering::Relaxed);
+            }
+            if compile_trace() {
+                crate::info!("first use: vs {:#x} ps {:#x} key {hkey:#x} left out while its pipeline is made in the background{}", vs.addr, ps.map_or(0, |p| p.addr), if stored { " (from the store)" } else { "" });
+            }
+        }
+    }
+    ensure_async_gfx_workers();
+    ASYNC_GFX_CV.notify_one();
+    ASYNC_GFX_STATS[0].fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+fn ensure_async_gfx_workers() {
+    let want = super::super::tune::async_gfx_workers();
+    while ASYNC_GFX_WORKERS.load(Ordering::Acquire) < want {
+        let n = ASYNC_GFX_WORKERS.fetch_add(1, Ordering::AcqRel);
+        if n >= want {
+            ASYNC_GFX_WORKERS.fetch_sub(1, Ordering::AcqRel);
+            break;
+        }
+        let name = format!("gpu-gfxasync{n}");
+        let r = crate::thread::spawn_host(
+            &name.clone(),
+            8 << 20,
+            Box::new(move || {
+                crate::log::set_thread_name(&name);
+                crate::exception::arm_watch_current_thread(false);
+                async_gfx_worker();
+            }),
+        );
+        if let Err(e) = r {
+            crate::warn!("gpu: no background graphics compile worker ({e})");
+            ASYNC_GFX_WORKERS.fetch_sub(1, Ordering::AcqRel);
+            break;
+        }
+    }
+}
+
+fn async_gfx_worker() {
+    loop {
+        let job = {
+            let mut g = ASYNC_GFX.lock();
+            loop {
+                if let Some(j) = g.as_mut().and_then(|s| s.jobs.pop_front()) {
+                    break j;
+                }
+                ASYNC_GFX_CV.wait(&mut g);
+            }
+        };
+        let t = std::time::Instant::now();
+        let created = std::cell::Cell::new(false);
+        // A panic must not leave the key pending (its draws left out forever).
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gfx_pipe_with(&job.key, job.hkey, (&*job.vs.0, job.vs.1), job.ps.as_ref().map(|p| (&*p.0, p.1)), job.push_mode, &created))).unwrap_or_else(|_| Err("pipeline creation panicked".to_string()));
+        let mut g = ASYNC_GFX.lock();
+        let st = g.get_or_insert_with(AsyncGfx::default);
+        st.pending.remove(&job.hkey);
+        match r {
+            Ok(_) => {
+                ASYNC_GFX_STATS[3].fetch_add(1, Ordering::Relaxed);
+                ASYNC_GFX_STATS[4].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                let wait = job.queued.elapsed().as_nanos() as u64;
+                ASYNC_GFX_STATS[5].fetch_add(wait, Ordering::Relaxed);
+                ASYNC_GFX_STATS[6].fetch_max(wait, Ordering::Relaxed);
+            }
+            Err(e) => {
+                st.failed.insert(job.hkey);
+                ASYNC_GFX_STATS[7].fetch_add(1, Ordering::Relaxed);
+                crate::warn!("gpu: background graphics pipeline for vs {:#x} ps {:#x} failed ({e}); its draws make it themselves", job.vs.1, job.ps.as_ref().map_or(0, |p| p.1));
+            }
+        }
+        let _ = job.stored;
+    }
+}
+
 fn gfx_pipe_with(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, push_mode: bool, created: &std::cell::Cell<bool>) -> Result<Pipe, String> {
     if let Some(x) = gfx_pipe(hkey) {
         return Ok(x);
@@ -1556,6 +1690,15 @@ impl Exec {
                 for t in f.colors.iter().flatten().chain(f.depth.iter()) {
                     t.used.stamp(frame);
                 }
+                // (And the frames they were drawn into, `async_gfx`.)
+                for t in f.colors.iter().flatten() {
+                    t.used.stamp_drawn(frame);
+                }
+                if f.z_write || f.s_write || f.clear_z || f.clear_s {
+                    if let Some(d) = &f.depth {
+                        d.used.stamp_drawn(frame);
+                    }
+                }
                 for k in 5..9 {
                     lap.mark(k);
                 }
@@ -1702,10 +1845,52 @@ impl Exec {
                     super::push_key(h, push_mode)
                 };
                 let cached = gfx_pipe_use(hkey);
+                let frame = crate::gpu::FRAMES.load(Ordering::Relaxed);
                 let Pipe { pipeline, layout, set_layout, push } = match cached {
                     Some(x) => x,
                     None => {
-                        // A first use.
+                        // A first use. A draw that changes nothing lasting is
+                        // left out while its pipeline is made in the
+                        // background (`tune async_gfx`): no memory writes, no
+                        // depth or stencil clear, and every target it writes
+                        // one that draws wrote in 3 of the 4 frames before (a
+                        // target drawn once, as a texture the title renders
+                        // for later frames, waits).
+                        if super::super::tune::async_gfx() != 0 {
+                            let per_frame = |t: &Target| t.used.drawn_before(frame) >= 3;
+                            let why = if mem_writes {
+                                Some(0)
+                            } else if clear_z || clear_s {
+                                Some(1)
+                            } else if batched || gpu_pair.is_some() {
+                                Some(4)
+                            } else if !self.recording || sync_mode() || super::super::capture::capturing() || super::super::verify::enabled() || super::super::replay::replaying() {
+                                Some(5)
+                            } else if !colors.iter().flatten().all(per_frame) || ((z_write || s_write) && !depth.as_ref().is_some_and(per_frame)) {
+                                Some(2)
+                            } else {
+                                None
+                            };
+                            match why {
+                                None => {
+                                    if async_gfx_submit(&key, hkey, &vs, ps.as_ref(), push_mode) {
+                                        // A draw that was to measure LOD statistics: its
+                                        // textures report their recent measurements instead,
+                                        // as the rotation's other draws do (`lodstats`).
+                                        if lod_measure {
+                                            if let Some(p) = &ps {
+                                                super::super::lodstats::carry(&p.resources);
+                                            }
+                                            ASYNC_GFX_WAITED[3].fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        return Ok(false);
+                                    }
+                                }
+                                Some(w) => {
+                                    ASYNC_GFX_WAITED[w].fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
                         let t = std::time::Instant::now();
                         let created = std::cell::Cell::new(false);
                         let p = gfx_pipe_with(&key, hkey, (&**vs.tr, vs.addr), ps.as_ref().map(|p| (&**p.tr, p.addr)), push_mode, &created)?;
@@ -1718,6 +1903,15 @@ impl Exec {
                     }
                 };
                 super::super::pipeuse::note(hkey);
+                // The frames each target was drawn into (`async_gfx`).
+                for t in colors.iter().flatten() {
+                    t.used.stamp_drawn(frame);
+                }
+                if z_write || s_write || clear_z || clear_s {
+                    if let Some(d) = &depth {
+                        d.used.stamp_drawn(frame);
+                    }
+                }
                 let t_pipe = since(t0);
                 lap.mark(7);
                 // Profile: the step's parts by draw kind ([draws, grow ns, check

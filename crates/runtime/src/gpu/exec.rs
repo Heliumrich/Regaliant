@@ -212,7 +212,27 @@ fn sync_why_status() -> String {
         draw::GFX_FLIGHT_WAITS[1].load(Ordering::Relaxed) / 1_000_000,
         draw::GFX_REPEAT_PAIRS[0].load(Ordering::Relaxed),
         draw::GFX_REPEAT_PAIRS[1].load(Ordering::Relaxed) / 1_000_000
-    )
+    ) + &{
+        let s = |i: usize| draw::ASYNC_GFX_STATS[i].load(Ordering::Relaxed);
+        let w = |i: usize| draw::ASYNC_GFX_WAITED[i].load(Ordering::Relaxed);
+        format!(
+            "    graphics pipelines made in the background (`async_gfx`): {} draws left out meanwhile; {} pipelines queued ({} of them from the store), {} made ({} ms creating; queued to made {} ms on average, at most {} ms), {} failed; first uses that waited: memory writes {}, a depth or stencil clear {}, a target not drawn into in 3 of the 4 frames before {}, GPU-resolved pairs {}, recording modes {}; LOD-measuring draws left out (their textures carried) {}\n",
+            s(0),
+            s(1),
+            s(2),
+            s(3),
+            s(4) / 1_000_000,
+            s(5) / 1_000_000 / s(3).max(1),
+            s(6) / 1_000_000,
+            s(7),
+            w(0),
+            w(1),
+            w(2),
+            w(4),
+            w(5),
+            w(3)
+        )
+    }
 }
 
 /// Time the completion thread spent waiting for fences / running actions (ns).

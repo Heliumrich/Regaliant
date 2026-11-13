@@ -907,23 +907,59 @@ pub struct Image {
 /// memory runs short (`Images::evict`). Leaked (8 bytes per image ever
 /// made): the memos read it without the cache's lock.
 #[derive(Clone, Copy)]
-pub struct UseStamp(&'static std::sync::atomic::AtomicU64);
+pub struct UseStamp(&'static Stamps);
+
+/// An image's use stamp and the frames draws wrote it (`UseStamp::drawn`:
+/// the last such frame shifted left by 16, a bit per frame before it).
+pub struct Stamps {
+    used: std::sync::atomic::AtomicU64,
+    drawn: std::sync::atomic::AtomicU64,
+}
 
 impl UseStamp {
     fn new(frame: u64) -> Self {
-        UseStamp(Box::leak(Box::new(std::sync::atomic::AtomicU64::new(frame))))
+        UseStamp(Box::leak(Box::new(Stamps { used: std::sync::atomic::AtomicU64::new(frame), drawn: std::sync::atomic::AtomicU64::new(0) })))
     }
 
     /// Notes a use in `frame` (one store per image and frame).
     #[inline]
     pub fn stamp(&self, frame: u64) {
-        if self.0.load(std::sync::atomic::Ordering::Relaxed) < frame {
-            self.0.store(frame, std::sync::atomic::Ordering::Relaxed);
+        if self.0.used.load(std::sync::atomic::Ordering::Relaxed) < frame {
+            self.0.used.store(frame, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
     fn get(&self) -> u64 {
-        self.0.load(std::sync::atomic::Ordering::Relaxed)
+        self.0.used.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Notes that a draw writes the image as an attachment in `frame` (one
+    /// store per image and frame; racing threads may lose a frame's bit).
+    #[inline]
+    pub fn stamp_drawn(&self, frame: u64) {
+        let v = self.0.drawn.load(std::sync::atomic::Ordering::Relaxed);
+        let last = v >> 16;
+        if last == frame && v & 1 != 0 {
+            return;
+        }
+        let mask = match frame.checked_sub(last) {
+            Some(d) if d < 16 => ((v & 0xFFFF) << d) | 1,
+            _ => 1,
+        };
+        self.0.drawn.store(frame << 16 | (mask & 0xFFFF), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// In how many of the 4 frames before `frame` draws wrote the image.
+    pub fn drawn_before(&self, frame: u64) -> u32 {
+        let v = self.0.drawn.load(std::sync::atomic::Ordering::Relaxed);
+        let last = v >> 16;
+        let Some(d) = frame.checked_sub(last) else { return 0 };
+        if d >= 5 {
+            return 0;
+        }
+        // Bit j of `rel`: drawn in frame `frame - j`.
+        let rel = (v & 0xFFFF) << d;
+        (rel & 0b11110).count_ones()
     }
 }
 
