@@ -532,6 +532,21 @@ struct ParRun {
     /// The command buffer and title submission it lies in.
     buf: usize,
     sub: u64,
+    /// Planned inside a stretch past a label wait (`par::Run::held`, `held_collect`).
+    held: bool,
+    /// Its stretch settled before all its chunks were collected (`past_wait_settle`).
+    unheld: Option<Box<Unheld>>,
+}
+
+/// A held run whose stretch settled before all its chunks were collected (`Cp::
+/// past_wait_settle`): its remaining chunks go to the GPU as they are collected, each checked as
+/// the stretch was (`Cp::unheld_collect`): its CPU reads against what other queues wrote during
+/// the stretch (`writes`), its images' pending clears and reloads, its placed ranges at the
+/// label's epoch (`need`; pages the stretch uploaded, `up`, count as current).
+struct Unheld {
+    writes: super::ranges::Ranges,
+    need: Option<u32>,
+    up: HashSet<u64>,
 }
 
 /// The graphics command processor recording past a parallel run before
@@ -572,7 +587,35 @@ struct PastWait {
     began: Instant,
     /// Packets since the label was last looked at.
     ticks: u32,
+    /// Held runs (`tune held_runs`): the stretch's share of front end 2's uploads (`par::
+    /// new_run_id`; 0: none) and the part the command processor records now (`Exec::
+    /// fe2_share`); the commit's segments in program order; per worker (`par::Pool::get`), the
+    /// batches of collected chunks its executor holds; held runs planned.
+    share: u64,
+    part: u32,
+    segs: Vec<HeldSeg>,
+    counts: Vec<usize>,
+    runs: u32,
+    /// The share is in use (from the stretch's first held run: `Cp::par_plan`).
+    sharing: bool,
 }
+
+/// A segment of a stretch's held work, in program order (`Cp::held_commit`): the command
+/// processor's closed batches up to this count, or a held run's chunk (its worker and its
+/// batches, the first ones that worker's executor holds after earlier segments').
+enum HeldSeg {
+    Cp(usize),
+    Chunk(usize, usize),
+}
+
+/// Held runs (`tune held_runs`): [runs planned, worker chunks, chunks stopped, chunk batches
+/// submitted at commits, ns waited for chunks, runs cancelled, stretches with held runs
+/// committed, dropped, commands planned for the workers, batches left in workers' executors at
+/// a commit (none expected), runs not planned (fast clears pending, indirect arguments its held
+/// work writes), plannings that stopped the stretch, the stretch's own fast clears applied at a
+/// held run's start, chunks collected after their stretch settled, of them dropped, stretches
+/// without held runs by the backoff].
+pub static HELD_RUNS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
 
 /// Recording past label waits (`Cp::past_wait_ok`): [stretches begun,
 /// committed, dropped, commands recorded past the waits, ns from a wait to
@@ -581,6 +624,8 @@ struct PastWait {
 pub static PAST_WAITS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 static PAST_WAIT_STOPS: parking_lot::Mutex<Vec<(&'static str, u64)>> = parking_lot::Mutex::new(Vec::new());
 static PAST_WAIT_DROPS: parking_lot::Mutex<Vec<(&'static str, u64)>> = parking_lot::Mutex::new(Vec::new());
+/// Held runs' chunks collected after their stretch settled and dropped, by reason (`Cp::unheld_collect`).
+static HELD_DROPS: parking_lot::Mutex<Vec<(&'static str, u64)>> = parking_lot::Mutex::new(Vec::new());
 
 fn note_why(l: &parking_lot::Mutex<Vec<(&'static str, u64)>>, why: &'static str) {
     let mut g = l.lock();
@@ -598,6 +643,10 @@ pub fn past_wait_reset() {
     PAST_SKIPPED.store(0, Ordering::Relaxed);
     PAST_WAIT_STOPS.lock().clear();
     PAST_WAIT_DROPS.lock().clear();
+    HELD_DROPS.lock().clear();
+    for c in HELD_RUNS.iter().chain(super::exec::HELD_RUN_STOPS.iter()).chain(super::exec::PAST_REPAIRS.iter()) {
+        c.store(0, Ordering::Relaxed);
+    }
 }
 
 /// Per label address gone past: (its stretches' recent drop rate in 1/1024,
@@ -625,6 +674,36 @@ fn past_backoff_pass(a: u64) -> bool {
     }
     PAST_SKIPPED.fetch_add(1, Ordering::Relaxed);
     false
+}
+
+/// Per label address: the recent drop rate of its stretches with held runs (1/1024) and
+/// stretches without them since the last probe (`tune held_runs`): a label whose stretches
+/// drop with held runs (they read further ahead than the command processor alone, e.g. what
+/// queue 0x50 writes before its label at Castlewall Front) goes on without them, probing every
+/// 16th stretch.
+static HELD_BACKOFF: parking_lot::Mutex<Option<HashMap<u64, (u32, u32)>>> = parking_lot::Mutex::new(None);
+
+/// Whether a stretch past a wait on label `a` may plan held runs (`HELD_BACKOFF`).
+fn held_backoff_pass(a: u64) -> bool {
+    let mut g = HELD_BACKOFF.lock();
+    let Some(e) = g.as_mut().and_then(|m| m.get_mut(&(a & !7))) else { return true };
+    if e.0 < 512 {
+        return true;
+    }
+    e.1 += 1;
+    if e.1 >= 16 {
+        e.1 = 0;
+        return true;
+    }
+    HELD_RUNS[15].fetch_add(1, Ordering::Relaxed);
+    false
+}
+
+/// A stretch with held runs past a wait on label `a` was dropped or committed (`HELD_BACKOFF`).
+fn held_backoff_note(a: u64, dropped: bool) {
+    let mut g = HELD_BACKOFF.lock();
+    let e = g.get_or_insert_with(HashMap::new).entry(a & !7).or_insert((0, 0));
+    e.0 = e.0 * 3 / 4 + if dropped { 256 } else { 0 };
 }
 
 /// A stretch past a wait on label `a` was dropped (`dropped`) or committed:
@@ -741,6 +820,48 @@ pub fn past_wait_status() -> String {
         super::exec::PAST_CHECKS[3].load(Ordering::Relaxed) as f64 / 1e3 / super::exec::PAST_CHECKS[0].load(Ordering::Relaxed).max(1) as f64,
         super::exec::PAST_HOT[0].load(Ordering::Relaxed),
         super::exec::PAST_HOT[1].load(Ordering::Relaxed)
+    ) + &{
+        let r = |i: usize| super::exec::PAST_REPAIRS[i].load(Ordering::Relaxed);
+        if r(0) == 0 {
+            String::new()
+        } else {
+            format!("    stale pages uploaded before their stretch (`tune past_repair`): {} stretches, {} runs, {} pages\n", r(0), r(1), r(2))
+        }
+    } + &held_runs_line()
+}
+
+/// The held runs' clause of the status ("" without any).
+fn held_runs_line() -> String {
+    let h = |i: usize| HELD_RUNS[i].load(Ordering::Relaxed);
+    if h(0) == 0 && h(10) == 0 && h(11) == 0 {
+        return String::new();
+    }
+    format!(
+        "    held runs (`tune held_runs`): {} runs planned in stretches ({} worker chunks, {} commands planned for them; {:.0} us waited for a chunk on average), {} chunks stopped, {} runs cancelled, {} runs not planned (clears pending or arguments of its held work), {} plannings stopped the stretch; stretches with held runs: {} committed, {} dropped; {} chunk batches submitted at commits ({} left in the workers' executors); chunks stopped reading held work before their run {}, using an image it clears {} or overwrote {} ({} of its fast clears applied at a run's start); chunks collected after their stretch settled {} ({} dropped: {}); stretches without held runs after drops {}\n",
+        h(0),
+        h(1),
+        h(8),
+        h(4) as f64 / 1e3 / h(1).max(1) as f64,
+        h(2),
+        h(5),
+        h(10),
+        h(11),
+        h(6),
+        h(7),
+        h(3),
+        h(9),
+        super::exec::HELD_RUN_STOPS[0].load(Ordering::Relaxed),
+        super::exec::HELD_RUN_STOPS[1].load(Ordering::Relaxed),
+        super::exec::HELD_RUN_STOPS[2].load(Ordering::Relaxed),
+        h(12),
+        h(13),
+        h(14),
+        {
+            let mut v = HELD_DROPS.lock().clone();
+            v.sort_by(|a, b| b.1.cmp(&a.1));
+            v.iter().map(|(w, n)| format!("{w} {n}")).collect::<Vec<_>>().join(", ")
+        },
+        h(15)
     )
 }
 
@@ -2793,6 +2914,35 @@ impl Cp {
         }
     }
 
+    /// A held run's chunk begins on this worker (`Exec::held_chunk_begin`).
+    pub fn held_chunk_begin(&mut self, writes: Arc<super::ranges::Ranges>, keys: Arc<HashMap<super::images::ImageKey, u8>>) {
+        if let Some(e) = self.exec.as_mut() {
+            e.held_chunk_begin(writes, keys);
+        }
+    }
+
+    /// The held chunk's end: its record (`Exec::held_chunk_end`).
+    pub fn held_chunk_end(&mut self) -> super::exec::HeldChunk {
+        self.exec.as_mut().map(|e| e.held_chunk_end()).unwrap_or_default()
+    }
+
+    /// Batches its executor closed and holds.
+    pub fn closed_count(&self) -> usize {
+        self.exec.as_ref().map_or(0, |e| e.closed_count())
+    }
+
+    /// Drops its executor's closed batches after the first `keep` (`Exec::discard_closed_tail`).
+    pub fn discard_closed_tail(&mut self, keep: usize) {
+        if let Some(e) = self.exec.as_mut() {
+            e.discard_closed_tail(keep);
+        }
+    }
+
+    /// Submits its executor's first `n` closed batches (`Exec::submit_closed_first`).
+    pub fn submit_closed_first(&mut self, n: usize) -> Option<u64> {
+        self.exec.as_mut().and_then(|e| e.submit_closed_first(n))
+    }
+
     /// Applies a state packet of a run to `st` as `packet` would.
     fn apply_state(st: &mut ChunkState, opcode: u32, n: u64, p: &dyn Fn(u64) -> u32) {
         let set = |v: &mut Vec<u32>, space: Space, cap: usize, first: u32| {
@@ -2965,6 +3115,8 @@ impl Cp {
         // (Profile: `tune cp_classes`, `PLAN_PHASES`.)
         let mut lap = PlanLaps(super::tune::cp_classes().then(Instant::now));
         let k = if self.compute { compute_workers() } else { super::par::workers() };
+        // Inside a stretch past a label wait (`held_runs_ok`): a held run (`par::Run::held`).
+        let held_run = self.held.is_some();
         // The run's commands, its end and the indirect arguments read in it.
         let mut ends: Vec<u64> = Vec::new();
         let mut args: Vec<(u64, u64)> = Vec::new();
@@ -3095,7 +3247,9 @@ impl Cp {
         let par_min = if self.compute { (super::tune::par_min_compute() as usize).max(super::par::floor()) } else { super::par::graphics_min() };
         let chunk_min = (par_min / 3).clamp(16, PAR_CHUNK_MIN);
         let chunks = ((k + 1) * super::par::split()).min(n / chunk_min);
-        if n < par_min || chunks < 2 {
+        // (A held run's parts within its stretch's share: `fe2::RUN_CHUNKS`.)
+        let chunks = if held_run { chunks.min((super::fe2::RUN_CHUNKS as usize).saturating_sub(self.past_wait.as_deref().map_or(0, |w| w.part as usize) + 2)) } else { chunks };
+        if n < par_min || chunks < 2 || (held_run && n < super::tune::held_min()) {
             // Not again before execution passes this run's end.
             self.par_skip = (end, run_end);
             self.par_skip_n = n;
@@ -3107,6 +3261,28 @@ impl Cp {
             PLAN_PHASES[1].fetch_add(1, Ordering::Relaxed);
             return;
         }
+        // Held: not planned where planning would stop the stretch (it is recorded by this
+        // command processor alone, as before, until its own stop): fast clears pending (a run
+        // applies them at its start), indirect arguments its held work writes or that its
+        // label's writer wrote before (`past_conflicts_hit`).
+        if held_run {
+            let a = self.past_wait.as_deref().map_or(0, |w| w.a);
+            let skip = super::images::with(|im| !im.pending_clear_keys().is_empty())
+                || (!args.is_empty() && (past_conflicts_hit(a, &args) || self.exec.as_ref().is_some_and(|e| e.held_writes_now().overlaps_any(&args))));
+            if skip {
+                self.par_skip = (end, run_end);
+                self.par_skip_n = n;
+                HELD_RUNS[10].fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            // Its own fast clears whose values are known are applied now, before the run (as
+            // the pending ones are at a run's start, below: its workers would stop at their
+            // images' first uses).
+            if let Some(e) = self.exec.as_mut() {
+                let n = e.resolve_own_held_clears();
+                HELD_RUNS[12].fetch_add(n as u64, Ordering::Relaxed);
+            }
+        }
         lap.mark(2);
         // The label waits the run holds take their effect on this queue's
         // view now, as each would when reached (`end_copy_scope_after_wait`):
@@ -3117,6 +3293,12 @@ impl Cp {
             self.last_wait_kind = b'I';
             self.last_wait_gpu = false;
             self.end_copy_scope_after_wait(a, wide);
+            // (Held: read now, checked when the stretch settles, as `held_wait` notes it.)
+            if held_run {
+                if let Some(e) = self.exec.as_mut() {
+                    e.note_held_reads(&[(a, if wide { 8 } else { 4 })], 3);
+                }
+            }
             RUN_PASSED[1].fetch_add(1, Ordering::Relaxed);
         }
         // Pending fast clears are applied now (a worker cannot apply one at
@@ -3174,6 +3356,12 @@ impl Cp {
             self.sync_reads(&merged);
         }
         lap.mark(3);
+        // (Held: a fast clear or a read of its own held work stopped the stretch here; it
+        // settles before the command, `run`.)
+        if held_run && (self.exec.as_ref().is_some_and(|e| e.stopped) || self.held.as_ref().is_some_and(|h| h.stop.is_some())) {
+            HELD_RUNS[11].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         // The main command processor's chunk first (`par::main_weight`
         // times a worker's), then equal ones for the workers' queue.
         let m = chunks - 1;
@@ -3261,7 +3449,7 @@ impl Cp {
         // processor goes on from there before collecting the chunks).
         let mut end_unknown: Vec<u32> = Vec::new();
         let timing = lap.0.is_some();
-        let end_state = (super::tune::past_runs() && self.main_gfx).then(|| {
+        let end_state = (super::tune::past_runs() && self.main_gfx && !held_run).then(|| {
             let tc = timing.then(Instant::now);
             let mut st = st.clone();
             if let Some(tc) = tc {
@@ -3332,7 +3520,9 @@ impl Cp {
         // see it unsubmitted, so a batch with writes is submitted before
         // they start and they wait for it like for any submitted work (the
         // run handed over first measured level: 2026-10-17, 2026-11-03).
-        let main_writes = self.exec.as_ref().map(|e| e.unsubmitted_writes()).unwrap_or_default();
+        // (Held: nothing is submitted before the stretch settles; the workers stop on reading
+        // what its held work writes, `par::Run::held_writes`.)
+        let main_writes = if held_run { Default::default() } else { self.exec.as_ref().map(|e| e.unsubmitted_writes()).unwrap_or_default() };
         if lap.0.is_some() && !main_writes.is_empty() {
             // (Profile: how much of them the forwarded copies cover.)
             let ranges: Vec<(u64, u64)> = main_writes.iter().collect();
@@ -3362,7 +3552,28 @@ impl Cp {
         approved.sort_unstable();
         run.passed_waits = std::sync::Arc::from(approved);
         run.cp_writes = std::sync::Arc::from(cp_writes);
-        if self.main_gfx && !self.compute && super::hscensus::on() {
+        if held_run {
+            if let (Some(e), Some(w)) = (self.exec.as_ref(), self.past_wait.as_deref_mut()) {
+                // (The stretch's parts share front end 2's uploads from its first held run on,
+                // `Exec::fe2_share`: what it uploaded so far is its part's.)
+                if !w.sharing {
+                    e.claim_held_uploads(w.share, w.part);
+                    w.sharing = true;
+                }
+                run.held = true;
+                run.id = w.share;
+                run.part_base = w.part;
+                run.held_writes = Arc::new(e.held_writes_now());
+                run.held_keys = Arc::new(e.held_note_keys());
+                w.runs += 1;
+            }
+            let (share, part) = self.past_wait.as_deref().map_or((0, 0), |w| (w.share, w.part));
+            self.fe2_set_run(share, part as usize);
+            HELD_RUNS[0].fetch_add(1, Ordering::Relaxed);
+            HELD_RUNS[1].fetch_add(starts.len() as u64, Ordering::Relaxed);
+            HELD_RUNS[8].fetch_add((n - main_n) as u64, Ordering::Relaxed);
+        }
+        if self.main_gfx && !self.compute && super::hscensus::on() && !held_run {
             run.hs_seg = super::hscensus::next_segment();
             if let Some(e) = self.exec.as_mut() {
                 e.hs_seg = run.hs_seg;
@@ -3385,7 +3596,7 @@ impl Cp {
         super::par::RUNS.fetch_add(1, Ordering::Relaxed);
         super::par::CHUNKS.fetch_add(starts.len() as u64, Ordering::Relaxed);
         let buf = self.cur_buf;
-        self.par = Some(ParRun { starts, end: run_end, next: 0, run, waited_ns: 0, sync, sig, n, firsts, writes: Default::default(), end_state, end_unknown, buf, sub: self.sub_index });
+        self.par = Some(ParRun { starts, end: run_end, next: 0, run, waited_ns: 0, sync, sig, n, firsts, writes: Default::default(), end_state, end_unknown, buf, sub: self.sub_index, held: held_run, unheld: None });
         lap.mark(5);
         PLAN_PHASES[6].fetch_add(1, Ordering::Relaxed);
     }
@@ -3397,6 +3608,9 @@ impl Cp {
     /// state from its end, or from the packet where the worker stopped.
     /// Returns where to continue.
     fn par_collect(&mut self) -> u64 {
+        if self.par.as_ref().is_some_and(|p| p.held) {
+            return self.held_collect();
+        }
         // (Its own part of the run ends here.)
         self.fe2_set_run(0, 0);
         if self.past_ok() {
@@ -3455,6 +3669,246 @@ impl Cp {
         }
     }
 
+    /// The command processor reached the next chunk of a held run (`par::Run::held`): its own
+    /// batch so far is closed (a segment of the stretch's commit, `held_commit`), the chunk's
+    /// record awaited (its worker posts it once recorded) and merged into its held executor
+    /// (`Exec::merge_held_chunk`); then it goes on as `par_collect` does, as the stretch's next
+    /// part (`Exec::fe2_share`). A failed chunk (its batches dropped) is recorded here from its
+    /// start, the rest of the run cancelled. Returns where to continue.
+    fn held_collect(&mut self) -> u64 {
+        let (run, i, from, to, last, unheld) = {
+            let pr = self.par.as_mut().unwrap();
+            let i = pr.next;
+            pr.next += 1;
+            (pr.run.clone(), i, pr.starts[i], if i + 1 < pr.starts.len() { pr.starts[i + 1] } else { pr.end }, pr.next == pr.starts.len(), pr.unheld.is_some())
+        };
+        // Its own work before the chunk: closed, a segment of the stretch's commit (or, the
+        // stretch settled, to the GPU).
+        let marker = if unheld {
+            self.submit_gpu("par");
+            0
+        } else {
+            self.exec.as_mut().map_or(0, |e| e.close_held())
+        };
+        let tw = super::timeline::wait_start();
+        let (done, waited) = run.collect_held(i);
+        tw.end(&self.name, || "wait: held chunk".into());
+        HELD_RUNS[4].fetch_add(waited, Ordering::Relaxed);
+        let cost_key = self.par.as_ref().filter(|p| p.sig != 0 && !done.costs.is_empty()).and_then(|p| Some((p.sig, p.n, *p.firsts.get(i)?)));
+        let mut taken: Option<Box<Unheld>> = None;
+        if last {
+            taken = self.par.take().and_then(|p| p.unheld);
+        } else if let Some(pr) = self.par.as_mut() {
+            pr.waited_ns += waited;
+        }
+        if let Some((sig, n, first)) = cost_key {
+            self.note_chunk_costs(sig, n, first, &done.costs);
+        }
+        if done.stopped.is_some() {
+            super::par::note_stop(done.why);
+            super::par::STOPS.fetch_add(1, Ordering::Relaxed);
+            HELD_RUNS[2].fetch_add(1, Ordering::Relaxed);
+        }
+        if unheld {
+            return self.unheld_collect(&run, i, from, to, done, taken);
+        }
+        let failed = done.held.is_none();
+        if let Some(w) = self.past_wait.as_deref_mut() {
+            w.segs.push(HeldSeg::Cp(marker));
+            if let Some(h) = done.held.as_deref().filter(|h| h.batches > 0) {
+                w.segs.push(HeldSeg::Chunk(done.worker, h.batches));
+                if w.counts.len() <= done.worker {
+                    w.counts.resize(done.worker + 1, 0);
+                }
+                w.counts[done.worker] += h.batches;
+            }
+            w.part = run.part_base + i as u32 + 1;
+        }
+        if let (Some(h), Some(e)) = (done.held.as_deref(), self.exec.as_mut()) {
+            e.merge_held_chunk(h);
+        }
+        if failed {
+            // (Later chunks may have left pages to its claims: they go too, `held_cancelled`
+            // takes a new share.)
+            if self.par.is_some() {
+                self.par_cancel();
+            } else {
+                self.held_cancelled();
+            }
+        }
+        let (share, part) = self.past_wait.as_deref().map_or((0, 0), |w| (w.share, w.part));
+        self.fe2_set_run(share, part as usize);
+        self.set_chunk_state(&done.state);
+        match done.stopped {
+            Some(s) => s,
+            None => to,
+        }
+    }
+
+    /// A chunk of a held run whose stretch settled (`Unheld`), checked as the stretch was: its
+    /// CPU reads against what other queues wrote during the stretch, its images' pending clears
+    /// and reloads, its placed ranges at the label's epoch (pages written since its checks
+    /// uploaded first, `tune past_repair`). Then its batches go to the GPU (its image notes to
+    /// the image cache); else they are dropped, the rest of the run cancelled (later chunks may
+    /// have left pages to its uploads), and the chunk is recorded here from its start (`from`).
+    /// `taken`: the run's state when this was its last chunk. Returns where to continue.
+    fn unheld_collect(&mut self, run: &super::par::Run, i: usize, from: u64, to: u64, done: super::par::Done, taken: Option<Box<Unheld>>) -> u64 {
+        HELD_RUNS[13].fetch_add(1, Ordering::Relaxed);
+        let mut verdict: Result<Vec<(u64, u64)>, &'static str> = Err("failed");
+        if let Some(h) = done.held.as_deref() {
+            let u: Option<&Unheld> = match taken.as_deref() {
+                Some(u) => Some(u),
+                None => self.par.as_ref().and_then(|p| p.unheld.as_deref()),
+            };
+            if let (Some(u), Some(e)) = (u, self.exec.as_mut()) {
+                verdict = if h.reads.iter().any(|&(a, n)| u.writes.overlaps(a, n)) {
+                    Err("read what other queues wrote")
+                } else if !h.keys.is_empty() && super::images::any_pending() && {
+                    let keys: Vec<super::images::ImageKey> = h.keys.iter().copied().collect();
+                    super::images::with(|im| im.clears_pending(&keys) || im.overwrites_pending(&keys))
+                } {
+                    Err("images with pending clears or reloads")
+                } else if let Some(need) = u.need.filter(|&n| h.want_min < n) {
+                    e.chunk_stale_for(&h.ranges, &h.up, &u.up, need).ok_or("a check failed")
+                } else {
+                    Ok(Vec::new())
+                };
+            }
+        }
+        // Pages written since its checks: uploaded first (`tune past_repair`).
+        if let Ok(stale) = &verdict {
+            if !stale.is_empty() && !(super::tune::past_repair() && self.exec.as_mut().is_some_and(|e| e.repair_now(stale))) {
+                verdict = Err("checks older than its label");
+            }
+        }
+        match (verdict, done.held.as_deref()) {
+            (Ok(_), Some(h)) => {
+                if !h.clears.is_empty() || !h.over.is_empty() {
+                    super::images::with(|im| im.apply_held(&h.clears, &h.over));
+                }
+                let seq = if h.batches > 0 { self.par_pool.get(done.worker).and_then(|w| w.with_cp(|c| c.submit_closed_first(h.batches))) } else { None };
+                if let (Some(s), Some(e)) = (seq, self.exec.as_mut()) {
+                    e.depend_on(s, false);
+                }
+                let part = run.part_base + i as u32 + 1;
+                self.fe2_set_run(if self.par.is_some() { run.id } else { 0 }, part as usize);
+                self.set_chunk_state(&done.state);
+                match done.stopped {
+                    Some(s) => s,
+                    None => to,
+                }
+            }
+            (r, _) => {
+                HELD_RUNS[14].fetch_add(1, Ordering::Relaxed);
+                note_why(&HELD_DROPS, match r {
+                    Err(w) => w,
+                    Ok(_) => "failed",
+                });
+                // (Its batches: the first ones its worker's executor holds; the rest of the run's
+                // follow them.)
+                if self.par.is_some() {
+                    self.par_cancel();
+                } else {
+                    self.held_truncate(&[]);
+                }
+                self.fe2_set_run(0, 0);
+                from
+            }
+        }
+    }
+
+    /// Whether a parallel run may be planned while recording past a label wait (`tune
+    /// held_runs`): its chunks are recorded held (`par::Run::held`).
+    fn held_runs_ok(&self) -> bool {
+        super::tune::held_runs()
+            && self.past.is_none()
+            && self.past_wait.as_deref().is_some_and(|w| w.share != 0 && (w.part as usize) + 4 < super::fe2::RUN_CHUNKS as usize)
+            && self.held.as_ref().is_some_and(|h| h.stop.is_none())
+            && !self.exec.as_ref().is_some_and(|e| e.stopped)
+    }
+
+    /// A held run was cancelled (its workers left it): its chunks posted but not collected
+    /// drop their batches (after the collected ones in each worker's executor), and the stretch
+    /// takes a new share from here (their claims stay under the old one).
+    fn held_cancelled(&mut self) {
+        HELD_RUNS[5].fetch_add(1, Ordering::Relaxed);
+        let counts = self.past_wait.as_deref().map(|w| w.counts.clone()).unwrap_or_default();
+        self.held_truncate(&counts);
+        if let Some(w) = self.past_wait.as_deref_mut() {
+            w.share = super::par::new_run_id();
+            w.part = 0;
+        }
+        let share = self.past_wait.as_deref().map_or(0, |w| w.share);
+        // (What the stretch uploaded so far is the new share's first part.)
+        if let Some(e) = self.exec.as_ref() {
+            e.claim_held_uploads(share, 0);
+        }
+        self.fe2_set_run(share, 0);
+    }
+
+    /// Drops the closed batches of each worker's executor after the first `counts[i]` (none
+    /// kept past `counts`' end).
+    fn held_truncate(&self, counts: &[usize]) {
+        for i in 0..self.par_pool.count() {
+            let keep = counts.get(i).copied().unwrap_or(0);
+            if let Some(w) = self.par_pool.get(i) {
+                w.with_cp(|c| {
+                    if c.closed_count() > keep {
+                        c.discard_closed_tail(keep);
+                    }
+                });
+            }
+        }
+    }
+
+    /// The stretch's held work goes to the GPU in program order (`Exec::past_commit` with held
+    /// runs): the command processor's closed batches up to each marker, each collected chunk's
+    /// batches from its worker's executor (this queue's later work follows them), then the
+    /// rest of its own.
+    fn held_commit(&mut self, segs: &[HeldSeg], counts: &[usize]) {
+        let Some(e) = self.exec.as_mut() else { return };
+        e.past_commit_begin();
+        e.submit_repair_first();
+        let mut own = 0usize;
+        for s in segs {
+            match *s {
+                HeldSeg::Cp(marker) => {
+                    if marker > own {
+                        if let Some(e) = self.exec.as_mut() {
+                            e.submit_closed_first(marker - own);
+                        }
+                        own = marker;
+                    }
+                }
+                HeldSeg::Chunk(wi, k) => {
+                    let seq = self.par_pool.get(wi).and_then(|w| w.with_cp(|c| c.submit_closed_first(k)));
+                    HELD_RUNS[3].fetch_add(k as u64, Ordering::Relaxed);
+                    if let (Some(s), Some(e)) = (seq, self.exec.as_mut()) {
+                        e.depend_on(s, false);
+                    }
+                }
+            }
+        }
+        if let Some(e) = self.exec.as_mut() {
+            e.submit_closed();
+        }
+        // (Nothing should be left in the workers' executors: a cancelled run's batches were
+        // dropped at its cancel. A held run being collected keeps its chunks' there.)
+        for (i, &c) in counts.iter().enumerate().filter(|_| self.par.is_none()) {
+            if c > 0 {
+                if let Some(w) = self.par_pool.get(i) {
+                    w.with_cp(|cp| {
+                        let left = cp.closed_count();
+                        if left > 0 {
+                            HELD_RUNS[9].fetch_add(left as u64, Ordering::Relaxed);
+                            cp.discard_closed_tail(0);
+                        }
+                    });
+                }
+            }
+        }
+    }
+
     /// Whether a wait on `a` that does not pass at once is gone past: the
     /// graphics command processor at command-buffer depth 1 with nothing
     /// held, the label last written by queue 0x50 (since 2026-10-27; any
@@ -3496,6 +3950,12 @@ impl Cp {
             fence_pending: self.fence_pending,
             began: Instant::now(),
             ticks: 0,
+            share: if super::tune::held_runs() && held_backoff_pass(a) { super::par::new_run_id() } else { 0 },
+            part: 0,
+            segs: Vec::new(),
+            counts: Vec::new(),
+            runs: 0,
+            sharing: false,
         }));
         self.held = Some(Box::new(HeldCp { stop: None, commands: 0 }));
         super::exec::journal_begin();
@@ -3523,6 +3983,11 @@ impl Cp {
     /// on at the stop; else it is dropped (`Exec::past_drop`) and execution
     /// goes back to the wait, which passes now. Returns where.
     fn past_wait_settle(&mut self) -> Option<u64> {
+        // (A run held planning passed over, `tune held_runs`, may be planned once the stretch
+        // settled: its label passed, its clears applied at its start.)
+        if super::tune::held_runs() {
+            self.par_skip = (0, 0);
+        }
         let mut w = self.past_wait.take().unwrap();
         let held = self.held.take();
         let (why, at) = held.as_ref().and_then(|h| h.stop).unwrap_or(("stopped", w.at));
@@ -3583,7 +4048,7 @@ impl Cp {
             super::images::with(|im| im.clears_pending(&keys) || im.overwrites_pending(&keys))
         } {
             Some("images with pending clears or reloads")
-        } else if let Some((_, why)) = needs.filter(|&(n, _)| e.past_checks_want() < n && !e.past_current_for(n) && !audit) {
+        } else if let Some((_, why)) = needs.filter(|&(n, _)| e.past_checks_want() < n && !e.past_current_for(n) && !audit && !(super::tune::past_repair() && e.past_repair())) {
             Some(why)
         } else if super::tune::past_drop() {
             Some("dropped (past_drop)")
@@ -3613,8 +4078,26 @@ impl Cp {
             }
             e.past_drop();
             PAST_WAITS[2].fetch_add(1, Ordering::Relaxed);
+            // (A held run being collected is cancelled: its chunks lie after the wait. Held
+            // runs' chunks: their batches in the workers' executors.)
+            if self.par.as_ref().is_some_and(|p| p.held) {
+                self.par_cancel();
+            }
+            if w.counts.iter().any(|&c| c > 0) {
+                self.held_truncate(&[]);
+            }
+            if w.share != 0 {
+                self.fe2_set_run(0, 0);
+            }
+            if w.runs > 0 {
+                HELD_RUNS[7].fetch_add(1, Ordering::Relaxed);
+            }
             if d != "shutdown" {
-                past_backoff_note(w.a, true);
+                if w.runs > 0 {
+                    held_backoff_note(w.a, true);
+                } else {
+                    past_backoff_note(w.a, true);
+                }
             }
             // Back to the wait.
             self.set_chunk_state(&w.state);
@@ -3641,8 +4124,32 @@ impl Cp {
         if super::fe2::on() {
             self.end_copy_scope_after_wait(w.a, w.wide);
         }
-        self.exec.as_mut().unwrap().past_commit();
+        // (A held run being collected goes on: its remaining chunks are checked as they are
+        // collected, `unheld_collect`; the stretch's uploaded pages are current for them.)
+        let up = if self.par.as_ref().is_some_and(|p| p.held) { self.exec.as_ref().map(|e| e.past_up().clone()) } else { None };
+        if w.segs.is_empty() && w.counts.iter().all(|&c| c == 0) {
+            self.exec.as_mut().unwrap().past_commit();
+        } else {
+            self.held_commit(&w.segs, &w.counts);
+        }
+        match (self.par.as_mut(), up) {
+            (Some(pr), Some(up)) => {
+                pr.unheld = Some(Box::new(Unheld { writes, need: needs.map(|x| x.0), up }));
+                self.fe2_set_run(w.share, w.part as usize);
+            }
+            _ => {
+                if w.share != 0 {
+                    self.fe2_set_run(0, 0);
+                }
+            }
+        }
+        if w.runs > 0 {
+            HELD_RUNS[6].fetch_add(1, Ordering::Relaxed);
+        }
         PAST_WAITS[1].fetch_add(1, Ordering::Relaxed);
+        if w.runs > 0 {
+            held_backoff_note(w.a, false);
+        }
         past_backoff_note(w.a, false);
         if why == "label" {
             self.submit_gpu("label");
@@ -3912,6 +4419,9 @@ impl Cp {
         let Some(pr) = self.par.take() else { return };
         pr.run.cancel();
         super::par::CANCELLED.fetch_add(1, Ordering::Relaxed);
+        if pr.held {
+            self.held_cancelled();
+        }
     }
 
     /// The executing command's stage preparations made ahead ([vertex,
@@ -5252,10 +5762,20 @@ impl Cp {
                     None => break,
                 }
             }
-            if self.par.is_none() && !skip && is_command(opcode) && h & 1 == 0 && f.words.is_empty() && !f.live && self.exec.is_some() && self.held.is_none() && (if self.compute { compute_workers() > 0 } else { super::par::workers() > 0 }) && !super::capture::capturing() {
+            if self.par.is_none() && !skip && is_command(opcode) && h & 1 == 0 && f.words.is_empty() && !f.live && self.exec.is_some() && (self.held.is_none() || self.held_runs_ok()) && (if self.compute { compute_workers() > 0 } else { super::par::workers() > 0 }) && !super::capture::capturing() {
                 let t = class_start(classes);
                 self.par_plan(&f, cur, end);
                 class_end(7, t);
+                // (Held: planning stopped the stretch before this command.)
+                if self.held.is_some() && self.par.is_none() && self.held_halted(cur) {
+                    match self.settle_held() {
+                        Some(c) => {
+                            cur = c;
+                            continue;
+                        }
+                        None => break,
+                    }
+                }
             }
             PACKETS.fetch_add(1, Ordering::Relaxed);
             if self.depth == 1 && self.shape() {

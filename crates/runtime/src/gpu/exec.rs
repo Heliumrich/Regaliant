@@ -7545,9 +7545,39 @@ fn profiling() -> bool {
     *ON.get_or_init(|| std::env::var("DS_PROFILE_GPU").ok().as_deref() == Some("1"))
 }
 
+/// A chunk of a held run as its worker recorded it (`Exec::held_chunk_end`): its batches stay
+/// closed in the worker's executor until the stretch settles; what the stretch's checks need
+/// goes to the command processor's held executor (`Exec::merge_held_chunk`).
+#[derive(Default)]
+pub struct HeldChunk {
+    /// Its batches (the last ones its executor closed).
+    pub batches: usize,
+    /// What they write.
+    pub writes: super::ranges::Ranges,
+    /// Guest ranges it read on the CPU, the images its commands used, its own image-cache
+    /// notes (fast clears pending, images overwritten).
+    pub reads: Vec<(u64, u64)>,
+    pub keys: HashSet<super::images::ImageKey>,
+    pub clears: HashMap<super::images::ImageKey, (u64, Option<u32>)>,
+    pub over: HashSet<super::images::ImageKey>,
+    /// Front end 2: the ranges its checks placed, the pages its batches upload, the oldest
+    /// epoch its checks wanted (`Exec::past_current_for`).
+    pub ranges: Vec<(u64, u64)>,
+    pub up: HashSet<u64>,
+    pub want_min: u32,
+}
+
+/// Held runs' chunks stopped by a CPU read of held work before them (`Exec::held_run_writes`)
+/// and by an image the held work before them notes (`Exec::held_run_keys`): a fast clear of
+/// its own, an image it overwrote.
+pub static HELD_RUN_STOPS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
 /// Stretches past label waits checked again at their label
 /// (`Exec::past_current_for`): [stretches, ranges, found stale, ns].
 pub static PAST_CHECKS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Stretches past label waits whose stale pages were uploaded before them (`Exec::past_repair`):
+/// [stretches, runs, pages].
+pub static PAST_REPAIRS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// Hot pages of small bindings a stretch past a label wait uploaded as
 /// they are when it runs (`fe2::hot_pages`): [runs, pages].
 pub static PAST_HOT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -9716,6 +9746,12 @@ pub struct Exec {
     /// (`past_current_for`).
     past_ranges: Vec<(u64, u64)>,
     past_up: HashSet<u64>,
+    /// The runs that check found written since the stretch's checks (`tune past_repair`), and
+    /// whether an upload of one failed; a repair batch is the last closed one
+    /// (`submit_repair_first`).
+    past_stale: Vec<(u64, u64)>,
+    past_stale_err: bool,
+    repair: bool,
     /// Its own image-cache notes (`Images::notes_for`), never in the image
     /// cache before a hand-over: fast clears pending (metadata address,
     /// value when known) and GPU-owned images overwritten by its work.
@@ -9723,6 +9759,15 @@ pub struct Exec {
     held_over: HashSet<super::images::ImageKey>,
     /// The images its commands used.
     held_keys: HashSet<super::images::ImageKey>,
+    /// A held executor's stretch: what the held runs' chunks it collected write (their batches
+    /// are not its own, `closed_overlap` counts them as if they were; `Cp::held_collect`).
+    held_extra: super::ranges::Ranges,
+    /// A parallel worker recording a held run's chunk (`held_chunk_begin`): what the held work
+    /// before the run writes (a CPU read of it stops the chunk) and the images that work notes
+    /// fast clears or overwrites of (a use stops the chunk); its closed batches before the chunk.
+    held_run_writes: Option<std::sync::Arc<super::ranges::Ranges>>,
+    held_run_keys: Option<std::sync::Arc<HashMap<super::images::ImageKey, u8>>>,
+    held_base: usize,
     pub(crate) stopped: bool,
     /// Why (statistics), and the reason a caller gives a flush that follows.
     pub(crate) stop_why: &'static str,
@@ -10741,9 +10786,16 @@ impl Exec {
                 past_want_min: u32::MAX,
                 past_ranges: Vec::new(),
                 past_up: HashSet::new(),
+                past_stale: Vec::new(),
+                past_stale_err: false,
+                repair: false,
                 held_clears: HashMap::new(),
                 held_over: HashSet::new(),
                 held_keys: HashSet::new(),
+                held_extra: super::ranges::Ranges::new(),
+                held_run_writes: None,
+                held_run_keys: None,
+                held_base: 0,
                 stopped: false,
                 stop_why: "",
                 flush_why: "",
@@ -13981,6 +14033,23 @@ impl Exec {
             self.stop("reads a CP write of its run's earlier chunks");
             return true;
         }
+        if let Some(w) = self.held_run_writes.as_ref().filter(|w| w.overlaps_any(reads)) {
+            // (Words a copy recorded before left there are read as forwarded, as
+            // `sync_for_reads` takes them: no wait for that copy.)
+            let left = super::forward::uncovered(reads);
+            let left: &[(u64, u64)] = left.as_deref().unwrap_or(reads);
+            if let Some(&(a, n)) = left.iter().find(|&&(a, n)| w.overlaps(a, n)) {
+                HELD_RUN_STOPS[0].fetch_add(1, Ordering::Relaxed);
+                static LOGGED: AtomicU64 = AtomicU64::new(0);
+                if LOGGED.fetch_add(1, Ordering::Relaxed) < 24 {
+                    const WHY: [&str; 6] = ["CP read", "dispatch shader read", "dispatch texture", "draw shader read", "draw texture", "draw indices"];
+                    let hit: Vec<String> = w.intersect(a, n).iter().take(3).map(|&(x, m)| format!("{x:#x}+{m:#x}")).collect();
+                    crate::info!("gpu[{}]: a held chunk read {a:#x}+{n:#x} ({}), which the held work before its run writes ({}; stages {:#x} {:#x})", self.name, WHY[why.min(5)], hit.join(", "), self.sync_readers[0], self.sync_readers[1]);
+                }
+                self.stop("reads held work before its run");
+                return true;
+            }
+        }
         if self.hs_seg != 0 && super::hscensus::on() {
             super::hscensus::reads(reads, self.hs_seg, why, self.sync_readers[0]);
         }
@@ -14304,7 +14373,7 @@ impl Exec {
     /// Whether a closed batch not yet submitted (a deferred executor's)
     /// writes into `reads`.
     fn closed_overlap(&self, reads: &[(u64, u64)]) -> bool {
-        !self.closed.is_empty() && self.closed.iter().any(|b| b.writes.overlaps_any(reads))
+        (!self.closed.is_empty() && self.closed.iter().any(|b| b.writes.overlaps_any(reads))) || (!self.held_extra.is_empty() && self.held_extra.overlaps_any(reads))
     }
 
     /// A CP memory write that follows earlier GPU work, performed by the GPU
@@ -14487,7 +14556,7 @@ impl Exec {
             self.pending_promises.push((a, v, n));
             // (Past a run, a request ends the stretch: `Cp::run` settles it
             // and submits. A parallel worker's batch goes at its turn.)
-            if !(self.deferred && !self.held) {
+            if !(self.deferred && (!self.held || self.par_worker)) {
                 UNSUBMITTED_LABELS.lock().get_or_insert_with(HashMap::new).insert(a & !7, self.submit_request.clone());
                 // Another queue already blocks on it: submit at the next packet.
                 if super::tune::label_early() && super::cp::waited_now(a) {
@@ -15220,8 +15289,12 @@ impl Exec {
         let need = need.min(ep);
         let t = std::time::Instant::now();
         let (mut stale, mut checked) = (false, 0u64);
+        // (`tune past_repair`: every stale run, for `past_repair`.)
+        let all = super::tune::past_repair();
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        let mut failed = false;
         let mut i = 0;
-        while i < ranges.len() && !stale {
+        while i < ranges.len() && (!stale || all) {
             // (Overlapping and adjacent ranges as one.)
             let (lo, mut hi) = ranges[i];
             i += 1;
@@ -15232,6 +15305,7 @@ impl Exec {
             checked += 1;
             let r = super::fe2::ensure(lo, hi, need, ep, false, &|p| up.contains(&p), !up.is_empty(), &mut |a, b| {
                 stale = true;
+                runs.push((a, b));
                 if PAST_STALE_LOGGED.fetch_add(1, Ordering::Relaxed) < 40 {
                     // (try_lock: the caller may hold the memory map.)
                     let map = crate::mem::MEM.try_lock().map_or_else(|| "busy".into(), |m| m.find(a).map_or_else(|| "none".into(), |v| format!("{:#x}+{:#x} {:?} '{}'", v.start, v.size, v.kind, v.name)));
@@ -15240,12 +15314,86 @@ impl Exec {
                 true
             }, &fe2_armable);
             stale |= r.is_err();
+            failed |= r.is_err();
         }
+        self.past_stale = runs;
+        self.past_stale_err = failed;
+        self.past_up = up;
         PAST_CHECKS[0].fetch_add(1, Ordering::Relaxed);
         PAST_CHECKS[1].fetch_add(checked, Ordering::Relaxed);
         PAST_CHECKS[2].fetch_add(stale as u64, Ordering::Relaxed);
         PAST_CHECKS[3].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         !stale
+    }
+
+    /// The pages the stretch past a label wait uploads (`past_up`).
+    pub fn past_up(&self) -> &HashSet<u64> {
+        &self.past_up
+    }
+
+    /// The runs of `ranges` (placed by a held run's chunk collected after its stretch settled,
+    /// `Cp::unheld_collect`) written since its checks, as of epoch `need` (as `past_current_for`
+    /// checks a stretch's): empty when current, None when a check failed. Pages in `mine` or
+    /// `also` (uploaded by the chunk or by its stretch) count as current.
+    pub fn chunk_stale_for(&mut self, ranges: &[(u64, u64)], mine: &HashSet<u64>, also: &HashSet<u64>, need: u32) -> Option<Vec<(u64, u64)>> {
+        let mut ranges = ranges.to_vec();
+        ranges.sort_unstable();
+        if need > super::precache::epoch() as u32 {
+            super::precache::end_scope(1);
+        }
+        let ep = super::precache::epoch() as u32;
+        let need = need.min(ep);
+        let any = !mine.is_empty() || !also.is_empty();
+        let mut runs = Vec::new();
+        let mut i = 0;
+        while i < ranges.len() {
+            let (lo, mut hi) = ranges[i];
+            i += 1;
+            while i < ranges.len() && ranges[i].0 <= hi {
+                hi = hi.max(ranges[i].1);
+                i += 1;
+            }
+            let r = super::fe2::ensure(lo, hi, need, ep, false, &|p| mine.contains(&p) || also.contains(&p), any, &mut |a, b| {
+                runs.push((a, b));
+                true
+            }, &fe2_armable);
+            if r.is_err() {
+                return None;
+            }
+        }
+        Some(runs)
+    }
+
+    /// Uploads `runs` in a batch of their own, submitted now (`Cp::unheld_collect`: a held
+    /// run's chunk collected after its stretch settled, its pages written since its checks
+    /// copied before its batches run). False: not possible.
+    pub fn repair_now(&mut self, runs: &[(u64, u64)]) -> bool {
+        let Some((mbuf, _)) = super::resident::mirror_buffer() else { return false };
+        self.submit_for("par");
+        // (Copies of its own: no claim decides them.)
+        let share = std::mem::replace(&mut self.fe2_run, (0, 0));
+        self.begin();
+        let mut ok = self.recording && !self.stopped;
+        if ok {
+            let mut up = std::mem::take(&mut self.fe2_up);
+            for &(a, b) in runs {
+                if !self.fe2_upload(mbuf, a, b, &mut up) {
+                    ok = false;
+                    break;
+                }
+            }
+            self.fe2_up = up;
+        }
+        if self.recording {
+            self.submit_for("repair");
+        }
+        self.fe2_run = share;
+        if ok {
+            PAST_REPAIRS[0].fetch_add(1, Ordering::Relaxed);
+            PAST_REPAIRS[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+            PAST_REPAIRS[2].fetch_add(runs.iter().map(|r| (r.1 - r.0) / super::resident::PAGE).sum::<u64>(), Ordering::Relaxed);
+        }
+        ok
     }
 
     /// The view this queue's label writes submitted now are promised with
@@ -15269,6 +15417,64 @@ impl Exec {
     /// writes; its image notes go to the image cache; the open batch goes
     /// on as an ordinary one.
     pub fn past_commit(&mut self) {
+        self.past_commit_begin();
+        self.submit_repair_first();
+        self.submit_closed();
+    }
+
+    /// The pages the check at the stretch's label found written since its own checks
+    /// (`past_current_for`, `tune past_repair`) are uploaded in a batch of their own, the last
+    /// closed one, which goes to the GPU before the stretch's (`submit_repair_first`): its
+    /// copies run after the label, from guest memory as it is then. False: not possible (an
+    /// upload failed, no batch slot); the stretch is dropped then.
+    pub fn past_repair(&mut self) -> bool {
+        let runs = std::mem::take(&mut self.past_stale);
+        if runs.is_empty() || self.past_stale_err || self.repair {
+            return false;
+        }
+        let Some((mbuf, _)) = super::resident::mirror_buffer() else { return false };
+        // (The stretch settles: its stop is behind it.)
+        self.stopped = false;
+        self.stop_why = "";
+        // The batch being recorded ends the stretch's work (closed after it).
+        self.close_held();
+        // (Copies of its own: no claim of the stretch's share decides them.)
+        let share = std::mem::replace(&mut self.fe2_run, (0, 0));
+        self.begin();
+        let mut ok = self.recording && !self.stopped;
+        if ok {
+            let mut up = std::mem::take(&mut self.fe2_up);
+            for &(a, b) in &runs {
+                if !self.fe2_upload(mbuf, a, b, &mut up) {
+                    ok = false;
+                    break;
+                }
+            }
+            self.fe2_up = up;
+            self.submit_for("repair");
+        }
+        self.fe2_run = share;
+        if ok {
+            self.repair = true;
+            PAST_REPAIRS[0].fetch_add(1, Ordering::Relaxed);
+            PAST_REPAIRS[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+            PAST_REPAIRS[2].fetch_add(runs.iter().map(|r| (r.1 - r.0) / super::resident::PAGE).sum::<u64>(), Ordering::Relaxed);
+        }
+        ok
+    }
+
+    /// The repair batch (`past_repair`) goes to the GPU first.
+    pub fn submit_repair_first(&mut self) {
+        if std::mem::take(&mut self.repair) {
+            if let Some(b) = self.closed.pop() {
+                self.submit_closed_list(vec![b]);
+            }
+        }
+    }
+
+    /// `past_commit` up to the submission of its closed batches (`Cp::held_commit` submits
+    /// them between the held runs' chunks).
+    pub fn past_commit_begin(&mut self) {
         // Its forwarded copies become everyone's before its batches are
         // submitted (`forward::submitted` dates them).
         super::forward::hold_commit();
@@ -15294,7 +15500,7 @@ impl Exec {
         self.held_reads.clear();
         self.held_kinds.clear();
         self.held_keys.clear();
-        self.submit_closed();
+        self.held_extra.clear();
     }
 
     /// What it recorded past the run is dropped (`Cp::past_settle`): its
@@ -15329,6 +15535,9 @@ impl Exec {
         self.held_reads.clear();
         self.held_kinds.clear();
         self.held_keys.clear();
+        self.held_extra.clear();
+        self.repair = false;
+        self.past_stale.clear();
     }
 
     /// A stretch into held batches begins: not stopped, nothing read or
@@ -15342,6 +15551,137 @@ impl Exec {
         self.held_clears.clear();
         self.held_over.clear();
         self.held_keys.clear();
+        self.held_extra.clear();
+        self.past_stale.clear();
+        self.past_stale_err = false;
+        self.repair = false;
+    }
+
+    /// A parallel worker begins a chunk of a held run (`par::Run::held`): it records as the
+    /// command processor's held executor past a label wait does (its image notes its own, its
+    /// CPU reads, placed ranges and uploaded pages kept for the stretch's checks), and stops on
+    /// a CPU read of `writes` or a use of an image in `keys` (the held work before the run).
+    pub fn held_chunk_begin(&mut self, writes: std::sync::Arc<super::ranges::Ranges>, keys: std::sync::Arc<HashMap<super::images::ImageKey, u8>>) {
+        self.held = true;
+        self.past_grow = true;
+        self.held_reset();
+        self.past_want_min = u32::MAX;
+        self.past_ranges.clear();
+        self.past_up.clear();
+        self.held_base = self.closed.len();
+        self.held_run_writes = Some(writes);
+        self.held_run_keys = Some(keys);
+    }
+
+    /// The held chunk's end (its batch closed): its record; the executor records as a
+    /// worker's again, the chunk's batches left closed for the commit.
+    pub fn held_chunk_end(&mut self) -> HeldChunk {
+        let first = self.held_base.min(self.closed.len());
+        let mut writes = super::ranges::Ranges::new();
+        for b in &self.closed[first..] {
+            writes.extend(&b.writes);
+        }
+        let h = HeldChunk {
+            batches: self.closed.len() - first,
+            writes,
+            reads: std::mem::take(&mut self.held_reads),
+            keys: std::mem::take(&mut self.held_keys),
+            clears: std::mem::take(&mut self.held_clears),
+            over: std::mem::take(&mut self.held_over),
+            ranges: std::mem::take(&mut self.past_ranges),
+            up: std::mem::take(&mut self.past_up),
+            want_min: std::mem::replace(&mut self.past_want_min, u32::MAX),
+        };
+        self.held = false;
+        self.past_grow = false;
+        self.held_run_writes = None;
+        self.held_run_keys = None;
+        self.held_promises.clear();
+        self.held_kinds.clear();
+        self.cp_written.clear();
+        h
+    }
+
+    /// A held run's chunk collected by this held executor's command processor (`Cp::
+    /// held_collect`): its notes become this executor's, as if it had recorded the chunk
+    /// (its later commands and the stretch's checks see them).
+    pub fn merge_held_chunk(&mut self, h: &HeldChunk) {
+        self.held_extra.extend(&h.writes);
+        self.held_reads.extend_from_slice(&h.reads);
+        if trace_past_drops() {
+            self.held_kinds.resize(self.held_reads.len(), u8::MAX);
+        }
+        self.held_keys.extend(h.keys.iter().copied());
+        for (k, v) in &h.clears {
+            self.held_clears.insert(*k, *v);
+        }
+        self.held_over.extend(h.over.iter().copied());
+        if self.past_grow {
+            self.past_ranges.extend_from_slice(&h.ranges);
+            self.past_up.extend(h.up.iter().copied());
+            self.past_want_min = self.past_want_min.min(h.want_min);
+        }
+    }
+
+    /// What this held executor's unsubmitted work writes: the batch being recorded, its closed
+    /// batches and the held runs' chunks it collected (a held run's `par::Run::held_writes`).
+    pub fn held_writes_now(&self) -> super::ranges::Ranges {
+        let mut r = if self.recording { self.pending.clone() } else { super::ranges::Ranges::new() };
+        for b in &self.closed {
+            r.extend(&b.writes);
+        }
+        r.extend(&self.held_extra);
+        r
+    }
+
+    /// The images this held executor notes fast clears (0) or overwrites (1) of (`par::Run::
+    /// held_keys`).
+    pub fn held_note_keys(&self) -> HashMap<super::images::ImageKey, u8> {
+        self.held_clears.keys().map(|k| (*k, 0)).chain(self.held_over.iter().map(|k| (*k, 1))).collect()
+    }
+
+    /// The pages this held executor's stretch uploads (its own batches' and the held runs'
+    /// chunks' it collected, `past_up`) claimed for part `part` of the share `run` (`fe2::
+    /// run_claim`): the parts after them need not upload them again (`Cp::par_plan`).
+    pub fn claim_held_uploads(&self, run: u64, part: u32) {
+        use super::resident::PAGE;
+        let mut pages: Vec<u64> = self.past_up.iter().copied().collect();
+        pages.sort_unstable();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < pages.len() {
+            let a = pages[i];
+            let mut b = a + PAGE;
+            i += 1;
+            while i < pages.len() && pages[i] == b {
+                b += PAGE;
+                i += 1;
+            }
+            out.clear();
+            super::fe2::run_claim(a, b, run, part, &mut out);
+        }
+    }
+
+    /// This held executor's own fast clears whose values are known are applied now
+    /// (`resolve_fast_clears`): a held run planned here (`Cp::par_plan`) begins after them, and
+    /// its workers would stop at their images' first uses (they cannot apply them in program
+    /// order). How many were applied.
+    pub fn resolve_own_held_clears(&mut self) -> usize {
+        let keys: Vec<super::images::ImageKey> = self.held_clears.iter().filter(|(_, v)| v.1.is_some()).map(|(k, _)| *k).collect();
+        if keys.is_empty() {
+            return 0;
+        }
+        self.resolve_fast_clears(&keys);
+        keys.iter().filter(|k| !self.held_clears.contains_key(k)).count()
+    }
+
+    /// Closes the batch being recorded (a held run's chunk follows it, `Cp::held_collect`):
+    /// the number of closed batches.
+    pub fn close_held(&mut self) -> usize {
+        if self.recording {
+            self.submit_for("held run");
+        }
+        self.closed.len()
     }
 
     /// The images the frame-ahead recorder's commands used since
@@ -15384,6 +15724,11 @@ impl Exec {
     pub(crate) fn held_hit(&mut self, keys: &[super::images::ImageKey]) -> bool {
         if !self.held {
             return false;
+        }
+        if let Some(&kind) = self.held_run_keys.as_ref().filter(|s| !s.is_empty()).and_then(|s| keys.iter().find_map(|k| s.get(k))) {
+            HELD_RUN_STOPS[1 + kind.min(1) as usize].fetch_add(1, Ordering::Relaxed);
+            self.stop(if kind == 0 { "an image the held work before its run clears" } else { "an image the held work before its run overwrote" });
+            return true;
         }
         self.held_keys.extend(keys.iter().copied());
         keys.iter().any(|k| self.held_clears.contains_key(k) || self.held_over.contains(k))
@@ -15556,10 +15901,44 @@ impl Exec {
         if self.par_worker && !self.held {
             self.held_promises.clear();
         }
-        if !self.recording {
+        // (Closed batches left, a held run's: their imports are still to be kept.)
+        if !self.recording && self.closed.is_empty() {
             self.open_gen.store(u64::MAX, Ordering::SeqCst);
         }
         last
+    }
+
+    /// Submits the first `n` batches this deferred executor closed (a held run's chunk or the
+    /// held work before one, `Cp::held_commit`); the last one's sequence.
+    pub fn submit_closed_first(&mut self, n: usize) -> Option<u64> {
+        let rest = self.closed.split_off(n.min(self.closed.len()));
+        let first = std::mem::replace(&mut self.closed, rest);
+        self.submit_closed_list(first)
+    }
+
+    /// Drops the batches this deferred executor closed after the first `keep` (a held run's
+    /// chunks not taken: cancelled, failed, or their stretch dropped).
+    pub fn discard_closed_tail(&mut self, keep: usize) {
+        if keep == 0 {
+            self.discard_closed();
+            return;
+        }
+        let tail = self.closed.split_off(keep.min(self.closed.len()));
+        let c = ctx();
+        for b in tail {
+            super::forward::drop_checks(&b.forward_ids);
+            super::forward::drop_entries(&b.forward_ids);
+            super::resident::dropped(&b.res_pages);
+            let s = &mut self.slots[b.slot];
+            unsafe {
+                c.device.reset_command_buffer(s.cmd, vk::CommandBufferResetFlags::empty()).ok();
+                c.device.reset_command_buffer(s.pre, vk::CommandBufferResetFlags::empty()).ok();
+                c.device.reset_descriptor_pool(s.desc_pool, vk::DescriptorPoolResetFlags::empty()).ok();
+            }
+            s.homes.clear();
+            s.keep.clear();
+            s.seq = 0;
+        }
     }
 
     /// Closes the batch being recorded (a deferred executor at the end of

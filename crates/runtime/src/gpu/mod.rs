@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 172] = [
+    static ALL: [Tunable; 175] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -204,6 +204,9 @@ pub mod tune {
         Tunable { name: "behind_us", env: "DS_BEHIND_US", default: 300, value: AtomicU64::new(UNSET) },
         Tunable { name: "async_gfx", env: "DS_ASYNC_GFX", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "async_gfx_workers", env: "DS_ASYNC_GFX_WORKERS", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "held_runs", env: "DS_HELD_RUNS", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "past_repair", env: "DS_PAST_REPAIR", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "held_min", env: "DS_HELD_MIN", default: 192, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1385,6 +1388,38 @@ pub mod tune {
             0 => (std::thread::available_parallelism().map_or(8, |n| n.get()) / 6).max(2),
             n => (n as usize).min(16),
         }
+    }
+
+    /// Parallel runs inside a stretch recorded past a label wait (`Cp::past_wait_start`): the
+    /// graphics command processor plans them there as elsewhere (runs of `held_min` commands or
+    /// more), its workers record the chunks held (submitted when the stretch commits, in program
+    /// order: `Cp::held_collect`; a run still being collected when it settles goes on unheld,
+    /// each chunk checked as the stretch was: `Cp::unheld_collect`), and the stretch's parts
+    /// share front end 2's uploads from its first held run (`Exec::fe2_share`). Since
+    /// 2026-11-13 (TowerL Top x1.006-1.009, the CP -0.5-0.65 ms a flip; Castlewall Front level;
+    /// FINDINGS.md). 0: a stretch is recorded by the command processor alone (as before).
+    #[inline]
+    pub fn held_runs() -> bool {
+        get(172) != 0
+    }
+
+    /// A stretch past a label wait whose check at its label (`Exec::past_current_for`) finds
+    /// pages written since its own checks uploads them in a batch of their own, submitted before
+    /// the stretch's (its copies run after the label, from guest memory as it is then:
+    /// `Exec::past_repair`), instead of being dropped and recorded again. Since 2026-11-13 (held
+    /// runs' chunks check earlier: their stale drops and the backoff they caused, ~200 waits a
+    /// window not gone past at TowerL Top, went). 0: dropped (as before).
+    #[inline]
+    pub fn past_repair() -> bool {
+        get(173) != 0
+    }
+
+    /// The fewest commands a run planned inside a stretch past a label wait is held at (`tune
+    /// held_runs`): shorter ones are recorded by the command processor as before (Castlewall
+    /// Front's ~96-command runs cost it a wait per chunk for no time saved).
+    #[inline]
+    pub fn held_min() -> usize {
+        get(174) as usize
     }
 
     /// Whether translations get `rdna::translate::Spec::hw_bounds` (scalar

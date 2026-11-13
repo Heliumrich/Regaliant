@@ -23,7 +23,11 @@
 //! and then gives the next chunk its turn. (Long runs through the title's
 //! GPU-side synchronization, `tune long_runs`, chained, parked and sealed
 //! work and runs past label waits were level and are removed: FINDINGS.md
-//! 2026-11-01.)
+//! 2026-11-01.) Inside a stretch the graphics command processor records past
+//! a label wait, runs are held (`Run::held`, `tune held_runs`, since
+//! 2026-11-13): the workers post each chunk once recorded and keep its
+//! batches until the stretch settles, when the command processor submits
+//! them in program order (`Cp::held_collect`, `Cp::held_commit`).
 
 use super::cp::{ChunkState, Cp};
 use parking_lot::{Condvar, Mutex};
@@ -141,6 +145,10 @@ pub struct Done {
     pub costs: Vec<u32>,
     /// What its batches write (`DS_RUN_PROBE` only).
     pub writes: super::ranges::Ranges,
+    /// A held run's chunk (`Run::held`): its record (None: failed, its batches dropped), and
+    /// the worker whose executor keeps its batches (`Pool::get`).
+    pub held: Option<Box<super::exec::HeldChunk>>,
+    pub worker: usize,
 }
 
 /// The chunks of a parallel run that the workers record (all but the main
@@ -182,10 +190,28 @@ pub struct Run {
     /// The graphics queue's handshake census: the run's segment
     /// (`gpu::hscensus`; 0: not counted).
     pub hs_seg: u64,
+    /// Planned inside a stretch recorded past a label wait (`tune held_runs`): its workers
+    /// record each chunk held (`Exec::held_chunk_begin`) and post it as recorded without
+    /// waiting for a turn, its batches left in their executors until the stretch settles
+    /// (`Cp::held_collect`, `Cp::held_commit`); `id` is the stretch's share and chunk i its
+    /// part `part_base` + i + 1. `held_writes` and `held_keys`: what the held work before it
+    /// writes and the images that work notes (a chunk's CPU read or use of one stops it).
+    pub held: bool,
+    pub part_base: u32,
+    pub held_writes: Arc<super::ranges::Ranges>,
+    pub held_keys: Arc<std::collections::HashMap<super::images::ImageKey, u8>>,
+    /// A held run's chunks recorded (posted in any order: `collect_held`).
+    recorded: Vec<AtomicBool>,
 }
 
 /// Run ids (`Run::id`; 0: none).
 static RUN_IDS: AtomicU64 = AtomicU64::new(1);
+
+/// A new id in the runs' space (`Run::id`): a stretch's share of front end 2's uploads
+/// (`Cp::past_wait_start`, `tune held_runs`).
+pub fn new_run_id() -> u64 {
+    RUN_IDS.fetch_add(1, Ordering::Relaxed)
+}
 
 impl Run {
     /// The run of `chunks` ([start state, first packet, end]).
@@ -208,7 +234,41 @@ impl Run {
             passed_waits: std::sync::Arc::from(Vec::new()),
             cp_writes: std::sync::Arc::from(Vec::new()),
             hs_seg: 0,
+            held: false,
+            part_base: 0,
+            held_writes: Arc::new(super::ranges::Ranges::new()),
+            held_keys: Arc::new(std::collections::HashMap::new()),
+            recorded: (0..n).map(|_| AtomicBool::new(false)).collect(),
         }
+    }
+
+    /// Waits for chunk `i` of a held run to be recorded (`Run::held`): it and how long the
+    /// wait took (ns).
+    pub fn collect_held(&self, i: usize) -> (Done, u64) {
+        let ready = || self.recorded[i].load(Ordering::Acquire);
+        let ns = if ready() {
+            0
+        } else {
+            let t = std::time::Instant::now();
+            let mut spins = 0;
+            let limit = super::tune::par_spins();
+            while spins < limit && !ready() {
+                std::hint::spin_loop();
+                spins += 1;
+            }
+            let mut g = self.lock.lock();
+            let mut logged = false;
+            while !ready() {
+                if self.cv.wait_for(&mut g, std::time::Duration::from_secs(3)).timed_out() && !logged && !ready() {
+                    logged = true;
+                    crate::warn!("gpu: waiting > 3 s for chunk {i} of a held run of {} chunks: taken {}, workers on it {}, cancelled {}", self.chunks.len(), self.next.load(Ordering::Acquire), self.active.load(Ordering::Acquire), self.cancelled.load(Ordering::Acquire));
+                }
+            }
+            t.elapsed().as_nanos() as u64
+        };
+        WAIT_NS.fetch_add(ns, Ordering::Relaxed);
+        let d = self.results.lock()[i].take().expect("held chunk collected twice");
+        (d, ns)
     }
 
     fn notify(&self) {
@@ -312,6 +372,8 @@ impl Run {
 }
 
 pub struct Worker {
+    /// Its index in its pool (`Pool::get`).
+    idx: usize,
     /// The command processor it records chunks with (its own executor).
     cp: Mutex<Cp>,
     /// Runs given it, taken in order, and whether there is one (what a
@@ -447,7 +509,7 @@ impl Pool {
                 crate::warn!("gpu[{wname}]: no executor for a parallel worker ({e})");
                 return None;
             }
-            let w = Arc::new(Worker { cp: Mutex::new(cp), job: Mutex::new(Default::default()), has_job: AtomicBool::new(false), wake: self.wake.clone() });
+            let w = Arc::new(Worker { idx: n, cp: Mutex::new(cp), job: Mutex::new(Default::default()), has_job: AtomicBool::new(false), wake: self.wake.clone() });
             let w2 = w.clone();
             let tname = wname.clone();
             let qname = name.to_string();
@@ -481,6 +543,18 @@ impl Pool {
 impl Default for Pool {
     fn default() -> Pool {
         Pool::new()
+    }
+}
+
+impl Pool {
+    /// Worker `i`, if it was started.
+    pub fn get(&self, i: usize) -> Option<Arc<Worker>> {
+        self.workers.get(i).cloned()
+    }
+
+    /// Workers started.
+    pub fn count(&self) -> usize {
+        self.workers.len()
     }
 }
 
@@ -544,8 +618,11 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
         cp.chunk_waits = run.passed_waits.clone();
         cp.set_run_writes(run.cp_writes.iter().filter(|w| w.0 < from).map(|w| (w.1, w.2)).collect());
         cp.fe2_set_view(run.fe2_view);
-        cp.fe2_set_run(run.id, i + 1);
+        cp.fe2_set_run(run.id, if run.held { run.part_base as usize + i + 1 } else { i + 1 });
         cp.chunk_start();
+        if run.held {
+            cp.held_chunk_begin(run.held_writes.clone(), run.held_keys.clone());
+        }
         cp.chunk_costs = run.timed.then(|| Vec::with_capacity(512));
         lap(1, &mut t);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cp.run_chunk(from, to)));
@@ -554,6 +631,12 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
         lap(2, &mut t);
         cp.chunk_finish();
         cp.fe2_set_run(0, 0);
+        if run.held {
+            let held = cp.held_chunk_end();
+            lap(3, &mut t);
+            post_held(run, i, cp, stopped, failed, state, held, w.idx);
+            continue;
+        }
         lap(3, &mut t);
         let ready = || run.turn.load(Ordering::Acquire) > i || run.cancelled.load(Ordering::Acquire);
         if !ready() {
@@ -581,13 +664,13 @@ fn commit(run: &Run, i: usize, mut cp: parking_lot::MutexGuard<'_, Cp>, stopped:
         return;
     }
     let done = if failed {
-        Done { stopped, state: *state, last: None, why: "failed", costs: Vec::new(), writes: Default::default() }
+        Done { stopped, state: *state, last: None, why: "failed", costs: Vec::new(), writes: Default::default(), held: None, worker: 0 }
     } else {
         let writes = if super::runprobe::on() || super::tune::past_runs() { cp.worker_writes() } else { Default::default() };
         let last = cp.worker_submit();
         let why = if stopped.is_some() { cp.worker_stop_why() } else { "" };
         let state = cp.chunk_state();
-        Done { stopped, state, last, why, costs: cp.chunk_costs.take().unwrap_or_default(), writes }
+        Done { stopped, state, last, why, costs: cp.chunk_costs.take().unwrap_or_default(), writes, held: None, worker: 0 }
     };
     drop(cp);
     run.results.lock()[i] = Some(done);
@@ -600,11 +683,46 @@ fn commit(run: &Run, i: usize, mut cp: parking_lot::MutexGuard<'_, Cp>, stopped:
     lap4(&mut t);
 }
 
+/// Chunk `i` of a held run (`Run::held`), recorded in `cp`: posted as recorded with what the
+/// stretch's checks need, its batches left closed in `cp`'s executor for the stretch's commit
+/// (`Cp::held_commit`); cancelled, its batches are dropped and it is not posted; failed, they
+/// are dropped and it is posted for the main command processor to record from its start.
+#[allow(clippy::too_many_arguments)]
+fn post_held(run: &Run, i: usize, mut cp: parking_lot::MutexGuard<'_, Cp>, stopped: Option<u64>, failed: bool, state: Box<ChunkState>, held: super::exec::HeldChunk, worker: usize) {
+    let mut t = std::time::Instant::now();
+    let cancelled = run.cancelled.load(Ordering::SeqCst);
+    if failed || cancelled {
+        let keep = cp.closed_count().saturating_sub(held.batches);
+        cp.discard_closed_tail(keep);
+        if cancelled {
+            return;
+        }
+    }
+    let done = if failed {
+        Done { stopped, state: *state, last: None, why: "failed", costs: Vec::new(), writes: Default::default(), held: None, worker }
+    } else {
+        let why = if stopped.is_some() { cp.worker_stop_why() } else { "" };
+        let state = cp.chunk_state();
+        Done { stopped, state, last: None, why, costs: cp.chunk_costs.take().unwrap_or_default(), writes: Default::default(), held: Some(Box::new(held)), worker }
+    };
+    drop(cp);
+    run.results.lock()[i] = Some(done);
+    run.recorded[i].store(true, Ordering::Release);
+    run.notify();
+    lap4(&mut t);
+}
+
 fn lap4(t: &mut std::time::Instant) {
     PHASE_NS[4].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
 }
 
 impl Worker {
+    /// Runs `f` on its command processor (waiting while it records a chunk): the commit or
+    /// drop of a held run's batches its executor keeps (`Cp::held_commit`).
+    pub fn with_cp<R>(&self, f: impl FnOnce(&mut Cp) -> R) -> R {
+        f(&mut self.cp.lock())
+    }
+
     /// Gives it `run` to take chunks of; it starts once its pool wakes
     /// (`Pool::wake`; `Run::active` counts it from then on).
     pub fn give(&self, run: Arc<Run>) {
