@@ -1452,9 +1452,15 @@ fn fmt_run_time(key_spec: &Spec, specialized: u64, plan_key: u64, addr: u64, ins
     if !super::exec::compute_key_stored(plan_key ^ h.rotate_left(1)) {
         // (Diagnosis, DS_FMT_MISS_TRACE=1: the preparation's guess for the same program against
         // the run-time variant looked up.)
-        if std::env::var("DS_FMT_MISS_TRACE").ok().as_deref() == Some("1") {
+        static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let limit = *LIMIT.get_or_init(|| match std::env::var("DS_FMT_MISS_TRACE").ok().and_then(|v| v.parse::<u32>().ok()) {
+            Some(1) => 24,
+            Some(n) => n,
+            None => 0,
+        });
+        if limit > 0 {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 24 {
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < limit {
                 let code_hash = plan_key ^ (rt.user_sgprs as u64) << 48 ^ (rt.user_base as u64) << 56;
                 let mut g = guess_compute_spec(0, insts, plan, code_hash, rt.cs_rsrc2, rt.cs_local_size);
                 if g.lod_stats && !g.batched && cs_lod_rotation() && !rt.lod_stats {
