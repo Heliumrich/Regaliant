@@ -329,6 +329,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             true
         }
         WM_TIMER if wp == shaders::TIMER => with_app(shaders::tick).is_some(),
+        WM_TIMER if wp == shaders::CHECK_TIMER => with_app(shaders::check_tick).is_some(),
         WM_GAME_EXIT => {
             handle_exit(hwnd, wp);
             true
@@ -469,6 +470,11 @@ fn main() {
         app.show_page(first);
         app.update_play();
         startup_status(&mut app);
+        // (The prepared shaders checked against this build's translation; `--shot` runs skip it.)
+        if arg("--shot").is_none() {
+            shaders::start_check(&app);
+            SetTimer(hwnd, shaders::CHECK_TIMER, 500, None);
+        }
         // `--shot <file>`: each page as <file>-<page>.png, then exit (layout checks).
         let shot = arg("--shot").map(PathBuf::from);
         APP.with(|a| *a.borrow_mut() = Some(app));

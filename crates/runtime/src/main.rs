@@ -70,6 +70,9 @@ pub struct Config {
     pub compile_bench: Option<Vec<String>>,
     /// `--precompile-all [threads]` (`gpu::compbench::precompile_all`).
     pub precompile_all: Option<usize>,
+    /// `--translation-fingerprint`: prints `translation = <fingerprint>` (the launcher's check
+    /// that the prepared shaders match this build: `gpu::compbench::translation_fingerprint`).
+    pub translation_fingerprint: bool,
     /// `--progress <file>`: the precompile's progress for the launcher.
     pub progress: Option<PathBuf>,
     /// `--safe-mode` (the launcher's, for one start): the PC settings' defaults for this session
@@ -191,6 +194,7 @@ fn parse_args() -> Config {
     let mut pipeline_test = None;
     let mut compile_bench: Option<Vec<String>> = None;
     let mut precompile_all: Option<usize> = None;
+    let mut translation_fingerprint = false;
     let mut progress = None;
     let mut safe_mode = false;
     let mut dispatch_bench = false;
@@ -232,6 +236,7 @@ fn parse_args() -> Config {
                 }
                 precompile_all = Some(n.unwrap_or(8));
             }
+            "--translation-fingerprint" => translation_fingerprint = true,
             "--record-bench" => {
                 let file = args.next().expect("--record-bench needs a capture file");
                 let cs = args.next().and_then(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok());
@@ -282,6 +287,7 @@ fn parse_args() -> Config {
         record_bench,
         compile_bench,
         precompile_all,
+        translation_fingerprint,
         progress,
         safe_mode,
         dispatch_bench,
@@ -1787,6 +1793,21 @@ This happens when other software takes that range. Restart the PC and try again.
     });
     if let Some(a) = &cfg.compile_bench {
         let code = gpu::compbench::run(a, &cfg.app);
+        log::flush();
+        std::process::exit(code);
+    }
+    if cfg.translation_fingerprint {
+        let code = match gpu::compbench::translation_fingerprint(&cfg.app) {
+            Ok(fp) => {
+                println!("translation = {fp}");
+                info!("translation fingerprint: {fp}");
+                0
+            }
+            Err(e) => {
+                error!("translation fingerprint: {e}");
+                2
+            }
+        };
         log::flush();
         std::process::exit(code);
     }

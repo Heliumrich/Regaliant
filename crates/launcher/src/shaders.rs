@@ -2,7 +2,10 @@
 //! program of the game's shader files compiled into the player's own pipeline store), with its
 //! progress, a stop that lets the current shaders finish, and the option to prepare them when
 //! Play is pressed the first time. Prepared shaders hold for one graphics card and driver
-//! (prepared.txt records them); a new driver asks for another preparation.
+//! (prepared.txt records them) and for the game's translation of them: a new driver, or a
+//! version of the port that translates the shaders differently (`dsport
+//! --translation-fingerprint`, checked once at start on a thread of its own), asks for another
+//! preparation.
 
 use crate::sys;
 use crate::ui::{self, Builder};
@@ -18,6 +21,53 @@ const ID_STOP: i32 = 202;
 const ID_AUTO: i32 = 203;
 /// The timer that follows a preparation.
 pub const TIMER: usize = 3;
+/// The timer that waits for the translation check (`start_check`).
+pub const CHECK_TIMER: usize = 4;
+
+/// This build's translation fingerprint (`dsport --translation-fingerprint`): None while the
+/// check runs, then its answer.
+static CHECK: std::sync::Mutex<Option<Result<String, String>>> = std::sync::Mutex::new(None);
+static CHECK_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Asks the game for its translation fingerprint on a thread of its own (a few seconds).
+pub fn start_check(app: &App) {
+    if CHECK_STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let exe = app.paths.exe_dir.join(dsconfig::paths::GAME_EXE);
+    let dir = app.paths.exe_dir.clone();
+    std::thread::spawn(move || {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+        let r = std::process::Command::new(&exe)
+            .arg("--translation-fingerprint")
+            .current_dir(&dir)
+            .creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .map_err(|e| e.to_string())
+            .and_then(|o| {
+                String::from_utf8_lossy(&o.stdout).lines().find_map(|l| l.trim().strip_prefix("translation = ").map(|v| v.trim().to_string())).filter(|v| !v.is_empty()).ok_or_else(|| format!("no answer (exit code {:?})", o.status.code()))
+            });
+        *CHECK.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+    });
+}
+
+/// The check's answer once it has one.
+fn checked_translation() -> Option<Result<String, String>> {
+    CHECK.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// The check timer: the page shows the check's outcome once it has one.
+pub fn check_tick(app: &mut App) {
+    if checked_translation().is_some() {
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::KillTimer(app.hwnd, CHECK_TIMER) };
+        refresh(app);
+        app.update_play();
+    }
+}
 
 #[derive(Default)]
 pub struct Page {
@@ -57,6 +107,18 @@ pub fn state(app: &App) -> (bool, String) {
     let get = |k: &str| kv.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone()).unwrap_or_default();
     let date = get("date");
     let date = if date.len() >= 8 { format!("{}-{}-{}", &date[..4], &date[4..6], &date[6..8]) } else { date };
+    // (A marker from before the translation fingerprint, or from a version of the port that
+    // translates the shaders differently: its pipelines no longer match.)
+    let updated = (false, "The game was updated since the shaders were prepared. Prepare them again.".to_string());
+    let translation = get("translation");
+    if translation.is_empty() {
+        return updated;
+    }
+    if let Some(Ok(current)) = checked_translation() {
+        if current != translation {
+            return updated;
+        }
+    }
     match sys::gpu() {
         Ok(g) if g.name == get("device") && g.driver.to_string() == get("driver") => (true, format!("The shaders are prepared (on {date}, for this graphics card and driver).")),
         Ok(g) if g.name == get("device") => (false, "The graphics driver changed since the shaders were prepared. Prepare them again.".into()),
@@ -66,6 +128,11 @@ pub fn state(app: &App) -> (bool, String) {
 }
 
 pub fn prepared(app: &App) -> bool {
+    // (Play waits for the translation check, a few seconds at most.)
+    let t = Instant::now();
+    while CHECK_STARTED.load(std::sync::atomic::Ordering::Relaxed) && checked_translation().is_none() && t.elapsed().as_secs() < 20 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     state(app).0
 }
 

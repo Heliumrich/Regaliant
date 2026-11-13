@@ -270,6 +270,44 @@ fn object_regs(o: &[u8]) -> Option<(u32, [u32; 3])> {
 /// with the spec guessed from its shader object, once per code hash.
 fn bundle_compute(app: &std::path::Path) -> Vec<(u64, std::sync::Arc<Vec<u32>>, Vec<rdna::translate::Spec>)> {
     let sample: u64 = std::env::var("DS_CB_SAMPLE").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(1);
+    bundle_compute_sampled(app, sample)
+}
+
+/// The programs a preparation's fingerprint translates: one in this many by code hash
+/// (~16 of the game's 8,233 compute programs).
+const FINGERPRINT_SAMPLE: u64 = 509;
+
+/// The translation fingerprint of the prepared shaders: a sample of the game's compute
+/// programs (`FINGERPRINT_SAMPLE`) translated as `precompile_all` translates them, their
+/// SPIR-V hashed. A port update that changes translations changes it; the prepared pipelines
+/// then no longer match (the store takes a binary only for the SPIR-V it was made from), so
+/// the launcher asks for another preparation (`prepared.txt`'s `translation`).
+pub fn translation_fingerprint(app: &std::path::Path) -> Result<String, String> {
+    // (Specs depend on the device's features.)
+    super::vk::init().map_err(|e| format!("Vulkan: {e}"))?;
+    let progs = bundle_compute_sampled(app, FINGERPRINT_SAMPLE);
+    if progs.is_empty() {
+        return Err("no compute programs found in the game's shader files".into());
+    }
+    let mut items: Vec<(u64, u64)> = progs
+        .into_iter()
+        .filter_map(|(h, code, mut specs)| {
+            let mut spec = specs.pop()?;
+            if spec.lod_stats && !spec.batched && super::shaders::cs_lod_rotation() {
+                spec.lod_stats = false;
+                spec.lod_lean = false;
+            }
+            let tr = super::shaders::translate_code_unkept(&code, h, spec).ok()?;
+            Some((h, super::shaders::hash_words(&tr.out.spirv)))
+        })
+        .collect();
+    items.sort_unstable();
+    let fp = items.iter().fold(0xcbf2_9ce4_8422_2325u64, |a, &(h, s)| ((a ^ h).wrapping_mul(0x100_0000_01b3) ^ s).wrapping_mul(0x100_0000_01b3));
+    Ok(format!("{fp:016x}-{}", items.len()))
+}
+
+/// `bundle_compute`, one program in `sample` by code hash.
+fn bundle_compute_sampled(app: &std::path::Path, sample: u64) -> Vec<(u64, std::sync::Arc<Vec<u32>>, Vec<rdna::translate::Spec>)> {
     let mut files: Vec<std::path::PathBuf> = Vec::new();
     let pdir = app.join("particles").join("!cookedparticleshaders").join("version01").join("_ps5");
     files.extend(std::fs::read_dir(&pdir).into_iter().flatten().flatten().map(|e| e.path()));
@@ -446,8 +484,14 @@ pub fn precompile_all(app: &std::path::Path, threads: usize, progress: Option<&s
         let c = super::vk::ctx();
         let props = unsafe { c.instance.get_physical_device_properties(c.pdev) };
         let uuid: String = props.pipeline_cache_uuid.iter().map(|b| format!("{b:02x}")).collect();
+        // (What the pipelines were translated as: another build that translates differently
+        // makes them stale, `translation_fingerprint`.)
+        let translation = translation_fingerprint(app).unwrap_or_else(|e| {
+            crate::warn!("precompile all: no translation fingerprint ({e})");
+            String::new()
+        });
         let t = format!(
-            "# The game's shaders prepared ahead (dsport --precompile-all); written when all were done\ndate = {}\nprograms = {}\nfailed = {}\nseconds = {:.0}\ndevice = {}\ndriver = {}\ncache_uuid = {uuid}\n",
+            "# The game's shaders prepared ahead (dsport --precompile-all); written when all were done\ndate = {}\nprograms = {}\nfailed = {}\nseconds = {:.0}\ndevice = {}\ndriver = {}\ncache_uuid = {uuid}\ntranslation = {translation}\n",
             crate::utc_stamp(),
             progs.len(),
             failed.load(Relaxed),
