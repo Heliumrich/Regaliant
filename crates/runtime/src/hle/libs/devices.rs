@@ -279,31 +279,6 @@ sysv! {
         if !ptr.is_null() {
             raw_add(h, &port, ptr);
         }
-        {
-            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n == 50 {
-                crate::info!("sceAudioOutOutput port {h} buffer {:#x} from {}", ptr as u64, crate::exception::current_guest_frames(8).join(" <- "));
-            }
-            // (Diagnosis: the title's RAD sound voices, their volume, pan, channels and speaker
-            // gains, from its voice list at eboot+0x336BE98, about once a second.)
-            if n % 180 == 20 {
-                if let Some(m) = crate::loader::main_module() {
-                    let rd32 = |a: u64| unsafe { std::ptr::read_unaligned(a as *const u32) };
-                    let rdf = |a: u64| f32::from_bits(rd32(a));
-                    let mut v = unsafe { std::ptr::read_unaligned((m.base + 0x336BE98) as *const u64) };
-                    let mut k = 0;
-                    while v != 0 && k < 8 && crate::loader::module_at(v).is_none() {
-                        crate::info!(
-                            "RAD voice {k} at {v:#x}: volume {:.3} pan {:.3} channels {} gains {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} paused {} active {}",
-                            rdf(v + 0x6C), rdf(v + 0x70), rd32(v + 0x38), rdf(v + 0x74), rdf(v + 0x78), rdf(v + 0x7C), rdf(v + 0x80), rdf(v + 0x84), rdf(v + 0x88), rdf(v + 0x8C), rdf(v + 0x90), rd32(v + 0xA0), rd32(v + 0x44)
-                        );
-                        v = unsafe { std::ptr::read_unaligned((v + 0xB4) as *const u64) };
-                        k += 1;
-                    }
-                }
-            }
-        }
         if routed(port.kind) {
             if !ptr.is_null() {
                 crate::audio::push_stream(port.stream, to_stereo(&port, ptr), 3);
