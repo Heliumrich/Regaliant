@@ -5918,7 +5918,20 @@ pub fn c4_on() -> bool {
 /// before it turns on, and the first callers may come before that).
 fn c4_wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("DS_C4").ok().as_deref() != Some("0") && !wb_buckets() && wb_same_mode() != 2 && std::env::var("DS_FE2_HOLD").ok().as_deref() != Some("1")) && crate::hosted::on()
+    *ON.get_or_init(|| std::env::var("DS_C4").ok().as_deref() != Some("0") && !wb_buckets() && wb_same_mode() != 2 && std::env::var("DS_FE2_HOLD").ok().as_deref() != Some("1")) && (crate::hosted::on() || SPECS_AS_HOSTED.load(Ordering::Acquire))
+}
+
+/// This process only makes translations for the game's sessions (`--precompile-all`, the
+/// translation fingerprint, the compile bench), which run hosted (the default): its specs take
+/// C4 and C5 as those sessions do (`Spec::marks_held` keys translations). The launcher's
+/// preparation ran unhosted, so from C5 on (2026-11-11) no prepared key matched a hosted
+/// session's (FINDINGS.md 2026-11-13).
+static SPECS_AS_HOSTED: AtomicBool = AtomicBool::new(false);
+
+/// Before any spec is made: this process's specs are made as a hosted session's
+/// (`SPECS_AS_HOSTED`).
+pub fn specs_as_hosted() {
+    SPECS_AS_HOSTED.store(true, Ordering::Release);
 }
 
 /// C5 is wanted: stores into held pages set no marks (`Spec::marks_held`;

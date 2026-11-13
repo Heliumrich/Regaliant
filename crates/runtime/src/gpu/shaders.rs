@@ -1450,6 +1450,26 @@ fn fmt_run_time(key_spec: &Spec, specialized: u64, plan_key: u64, addr: u64, ins
     // prepared session's 1,080 compute first uses). Both push modes are
     // looked up before translating.
     if !super::exec::compute_key_stored(plan_key ^ h.rotate_left(1)) {
+        // (Diagnosis, DS_FMT_MISS_TRACE=1: the preparation's guess for the same program against
+        // the run-time variant looked up.)
+        if std::env::var("DS_FMT_MISS_TRACE").ok().as_deref() == Some("1") {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 24 {
+                let code_hash = plan_key ^ (rt.user_sgprs as u64) << 48 ^ (rt.user_base as u64) << 56;
+                let mut g = guess_compute_spec(0, insts, plan, code_hash, rt.cs_rsrc2, rt.cs_local_size);
+                if g.lod_stats && !g.batched && cs_lod_rotation() && !rt.lod_stats {
+                    g.lod_stats = false;
+                    g.lod_lean = false;
+                }
+                let gh = {
+                    let mut x = std::collections::hash_map::DefaultHasher::new();
+                    g.hash(&mut x);
+                    x.finish()
+                };
+                let stored = super::exec::compute_key_stored(plan_key ^ gh.rotate_left(1));
+                crate::info!("fmt miss: cs {addr:#x} code {code_hash:#x} rsrc2 {:#x} local {:?} user_base {}: guess stored {stored}, guess == run-time {}; differs: {}", rt.cs_rsrc2, rt.cs_local_size, rt.user_base, g == rt, super::exec::spec_diff(&g, &rt));
+            }
+        }
         return None;
     }
     let t = match t {

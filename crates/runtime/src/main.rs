@@ -1791,6 +1791,11 @@ This happens when other software takes that range. Restart the PC and try again.
         Some(p) => cache_root.join(p),
         None => cache_root.join("shader-specs.txt"),
     });
+    // (Translations made here are for the game's hosted sessions: their specs as those make
+    // them, `fe2::specs_as_hosted`.)
+    if cfg.compile_bench.is_some() || cfg.translation_fingerprint || cfg.precompile_all.is_some() {
+        gpu::fe2::specs_as_hosted();
+    }
     if let Some(a) = &cfg.compile_bench {
         let code = gpu::compbench::run(a, &cfg.app);
         log::flush();

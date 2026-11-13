@@ -358,8 +358,9 @@ const FINGERPRINT_SAMPLE: u64 = 509;
 /// made): raised whenever they change, since the fingerprint's sample may not show it (2: an
 /// image only loaded from guessed Uint by its words' first uses, 2026-11-13; 3: the engine
 /// programs' image-dimension variants, `shaders::guess_dim_variants`, 2026-11-13; 4: their
-/// depth-view variants too, 2026-11-13).
-const PREPARATION_RULES: u32 = 4;
+/// depth-view variants too, 2026-11-13; 5: specs as a hosted session makes them,
+/// `fe2::specs_as_hosted`, 2026-11-13).
+const PREPARATION_RULES: u32 = 5;
 
 /// The translation fingerprint of the prepared shaders: a sample of the game's compute
 /// programs (`FINGERPRINT_SAMPLE`) translated as `precompile_all` translates them, their
@@ -427,6 +428,12 @@ fn bundle_compute_sampled(app: &std::path::Path, sample: u64) -> Vec<(u64, std::
             let user_sgprs = ((rsrc2 >> 1) & 0x1F).min(16) as u16;
             let plan = rdna::analysis::analyze_opts(&insts, user_sgprs, 0, false);
             let spec = super::shaders::guess_compute_spec(0, &insts, &plan, p.hash, rsrc2, local);
+            // (Diagnosis, DS_CB_OBJ=<hex code hash,...>: the preparation's registers and spec.)
+            if let Ok(list) = std::env::var("DS_CB_OBJ") {
+                if list.split(',').any(|x| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok() == Some(p.hash)) {
+                    crate::info!("prep obj: code {:#x} rsrc2 {rsrc2:#x} local {local:?} user_sgprs {user_sgprs} user_base {}: {spec:?}", p.hash, spec.user_base);
+                }
+            }
             // (The guess first; the engine's image-dimension variants after it.)
             let mut specs = vec![spec];
             if engine {
@@ -465,10 +472,13 @@ pub fn precompile_all(app: &std::path::Path, threads: usize, progress: Option<&s
     // first (they set the end).
     let mut first = Vec::new();
     let mut second = Vec::new();
+    // The engine's image variants: [pipelines, code words].
+    let mut variants = [0usize; 2];
     for (h, code, specs) in bundle_compute(app) {
         let n = code.len();
         // (The guess and, for the engine's programs, its image-dimension variants.)
-        for spec in specs {
+        for (k, spec) in specs.into_iter().enumerate() {
+            let (f0, s0) = (first.len(), second.len());
             if spec.lod_stats && !spec.batched && super::shaders::cs_lod_rotation() {
                 let mut plain = spec.clone();
                 plain.lod_stats = false;
@@ -480,6 +490,11 @@ pub fn precompile_all(app: &std::path::Path, threads: usize, progress: Option<&s
             } else {
                 first.push((h, code.clone(), spec, n));
             }
+            if k > 0 {
+                let added = first.len() - f0 + second.len() - s0;
+                variants[0] += added;
+                variants[1] += added * n;
+            }
         }
     }
     first.sort_by(|a, b| b.3.cmp(&a.3));
@@ -488,7 +503,7 @@ pub fn precompile_all(app: &std::path::Path, threads: usize, progress: Option<&s
     let mut progs: Vec<(u64, std::sync::Arc<Vec<u32>>, rdna::translate::Spec, usize)> = first;
     progs.extend(second);
     let total_words: usize = progs.iter().map(|p| p.3).sum();
-    crate::info!("precompile all: {} compute pipelines ({} code words) on {threads} threads", progs.len(), total_words);
+    crate::info!("precompile all: {} compute pipelines ({} code words; the engine's image variants {} of them, {} words) on {threads} threads", progs.len(), total_words, variants[0], variants[1]);
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
     let code_done = AtomicU64::new(0);
