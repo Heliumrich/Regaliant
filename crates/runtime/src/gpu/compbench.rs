@@ -299,6 +299,11 @@ fn bundle_compute(app: &std::path::Path) -> Vec<(u64, std::sync::Arc<Vec<u32>>, 
 /// (~16 of the game's 8,233 compute programs).
 const FINGERPRINT_SAMPLE: u64 = 509;
 
+/// The preparation's rules (the guessed specs, `shaders::guess_compute_spec`, and the variants
+/// made): raised whenever they change, since the fingerprint's sample may not show it (2: an
+/// image only loaded from guessed Uint by its words' first uses, 2026-11-13).
+const PREPARATION_RULES: u32 = 2;
+
 /// The translation fingerprint of the prepared shaders: a sample of the game's compute
 /// programs (`FINGERPRINT_SAMPLE`) translated as `precompile_all` translates them, their
 /// SPIR-V hashed. A port update that changes translations changes it; the prepared pipelines
@@ -325,7 +330,7 @@ pub fn translation_fingerprint(app: &std::path::Path) -> Result<String, String> 
         .collect();
     items.sort_unstable();
     let fp = items.iter().fold(0xcbf2_9ce4_8422_2325u64, |a, &(h, s)| ((a ^ h).wrapping_mul(0x100_0000_01b3) ^ s).wrapping_mul(0x100_0000_01b3));
-    Ok(format!("{fp:016x}-{}", items.len()))
+    Ok(format!("{fp:016x}-{}-r{PREPARATION_RULES}", items.len()))
 }
 
 /// `bundle_compute`, one program in `sample` by code hash.
