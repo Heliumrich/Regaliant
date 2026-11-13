@@ -3554,10 +3554,11 @@ pub(crate) fn guess_compute_spec(addr: u64, insts: &[rdna::Inst], plan: &Plan, c
 }
 
 /// The preparation's other guesses of an engine program's spec (`compbench::precompile_all`):
-/// image dimensions its instructions do not settle, which the descriptor decides at run time
-/// (the guess report of 2026-11-13: the engine's cube instructions on cube arrays in 341 learned
-/// specs, its 2D-array instructions on 2D textures in 309). The guess with every cube image as a
-/// cube array, with every 2D array as 2D, and with both.
+/// image dimensions and depth views its instructions do not settle, which the descriptor decides
+/// at run time (the guess report of 2026-11-13: the engine's cube instructions on cube arrays in
+/// 341 learned specs, its 2D-array instructions on 2D textures in 309, compared images bound
+/// with colour textures). The guess with every cube image as a cube array, with every 2D array as
+/// 2D, and with both; each of those and the guess also with every depth view a colour view.
 pub(crate) fn guess_dim_variants(guess: &Spec) -> Vec<Spec> {
     let has = |d: ImageDim| guess.resources.iter().any(|r| matches!(r, ResSpec::Image { dim, .. } if *dim == d));
     let flip = |cube: bool, array: bool| {
@@ -3583,6 +3584,21 @@ pub(crate) fn guess_dim_variants(guess: &Spec) -> Vec<Spec> {
     }
     if cube && array {
         v.push(flip(true, true));
+    }
+    // Each also with every depth view as a colour view (a compared image the title binds with a
+    // colour texture: the report's depth-view differences, 141 more specs).
+    if guess.resources.iter().any(|r| matches!(r, ResSpec::Image { depth: true, .. })) {
+        let mut all = vec![guess.clone()];
+        all.extend(v.iter().cloned());
+        for s in all {
+            let mut s = s.clone();
+            for r in s.resources.iter_mut() {
+                if let ResSpec::Image { depth, .. } = r {
+                    *depth = false;
+                }
+            }
+            v.push(s);
+        }
     }
     v
 }

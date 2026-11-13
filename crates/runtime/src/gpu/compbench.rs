@@ -275,6 +275,11 @@ fn guess_report(app: &std::path::Path) -> i32 {
         crate::info!("guess report ({what}): {} specs: guess equal {}, equal but for typed buffers' formats {}, different {}", n[k][0], n[k][1], n[k][2], n[k][3]);
     }
     crate::info!("guess report: {engine_learned} of the learned programs are the engine's; other differences: {other_why:?}");
+    {
+        let progs = bundle_compute(app);
+        let engine_variants: usize = progs.iter().map(|p| p.2.len() - 1).sum();
+        crate::info!("guess report: the preparation would make {} compute pipelines' specs ({} of them engine image variants)", progs.iter().map(|p| p.2.len()).sum::<usize>(), engine_variants);
+    }
     crate::info!("guess report (engine): of the specs not equal to the guess, {} equal one of its image-dimension variants (`shaders::guess_dim_variants`), {} the guess with the LOD rule and typed buffers' formats; of the rest, equal with the learned image dimensions {}, also their depth views {}, also their classes {}", var_equal[0], var_equal[1], var_equal[2], var_equal[3], var_equal[4]);
     let mut fv: Vec<_> = fields.into_iter().collect();
     fv.sort_by(|a, b| b.1.cmp(&a.1));
@@ -352,8 +357,9 @@ const FINGERPRINT_SAMPLE: u64 = 509;
 /// The preparation's rules (the guessed specs, `shaders::guess_compute_spec`, and the variants
 /// made): raised whenever they change, since the fingerprint's sample may not show it (2: an
 /// image only loaded from guessed Uint by its words' first uses, 2026-11-13; 3: the engine
-/// programs' image-dimension variants, `shaders::guess_dim_variants`, 2026-11-13).
-const PREPARATION_RULES: u32 = 3;
+/// programs' image-dimension variants, `shaders::guess_dim_variants`, 2026-11-13; 4: their
+/// depth-view variants too, 2026-11-13).
+const PREPARATION_RULES: u32 = 4;
 
 /// The translation fingerprint of the prepared shaders: a sample of the game's compute
 /// programs (`FINGERPRINT_SAMPLE`) translated as `precompile_all` translates them, their
