@@ -1821,6 +1821,11 @@ This happens when other software takes that range. Restart the PC and try again.
         log::flush();
         std::process::exit(code);
     }
+    // A player's install executes the GPU work unless DS_GPU says otherwise (a development run
+    // sets DS_GPU=1 itself; the launcher's preparation and fingerprint runs above are as before).
+    if cfg.paths.layout != dsconfig::paths::Layout::Dev {
+        gpu::exec::default_on();
+    }
 
     // Modules: the decrypted executable and the title's own libraries.
     let t0 = Instant::now();
@@ -1922,7 +1927,7 @@ This happens when other software takes that range. Restart the PC and try again.
         std::thread::sleep(Duration::from_millis(250));
         ticks += 1;
         if boot_watch > 0 && start.elapsed() >= Duration::from_secs(boot_watch) {
-            if gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed) == 0 && std::env::var("DS_GPU").ok().as_deref() == Some("1") {
+            if gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed) == 0 && gpu::exec::enabled() {
                 warn!("boot watch: no frame flipped {boot_watch} s after start (DS_BOOT_WATCH); guest thread stacks:\n{}", thread_summary_ex(true));
             }
             boot_watch = 0;

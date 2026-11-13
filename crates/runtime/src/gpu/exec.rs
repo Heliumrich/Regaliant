@@ -583,15 +583,35 @@ pub fn trace_writes(what: impl FnOnce() -> String, base: u64, size: u64) {
     }
 }
 
+/// GPU execution's default when DS_GPU is not set (`default_on`).
+static DEFAULT_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A player's install (not a development checkout) executes the GPU work unless DS_GPU says
+/// otherwise, started by the launcher or directly (`main`; until 2026-11-13 only DS_GPU=1,
+/// which only the development scripts set: a player's game drew nothing). Before `enabled`'s
+/// first call.
+pub fn default_on() {
+    DEFAULT_ON.store(true, Ordering::Release);
+}
+
+/// Whether GPU execution is wanted: DS_GPU=1 on, any other value off (diagnosis: the GPU work
+/// only decoded), unset the default (`default_on`).
+fn wanted_on() -> bool {
+    match std::env::var("DS_GPU").ok().as_deref() {
+        Some(v) => v == "1",
+        None => DEFAULT_ON.load(Ordering::Acquire),
+    }
+}
+
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        if std::env::var("DS_GPU").ok().as_deref() != Some("1") {
+        if !wanted_on() {
             return false;
         }
         match super::vk::init() {
             Ok(()) => {
-                crate::info!("gpu: executing compute dispatches on Vulkan (DS_GPU=1)");
+                crate::info!("gpu: executing the GPU work on Vulkan");
                 super::resident::init();
                 super::fe2::init();
                 super::resident::section_test_maybe();
