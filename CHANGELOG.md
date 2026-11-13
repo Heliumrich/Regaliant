@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.1.0 (unreleased draft)
+## 0.1.0
 
-The first version. It runs the PS5 game Demon's Souls (PPSA01341, version 01.007.000) from the
+The first version of Regaliant. It runs the PS5 game Demon's Souls (PPSA01341, version 01.007.000) from the
 player's own game files on Windows.
 
 - The game's own program runs on the PC's processor. Its system calls, audio, saves, controllers
@@ -18,5 +18,8 @@ player's own game files on Windows.
 - Keyboard and mouse with raw mouse look, key prompts in the game's style, a mouse pointer in
   menus, and Xbox prompts for Xbox controllers.
 - 5.1 and 7.1 sound, headphone and Windows Sonic or Dolby Atmos output of the game's 3D sound.
+  The controller speaker's sounds can play through the PC's speakers (Pad Speaker).
+- Shaders the launcher did not prepare compile in the background where that is safe: an object
+  can be missing for a moment instead of the game pausing.
 - Trophies as achievements with a pop-up and a list.
 - Saves are backed up before each session changes them.

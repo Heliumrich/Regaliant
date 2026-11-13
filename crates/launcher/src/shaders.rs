@@ -34,7 +34,7 @@ pub fn start_check(app: &App) {
     if CHECK_STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    let exe = app.paths.exe_dir.join(dsconfig::paths::GAME_EXE);
+    let exe = dsconfig::paths::game_exe_in(&app.paths.exe_dir);
     let dir = app.paths.exe_dir.clone();
     std::thread::spawn(move || {
         use std::os::windows::process::CommandExt;
@@ -192,7 +192,7 @@ pub fn start(app: &mut App, play_after: bool) {
     if app.shaders.child.is_some() || app.running.is_some() {
         return;
     }
-    let exe = app.paths.exe_dir.join(dsconfig::paths::GAME_EXE);
+    let exe = dsconfig::paths::game_exe_in(&app.paths.exe_dir);
     if !exe.is_file() {
         unsafe { ui::message(app.hwnd, &format!("{} was not found next to the launcher.", dsconfig::paths::GAME_EXE), crate::TITLE, windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONERROR) };
         return;

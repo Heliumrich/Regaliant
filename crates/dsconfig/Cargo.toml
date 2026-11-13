@@ -1,7 +1,7 @@
 [package]
 name = "dsconfig"
 version.workspace = true
-description = "Shared by the Demon's Souls port's runtime and launcher: where its files are kept, the game folder's checks"
+description = "Shared by Regaliant's runtime and launcher: where its files are kept, the game folder's checks"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

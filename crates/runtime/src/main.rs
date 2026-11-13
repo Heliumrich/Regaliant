@@ -1472,7 +1472,7 @@ pub fn player_error(text: &str) {
     }
     use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MessageBoxW};
     let w = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
-    let (t, m) = (w("Demon's Souls"), w(text));
+    let (t, m) = (w("Regaliant"), w(text));
     unsafe { MessageBoxW(std::ptr::null_mut(), m.as_ptr(), t.as_ptr(), MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST) };
 }
 
@@ -1498,7 +1498,7 @@ fn single_instance(cfg: &Config) {
     use windows_sys::Win32::System::Threading::CreateMutexW;
     // (Named by the data folder: a checkout and a player's install do not exclude each other.)
     let key: String = cfg.paths.user.display().to_string().chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).collect();
-    let name: Vec<u16> = format!("Local\\DemonsSoulsPort_{key}").encode_utf16().chain(std::iter::once(0)).collect();
+    let name: Vec<u16> = format!("Local\\Regaliant_{key}").encode_utf16().chain(std::iter::once(0)).collect();
     // (Kept for the process's life: never closed.)
     let h = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
     if !h.is_null() && unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
@@ -1680,7 +1680,7 @@ This happens when other software takes that range. Restart the PC and try again.
     }
     log::TRACE_HLE.store(cfg.trace, std::sync::atomic::Ordering::Relaxed);
     hle::LENIENT_IMPORTS.store(cfg.lenient, std::sync::atomic::Ordering::Relaxed);
-    info!("dsport {} | run dir {} | TLS slot {} | host heap: {} | guest write watch: {}", env!("CARGO_PKG_VERSION"), cfg.run_dir.display(), slot, heap::name(), mem::write_watch_state());
+    info!("Regaliant {} | run dir {} | TLS slot {} | host heap: {} | guest write watch: {}", env!("CARGO_PKG_VERSION"), cfg.run_dir.display(), slot, heap::name(), mem::write_watch_state());
     info!("files: {:?} layout, settings and saves in {}, logs and caches in {}", cfg.paths.layout, cfg.paths.user.display(), cfg.paths.cache.display());
     if let Some(p) = &cfg.game_problem {
         error!("game files: {}", p.replace('\n', " "));
@@ -1723,7 +1723,7 @@ This happens when other software takes that range. Restart the PC and try again.
     // (Its samples are timed by the process clock.)
     guestprof::start_trace();
     if !cfg.headless {
-        if let Err(e) = gpu::vk::present::init("dsport - Demon's Souls (PPSA01341)") {
+        if let Err(e) = gpu::vk::present::init("Regaliant - Demon's Souls") {
             warn!("no presentation window: {e}");
         }
     }

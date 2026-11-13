@@ -1,5 +1,5 @@
 r"""Writes THIRD_PARTY_NOTICES.txt: the license notices of the third-party code compiled into
-dsport.exe and DemonsSoulsLauncher.exe (this project's own code: LICENSE).
+regaliant.exe and regaliant-launcher.exe (this project's own code: LICENSE).
 
     python -I scripts\notices.py
 
@@ -220,10 +220,10 @@ def rust_std_section():
 
 
 INTRO = """\
-Third-party notices: dsport.exe and DemonsSoulsLauncher.exe
-===========================================================
+Third-party notices: regaliant.exe and regaliant-launcher.exe
+=============================================================
 
-The Demon's Souls unofficial PC port is free software under the GNU General Public
+Regaliant, an unofficial PC port of Demon's Souls, is free software under the GNU General Public
 License, version 3 or (at your option) any later version (LICENSE). Besides its own code,
 the two programs contain the third-party code below, used under the licenses shown, all of
 which allow it in a program under the GPL version 3. Where a component offers a choice of

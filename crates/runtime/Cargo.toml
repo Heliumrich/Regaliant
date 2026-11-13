@@ -1,7 +1,7 @@
 [package]
 name = "dsport"
 version.workspace = true
-description = "Native Windows x86-64 runtime for Demon's Souls (PS5, PPSA01341): PS5 HLE + native CPU execution"
+description = "Regaliant's runtime: Demon's Souls (PS5, PPSA01341) on Windows x86-64, PS5 HLE + native CPU execution (shipped as regaliant.exe)"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

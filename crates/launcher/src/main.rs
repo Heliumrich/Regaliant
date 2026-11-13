@@ -1,4 +1,4 @@
-//! DemonsSoulsLauncher: sets up and starts the Demon's Souls port for players.
+//! regaliant-launcher: sets up and starts Regaliant, the Demon's Souls PC port, for players.
 //!
 //! - Game: the game folder, checked when chosen (title, version 01.007.000, the decrypted
 //!   executable and libraries, the data folders); what this PC brings; safe mode for one start.
@@ -31,7 +31,7 @@ use windows_sys::Win32::UI::Controls::*;
 use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-pub const TITLE: &str = "Demon's Souls PC port";
+pub const TITLE: &str = "Regaliant";
 const CLIENT: (i32, i32) = (780, 600);
 
 /// Posted when the game exits (WPARAM: its exit code).
@@ -167,7 +167,7 @@ pub fn start_game(app: &mut App) {
     if app.running.is_some() {
         return;
     }
-    let exe = app.paths.exe_dir.join(dsconfig::paths::GAME_EXE);
+    let exe = dsconfig::paths::game_exe_in(&app.paths.exe_dir);
     if !exe.is_file() {
         unsafe { ui::message(app.hwnd, &format!("{} was not found next to the launcher.", dsconfig::paths::GAME_EXE), TITLE, MB_ICONERROR) };
         return;
@@ -383,7 +383,7 @@ fn main() {
         let icc = INITCOMMONCONTROLSEX { dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_TAB_CLASSES | ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES | ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES };
         InitCommonControlsEx(&icc);
         let hinst = GetModuleHandleW(std::ptr::null());
-        let class = wide("demonssouls_launcher");
+        let class = wide("regaliant_launcher");
         // One launcher at a time (two could prepare the shaders twice): a second start brings
         // the first one to the front. (`--shot` runs are layout checks: they may run beside one.)
         if arg("--shot").is_none() {

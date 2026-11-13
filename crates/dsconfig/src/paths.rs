@@ -6,17 +6,29 @@
 //! - Portable (`portable.txt` beside the executable, or `DSPORT_HOME=<folder>`): everything in
 //!   `<exe folder>\user` (or that folder).
 //! - Installed (anything else): settings, key bindings, saves and their backups in
-//!   `%APPDATA%\DemonsSoulsPort`; logs, prepared shaders and the game's own runtime folders in
-//!   `%LOCALAPPDATA%\DemonsSoulsPort`.
+//!   `%APPDATA%\Regaliant`; logs, prepared shaders and the game's own runtime folders in
+//!   `%LOCALAPPDATA%\Regaliant`.
 
 use std::path::{Path, PathBuf};
 
 /// The folder name under `%APPDATA%` and `%LOCALAPPDATA%`.
-pub const APP_FOLDER: &str = "DemonsSoulsPort";
+pub const APP_FOLDER: &str = "Regaliant";
 pub const PORTABLE_MARKER: &str = "portable.txt";
-/// The runtime's and the launcher's file names.
-pub const GAME_EXE: &str = "dsport.exe";
-pub const LAUNCHER_EXE: &str = "DemonsSoulsLauncher.exe";
+/// The runtime's and the launcher's file names as shipped (the package names the development
+/// build's runtime, `GAME_EXE_DEV`, `GAME_EXE`).
+pub const GAME_EXE: &str = "regaliant.exe";
+pub const GAME_EXE_DEV: &str = "dsport.exe";
+pub const LAUNCHER_EXE: &str = "regaliant-launcher.exe";
+
+/// The runtime in the folder `dir` (the launcher's): `GAME_EXE`, or in a development build's
+/// output folder `GAME_EXE_DEV`.
+pub fn game_exe_in(dir: &Path) -> PathBuf {
+    let shipped = dir.join(GAME_EXE);
+    if !shipped.exists() && dir.join(GAME_EXE_DEV).exists() {
+        return dir.join(GAME_EXE_DEV);
+    }
+    shipped
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Layout {
@@ -246,7 +258,7 @@ mod tests {
             assert_eq!(p.shaders(), dev.join("local-data"));
             assert_eq!(p.upscalers(), dev.join("local-data").join("upscalers"));
 
-            let rel = tmp.join("Games").join("DemonsSoulsPort");
+            let rel = tmp.join("Games").join("Regaliant");
             std::fs::create_dir_all(&rel).unwrap();
             // (A stray local-data folder above a player's folder.)
             std::fs::create_dir_all(tmp.join("local-data")).unwrap();

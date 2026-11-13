@@ -1,7 +1,7 @@
-Demon's Souls - unofficial PC port 0.1.0 for Windows (64-bit)
-=============================================================
+Regaliant 0.1.0 - an unofficial PC port of Demon's Souls for Windows (64-bit)
+=============================================================================
 
-An unofficial PC port of Demon's Souls (PS5, PPSA01341). It is not rebuilt from the game's
+Regaliant is an unofficial PC port of Demon's Souls (PS5, PPSA01341). It is not rebuilt from the game's
 source code. It runs the game's own PS5 program from your copy of the game's files. The
 program's x86-64 code runs directly on your processor. The PS5 system libraries it calls are
 reimplemented for Windows, and its graphics commands and shaders are translated to Vulkan.
@@ -30,8 +30,8 @@ requirements" for what was measured and what is estimated.
 
 Getting started
 ---------------
-1. Unpack this zip into a folder, for example C:\Games\DemonsSouls-Port.
-2. Start DemonsSoulsLauncher.exe. If Windows says "Windows protected your PC", click
+1. Unpack this zip into a folder, for example C:\Games\Regaliant.
+2. Start regaliant-launcher.exe. If Windows says "Windows protected your PC", click
    "More info", then "Run anyway". The programs are not code-signed.
 3. On the Game page, choose the game folder. The launcher checks it and says what is missing.
 4. Click Play. The first time, the launcher prepares the game's shaders before the game
@@ -69,12 +69,12 @@ The game's SETTINGS screen has a PC tab with the port's settings. Most take effe
 - Graphics: quality preset, geometry detail, texture filtering, anti-aliasing (the game's TAA,
   off, DLSS, FSR or XeSS), bloom, vignette, frame rate limit (30, 60 or uncapped).
 - Game and controls: menu and HUD size, HUD margin, button prompts, mouse sensitivity and
-  inversion, mouse look blur, skip intro logos, save folder, import of a PS5 save, key and
-  controller bindings.
+  inversion, mouse look blur, skip intro logos, the controller speaker's sounds through your
+  speakers (Pad Speaker), save folder, import of a PS5 save, key and controller bindings.
 - Sound: output (headphones, stereo, 5.1, 7.1, Windows Sonic or Dolby Atmos) and device.
 
 DLSS needs one more file. NVIDIA's nvngx_dlss.dll is under NVIDIA's own license and does not
-come with the port. Copy your own into the "upscalers" folder beside dsport.exe. Games with DLSS
+come with the port. Copy your own into the "upscalers" folder beside regaliant.exe. Games with DLSS
 have the file in their installation folder. Then DLSS appears in the Anti-Aliasing list. XeSS and
 FSR are in the "upscalers" folder already. Each library is checked for its maker's digital
 signature before it is loaded. NVIDIA and DLSS are trademarks of NVIDIA Corporation. Intel and
@@ -87,10 +87,11 @@ The launcher
 - Game: the game folder and its check, what your PC brings, and safe mode for the next start.
   Safe mode starts the game in a window with the default settings and without an upscaler. Use
   it when the game does not start.
-- Shaders: prepares the game's shaders ahead. The game compiles each shader the first time it
-  needs it, which makes play stutter. Prepared shaders make the longest stutters much shorter,
-  but some remain on first visits. They hold for one graphics card and driver. After a driver
-  update the launcher asks to prepare them again.
+- Shaders: prepares the game's shaders ahead. Without them the game compiles each shader the
+  first time it needs it. An object can then be missing for a moment, and some compiles make
+  play stutter. Prepared shaders make the stutters much shorter, but some remain on first
+  visits. They hold for one graphics card and driver. After a driver update, or a port update
+  that needs it, the launcher asks to prepare them again.
 - Saves: the save folder and the backups the game makes. The game copies each save before a
   session first changes it. "Restore..." puts a backup back. The save as it is now is kept
   as a backup first.
@@ -101,9 +102,9 @@ The launcher
 
 Settings, saves and logs
 ------------------------
-- Settings, key bindings and saves: %APPDATA%\DemonsSoulsPort.
-- Logs, prepared shaders and the game's own temporary files: %LOCALAPPDATA%\DemonsSoulsPort.
-- Portable use: an empty file named portable.txt next to dsport.exe keeps everything in a
+- Settings, key bindings and saves: %APPDATA%\Regaliant.
+- Logs, prepared shaders and the game's own temporary files: %LOCALAPPDATA%\Regaliant.
+- Portable use: an empty file named portable.txt next to regaliant.exe keeps everything in a
   "user" folder beside it.
 - Logs leave out your user name, your computer's name and your profile folder.
 
@@ -158,7 +159,7 @@ Known issues
 
 License
 -------
-Copyright (C) 2026 SulphurS16 and the Demon's Souls unofficial PC port contributors.
+Copyright (C) 2026 SulphurS16 and the Regaliant contributors.
 
 The port is free software: you can redistribute it and/or modify it under the terms of the
 GNU General Public License as published by the Free Software Foundation, either version 3 of

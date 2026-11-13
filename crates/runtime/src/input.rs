@@ -416,7 +416,7 @@ fn xinput(st: &mut PadState) {
 /// The default keyboard and mouse layout, also written to controls.txt on
 /// first start: Dark Souls III's PC defaults on the PS5 pad's buttons.
 pub const DEFAULT_LAYOUT: &str = "\
-# Keyboard and mouse layout of the Demon's Souls port (Dark Souls III-style PC
+# Keyboard and mouse layout of Regaliant (Dark Souls III-style PC
 # controls), and the controller's buttons where remapped. The menu's Key
 # Bindings and Controller Bindings write it; or edit it and restart; delete it
 # to get the defaults back.

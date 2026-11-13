@@ -1,6 +1,7 @@
 # Builds the player package:
-#   dist\DemonsSouls-Port-<version>\     dsport.exe, DemonsSoulsLauncher.exe, README.txt, upscalers\
-#   dist\DemonsSouls-Port-<version>.zip  (the same files, no top folder)
+#   dist\Regaliant-<version>\     regaliant.exe, regaliant-launcher.exe, README.txt, upscalers\
+#   dist\Regaliant-<version>.zip  (the same files, no top folder)
+# (regaliant.exe is the runtime the build names dsport.exe.)
 # README.txt is the player README (with the port's copyright and license notice), then the
 # third-party notices of the two programs (THIRD_PARTY_NOTICES.txt, made by scripts\notices.py
 # from what was just built), then the text of the port's license, the GNU GPL version 3.
@@ -52,7 +53,7 @@ if (-not $NoBuild) {
   if ($LASTEXITCODE -ne 0) { Write-Host "notices failed"; exit 1 }
 }
 $bin = Join-Path $root "target\$target\dist"
-$name = "DemonsSouls-Port-$ver"
+$name = "Regaliant-$ver"
 $dist = Join-Path $root 'dist'
 $final = Join-Path $dist $name
 # (Built in a fresh staging folder, then swapped in: a launcher still running from the previous
@@ -60,10 +61,12 @@ $final = Join-Path $dist $name
 $out = Join-Path $dist ".stage-$name"
 if (Test-Path $out) { Remove-Item -Recurse -Force $out -ErrorAction Stop }
 New-Item -ItemType Directory -Force $out | Out-Null
-foreach ($f in 'dsport.exe', 'DemonsSoulsLauncher.exe') {
-  $src = Join-Path $bin $f
+# Shipped name = built name.
+$programs = [ordered]@{ 'regaliant.exe' = 'dsport.exe'; 'regaliant-launcher.exe' = 'regaliant-launcher.exe' }
+foreach ($f in $programs.Keys) {
+  $src = Join-Path $bin $programs[$f]
   if (-not (Test-Path $src)) { Write-Host "missing $src"; exit 1 }
-  Copy-Item $src $out -ErrorAction Stop
+  Copy-Item $src (Join-Path $out $f) -ErrorAction Stop
   if ((Get-FileHash $src).Hash -ne (Get-FileHash (Join-Path $out $f)).Hash) { Write-Host "$f was not copied whole"; exit 1 }
 }
 # The upscalers' libraries and their licenses (an allowlist of names). DLSS itself,
@@ -89,7 +92,7 @@ if (-not $NoUpscalers) {
 $needles = @($root, $root.Replace('\', '/'), $cargoHome, $env:USERPROFILE) | Where-Object { $_ }
 if ($env:USERNAME -and $env:USERNAME.Length -ge 4) { $needles += "\$($env:USERNAME)\" }
 $words = @($env:COMPUTERNAME) | Where-Object { $_ }
-foreach ($f in 'dsport.exe', 'DemonsSoulsLauncher.exe') {
+foreach ($f in $programs.Keys) {
   $bytes = [IO.File]::ReadAllBytes((Join-Path $out $f))
   $text = [Text.Encoding]::GetEncoding(28591).GetString($bytes).ToLowerInvariant()
   $wide = [Text.Encoding]::Unicode.GetString($bytes).ToLowerInvariant()
@@ -110,7 +113,7 @@ if (-not (Test-Path $license)) { $license = Join-Path $root 'LICENSE' }
 $readme = (& $read (Join-Path $root 'docs\PLAYER_README.txt')) + "`n`n`n$rule`nThird-party notices`n$rule`n`n" + (& $read (Join-Path $root 'THIRD_PARTY_NOTICES.txt')) + "`n`n`n$rule`nLicense: GNU General Public License, version 3`n$rule`n`n" + (& $read $license) + "`n"
 [IO.File]::WriteAllText((Join-Path $out 'README.txt'), $readme.Replace("`n", "`r`n"), (New-Object Text.UTF8Encoding $true))
 # Allowlist: nothing else may be in the package.
-$allowed = @('dsport.exe', 'DemonsSoulsLauncher.exe', 'README.txt') + @($upNames | ForEach-Object { "upscalers\$_" })
+$allowed = @($programs.Keys) + @('README.txt') + @($upNames | ForEach-Object { "upscalers\$_" })
 $extra = @(Get-ChildItem -Recurse -File $out | Where-Object { $allowed -notcontains $_.FullName.Substring($out.Length + 1) })
 if ($extra.Count -gt 0) { Write-Host "unexpected files in the package: $($extra.FullName -join ', ')"; exit 1 }
 $zip = Join-Path $dist "$name.zip"
@@ -118,7 +121,7 @@ if (Test-Path $zip) { Remove-Item -Force $zip }
 Compress-Archive -Path (Join-Path $out '*') -DestinationPath $zip
 $size = (Get-ChildItem -Recurse -File $out | Measure-Object Length -Sum).Sum
 $count = (Get-ChildItem -Recurse -File $out).Count
-# The staged files become dist\DemonsSouls-Port-<version> unless the earlier folder is in use.
+# The staged files become dist\Regaliant-<version> unless the earlier folder is in use.
 if (Test-Path $final) {
   if (Test-Path "$final.old") { Remove-Item -Recurse -Force "$final.old" -ErrorAction SilentlyContinue }
   try { Rename-Item $final "$name.old" -ErrorAction Stop } catch { }
