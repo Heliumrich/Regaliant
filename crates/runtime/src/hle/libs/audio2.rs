@@ -503,6 +503,46 @@ unsafe fn add_field(p: &Port, n: usize, field: &mut [Vec<f32>]) {
     }
 }
 
+/// Headphones: an 8-channel bed port's speakers (the title's L R C LFE Ls Rs Lb Rb) added to
+/// the context's field as plane waves from their places in the 7.1 layout the title mixes for
+/// (L and R at +-30 degrees, C ahead, the sides at +-90, the backs at +-150; LFE left out, as in
+/// the stereo fold-down), so the head model renders them as virtual speakers: each reaches both
+/// ears with the head's level, shadow and delay (a console renders its bed so for headphones).
+/// The stereo fold-down put the surrounds hard into one ear each. Returns whether it did.
+unsafe fn add_bed_field(p: &Port, n: usize, field: &mut [Vec<f32>]) -> bool {
+    use crate::spatial::{CHANNELS, Layout, sh};
+    if p.latched == 0 || channels(p.format) < 8 || render_layout() != Layout::Headphones || field.len() < CHANNELS {
+        return false;
+    }
+    static DIRS: std::sync::OnceLock<[[f32; CHANNELS]; 8]> = std::sync::OnceLock::new();
+    let dirs = DIRS.get_or_init(|| {
+        let az = [30.0f32, -30.0, 0.0, 0.0, 90.0, -90.0, 150.0, -150.0];
+        std::array::from_fn(|c| {
+            let a = az[c].to_radians();
+            sh(a.cos(), a.sin(), 0.0)
+        })
+    });
+    let ch = channels(p.format);
+    let float = p.format & 0x7F == 0;
+    for f in field.iter_mut().take(CHANNELS) {
+        if f.len() < n {
+            f.resize(n, 0.0);
+        }
+    }
+    for i in 0..n {
+        for c in [0usize, 1, 2, 4, 5, 6, 7] {
+            let x = unsafe { if float { *((p.latched as *const f32).add(i * ch + c)) } else { *((p.latched as *const i16).add(i * ch + c)) as f32 / 32768.0 } } * p.gains[c];
+            if x == 0.0 {
+                continue;
+            }
+            for (k, f) in field.iter_mut().take(CHANNELS).enumerate() {
+                f[i] += x * dirs[c][k];
+            }
+        }
+    }
+    true
+}
+
 /// Renders the gathered field of context `ctx` into its mix.
 fn render_field(ctx: u32, field: &[Vec<f32>], n: usize, mix: &mut [f32]) {
     use crate::spatial::{CHANNELS, Renderer};
@@ -557,7 +597,17 @@ unsafe fn mix_port_ch(p: &Port, n: usize, out: &mut [f32], och: usize) {
     if p.latched == 0 {
         return;
     }
-    // (Diagnostics: the signal this port adds, after its gains.)
+    unsafe {
+        port_energy(p, n);
+        mix_port_body(p, n, out, och);
+    }
+}
+
+/// Diagnostics: the signal a port adds, after its gains (the status's levels by port type).
+unsafe fn port_energy(p: &Port, n: usize) {
+    if p.latched == 0 {
+        return;
+    }
     {
         let ch = channels(p.format);
         let float = p.format & 0x7F == 0;
@@ -581,6 +631,9 @@ unsafe fn mix_port_ch(p: &Port, n: usize, out: &mut [f32], och: usize) {
         x.1 += (n * ch) as u64;
         x.2 += (e > 1e-9) as u64;
     }
+}
+
+unsafe fn mix_port_body(p: &Port, n: usize, out: &mut [f32], och: usize) {
     let ch = channels(p.format);
     let float = p.format & 0x7F == 0;
     let sample = |i: usize| -> f32 {
@@ -764,7 +817,12 @@ sysv! {
                     continue;
                 }
                 if !(ambi_decode() && ambi_channel(p).is_some()) {
-                    mix_port_ch(p, n, &mut mix, och);
+                    // (Headphones: a bed's speakers through the head model, `add_bed_field`.)
+                    if !(ambi_decode() && add_bed_field(p, n, &mut field)) {
+                        mix_port_ch(p, n, &mut mix, och);
+                    } else {
+                        port_energy(p, n);
+                    }
                     continue;
                 }
                 match ambi_channel(p) {

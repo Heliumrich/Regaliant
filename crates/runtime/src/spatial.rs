@@ -9,10 +9,17 @@
 //! - headphones: each virtual speaker reaches each ear with a broadband level by the angle to the
 //!   ear (down to -5.4 dB facing away) and Brown and Duda's head-shadow filter (a first-order
 //!   shelf by that angle: +6 dB treble facing the ear, down to -20 dB behind the head): a sound to
-//!   one side is louder and brighter in the near ear and still heard, darker, in the far one. No
-//!   interaural delays: delayed copies summed over neighbouring virtual speakers cut a frontal
-//!   source's treble by 11-19 dB from 2 kHz, and delaying the low band alone left a 9 dB dip at
-//!   its crossover;
+//!   one side is louder and brighter in the near ear and still heard, darker, in the far one. The
+//!   interaural delays (Woodworth's, up to 0.66 ms) as each path's group delay at low frequencies
+//!   (since 2026-11-13): a first-order allpass, whose delay falls off above a few hundred hertz,
+//!   every path 8 samples more (`ITD_BASE`) so that their phases differ little at high
+//!   frequencies, and the virtual speakers' paths add without the comb of plain delays: levels
+//!   within 0.6 dB of the paths without delays at every direction and frequency, the far ear of a
+//!   source at 90 degrees 0.72 ms later at 125 Hz and 0.53 ms at 500 Hz (at 30 degrees 0.35 and
+//!   0.27). (Plain delayed copies cut a frontal source's treble by 11-19 dB from 2 kHz; delaying a
+//!   low band alone left a 9 dB dip at its crossover; the allpasses without the common delay cut
+//!   the near ear's treble 6 dB.) The title's 8-channel beds reach headphones the same way, as
+//!   virtual speakers (`audio2::add_bed_field`);
 //! - stereo speakers: amplitude panning between speakers at +-30 degrees (sources further out at
 //!   the speaker, rear ones folded forward at -3 dB, the far channel never below -12 dB);
 //! - 5.1 and 7.1: pairwise panning between the layout's speakers around the listener;
@@ -105,7 +112,8 @@ impl Layout {
 }
 
 /// One ear's path from a virtual speaker: a level and a first-order head-shadow filter
-/// (`y = b0 x + b1 x1 - a1 y1`, the level folded into b0 and b1).
+/// (`y = b0 x + b1 x1 - a1 y1`, the level folded into b0 and b1), then a first-order allpass
+/// (`v = ap y + u1 - ap v1`) delaying the path's low frequencies by its interaural delay.
 #[derive(Clone, Copy, Default)]
 struct Ear {
     b0: f32,
@@ -113,6 +121,10 @@ struct Ear {
     a1: f32,
     x1: f32,
     y1: f32,
+    /// The allpass's coefficient: (1 - D) / (1 + D) for a delay of D samples at DC.
+    ap: f32,
+    u1: f32,
+    v1: f32,
 }
 
 pub struct Renderer {
@@ -235,7 +247,10 @@ impl Renderer {
                             let y = e.b0 * x + e.b1 * e.x1 - e.a1 * e.y1;
                             e.x1 = x;
                             e.y1 = y;
-                            *acc += y;
+                            let v = e.ap * y + e.u1 - e.ap * e.v1;
+                            e.u1 = y;
+                            e.v1 = v;
+                            *acc += v;
                         }
                     }
                     out[2 * f] += l * gain;
@@ -254,9 +269,14 @@ impl Renderer {
     }
 }
 
+/// The allpasses' delay at DC common to every ear path (samples at 48 kHz: 0.17 ms; the test
+/// `report_responses_by_direction` against the paths without delays: within 0.6 dB).
+const ITD_BASE: f32 = 8.0;
+
 /// The two ear paths of a virtual speaker at (az, el): a level (1 facing the ear, 0.54 facing
-/// away: (1 + 0.3 cos) / 1.3) and Brown and Duda's head shadow for a head of radius 8.75 cm, at
-/// 48 kHz.
+/// away: (1 + 0.3 cos) / 1.3), Brown and Duda's head shadow for a head of radius 8.75 cm, at
+/// 48 kHz, and Woodworth's delay to the ear (from the ear's side (a / c)(1 - cos), around the
+/// head (a / c)(1 + angle - 90 degrees): 0 to 0.66 ms) as the allpass's delay at DC.
 fn head_paths(az: f32, el: f32) -> [Ear; 2] {
     let (_, y, _) = unit(az, el);
     let (a, c, fs) = (0.0875f32, 343.0f32, 48000.0f32);
@@ -269,10 +289,23 @@ fn head_paths(az: f32, el: f32) -> [Ear; 2] {
         let tau = a / (2.0 * c);
         let k = 2.0 * fs;
         let den = 1.0 + tau * k;
-        Ear { b0: level * (1.0 + alpha * tau * k) / den, b1: level * (1.0 - alpha * tau * k) / den, a1: (1.0 - tau * k) / den, x1: 0.0, y1: 0.0 }
+        Ear { b0: level * (1.0 + alpha * tau * k) / den, b1: level * (1.0 - alpha * tau * k) / den, a1: (1.0 - tau * k) / den, ..Ear::default() }
+    };
+    // Woodworth's delay to an ear at angle g from the source (from the head's centre, plus a/c).
+    let to_ear = |cos_to_ear: f32| -> f32 {
+        let g = cos_to_ear.clamp(-1.0, 1.0).acos();
+        if g < PI / 2.0 { a / c * (1.0 - cos_to_ear) } else { a / c * (1.0 + g - PI / 2.0) }
     };
     // The left ear's axis is +y, the right's -y.
-    [ear(y), ear(-y)]
+    let mut e = [ear(y), ear(-y)];
+    for (e, cos_to_ear) in e.iter_mut().zip([y, -y]) {
+        // Every path also gets ITD_BASE: the allpasses' phases then differ little above a few
+        // kilohertz, where an undelayed path and a delayed one cancelled (the near ear of a source
+        // to the side lost 6 dB at 12 kHz, the far ear of one at 30 degrees had a 35 dB notch).
+        let d = to_ear(cos_to_ear) * fs + ITD_BASE;
+        e.ap = (1.0 - d) / (1.0 + d);
+    }
+    e
 }
 
 /// A virtual speaker's gains into the layout's channels.
@@ -488,6 +521,84 @@ mod tests {
                 line += &format!(" {hz}: {:+.1}/{:+.1}", 20.0 * (l / 0.5).log10(), 20.0 * (rr / 0.5).log10());
             }
             eprintln!("{line}");
+        }
+    }
+
+    /// The headphones' ear levels (dB against 0.5) for a horizontal source at `az` degrees, by
+    /// frequency: [(left, right)].
+    fn ear_response(az: f32, hzs: &[f32]) -> Vec<(f32, f32)> {
+        hzs.iter()
+            .map(|&hz| {
+                let (x, y, z) = unit(az.to_radians(), 0.0);
+                let b = sh(x, y, z);
+                let tone: Vec<f32> = (0..9600).map(|i| (2.0 * PI * hz * i as f32 / 48000.0).sin()).collect();
+                let field: [Vec<f32>; CHANNELS] = std::array::from_fn(|k| tone.iter().map(|v| v * b[k]).collect());
+                let acn: [Option<&[f32]>; CHANNELS] = std::array::from_fn(|k| Some(field[k].as_slice()));
+                let mut r = Renderer::new(Layout::Headphones);
+                let mut out = vec![0f32; 9600 * 2];
+                r.render(&acn, 9600, &mut out);
+                let (l, rr) = (rms(out.iter().step_by(2).copied().skip(2000)), rms(out.iter().skip(1).step_by(2).copied().skip(2000)));
+                (20.0 * (l / 0.5).log10(), 20.0 * (rr / 0.5).log10())
+            })
+            .collect()
+    }
+
+    /// How much later the right ear hears a horizontal tone of `hz` from `az` degrees than the
+    /// left (ms; from the phases after the first quarter second).
+    fn ear_lag(az: f32, hz: f32) -> f32 {
+        let (x, y, z) = unit(az.to_radians(), 0.0);
+        let b = sh(x, y, z);
+        let n = 48000;
+        let tone: Vec<f32> = (0..n).map(|i| (2.0 * PI * hz * i as f32 / 48000.0).sin()).collect();
+        let field: [Vec<f32>; CHANNELS] = std::array::from_fn(|k| tone.iter().map(|v| v * b[k]).collect());
+        let acn: [Option<&[f32]>; CHANNELS] = std::array::from_fn(|k| Some(field[k].as_slice()));
+        let mut r = Renderer::new(Layout::Headphones);
+        let mut out = vec![0f32; n * 2];
+        r.render(&acn, n, &mut out);
+        let tau = std::f64::consts::TAU;
+        let phase = |c: usize| {
+            let (mut s, mut co) = (0f64, 0f64);
+            for i in 12000..n {
+                let t = tau * hz as f64 * i as f64 / 48000.0;
+                let v = out[2 * i + c] as f64;
+                s += v * t.sin();
+                co += v * t.cos();
+            }
+            co.atan2(s)
+        };
+        let mut d = phase(0) - phase(1);
+        while d > std::f64::consts::PI {
+            d -= tau;
+        }
+        while d < -std::f64::consts::PI {
+            d += tau;
+        }
+        (d / (tau * hz as f64) * 1000.0) as f32
+    }
+
+    #[test]
+    fn headphones_delay_the_far_ear() {
+        let front = ear_lag(0.0, 250.0);
+        assert!(front.abs() < 0.02, "front: {front} ms");
+        let left = ear_lag(90.0, 250.0);
+        assert!(left > 0.25 && left < 0.8, "a left source: the right ear {left} ms later");
+        let right = ear_lag(-90.0, 250.0);
+        assert!((right + left).abs() < 0.02, "mirrored: {right} against {left}");
+        // (Run with --nocapture: the lag by direction and frequency.)
+        for az in [0.0f32, 30.0, 60.0, 90.0, 120.0, 150.0] {
+            let v: Vec<String> = [125.0f32, 250.0, 500.0, 750.0, 1000.0].iter().map(|&hz| format!("{hz}: {:.3}", ear_lag(az, hz))).collect();
+            eprintln!("az {az:5.1}: right ear later by (ms) {}", v.join(", "));
+        }
+    }
+
+    #[test]
+    fn report_responses_by_direction() {
+        // (Run with --nocapture: each ear's level by frequency for sources around the head.)
+        let hzs = [125.0f32, 250.0, 500.0, 750.0, 1000.0, 1500.0, 2000.0, 3000.0, 4000.0, 6000.0, 8000.0, 12000.0];
+        for az in [0.0f32, 30.0, 60.0, 90.0, 120.0, 150.0, 180.0] {
+            let v = ear_response(az, &hzs);
+            let line: Vec<String> = hzs.iter().zip(&v).map(|(h, (l, r))| format!("{h}: {l:+.1}/{r:+.1}")).collect();
+            eprintln!("az {az:5.1}: {}", line.join(" "));
         }
     }
 
