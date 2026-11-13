@@ -103,6 +103,9 @@ fn guess_report(app: &std::path::Path) -> i32 {
     // Format-accessed buffers: access pattern -> (format, dst_sel) -> count.
     let mut by_access: HashMap<String, HashMap<(u8, u16), u64>> = HashMap::new();
     let mut engine_learned = 0;
+    // Engine specs not equal to the guess: [equal to one of its image-dimension variants, equal
+    // to the guess with the LOD rule applied].
+    let mut var_equal = [0u64; 5];
     for (h, code, specs) in super::precompile::learned_compute() {
         let Ok(insts) = rdna::decode_program(&code) else { continue };
         let is_engine = engine.contains_key(&h);
@@ -206,6 +209,52 @@ fn guess_report(app: &std::path::Path) -> i32 {
                     n[k][class] += 1;
                 }
             }
+            if class != 1 && is_engine {
+                let mut g = guess.clone();
+                if g.lod_stats && !g.batched && super::shaders::cs_lod_rotation() && !actual.lod_stats {
+                    g.lod_stats = false;
+                    g.lod_lean = false;
+                }
+                // (Typed buffers' formats are read at run time: those differences match.)
+                let norm = |s: &rdna::translate::Spec| {
+                    let mut s = s.clone();
+                    if s.resources.len() == actual.resources.len() {
+                        for (a, b) in s.resources.iter_mut().zip(&actual.resources) {
+                            if matches!((&*a, b), (ResSpec::Buffer { .. }, ResSpec::Buffer { .. })) {
+                                *a = b.clone();
+                            }
+                        }
+                    }
+                    s
+                };
+                if norm(&g) == actual {
+                    var_equal[1] += 1;
+                } else if super::shaders::guess_dim_variants(&g).iter().any(|v| norm(v) == actual) {
+                    var_equal[0] += 1;
+                } else if g.resources.len() == actual.resources.len() {
+                    // Upper bounds: the guess with every image's dimension as learned, then also
+                    // its depth view, then also its class.
+                    let mut u = norm(&g);
+                    let set = |u: &mut rdna::translate::Spec, k: u8| {
+                        for (a, b) in u.resources.iter_mut().zip(&actual.resources) {
+                            if let (ResSpec::Image { dim, depth, class }, ResSpec::Image { dim: d2, depth: z2, class: c2 }) = (a, b) {
+                                match k {
+                                    0 => *dim = *d2,
+                                    1 => *depth = *z2,
+                                    _ => *class = *c2,
+                                }
+                            }
+                        }
+                    };
+                    for k in 0..3u8 {
+                        set(&mut u, k);
+                        if u == actual {
+                            var_equal[2 + k as usize] += 1;
+                            break;
+                        }
+                    }
+                }
+            }
             if let Some(dir) = engine.get(&h) {
                 let e = by_dir.entry(dir.clone()).or_default();
                 e[0] += 1;
@@ -226,6 +275,7 @@ fn guess_report(app: &std::path::Path) -> i32 {
         crate::info!("guess report ({what}): {} specs: guess equal {}, equal but for typed buffers' formats {}, different {}", n[k][0], n[k][1], n[k][2], n[k][3]);
     }
     crate::info!("guess report: {engine_learned} of the learned programs are the engine's; other differences: {other_why:?}");
+    crate::info!("guess report (engine): of the specs not equal to the guess, {} equal one of its image-dimension variants (`shaders::guess_dim_variants`), {} the guess with the LOD rule and typed buffers' formats; of the rest, equal with the learned image dimensions {}, also their depth views {}, also their classes {}", var_equal[0], var_equal[1], var_equal[2], var_equal[3], var_equal[4]);
     let mut fv: Vec<_> = fields.into_iter().collect();
     fv.sort_by(|a, b| b.1.cmp(&a.1));
     crate::info!("guess report: fields that differ after the preparation's variant rule (count): {fv:?}");
@@ -301,8 +351,9 @@ const FINGERPRINT_SAMPLE: u64 = 509;
 
 /// The preparation's rules (the guessed specs, `shaders::guess_compute_spec`, and the variants
 /// made): raised whenever they change, since the fingerprint's sample may not show it (2: an
-/// image only loaded from guessed Uint by its words' first uses, 2026-11-13).
-const PREPARATION_RULES: u32 = 2;
+/// image only loaded from guessed Uint by its words' first uses, 2026-11-13; 3: the engine
+/// programs' image-dimension variants, `shaders::guess_dim_variants`, 2026-11-13).
+const PREPARATION_RULES: u32 = 3;
 
 /// The translation fingerprint of the prepared shaders: a sample of the game's compute
 /// programs (`FINGERPRINT_SAMPLE`) translated as `precompile_all` translates them, their
@@ -318,8 +369,8 @@ pub fn translation_fingerprint(app: &std::path::Path) -> Result<String, String> 
     }
     let mut items: Vec<(u64, u64)> = progs
         .into_iter()
-        .filter_map(|(h, code, mut specs)| {
-            let mut spec = specs.pop()?;
+        .filter_map(|(h, code, specs)| {
+            let mut spec = specs.into_iter().next()?;
             if spec.lod_stats && !spec.batched && super::shaders::cs_lod_rotation() {
                 spec.lod_stats = false;
                 spec.lod_lean = false;
@@ -352,8 +403,11 @@ fn bundle_compute_sampled(app: &std::path::Path, sample: u64) -> Vec<(u64, std::
     let mut seen = std::collections::HashSet::new();
     let (mut programs, mut no_object) = (0u64, 0u64);
     let mut out = Vec::new();
+    let engine_dir = app.join("coredata");
+    let mut variants = 0u64;
     for f in files.iter().filter(|p| p.extension().is_some_and(|x| x == "csdr")) {
         let Some(v) = std::fs::read(f).ok().and_then(|b| super::particles::bundle_programs(&b)) else { continue };
+        let engine = f.starts_with(&engine_dir);
         for p in v.into_iter().filter(|p| p.stage == 0) {
             if !seen.insert(p.hash) || p.hash % sample != 0 {
                 continue;
@@ -367,10 +421,16 @@ fn bundle_compute_sampled(app: &std::path::Path, sample: u64) -> Vec<(u64, std::
             let user_sgprs = ((rsrc2 >> 1) & 0x1F).min(16) as u16;
             let plan = rdna::analysis::analyze_opts(&insts, user_sgprs, 0, false);
             let spec = super::shaders::guess_compute_spec(0, &insts, &plan, p.hash, rsrc2, local);
-            out.push((p.hash, std::sync::Arc::new(p.code), vec![spec]));
+            // (The guess first; the engine's image-dimension variants after it.)
+            let mut specs = vec![spec];
+            if engine {
+                specs.extend(super::shaders::guess_dim_variants(&specs[0]));
+                variants += specs.len() as u64 - 1;
+            }
+            out.push((p.hash, std::sync::Arc::new(p.code), specs));
         }
     }
-    crate::info!("compile bench: {programs} compute programs in the game's shader files (every {sample}th by code hash): {} guessed, {no_object} without an object read", out.len());
+    crate::info!("compile bench: {programs} compute programs in the game's shader files (every {sample}th by code hash): {} guessed, {variants} engine image-dimension variants, {no_object} without an object read", out.len());
     out
 }
 
@@ -399,19 +459,21 @@ pub fn precompile_all(app: &std::path::Path, threads: usize, progress: Option<&s
     // first (they set the end).
     let mut first = Vec::new();
     let mut second = Vec::new();
-    for (h, code, mut specs) in bundle_compute(app) {
-        let Some(spec) = specs.pop() else { continue };
+    for (h, code, specs) in bundle_compute(app) {
         let n = code.len();
-        if spec.lod_stats && !spec.batched && super::shaders::cs_lod_rotation() {
-            let mut plain = spec.clone();
-            plain.lod_stats = false;
-            plain.lod_lean = false;
-            first.push((h, code.clone(), plain, n));
-            if spec.resources.iter().any(|r| matches!(r, rdna::translate::ResSpec::Image { .. })) {
-                second.push((h, code, spec, n));
+        // (The guess and, for the engine's programs, its image-dimension variants.)
+        for spec in specs {
+            if spec.lod_stats && !spec.batched && super::shaders::cs_lod_rotation() {
+                let mut plain = spec.clone();
+                plain.lod_stats = false;
+                plain.lod_lean = false;
+                first.push((h, code.clone(), plain, n));
+                if spec.resources.iter().any(|r| matches!(r, rdna::translate::ResSpec::Image { .. })) {
+                    second.push((h, code.clone(), spec, n));
+                }
+            } else {
+                first.push((h, code.clone(), spec, n));
             }
-        } else {
-            first.push((h, code, spec, n));
         }
     }
     first.sort_by(|a, b| b.3.cmp(&a.3));

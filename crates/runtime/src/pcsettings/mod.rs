@@ -282,7 +282,7 @@ pub fn game_items() -> Vec<Item> {
             kind: ItemKind::Choice(vec![s("Automatic"), s("PlayStation"), s("Xbox"), s("Keyboard & Mouse")], 0),
         },
         toggle("SkipIntro", "Skip Intro Logos", "Skips the logos when the game starts.", false),
-        toggle("PadSpeaker", "Controller Speaker Sounds", "Plays the controller speaker's sounds with the game's.", false),
+        toggle("PadSpeaker", "Pad Speaker", "Plays the controller speaker's sounds with the game's.", false),
         Item {
             id: s("SaveFolder"),
             label: s("Save Folder"),

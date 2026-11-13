@@ -3553,6 +3553,40 @@ pub(crate) fn guess_compute_spec(addr: u64, insts: &[rdna::Inst], plan: &Plan, c
     compute_spec(addr, code_hash, rsrc2, local, wave64, resources, batchable(addr))
 }
 
+/// The preparation's other guesses of an engine program's spec (`compbench::precompile_all`):
+/// image dimensions its instructions do not settle, which the descriptor decides at run time
+/// (the guess report of 2026-11-13: the engine's cube instructions on cube arrays in 341 learned
+/// specs, its 2D-array instructions on 2D textures in 309). The guess with every cube image as a
+/// cube array, with every 2D array as 2D, and with both.
+pub(crate) fn guess_dim_variants(guess: &Spec) -> Vec<Spec> {
+    let has = |d: ImageDim| guess.resources.iter().any(|r| matches!(r, ResSpec::Image { dim, .. } if *dim == d));
+    let flip = |cube: bool, array: bool| {
+        let mut s = guess.clone();
+        for r in s.resources.iter_mut() {
+            if let ResSpec::Image { dim, .. } = r {
+                if cube && *dim == ImageDim::Cube {
+                    *dim = ImageDim::CubeArray;
+                } else if array && *dim == ImageDim::D2Array {
+                    *dim = ImageDim::D2;
+                }
+            }
+        }
+        s
+    };
+    let (cube, array) = (has(ImageDim::Cube), has(ImageDim::D2Array));
+    let mut v = Vec::new();
+    if cube {
+        v.push(flip(true, false));
+    }
+    if array {
+        v.push(flip(false, true));
+    }
+    if cube && array {
+        v.push(flip(true, true));
+    }
+    v
+}
+
 /// An image's number class as its program uses it (`guess_compute_spec`; the class itself comes
 /// from the descriptor's format at run time): an image the program only loads from, whose
 /// loaded words feed integer operations first (bit operations, integer arithmetic and compares,
