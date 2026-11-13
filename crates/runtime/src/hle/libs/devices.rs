@@ -70,6 +70,112 @@ unsafe fn to_stereo(p: &Port, ptr: *const u8) -> Vec<f32> {
 
 static PORTS: Mutex<Vec<Option<Port>>> = Mutex::new(Vec::new());
 
+/// RAD's speaker-gain setter (`titlefix` "stereo movie sound on both front speakers",
+/// eboot+0x1e4b340; rdi the voice (its channel count at +0x38), rsi a speaker-by-channel gain
+/// matrix (speaker s, channel c at 2s + c for a stereo voice), edx the speaker count). The
+/// title's movie player routes track k to speaker k alone, which for a stereo track is the
+/// left channel at the front left and the right nowhere: the right channel then goes to the
+/// front right with the left's gain. The first calls are logged.
+pub extern "sysv64" fn rad_speaker_hook(regs: *const u64, _arg: u32) {
+    let r = |i: usize| unsafe { *regs.add(i) };
+    let (voice, matrix, count) = (r(7), r(6), r(2) as u32);
+    if voice == 0 || matrix == 0 {
+        return;
+    }
+    let ch = unsafe { std::ptr::read_unaligned((voice + 0x38) as *const u32) };
+    let n = (count.min(8) * ch.clamp(1, 8)) as usize;
+    let at = |i: usize| (matrix + 4 * i as u64) as *mut f32;
+    let mut fixed = false;
+    if ch == 2 && count >= 2 {
+        let g0 = unsafe { std::ptr::read_unaligned(at(0)) };
+        let rest_silent = (1..n).all(|i| unsafe { std::ptr::read_unaligned(at(i)) } == 0.0);
+        if g0 != 0.0 && rest_silent {
+            unsafe { std::ptr::write_unaligned(at(3), g0) };
+            fixed = true;
+        }
+    }
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+        let gains: Vec<String> = (0..n.min(16)).map(|i| format!("{:.2}", unsafe { std::ptr::read_unaligned(at(i)) })).collect();
+        crate::info!(
+            "RAD speaker gains: voice {voice:#x} ({ch} channels), {count} speakers, matrix [{}]{} (from {})",
+            gains.join(" "),
+            if fixed { ": the right channel added to the front right" } else { "" },
+            crate::exception::current_guest_frames(3).join(" <- ")
+        );
+    }
+}
+
+/// A raw capture of the AudioOut ports (`start_raw_capture`): per port its
+/// channels and samples, and the frames each port still takes.
+struct RawCapture {
+    dir: std::path::PathBuf,
+    n: u32,
+    frames: usize,
+    ports: std::collections::BTreeMap<i32, (usize, Vec<f32>)>,
+}
+
+static RAW: Mutex<Option<RawCapture>> = Mutex::new(None);
+
+/// `audio ports <seconds>` (control): the next seconds of every AudioOut
+/// port's buffers as the title wrote them (all channels, as float, before
+/// the port volume and the stereo fold) to `<run dir>/audioout-<port>-<n>.wav`.
+pub fn start_raw_capture(seconds: f64) -> Result<(), String> {
+    let dir = crate::run_dir().ok_or("no run directory")?;
+    let mut g = RAW.lock();
+    if g.is_some() {
+        return Err("an AudioOut port capture is in progress".into());
+    }
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    *g = Some(RawCapture { dir: dir.to_path_buf(), n: N.fetch_add(1, std::sync::atomic::Ordering::Relaxed), frames: (seconds * 48000.0) as usize, ports: Default::default() });
+    crate::info!("AudioOut: capturing {seconds} s of each port's buffers");
+    Ok(())
+}
+
+/// Adds one output buffer of port `h` to the raw capture in progress.
+unsafe fn raw_add(h: i32, p: &Port, ptr: *const u8) {
+    let mut g = RAW.lock();
+    let Some(rc) = g.as_mut() else { return };
+    let ch = port_channels(p.format) as usize;
+    let float = matches!(p.format & 0xFF, 3 | 4 | 5 | 7);
+    let e = rc.ports.entry(h).or_insert_with(|| (ch, Vec::new()));
+    for i in 0..p.len as usize * ch {
+        e.1.push(if float { unsafe { *(ptr as *const f32).add(i) } } else { (unsafe { *(ptr as *const i16).add(i) }) as f32 / 32768.0 });
+    }
+    if rc.ports.values().all(|(c, v)| v.len() / c < rc.frames) {
+        return;
+    }
+    let rc = g.take().unwrap();
+    drop(g);
+    let _ = std::thread::Builder::new().name("audioout-capture".into()).spawn(move || {
+        for (port, (ch, v)) in &rc.ports {
+            let path = rc.dir.join(format!("audioout-{port}-{}.wav", rc.n));
+            let data = 4 * v.len() as u32;
+            let mut b = Vec::with_capacity(46 + data as usize);
+            b.extend_from_slice(b"RIFF");
+            b.extend_from_slice(&(38 + data).to_le_bytes());
+            b.extend_from_slice(b"WAVEfmt ");
+            b.extend_from_slice(&18u32.to_le_bytes());
+            b.extend_from_slice(&3u16.to_le_bytes());
+            b.extend_from_slice(&(*ch as u16).to_le_bytes());
+            b.extend_from_slice(&48000u32.to_le_bytes());
+            b.extend_from_slice(&(48000 * 4 * *ch as u32).to_le_bytes());
+            b.extend_from_slice(&(4 * *ch as u16).to_le_bytes());
+            b.extend_from_slice(&32u16.to_le_bytes());
+            b.extend_from_slice(&0u16.to_le_bytes());
+            b.extend_from_slice(b"data");
+            b.extend_from_slice(&data.to_le_bytes());
+            for s in v {
+                b.extend_from_slice(&s.to_le_bytes());
+            }
+            match std::fs::write(&path, &b) {
+                Ok(()) => crate::info!("AudioOut: port {port} capture written: {} ({} channels, {:.1} s)", path.display(), ch, v.len() as f64 / *ch as f64 / 48000.0),
+                Err(e) => crate::warn!("AudioOut: port {port} capture {}: {e}", path.display()),
+            }
+        }
+    });
+}
+
 fn port_channels(format: u32) -> u32 {
     match format & 0xFF {
         0 | 3 => 1,
@@ -170,6 +276,34 @@ sysv! {
             p.next = start + dur;
             (p.clone(), start.saturating_duration_since(now))
         };
+        if !ptr.is_null() {
+            raw_add(h, &port, ptr);
+        }
+        {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n == 50 {
+                crate::info!("sceAudioOutOutput port {h} buffer {:#x} from {}", ptr as u64, crate::exception::current_guest_frames(8).join(" <- "));
+            }
+            // (Diagnosis: the title's RAD sound voices, their volume, pan, channels and speaker
+            // gains, from its voice list at eboot+0x336BE98, about once a second.)
+            if n % 180 == 20 {
+                if let Some(m) = crate::loader::main_module() {
+                    let rd32 = |a: u64| unsafe { std::ptr::read_unaligned(a as *const u32) };
+                    let rdf = |a: u64| f32::from_bits(rd32(a));
+                    let mut v = unsafe { std::ptr::read_unaligned((m.base + 0x336BE98) as *const u64) };
+                    let mut k = 0;
+                    while v != 0 && k < 8 && crate::loader::module_at(v).is_none() {
+                        crate::info!(
+                            "RAD voice {k} at {v:#x}: volume {:.3} pan {:.3} channels {} gains {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} paused {} active {}",
+                            rdf(v + 0x6C), rdf(v + 0x70), rd32(v + 0x38), rdf(v + 0x74), rdf(v + 0x78), rdf(v + 0x7C), rdf(v + 0x80), rdf(v + 0x84), rdf(v + 0x88), rdf(v + 0x8C), rdf(v + 0x90), rd32(v + 0xA0), rd32(v + 0x44)
+                        );
+                        v = unsafe { std::ptr::read_unaligned((v + 0xB4) as *const u64) };
+                        k += 1;
+                    }
+                }
+            }
+        }
         if routed(port.kind) {
             if !ptr.is_null() {
                 crate::audio::push_stream(port.stream, to_stereo(&port, ptr), 3);
@@ -183,6 +317,10 @@ sysv! {
         let mut ports = PORTS.lock();
         let Some(Some(p)) = ports.get_mut((h - 1) as usize) else { return 0x8026_0004u32 as i32 };
         for i in 0..8 { if flags & (1 << i) != 0 && !vol.is_null() { p.volume[i] = *vol.add(i); } }
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+            crate::info!("sceAudioOutSetVolume port {h} flags {flags:#x}: volumes now {:?}", p.volume);
+        }
         0
     }
     fn sceAudioOutGetPortState(h: i32, st: *mut u8) -> i32 {

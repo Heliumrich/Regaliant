@@ -978,7 +978,9 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     (Some("capture"), Some(s)) if s > 0.0 && s <= 600.0 => audio::start_capture(s),
                     // `audio split <seconds>`: each AudioOut2 port group's mix to its own file.
                     (Some("split"), Some(s)) if s > 0.0 && s <= 120.0 => hle::libs::audio2::start_split(s),
-                    _ => Err("usage: audio capture <seconds 0-600> | audio split <seconds 0-120>".into()),
+                    // `audio ports <seconds>`: each AudioOut port's buffers as the title wrote them.
+                    (Some("ports"), Some(s)) if s > 0.0 && s <= 300.0 => hle::libs::devices::start_raw_capture(s),
+                    _ => Err("usage: audio capture <seconds 0-600> | audio split <seconds 0-120> | audio ports <seconds 0-300>".into()),
                 }
             }
             "frametimes" => {

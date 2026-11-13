@@ -282,6 +282,7 @@ pub fn game_items() -> Vec<Item> {
             kind: ItemKind::Choice(vec![s("Automatic"), s("PlayStation"), s("Xbox"), s("Keyboard & Mouse")], 0),
         },
         toggle("SkipIntro", "Skip Intro Logos", "Skips the logos when the game starts.", false),
+        toggle("PadSpeaker", "Controller Speaker Sounds", "Plays the controller speaker's sounds with the game's.", false),
         Item {
             id: s("SaveFolder"),
             label: s("Save Folder"),
@@ -338,6 +339,7 @@ pub fn apply() {
     convar::want("r_vignetteOverrideEnable", vignette_off.then_some(1));
     convar::want("r_vignetteScale", vignette_off.then(|| convar::float(0.0)));
     crate::hle::libs::audio2::OUTPUT_CHOICE.store(get("AudioOutput").unwrap_or(0).min(5), std::sync::atomic::Ordering::Relaxed);
+    crate::hle::libs::audio2::PAD_SPEAKER.store(get("PadSpeaker") == Some(1), std::sync::atomic::Ordering::Relaxed);
     // Frame Rate Limit: 0 30 FPS (`tune frame_cap` 30), 1 60 FPS (the original's: the title
     // flips at every 59.94 Hz vblank), 2 Uncapped (`tune uncapped`). Set when it changes (at
     // start only away from the default), and as defaults: DS_FRAME_CAP and DS_UNCAPPED, and
@@ -479,7 +481,7 @@ pub fn state_report() {
         format!("UiSize {} (scale {:.2})", v("UiSize"), ui_size()),
         format!("HudMargin {} (safe area {:?})", v("HudMargin"), safe_area()),
         format!("ButtonPrompts {} (in effect {})", v("ButtonPrompts"), prompts::MODE.load(Relaxed)),
-        format!("SkipIntro {} / SaveFolder {} / ImportSaves {}", v("SkipIntro"), v("SaveFolder"), v("ImportSaves")),
+        format!("SkipIntro {} / PadSpeaker {} / SaveFolder {} / ImportSaves {}", v("SkipIntro"), v("PadSpeaker"), v("SaveFolder"), v("ImportSaves")),
     ];
     crate::info!("pc settings: state: {}", lines.join("; "));
     convar::report();

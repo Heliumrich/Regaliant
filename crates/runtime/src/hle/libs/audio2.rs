@@ -45,7 +45,22 @@ const ATTR_GAIN: u32 = 1;
 struct Context {
     num_grains: u32,
     queue_depth: u32,
+    /// Its host stream (`crate::audio`): contexts are mixed together, each paced by its own
+    /// queue. (Until 2026-11-13 every context pushed into one stream, so two contexts pushing at
+    /// once had their grains played one after the other.)
+    stream: usize,
+    /// Grains pushed (status).
+    pushes: u64,
+    /// When the last push arrived, and per push the queue level it found (indices 0..=8, 8 for
+    /// eight or more) and the gaps between pushes (status: [<2 ms, <6, <12, <25, <50, <100,
+    /// longer]).
+    last_push: Option<std::time::Instant>,
+    levels: [u64; 9],
+    gaps: [u64; 7],
 }
+
+/// Each context's 3D-field renderer (its filters' state is the context's own).
+static RENDERERS: Mutex<Option<HashMap<u32, crate::spatial::Renderer>>> = Mutex::new(None);
 
 struct Port {
     ctx: u32,
@@ -77,6 +92,17 @@ fn is_object(port_type: u16) -> bool {
 
 /// The DualSense haptics port type (not mixed: `haptics`).
 const PORT_HAPTICS: u16 = 6;
+
+/// The DualSense speaker's port type: AudioOut2's port types 0-6 are main, BGM, voice, pad
+/// speaker, personal, aux and vibration (an interface fact, PROVENANCE.md); measured, a mono
+/// layer of its own at 0.5-16 kHz with hits, attacks and rolls (FINDINGS.md 2026-11-06 night,
+/// 2026-11-13). On the console it plays from the controller, never in the TV's or a headset's
+/// sound, so it is left out of the output unless `PAD_SPEAKER` (the PC setting Controller
+/// Speaker Sounds; it was mixed in, centred, until 2026-11-13).
+const PORT_PAD_SPEAKER: u16 = 3;
+
+/// Whether the pad speaker's sound is mixed into the output (`PORT_PAD_SPEAKER`).
+pub static PAD_SPEAKER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// One grain of the haptics port: its RMS per side to the controller's motors.
 unsafe fn haptics(p: &Port, n: usize) {
@@ -118,10 +144,6 @@ fn ambi_mode() -> u8 {
 fn ambi_decode() -> bool {
     ambi_mode() != 0
 }
-
-/// The renderer of the ambisonic field (its delay lines and filters persist across grains),
-/// made again when the output layout changes.
-static RENDERER: Mutex<Option<crate::spatial::Renderer>> = Mutex::new(None);
 
 /// The PC tab's Audio Output: 0 automatic, 1 headphones, 2 stereo speakers, 3 5.1, 4 7.1, 5
 /// Windows' spatial sound (Windows Sonic, Dolby Atmos; headphones where it is off). (The
@@ -253,6 +275,14 @@ pub fn status() -> String {
     v.sort_by_key(|e| *e.0);
     let parts: Vec<String> = v.iter().map(|(t, (e, n, gr))| format!("type {:#x}: rms {:.4} ({} grains with signal)", t, (e / (*n).max(1) as f64).sqrt(), gr)).collect();
     let mut out = format!("    AudioOut2 mixed signal by port type: {}\n", parts.join(", "));
+    if let Some(cs) = CONTEXTS.try_lock() {
+        for (h, c) in cs.iter().flat_map(|m| m.iter()).filter(|(_, c)| c.pushes > 0) {
+            out.push_str(&format!(
+                "    AudioOut2 context {h}: {} pushes ({} frames each, queue depth {}); the queue each found (grains 0..8+): {:?}; gaps between pushes (<2, <6, <12, <25, <50, <100 ms, longer): {:?}\n",
+                c.pushes, c.num_grains, c.queue_depth, c.levels, c.gaps
+            ));
+        }
+    }
     if let Some(o) = ENERGY_OBJ.lock().as_ref() {
         let mut v: Vec<_> = o.iter().collect();
         v.sort_by_key(|e| *e.0);
@@ -272,6 +302,57 @@ struct Split {
     frames_left: usize,
     frames: usize,
     mixes: std::collections::BTreeMap<String, Vec<f32>>,
+    /// The title's ambisonic field as it arrived (ACN 0-35 interleaved, after the ports' gains).
+    field: Vec<f32>,
+    /// 8-channel bed ports as they arrived (8 channels interleaved, after the ports' gains), by
+    /// group.
+    beds: std::collections::BTreeMap<String, Vec<f32>>,
+}
+
+/// Channels of the raw field the split capture keeps (the title's 5th order).
+const FIELD_RAW: usize = 36;
+
+/// One grain of each 8-channel bed port (raw channels after its gains) for the split capture.
+unsafe fn beds_raw(ports: &HashMap<u32, Port>, ctx: u32, n: usize) -> Vec<(String, Vec<f32>)> {
+    let mut out: Vec<(String, Vec<f32>)> = Vec::new();
+    for p in ports.values().filter(|p| p.ctx == ctx && p.latched != 0 && !is_object(p.port_type) && channels(p.format) >= 8) {
+        let ch = channels(p.format);
+        let float = p.format & 0x7F == 0;
+        let k = split_group(p);
+        let i = match out.iter().position(|(g, _)| *g == k) {
+            Some(i) => i,
+            None => {
+                out.push((k, vec![0f32; 8 * n]));
+                out.len() - 1
+            }
+        };
+        let v = &mut out[i].1;
+        for f in 0..n {
+            for c in 0..8 {
+                let x = unsafe { if float { *((p.latched as *const f32).add(f * ch + c)) } else { *((p.latched as *const i16).add(f * ch + c)) as f32 / 32768.0 } };
+                v[8 * f + c] += x * p.gains[c];
+            }
+        }
+    }
+    out
+}
+
+/// One grain of the raw field (36 channels) for the split capture.
+unsafe fn field_raw(ports: &HashMap<u32, Port>, ctx: u32, n: usize) -> Vec<f32> {
+    let mut out = vec![0f32; FIELD_RAW * n];
+    for p in ports.values().filter(|p| p.ctx == ctx && p.latched != 0) {
+        let Some(acn) = ambi_channel(p) else { continue };
+        if channels(p.format) != 1 || acn as usize >= FIELD_RAW {
+            continue;
+        }
+        let float = p.format & 0x7F == 0;
+        let g = p.gains[0];
+        for i in 0..n {
+            let x = unsafe { if float { *((p.latched as *const f32).add(i)) } else { *((p.latched as *const i16).add(i)) as f32 / 32768.0 } };
+            out[FIELD_RAW * i + acn as usize] += x * g;
+        }
+    }
+    out
 }
 
 static SPLIT: Mutex<Option<Split>> = Mutex::new(None);
@@ -283,7 +364,10 @@ pub fn start_split(seconds: f64) -> Result<(), String> {
         return Err("a split capture is in progress".into());
     }
     static N: AtomicU32 = AtomicU32::new(0);
-    *g = Some(Split { dir: dir.to_path_buf(), n: N.fetch_add(1, Ordering::Relaxed), frames_left: (seconds * 48000.0) as usize, frames: 0, mixes: Default::default() });
+    // (Reserved whole: growing them in the title's audio job stalled it 40-117 ms at each
+    // doubling, and the sound ran dry.)
+    let frames = (seconds * 48000.0) as usize;
+    *g = Some(Split { dir: dir.to_path_buf(), n: N.fetch_add(1, Ordering::Relaxed), frames_left: frames, frames: 0, mixes: Default::default(), field: Vec::with_capacity(FIELD_RAW * (frames + 4096)), beds: Default::default() });
     crate::info!("AudioOut2: capturing {seconds} s of each port group's mix");
     Ok(())
 }
@@ -296,12 +380,33 @@ fn split_group(p: &Port) -> String {
     }
 }
 
-/// One grain's groups (`group` -> its stereo mix of `n` frames) into the split capture.
-fn split_add(n: usize, grain: std::collections::BTreeMap<String, Vec<f32>>) {
+/// One grain's groups (`group` -> its stereo mix of `n` frames) and its raw field into the
+/// split capture.
+fn split_add(n: usize, grain: std::collections::BTreeMap<String, Vec<f32>>, field: Vec<f32>, beds: Vec<(String, Vec<f32>)>) {
     let mut g = SPLIT.lock();
     let Some(sp) = g.as_mut() else { return };
+    sp.field.extend_from_slice(&field);
+    let reserve = 8 * (sp.frames_left + sp.frames + 4096);
+    for (k, v) in beds {
+        let frames = sp.frames;
+        let e = sp.beds.entry(k).or_insert_with(|| {
+            let mut b = Vec::with_capacity(reserve);
+            b.resize(8 * frames, 0.0);
+            b
+        });
+        e.extend_from_slice(&v);
+    }
+    let frames_now = sp.frames + n;
+    for b in sp.beds.values_mut() {
+        b.resize(8 * frames_now, 0.0);
+    }
     for (k, v) in grain {
-        let e = sp.mixes.entry(k).or_insert_with(|| vec![0.0; 2 * sp.frames]);
+        let reserve = 2 * (sp.frames_left + sp.frames + 4096);
+        let e = sp.mixes.entry(k).or_insert_with(|| {
+            let mut b = Vec::with_capacity(reserve);
+            b.resize(2 * sp.frames, 0.0);
+            b
+        });
         e.extend_from_slice(&v);
     }
     sp.frames += n;
@@ -316,6 +421,58 @@ fn split_add(n: usize, grain: std::collections::BTreeMap<String, Vec<f32>>) {
     drop(g);
     // Written on a thread of its own (the title's audio job must not wait for the files).
     let _ = std::thread::Builder::new().name("audio-split".into()).spawn(move || {
+        // The raw beds: 8-channel float WAVs.
+        for (k, v) in &sp.beds {
+            let path = sp.dir.join(format!("audio-split{}-bed-{k}.wav", sp.n));
+            let data = 4 * v.len() as u32;
+            let mut b = Vec::with_capacity(46 + data as usize);
+            b.extend_from_slice(b"RIFF");
+            b.extend_from_slice(&(38 + data).to_le_bytes());
+            b.extend_from_slice(b"WAVEfmt ");
+            b.extend_from_slice(&18u32.to_le_bytes());
+            b.extend_from_slice(&3u16.to_le_bytes());
+            b.extend_from_slice(&8u16.to_le_bytes());
+            b.extend_from_slice(&48000u32.to_le_bytes());
+            b.extend_from_slice(&(48000 * 4 * 8u32).to_le_bytes());
+            b.extend_from_slice(&32u16.to_le_bytes());
+            b.extend_from_slice(&32u16.to_le_bytes());
+            b.extend_from_slice(&0u16.to_le_bytes());
+            b.extend_from_slice(b"data");
+            b.extend_from_slice(&data.to_le_bytes());
+            for s in v {
+                b.extend_from_slice(&s.to_le_bytes());
+            }
+            match std::fs::write(&path, &b) {
+                Ok(()) => crate::info!("AudioOut2: split capture {} (the raw bed, 8 channels)", path.display()),
+                Err(e) => crate::warn!("AudioOut2: split capture {}: {e}", path.display()),
+            }
+        }
+        // The raw field: a 36-channel float WAV.
+        {
+            let path = sp.dir.join(format!("audio-split{}-field36.wav", sp.n));
+            let data = 4 * sp.field.len() as u32;
+            let mut b = Vec::with_capacity(46 + data as usize);
+            b.extend_from_slice(b"RIFF");
+            b.extend_from_slice(&(38 + data).to_le_bytes());
+            b.extend_from_slice(b"WAVEfmt ");
+            b.extend_from_slice(&18u32.to_le_bytes());
+            b.extend_from_slice(&3u16.to_le_bytes());
+            b.extend_from_slice(&(FIELD_RAW as u16).to_le_bytes());
+            b.extend_from_slice(&48000u32.to_le_bytes());
+            b.extend_from_slice(&(48000 * 4 * FIELD_RAW as u32).to_le_bytes());
+            b.extend_from_slice(&(4 * FIELD_RAW as u16).to_le_bytes());
+            b.extend_from_slice(&32u16.to_le_bytes());
+            b.extend_from_slice(&0u16.to_le_bytes());
+            b.extend_from_slice(b"data");
+            b.extend_from_slice(&data.to_le_bytes());
+            for s in &sp.field {
+                b.extend_from_slice(&s.to_le_bytes());
+            }
+            match std::fs::write(&path, &b) {
+                Ok(()) => crate::info!("AudioOut2: split capture {} (the raw field, {} channels)", path.display(), FIELD_RAW),
+                Err(e) => crate::warn!("AudioOut2: split capture {}: {e}", path.display()),
+            }
+        }
         for (k, v) in &sp.mixes {
             let path = sp.dir.join(format!("audio-split{}-{k}.wav", sp.n));
             let peak = v.iter().fold(0f32, |m, x| m.max(x.abs()));
@@ -346,17 +503,18 @@ unsafe fn add_field(p: &Port, n: usize, field: &mut [Vec<f32>]) {
     }
 }
 
-/// Renders the gathered field into the stereo mix.
-fn render_field(field: &[Vec<f32>], n: usize, mix: &mut [f32]) {
+/// Renders the gathered field of context `ctx` into its mix.
+fn render_field(ctx: u32, field: &[Vec<f32>], n: usize, mix: &mut [f32]) {
     use crate::spatial::{CHANNELS, Renderer};
     if field.iter().all(|f| f.is_empty()) {
         return;
     }
     let layout = render_layout();
-    let mut g = RENDERER.lock();
-    if g.as_ref().is_none_or(|r| r.layout() != layout) {
-        crate::info!("AudioOut2: the 3D sound field rendered for {layout:?}");
-        *g = Some(Renderer::new(layout));
+    let mut g = RENDERERS.lock();
+    let m = g.get_or_insert_with(HashMap::new);
+    if m.get(&ctx).is_none_or(|r| r.layout() != layout) {
+        crate::info!("AudioOut2: context {ctx}'s 3D sound field rendered for {layout:?}");
+        m.insert(ctx, Renderer::new(layout));
     }
     // Mirrored (`DS_AUDIO_AMBI=2`): the left-right channels (odd in y) negated.
     let mirror = ambi_mode() == 2;
@@ -367,7 +525,7 @@ fn render_field(field: &[Vec<f32>], n: usize, mix: &mut [f32]) {
     };
     let src = if mirror { &flipped } else { field };
     let acn: [Option<&[f32]>; CHANNELS] = std::array::from_fn(|k| src.get(k).filter(|f| f.len() >= n).map(|f| &f[..n]));
-    g.as_mut().unwrap().render(&acn, n, mix);
+    m.get_mut(&ctx).unwrap().render(&acn, n, mix);
 }
 
 /// The split capture's copy of the field's rendering: the mix minus everything else would need
@@ -516,13 +674,16 @@ sysv! {
         let depth = if *p.add(3) == 0 { 4 } else { *p.add(3) };
         let grains = if *p.add(4) == 0 { 512 } else { *p.add(4) };
         let h = NEXT.fetch_add(1, Ordering::Relaxed);
-        CONTEXTS.lock().get_or_insert_with(HashMap::new).insert(h, Context { num_grains: grains, queue_depth: depth });
+        CONTEXTS.lock().get_or_insert_with(HashMap::new).insert(h, Context { num_grains: grains, queue_depth: depth, stream: crate::audio::new_stream(), pushes: 0, last_push: None, levels: [0; 9], gaps: [0; 7] });
         crate::info!("sceAudioOut2ContextCreate -> {h} ({grains} samples/grain, queue depth {depth}, max ports {}, objects {})", *p, *p.add(1));
         *out = h;
         0
     }
     fn sceAudioOut2ContextDestroy(ctx: u32) -> i32 {
         CONTEXTS.lock().get_or_insert_with(HashMap::new).remove(&ctx);
+        if let Some(m) = RENDERERS.lock().as_mut() {
+            m.remove(&ctx);
+        }
         PORTS.lock().get_or_insert_with(HashMap::new).retain(|_, p| p.ctx != ctx);
         0
     }
@@ -545,10 +706,30 @@ sysv! {
         0
     }
     fn sceAudioOut2ContextPush(ctx: u32, blocking: u32) -> i32 {
-        let Some((n, depth)) = CONTEXTS.lock().get_or_insert_with(HashMap::new).get(&ctx).map(|c| (c.num_grains as usize, c.queue_depth)) else {
+        let Some((n, depth, stream)) = CONTEXTS.lock().get_or_insert_with(HashMap::new).get_mut(&ctx).map(|c| {
+            c.pushes += 1;
+            // (Diagnostics: the queue this push found and the gap since the last one; a push
+            // that found it empty came late.)
+            let now = std::time::Instant::now();
+            let level = crate::audio::queued_grains(c.stream);
+            c.levels[level.min(8)] += 1;
+            if let Some(t) = c.last_push {
+                let gap = now.duration_since(t).as_secs_f64() * 1000.0;
+                let k = [2.0, 6.0, 12.0, 25.0, 50.0, 100.0].iter().position(|&b| gap < b).unwrap_or(6);
+                c.gaps[k] += 1;
+                if level == 0 && c.pushes > 100 {
+                    static LATE: AtomicU32 = AtomicU32::new(0);
+                    if LATE.fetch_add(1, Ordering::Relaxed) < 40 {
+                        crate::info!("AudioOut2: context {ctx} pushed into an empty queue {gap:.1} ms after its last push (thread {}, flip {})", crate::log::thread_name(), crate::gpu::FRAMES.load(Ordering::Relaxed));
+                    }
+                }
+            }
+            c.last_push = Some(now);
+            (c.num_grains as usize, c.queue_depth, c.stream)
+        }) else {
             return ERR_INVALID_PARAM;
         };
-        if blocking == 0 && crate::audio::queued_grains() >= depth as usize {
+        if blocking == 0 && crate::audio::queued_grains(stream) >= depth as usize {
             return ERR_NOT_READY;
         }
         // The output's layout: the renderer's (the output thread opens its client to match).
@@ -579,6 +760,9 @@ sysv! {
                     haptics(p, n);
                     continue;
                 }
+                if p.port_type == PORT_PAD_SPEAKER && !PAD_SPEAKER.load(Ordering::Relaxed) {
+                    continue;
+                }
                 if !(ambi_decode() && ambi_channel(p).is_some()) {
                     mix_port_ch(p, n, &mut mix, och);
                     continue;
@@ -601,22 +785,30 @@ sysv! {
             if !w.is_empty() && w.len() == y.len() && w.len() == x.len() {
                 note_balance(&w, &y, &x);
             }
-            render_field(&field, n, &mut mix);
+            render_field(ctx, &field, n, &mut mix);
             if splitting {
                 // The field's rendering as its own group (`ambi`).
                 let mut r = vec![0f32; 2 * n];
                 render_field_copy(&field, n, &mut r);
                 groups.insert("ambi-rendered".into(), r);
-                split_add(n, groups);
+                let raw = match ports.as_ref() {
+                    Some(m) => unsafe { field_raw(m, ctx, n) },
+                    None => vec![0f32; FIELD_RAW * n],
+                };
+                let beds = match ports.as_ref() {
+                    Some(m) => unsafe { beds_raw(m, ctx, n) },
+                    None => Vec::new(),
+                };
+                split_add(n, groups, raw, beds);
             }
         }
         // Blocks while `depth` grains are queued (the title's pacing).
-        crate::audio::push_grain(mix, och, depth as usize);
+        crate::audio::push_stream_ch(stream, mix, och, depth as usize);
         0
     }
     fn sceAudioOut2ContextGetQueueLevel(ctx: u32, level: *mut u32, available: *mut u32) -> i32 {
-        let depth = CONTEXTS.lock().get_or_insert_with(HashMap::new).get(&ctx).map(|c| c.queue_depth).unwrap_or(4);
-        let q = (crate::audio::queued_grains() as u32).min(depth);
+        let (depth, stream) = CONTEXTS.lock().get_or_insert_with(HashMap::new).get(&ctx).map(|c| (c.queue_depth, c.stream)).unwrap_or((4, usize::MAX));
+        let q = (crate::audio::queued_grains(stream) as u32).min(depth);
         if !level.is_null() { *level = q; }
         if !available.is_null() { *available = depth - q; }
         0
@@ -677,10 +869,40 @@ sysv! {
     /// SceAudioOut2PortState: {u16 output, u8 channels, u8, i16 volume, u16 reroute, u32 flags, ...}.
     fn sceAudioOut2PortGetState(port: u32, st: *mut u8) -> i32 {
         if st.is_null() { return ERR_INVALID_PARAM; }
-        let ch = PORTS.lock().get_or_insert_with(HashMap::new).get(&port).map(|p| channels(p.format)).unwrap_or(2);
+        let Some((own, ty)) = PORTS.lock().get_or_insert_with(HashMap::new).get(&port).map(|p| (channels(p.format), p.port_type)) else {
+            return ERR_INVALID_PORT;
+        };
+        // The title polls its main, BGM and pad-speaker ports and sets its speaker layout and
+        // Output Device Type from their state (eboot+0x1dda2a1: the channels through a jump
+        // table, AudioOut's state bits 0x01 primary output, 0x04 controller speaker, 0x40
+        // headphones). Each port reports its own data format's channels on the primary output:
+        // 8 for its 7.1 beds, so the title mixes for 7.1 speakers (its ambisonic field and beds,
+        // which `crate::spatial` renders). `DS_AUDIO_PORT_STATE=1` (diagnosis) reports the
+        // output as the console would for this PC's (2 channels for stereo or headphones, the
+        // headphone bit): the title then masters 6-8 dB louder, sends sound to object ports
+        // outside the field (mixed to the centre here) and the mix reached the soft knee 2,974
+        // times in 70 s of the cinematic (FINDINGS.md 2026-11-13).
+        let (output, ch) = if std::env::var("DS_AUDIO_PORT_STATE").ok().as_deref() != Some("1") {
+            (1u16, own as u8)
+        } else if ty == PORT_PAD_SPEAKER {
+            (4, 1)
+        } else {
+            match render_layout() {
+                crate::spatial::Layout::Headphones => (0x40, 2),
+                crate::spatial::Layout::Stereo => (1, 2),
+                crate::spatial::Layout::Surround51 => (1, 6),
+                _ => (1, 8),
+            }
+        };
+        {
+            static N: AtomicU32 = AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                crate::info!("sceAudioOut2PortGetState port {port} (type {ty:#x}, {own} channels) -> output {output:#x}, {ch} channels");
+            }
+        }
         std::ptr::write_bytes(st, 0, 0x40);
-        *(st as *mut u16) = 1; // primary output connected
-        *st.add(2) = ch as u8;
+        *(st as *mut u16) = output;
+        *st.add(2) = ch;
         *(st.add(4) as *mut i16) = 127;
         0
     }

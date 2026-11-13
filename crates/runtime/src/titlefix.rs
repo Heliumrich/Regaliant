@@ -395,6 +395,20 @@ const FIXES: &[Fix] = &[
         why: "the port learns when a streamed texture chunk's data is complete (census)",
         only_with: Some("DS_TEX_STREAM"),
     },
+    // RAD's sound system: a voice's speaker-gain setter (eboot+0x1e4b340, `cmp edx,8; mov
+    // ecx,8`: rdi the voice, rsi a speaker-by-channel gain matrix, edx the speaker count).
+    // The title's movie player routes Bink track k to speaker k alone (eboot+0x981dec: a 5.1
+    // movie as six mono tracks), so the one movie with sound, the PlayStation Studios logo
+    // (one stereo track), played its left channel from the front left and lost its right.
+    Fix {
+        name: "stereo movie sound on both front speakers",
+        offset: 0x1e4b340,
+        from: (8, 0x3933a16e8590f353),
+        change: Change::Hook { at: 0, handler: crate::hle::libs::devices::rad_speaker_hook },
+        kind: "title bug",
+        why: "a stereo movie track routed like a 5.1 movie's mono tracks keeps only its left channel",
+        only_with: None,
+    },
     // The heaps' allocate's one epilogue (eboot+0x802c2a, `mov rax,rbx; add
     // rsp,28h`, a branch target: rbx the block or 0, r12 the heap or the
     // heap + 0x20, [rbp-0x40] the size asked for, rbp its frame).

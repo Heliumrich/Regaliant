@@ -78,6 +78,14 @@ struct Stream {
     pushed: u64,
     /// Peak absolute sample value pushed (diagnostics: 0 = silence).
     peak: f32,
+    /// Whether the last mix took frames from it (a stream that did and
+    /// has none now ran dry: an underrun heard as a gap).
+    fed: bool,
+    /// Underruns: mixes that found it dry while it was playing, the frames
+    /// left silent, and the largest mix request then (diagnostics).
+    dry: u64,
+    dry_frames: u64,
+    dry_request: usize,
 }
 
 struct Mixer {
@@ -197,8 +205,6 @@ fn write_wav(path: &std::path::Path, samples: &[f32]) -> std::io::Result<()> {
     std::fs::write(path, b)
 }
 
-/// Stream 0 belongs to AudioOut2 (one context mixes everything it pushes).
-pub const STREAM_AUDIOOUT2: usize = 0;
 
 fn mixer() -> &'static Mixer {
     MIXER.get_or_init(|| {
@@ -261,18 +267,23 @@ pub fn status() -> String {
         UNDERRUN_FRAMES.load(Ordering::Relaxed) as f64 / RATE as f64
     );
     for (i, st) in s.iter().enumerate() {
-        out.push_str(&format!("    audio stream {i}: {:.1} s pushed, {} grain(s) queued, peak {:.3}\n", st.pushed as f64 / RATE as f64, st.grains.len(), st.peak));
+        out.push_str(&format!(
+            "    audio stream {i}: {:.1} s pushed, {} grain(s) queued, peak {:.3}; ran dry {} times while playing ({:.1} ms left silent, largest request {} frames)\n",
+            st.pushed as f64 / RATE as f64,
+            st.grains.len(),
+            st.peak,
+            st.dry,
+            st.dry_frames as f64 * 1000.0 / RATE as f64,
+            st.dry_request
+        ));
     }
     out
 }
 
-pub fn push_grain(grain: Vec<f32>, channels: usize, depth: usize) {
-    push_stream_ch(STREAM_AUDIOOUT2, grain, channels, depth);
-}
-
-pub fn queued_grains() -> usize {
+/// Grains queued on stream `id`.
+pub fn queued_grains(id: usize) -> usize {
     let s = mixer().streams.lock();
-    s.get(STREAM_AUDIOOUT2).map(|x| x.grains.len()).unwrap_or(0)
+    s.get(id).map(|x| x.grains.len()).unwrap_or(0)
 }
 
 /// Where channel `k` of a `gch`-channel layout goes in an `och`-channel one (layouts: 1 mono, 2
@@ -362,12 +373,20 @@ fn mix_into(out: &mut [f32], frames: usize, och: usize) {
     let m = mixer();
     let mut s = m.streams.lock();
     let mut starved = false;
-    for st in s.iter_mut() {
+    for (id, st) in s.iter_mut().enumerate() {
         let mut done = 0usize;
         while done < frames {
             let Some((gch, front)) = st.grains.front() else {
-                if done > 0 || !st.grains.is_empty() {
+                // Dry while playing: frames left silent in this mix.
+                if done > 0 || st.fed {
                     starved = true;
+                    st.dry += 1;
+                    st.dry_frames += (frames - done) as u64;
+                    st.dry_request = st.dry_request.max(frames);
+                    static LOGGED: AtomicU64 = AtomicU64::new(0);
+                    if LOGGED.fetch_add(1, Ordering::Relaxed) < 40 {
+                        crate::info!("audio: stream {id} ran dry: {} of {frames} frames silent ({} pushed so far)", frames - done, st.pushed);
+                    }
                 }
                 break;
             };
@@ -385,6 +404,7 @@ fn mix_into(out: &mut [f32], frames: usize, och: usize) {
                 st.offset = 0;
             }
         }
+        st.fed = done > 0;
     }
     drop(s);
     m.cv.notify_all();
