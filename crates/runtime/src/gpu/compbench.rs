@@ -359,8 +359,8 @@ const FINGERPRINT_SAMPLE: u64 = 509;
 /// image only loaded from guessed Uint by its words' first uses, 2026-11-13; 3: the engine
 /// programs' image-dimension variants, `shaders::guess_dim_variants`, 2026-11-13; 4: their
 /// depth-view variants too, 2026-11-13; 5: specs as a hosted session makes them,
-/// `fe2::specs_as_hosted`, 2026-11-13).
-const PREPARATION_RULES: u32 = 5;
+/// `fe2::specs_as_hosted`, 2026-11-13; 6: the materials' shader bundles too, 2026-11-13).
+const PREPARATION_RULES: u32 = 6;
 
 /// The translation fingerprint of the prepared shaders: a sample of the game's compute
 /// programs (`FINGERPRINT_SAMPLE`) translated as `precompile_all` translates them, their
@@ -396,13 +396,19 @@ fn bundle_compute_sampled(app: &std::path::Path, sample: u64) -> Vec<(u64, std::
     let mut files: Vec<std::path::PathBuf> = Vec::new();
     let pdir = app.join("particles").join("!cookedparticleshaders").join("version01").join("_ps5");
     files.extend(std::fs::read_dir(&pdir).into_iter().flatten().flatten().map(|e| e.path()));
-    let mut stack = vec![app.join("coredata").join("enginesupport").join("shaders").join("_ps5")];
+    // The engine's shaders, and the materials' bundles (their compute programs: 58% of a prepared
+    // first session's remaining misses, 2026-11-13; a material's `_trinity` bundle repeats its
+    // other one's programs, left out).
+    // (A stack: the engine's tree is walked before the materials', so a program in both is
+    // the engine's and gets its image variants.)
+    let materials = app.join("materials").join("!cookedshaders");
+    let mut stack = vec![materials.clone(), app.join("coredata").join("enginesupport").join("shaders").join("_ps5")];
     while let Some(d) = stack.pop() {
         for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
             let p = e.path();
             if p.is_dir() {
                 stack.push(p);
-            } else {
+            } else if !(p.starts_with(&materials) && p.file_stem().is_some_and(|s| s.to_string_lossy().ends_with("_trinity"))) {
                 files.push(p);
             }
         }
