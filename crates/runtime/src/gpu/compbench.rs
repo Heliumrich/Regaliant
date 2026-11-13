@@ -278,7 +278,7 @@ fn guess_report(app: &std::path::Path) -> i32 {
     {
         let progs = bundle_compute(app);
         let engine_variants: usize = progs.iter().map(|p| p.2.len() - 1).sum();
-        crate::info!("guess report: the preparation would make {} compute pipelines' specs ({} of them engine image variants)", progs.iter().map(|p| p.2.len()).sum::<usize>(), engine_variants);
+        crate::info!("guess report: the preparation would make {} compute pipelines' specs ({} of them variants of the guess)", progs.iter().map(|p| p.2.len()).sum::<usize>(), engine_variants);
     }
     crate::info!("guess report (engine): of the specs not equal to the guess, {} equal one of its image-dimension variants (`shaders::guess_dim_variants`), {} the guess with the LOD rule and typed buffers' formats; of the rest, equal with the learned image dimensions {}, also their depth views {}, also their classes {}", var_equal[0], var_equal[1], var_equal[2], var_equal[3], var_equal[4]);
     let mut fv: Vec<_> = fields.into_iter().collect();
@@ -359,8 +359,9 @@ const FINGERPRINT_SAMPLE: u64 = 509;
 /// image only loaded from guessed Uint by its words' first uses, 2026-11-13; 3: the engine
 /// programs' image-dimension variants, `shaders::guess_dim_variants`, 2026-11-13; 4: their
 /// depth-view variants too, 2026-11-13; 5: specs as a hosted session makes them,
-/// `fe2::specs_as_hosted`, 2026-11-13; 6: the materials' shader bundles too, 2026-11-13).
-const PREPARATION_RULES: u32 = 6;
+/// `fe2::specs_as_hosted`, 2026-11-13; 6: the materials' shader bundles too, 2026-11-13; 7:
+/// written 3D images as 2D, `shaders::guess_d3_variant`, 2026-11-13).
+const PREPARATION_RULES: u32 = 7;
 
 /// The translation fingerprint of the prepared shaders: a sample of the game's compute
 /// programs (`FINGERPRINT_SAMPLE`) translated as `precompile_all` translates them, their
@@ -418,6 +419,7 @@ fn bundle_compute_sampled(app: &std::path::Path, sample: u64) -> Vec<(u64, std::
     let mut out = Vec::new();
     let engine_dir = app.join("coredata");
     let mut variants = 0u64;
+    let mut d3_variants = 0u64;
     for f in files.iter().filter(|p| p.extension().is_some_and(|x| x == "csdr")) {
         let Some(v) = std::fs::read(f).ok().and_then(|b| super::particles::bundle_programs(&b)) else { continue };
         let engine = f.starts_with(&engine_dir);
@@ -446,10 +448,14 @@ fn bundle_compute_sampled(app: &std::path::Path, sample: u64) -> Vec<(u64, std::
                 specs.extend(super::shaders::guess_dim_variants(&specs[0]));
                 variants += specs.len() as u64 - 1;
             }
+            if let Some(v) = super::shaders::guess_d3_variant(&specs[0]) {
+                specs.push(v);
+                d3_variants += 1;
+            }
             out.push((p.hash, std::sync::Arc::new(p.code), specs));
         }
     }
-    crate::info!("compile bench: {programs} compute programs in the game's shader files (every {sample}th by code hash): {} guessed, {variants} engine image-dimension variants, {no_object} without an object read", out.len());
+    crate::info!("compile bench: {programs} compute programs in the game's shader files (every {sample}th by code hash): {} guessed, {variants} engine image-dimension variants, {d3_variants} written 3D images as 2D, {no_object} without an object read", out.len());
     out
 }
 

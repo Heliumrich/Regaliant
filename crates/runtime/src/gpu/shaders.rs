@@ -3629,6 +3629,25 @@ pub(crate) fn guess_dim_variants(guess: &Spec) -> Vec<Spec> {
     v
 }
 
+/// The preparation's other guess of any program's spec (`compbench::precompile_all`): images its
+/// instructions address as 3D that it also writes (no `ImageDim::D3OrD2` for them), as 2D (the
+/// title binds 2D textures there: 29 misses of 26 particle and material programs in a prepared
+/// first session, 2026-11-13). None when it has no such image.
+pub(crate) fn guess_d3_variant(guess: &Spec) -> Option<Spec> {
+    if !guess.resources.iter().any(|r| matches!(r, ResSpec::Image { dim: ImageDim::D3, .. })) {
+        return None;
+    }
+    let mut s = guess.clone();
+    for r in s.resources.iter_mut() {
+        if let ResSpec::Image { dim, .. } = r {
+            if *dim == ImageDim::D3 {
+                *dim = ImageDim::D2;
+            }
+        }
+    }
+    Some(s)
+}
+
 /// An image's number class as its program uses it (`guess_compute_spec`; the class itself comes
 /// from the descriptor's format at run time): an image the program only loads from, whose
 /// loaded words feed integer operations first (bit operations, integer arithmetic and compares,
