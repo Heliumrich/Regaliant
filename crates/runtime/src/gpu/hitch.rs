@@ -17,6 +17,17 @@
 
 use parking_lot::Mutex;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// The GPU's busy share of each frame (busy time over the frame's interval), averaged over
+/// ~16 frames, x 1e6 (`gpu_busy_share`; 1.0 until frames come in).
+static BUSY_SHARE: AtomicU64 = AtomicU64::new(1_000_000);
+
+/// The GPU's busy share of the recent frames (0..1): low where the command processors (or the
+/// title) leave it waiting (`par::graphics_min`).
+pub fn gpu_busy_share() -> f64 {
+    BUSY_SHARE.load(Ordering::Relaxed) as f64 / 1e6
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
@@ -235,6 +246,12 @@ fn take_pending(s: &mut State) {
         }
         let p = s.pending.pop_front().unwrap();
         let busy = gpu_busy(s, p.start, p.end);
+        let span = p.end.saturating_sub(p.start);
+        if span > 0 {
+            let x = (busy as f64 / span as f64).min(1.0);
+            let old = BUSY_SHARE.load(Ordering::Relaxed) as f64 / 1e6;
+            BUSY_SHARE.store(((old + (x - old) / 16.0) * 1e6) as u64, Ordering::Relaxed);
+        }
         // GPU time per queue and batch kind in the frame (clipped to it).
         let mut kinds: std::collections::HashMap<(u8, u64), u64> = std::collections::HashMap::new();
         for g in s.gpu.iter().rev() {

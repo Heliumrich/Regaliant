@@ -3092,7 +3092,7 @@ impl Cp {
         };
         let n = ends.len();
         super::par::note_run(n, why, self.compute);
-        let par_min = (if self.compute { super::tune::par_min_compute() as usize } else { super::par::min_run() }).max(super::par::floor());
+        let par_min = if self.compute { (super::tune::par_min_compute() as usize).max(super::par::floor()) } else { super::par::graphics_min() };
         let chunk_min = (par_min / 3).clamp(16, PAR_CHUNK_MIN);
         let chunks = ((k + 1) * super::par::split()).min(n / chunk_min);
         if n < par_min || chunks < 2 {
@@ -3870,7 +3870,7 @@ impl Cp {
             }
             c = next;
         };
-        let par_min = super::par::min_run().max(super::par::floor());
+        let par_min = super::par::graphics_min();
         let chunk_min = (par_min / 3).clamp(16, PAR_CHUNK_MIN);
         let chunks = ((super::par::workers() + 1) * super::par::split()).min(n / chunk_min);
         if n < par_min || chunks < 2 {
@@ -4061,7 +4061,7 @@ impl Cp {
         let t0 = Instant::now();
         // Runs this command processor would split among parallel workers.
         let par_min = if !whole && f.words.is_empty() && !super::capture::capturing() && (if self.compute { compute_workers() > 0 } else { super::par::workers() > 0 }) {
-            (if self.compute { super::tune::par_min_compute() as usize } else { super::par::min_run() }).max(super::par::floor())
+            if self.compute { (super::tune::par_min_compute() as usize).max(super::par::floor()) } else { super::par::graphics_min() }
         } else {
             usize::MAX
         };

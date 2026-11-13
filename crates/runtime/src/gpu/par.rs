@@ -70,6 +70,45 @@ pub fn min_run() -> usize {
     }
 }
 
+/// The fewest commands a graphics run is split at (`min_run` and `floor`). With `tune par_min`
+/// 0 (automatic) and eight workers or more it follows the bottleneck: 32 while the GPU is busy
+/// under 70% of the frames (`hitch::gpu_busy_share`: the command processors leave it waiting;
+/// TowerL Top x1.013 against 64, its CP 14.5 against 15.1 ms a flip), the 64 again once it is
+/// busy over 85% (where the GPU limits, the more chunks' seams cost it: x0.98 at the swamp;
+/// FINDINGS.md 2026-11-13).
+pub fn graphics_min() -> usize {
+    let fixed = min_run().max(floor());
+    if super::tune::par_min() != 0 || workers() < 8 {
+        return fixed;
+    }
+    static CP_LIMITED: AtomicBool = AtomicBool::new(false);
+    let share = super::hitch::gpu_busy_share();
+    let was = CP_LIMITED.load(Ordering::Relaxed);
+    let limited = if share < 0.70 {
+        true
+    } else if share > 0.85 {
+        false
+    } else {
+        was
+    };
+    if limited != was {
+        CP_LIMITED.store(limited, Ordering::Relaxed);
+        MIN_SWITCHES.fetch_add(1, Ordering::Relaxed);
+    }
+    if limited {
+        MIN_LOW.fetch_add(1, Ordering::Relaxed);
+        32.min(fixed)
+    } else {
+        MIN_HIGH.fetch_add(1, Ordering::Relaxed);
+        fixed
+    }
+}
+
+/// `graphics_min`'s answers: [32 (the GPU waiting), the fixed threshold, switches between them].
+static MIN_LOW: AtomicU64 = AtomicU64::new(0);
+static MIN_HIGH: AtomicU64 = AtomicU64::new(0);
+static MIN_SWITCHES: AtomicU64 = AtomicU64::new(0);
+
 /// Chunks per recorder (the main command processor and each worker) a run
 /// is split into (`tune par_split`; 1: one each, all submitted when the
 /// main command processor's own chunk is done).
@@ -675,4 +714,17 @@ pub fn status() -> String {
         ends_c.join(", "),
         super::cp::run_passed_line()
     ) + &super::hscensus::line()
+        + &{
+            let (lo, hi) = (MIN_LOW.load(Ordering::Relaxed), MIN_HIGH.load(Ordering::Relaxed));
+            if lo + hi == 0 {
+                String::new()
+            } else {
+                format!(
+                    "    graphics split threshold (automatic, `graphics_min`): 32 for {lo} plans while the GPU waited, the fixed one for {hi}, {} switches; the GPU's busy share of the frames now {:.2}
+",
+                    MIN_SWITCHES.load(Ordering::Relaxed),
+                    super::hitch::gpu_busy_share()
+                )
+            }
+        }
 }
