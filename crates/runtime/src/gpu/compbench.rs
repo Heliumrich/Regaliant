@@ -98,6 +98,8 @@ fn guess_report(app: &std::path::Path) -> i32 {
     // The differences in detail: (guess -> learned) image dimensions and
     // classes, and the resource kinds when their counts differ.
     let mut pairs: HashMap<String, u64> = HashMap::new();
+    // The same by the programs' origin (particle bundles, engine, other).
+    let mut pairs_by: HashMap<String, u64> = HashMap::new();
     // Format-accessed buffers: access pattern -> (format, dst_sel) -> count.
     let mut by_access: HashMap<String, HashMap<(u8, u16), u64>> = HashMap::new();
     let mut engine_learned = 0;
@@ -150,12 +152,29 @@ fn guess_report(app: &std::path::Path) -> i32 {
                                 *a = b.clone();
                             }
                             (ResSpec::Image { dim: d1, class: c1, depth: z1 }, ResSpec::Image { dim: d2, class: c2, depth: z2 }) => {
+                                let tag = if particle.contains(&h) { "particle" } else if engine.contains_key(&h) { "engine" } else { "other" };
                                 if d1 != d2 {
                                     *other_why.entry("an image's dimension").or_default() += 1;
                                     *pairs.entry(format!("dim {d1:?} -> {d2:?}")).or_default() += 1;
+                                    *pairs_by.entry(format!("{tag}: dim {d1:?} -> {d2:?}")).or_default() += 1;
                                 } else if c1 != c2 {
                                     *other_why.entry("an image's class").or_default() += 1;
                                     *pairs.entry(format!("class {c1:?} -> {c2:?}")).or_default() += 1;
+                                    *pairs_by.entry(format!("{tag}: class {c1:?} -> {c2:?}")).or_default() += 1;
+                                    // (The image instructions on that resource.)
+                                    let mut ops: Vec<&str> = insts.iter().filter(|i| i.enc == rdna::Enc::Mimg && plan.inst_res.get(&i.pc).is_some_and(|x| x.0 == r)).filter_map(|i| i.name()).collect();
+                                    ops.sort();
+                                    ops.dedup();
+                                    *pairs_by.entry(format!("{tag}: class {c1:?} -> {c2:?} by [{}]", ops.join(" "))).or_default() += 1;
+                                    // And for the ones guessed right, the same key with their class.
+                                }
+                                if c1 == c2 && d1 == d2 && matches!(c2, rdna::translate::NumClass::Float) && tag == "engine" {
+                                    let mut ops: Vec<&str> = insts.iter().filter(|i| i.enc == rdna::Enc::Mimg && plan.inst_res.get(&i.pc).is_some_and(|x| x.0 == r)).filter_map(|i| i.name()).collect();
+                                    ops.sort();
+                                    ops.dedup();
+                                    *pairs_by.entry(format!("{tag}: Float right by [{}]", ops.join(" "))).or_default() += 1;
+                                }
+                                if d1 != d2 || c1 != c2 {
                                 } else if z1 != z2 {
                                     *other_why.entry("an image's depth view").or_default() += 1;
                                 }
@@ -216,6 +235,9 @@ fn guess_report(app: &std::path::Path) -> i32 {
     let mut pv: Vec<(&String, &u64)> = pairs.iter().collect();
     pv.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
     crate::info!("guess report: differences in detail (guess -> learned): {}", pv.iter().take(24).map(|(k, c)| format!("{k} {c}")).collect::<Vec<_>>().join(", "));
+    let mut pb: Vec<(&String, &u64)> = pairs_by.iter().collect();
+    pb.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    crate::info!("guess report: image differences by origin (guess -> learned): {}", pb.iter().take(30).map(|(k, c)| format!("{k} {c}")).collect::<Vec<_>>().join(", "));
     crate::info!("guess report (engine programs binding no image and no typed buffer): {} specs: equal {}, format-only {}, different {}", plain[0], plain[1], plain[2], plain[3]);
     let mut dirs: Vec<(&String, &[u64; 4])> = by_dir.iter().collect();
     dirs.sort_by(|a, b| b.1[0].cmp(&a.1[0]).then(a.0.cmp(b.0)));

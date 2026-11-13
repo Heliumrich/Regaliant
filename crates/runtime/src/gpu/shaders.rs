@@ -3546,11 +3546,69 @@ pub(crate) fn guess_compute_spec(addr: u64, insts: &[rdna::Inst], plan: &Plan, c
                     _ if !super::tune::cmp_emulate() => true,
                     _ => r < 64 && cmp & (1 << r) != 0,
                 };
-                ResSpec::Image { dim, class: NumClass::Float, depth }
+                ResSpec::Image { dim, class: guess_image_class(insts, plan, r), depth }
             }
         })
         .collect();
     compute_spec(addr, code_hash, rsrc2, local, wave64, resources, batchable(addr))
+}
+
+/// An image's number class as its program uses it (`guess_compute_spec`; the class itself comes
+/// from the descriptor's format at run time): an image the program only loads from, whose
+/// loaded words feed integer operations first (bit operations, integer arithmetic and compares,
+/// a conversion from an integer), is guessed Uint; anything else Float. (The guess report:
+/// the engine's images read with image_load alone were Uint in 952 specs and Float in 1,050.)
+fn guess_image_class(insts: &[rdna::Inst], plan: &Plan, r: usize) -> NumClass {
+    let on_r = |i: &rdna::Inst| i.enc == rdna::Enc::Mimg && plan.inst_res.get(&i.pc).is_some_and(|x| x.0 == r);
+    let mut loads = insts.iter().enumerate().filter(|(_, i)| on_r(i)).peekable();
+    if loads.peek().is_none() {
+        return NumClass::Float;
+    }
+    let (mut int_votes, mut float_votes) = (0u32, 0u32);
+    for (k, i) in insts.iter().enumerate().filter(|(_, i)| on_r(i)) {
+        let Some(name) = i.name() else { return NumClass::Float };
+        if !name.starts_with("image_load") || name.contains("d16") {
+            // Sampled, stored or anything else: as before.
+            if !name.starts_with("image_store") {
+                return NumClass::Float;
+            }
+            continue;
+        }
+        // The loaded VGPRs and the first instructions after the load that read one of them.
+        let first = i.vdst() as u32;
+        let count = i.mimg_dmask().count_ones().max(1);
+        let reads = |j: &rdna::Inst| -> bool {
+            let srcs: &[usize] = match j.enc {
+                rdna::Enc::Vop1 => &[0],
+                rdna::Enc::Vop2 | rdna::Enc::Vopc => &[0, 1],
+                rdna::Enc::Vop3 | rdna::Enc::Vop3p => &[0, 1, 2],
+                _ => &[],
+            };
+            srcs.iter().any(|&s| {
+                let o = j.src(s) as u32;
+                o >= 256 && (o - 256) >= first && (o - 256) < first + count
+            })
+        };
+        let mut seen = 0;
+        for j in insts[k + 1..].iter().take(64) {
+            if !reads(j) {
+                continue;
+            }
+            let Some(n) = j.name() else { break };
+            let int = n.contains("_u32") || n.contains("_i32") || n.contains("_b32") || n.contains("_u16") || n.contains("_i16") || n.contains("bfe") || n.contains("bfi") || n.contains("lshl") || n.contains("lshr") || n.contains("ashr") || n.contains("and_") || n.contains("or_") || n.contains("xor") || n.contains("perm") || n.starts_with("v_cvt_f32_u") || n.starts_with("v_cvt_f32_i") || n.starts_with("v_cvt_f32_ubyte");
+            let float = !int && (n.contains("_f32") || n.contains("_f16") || n.contains("_f64"));
+            if int {
+                int_votes += 1;
+            } else if float {
+                float_votes += 1;
+            }
+            seen += 1;
+            if seen >= 3 {
+                break;
+            }
+        }
+    }
+    if int_votes > float_votes { NumClass::Uint } else { NumClass::Float }
 }
 
 /// The key spec (code base left out) `prepare_ngg` makes for the vertex
