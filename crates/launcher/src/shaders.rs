@@ -128,12 +128,19 @@ pub fn state(app: &App) -> (bool, String) {
 }
 
 pub fn prepared(app: &App) -> bool {
-    // (Play waits for the translation check, a few seconds at most.)
+    wait_check();
+    state(app).0
+}
+
+/// Waits for the translation check to end (a few seconds at most): Play waits for it, also to
+/// start the game, as the check's run of the game holds the game's one-session lock meanwhile
+/// (a start then is told the game already runs: seen 2026-11-14 with Play pressed 2 s after the
+/// launcher opened and the preparation on Play turned off).
+pub fn wait_check() {
     let t = Instant::now();
     while CHECK_STARTED.load(std::sync::atomic::Ordering::Relaxed) && checked_translation().is_none() && t.elapsed().as_secs() < 20 {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    state(app).0
 }
 
 pub fn build(app: &mut App) {
