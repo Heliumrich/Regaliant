@@ -77,6 +77,13 @@ impl ViewMemo {
 /// every `with`): draws check them without the lock while both are 0.
 static PENDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// `DS_TRACE_CLEARS=1` (diagnosis): fast clears made pending and applied, with the flip and
+/// thread (`trace clears` lines).
+pub fn trace_clears() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_TRACE_CLEARS").is_ok_and(|v| v == "1"))
+}
+
 /// Whether any fast clear or overwrite reload is pending.
 pub fn any_pending() -> bool {
     PENDING.load(std::sync::atomic::Ordering::Acquire) != 0
@@ -4338,6 +4345,9 @@ impl Images {
             for (&meta, &(key, _)) in self.meta_of.range(b..b.saturating_add(n)) {
                 self.pending_clears.insert(key, (meta, None));
                 self.pending_change += 1;
+                if trace_clears() {
+                    crate::info!("trace clears: {:#x} ({:?}) pending: write {b:#x}+{n:#x} covers its metadata {meta:#x} (for flip {}, {})", key.base, key.format, crate::hle::libs::videoout::QUEUED_FLIP.load(std::sync::atomic::Ordering::Relaxed) + 1, std::thread::current().name().unwrap_or("?"));
+                }
             }
         }
     }
@@ -4446,6 +4456,9 @@ impl Images {
         let end = base.saturating_add(len);
         for (&meta, &(key, _)) in self.meta_of.range(base..end) {
             if meta + 4 <= end {
+                if trace_clears() {
+                    crate::info!("trace clears: {:#x} ({:?}) pending: fill {base:#x}+{len:#x} of {v:#x} covers its metadata {meta:#x} (for flip {}, {})", key.base, key.format, crate::hle::libs::videoout::QUEUED_FLIP.load(std::sync::atomic::Ordering::Relaxed) + 1, std::thread::current().name().unwrap_or("?"));
+                }
                 self.pending_clears.insert(key, (meta, Some(v)));
                 // A write noted again over it makes it unknown again: not a
                 // repeat for the memos of `note_writes` and `Exec::last_notes`.
@@ -4771,6 +4784,9 @@ impl Images {
             NOTE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
             self.overwrite_clears += 1;
             ZERO_FILL_CLEARS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if trace_clears() {
+                crate::info!("trace clears: {:#x} ({:?} {}x{}) zero-filled by a fill {base:#x}+{len:#x} (for flip {}, {})", k.base, k.format, k.width, k.height, crate::hle::libs::videoout::QUEUED_FLIP.load(std::sync::atomic::Ordering::Relaxed) + 1, std::thread::current().name().unwrap_or("?"));
+            }
             out.push((img.image, k.format));
         }
         out
@@ -4909,6 +4925,11 @@ impl Images {
     /// guest contents (the writers have completed): all-zero bytes clear the
     /// image, other contents are uploaded with the layout of its T#.
     pub fn reload_overwritten(&mut self, keys: &[ImageKey]) {
+        if trace_clears() {
+            for k in keys.iter().filter(|k| self.map.get(k).is_some_and(|i| i.overwritten)) {
+                crate::info!("trace clears: {:#x} ({:?} {}x{}) reloaded from guest memory (overwritten; for flip {}, {})", k.base, k.format, k.width, k.height, crate::hle::libs::videoout::QUEUED_FLIP.load(std::sync::atomic::Ordering::Relaxed) + 1, std::thread::current().name().unwrap_or("?"));
+            }
+        }
         for k in keys {
             let Some(img) = self.map.get_mut(k) else { continue };
             if !img.overwritten {

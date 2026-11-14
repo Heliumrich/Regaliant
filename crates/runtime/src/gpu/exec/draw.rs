@@ -452,6 +452,14 @@ pub fn set_equal_bias(v: Option<f32>) {
     EQUAL_BIAS.store(v.unwrap_or(f32::NAN).to_bits(), Ordering::Relaxed);
 }
 
+/// Whether a draw trace is on (`DS_TRACE_PS`, `DS_TRACE_PS_BINS`, `DS_TRACE_ARGS`,
+/// `DS_TRACE_DEPTH`): the draw path's one check while they are off.
+#[inline]
+fn draw_traces() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| ["DS_TRACE_PS", "DS_TRACE_PS_BINS", "DS_TRACE_ARGS", "DS_TRACE_DEPTH"].iter().any(|v| std::env::var_os(v).is_some()))
+}
+
 /// Draws whose vertex shader is on this list are skipped (`skipvs` control
 /// command; diagnosis).
 static SKIP_VS: parking_lot::Mutex<Option<std::collections::HashSet<u64>>> = parking_lot::Mutex::new(None);
@@ -470,6 +478,132 @@ pub fn toggle_skip_vs(addr: u64) -> bool {
     };
     SKIP_VS_ANY.store(!s.is_empty(), Ordering::Relaxed);
     listed
+}
+
+/// `DS_TRACE_PS=<hex>[,<hex>...]` (diagnosis): each draw of those pixel programs logs, at the
+/// flip it is recorded in, its image resources (T# base, type, size) and what they were bound
+/// to (view and image handles, null views of a 2D/3D binding left unused), and whether the
+/// bindings came from the thread's memo (`trace ps` lines).
+fn trace_ps_addrs() -> &'static [u64] {
+    static ADDRS: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    ADDRS.get_or_init(|| {
+        std::env::var("DS_TRACE_PS").unwrap_or_default().split([',', ';']).filter_map(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()).collect()
+    })
+}
+
+/// `DS_TRACE_DEPTH=<hex base>` (diagnosis): each flip's draws with a depth attachment at that
+/// address, by attachment image, key and depth write (one line per flip and combination, with
+/// the count of draws and the first draw's programs).
+fn trace_depth_attachment(vs: u64, ps: u64, depth: &Option<Target>, z_write: bool) {
+    static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let base = *BASE.get_or_init(|| std::env::var("DS_TRACE_DEPTH").ok().and_then(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()).unwrap_or(0));
+    let Some(d) = depth.as_ref().filter(|d| base != 0 && d.key.base == base) else { return };
+    use ash::vk::Handle;
+    static SEEN: parking_lot::Mutex<(u64, Vec<(u64, u32, u32, bool, u64, u64, u32)>)> = parking_lot::Mutex::new((0, Vec::new()));
+    let flip = crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1;
+    let mut g = SEEN.lock();
+    if g.0 != flip {
+        for &(img, w, h, zw, v, p, n) in &g.1 {
+            crate::info!("trace depth {base:#x} for flip {}: image {img:x} {w}x{h} z write {zw}: {n} draws, first vs {v:#x} ps {p:#x}", g.0);
+        }
+        g.0 = flip;
+        g.1.clear();
+    }
+    let img = d.image.as_raw();
+    match g.1.iter_mut().find(|e| e.0 == img && e.3 == z_write) {
+        Some(e) => e.6 += 1,
+        None => g.1.push((img, d.key.width, d.key.height, z_write, vs, ps, 1)),
+    }
+}
+
+/// `DS_TRACE_PS`: the traced draw's attachments (key base and image handle).
+fn trace_ps_targets(ps: u64, colors: &[Option<Target>; MAX_RT], depth: &Option<Target>) {
+    let addrs = trace_ps_addrs();
+    if addrs.is_empty() || !addrs.contains(&ps) {
+        return;
+    }
+    use ash::vk::Handle;
+    let t: Vec<String> = colors.iter().enumerate().filter_map(|(i, c)| c.map(|c| format!("c{i}:{:#x}={:x}", c.key.base, c.image.as_raw()))).chain(depth.iter().map(|d| format!("z:{:#x}={:x}", d.key.base, d.image.as_raw()))).collect();
+    crate::info!("trace ps {ps:#x} targets at flip {}: {}", crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1, t.join(" "));
+}
+
+/// `DS_TRACE_PS_BINS=<path>[;<path>...]` (diagnosis): programs whose code up to s_endpgm equals
+/// those of a saved shader binary (a capture's `shaders/<address>.bin`) are traced as
+/// `DS_TRACE_PS` addresses are, wherever this boot loaded them (level programs move).
+fn trace_bin_match(addr: u64) -> bool {
+    static BINS: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
+    let bins = BINS.get_or_init(|| {
+        std::env::var("DS_TRACE_PS_BINS").unwrap_or_default().split(';').filter(|s| !s.is_empty()).filter_map(|p| std::fs::read(p.trim()).ok()).map(|mut b| {
+            // The program up to its first s_endpgm (0xbf810000).
+            let end = b.chunks_exact(4).position(|w| w == [0x00, 0x00, 0x81, 0xbf]).map_or(b.len(), |i| 4 * i + 4);
+            b.truncate(end);
+            b
+        }).collect()
+    });
+    if bins.is_empty() {
+        return false;
+    }
+    static SEEN: parking_lot::Mutex<Option<std::collections::HashMap<u64, bool>>> = parking_lot::Mutex::new(None);
+    let mut g = SEEN.lock();
+    let m = g.get_or_insert_with(Default::default);
+    *m.entry(addr).or_insert_with(|| {
+        let hit = bins.iter().any(|b| super::super::cp::guest_readable(addr, b.len() as u64) && unsafe { std::slice::from_raw_parts(addr as *const u8, b.len()) } == &b[..]);
+        if hit {
+            crate::info!("trace ps: program {addr:#x} matches a DS_TRACE_PS_BINS binary");
+        }
+        hit
+    })
+}
+
+thread_local! {
+    /// The command processor is recording a draw whose indirect arguments lie at
+    /// `DS_TRACE_ARGS` (diagnosis): its stages are traced as `DS_TRACE_PS` ones are.
+    pub static TRACE_DRAW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `DS_TRACE_ARGS=<hex>` (diagnosis): the indirect argument address whose draws are traced.
+pub fn trace_args_addr() -> u64 {
+    static A: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *A.get_or_init(|| std::env::var("DS_TRACE_ARGS").ok().and_then(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()).unwrap_or(0))
+}
+
+fn trace_ps_binding(p: &Prepared, b: &Bound, note: Option<([u64; 3], bool)>) {
+    let addrs = trace_ps_addrs();
+    if !addrs.contains(&p.addr) && !trace_bin_match(p.addr) && !TRACE_DRAW.with(|c| c.get()) {
+        return;
+    }
+    use ash::vk::Handle;
+    let res: Vec<String> = p.found.resources.iter().enumerate().filter_map(|(i, r)| match r {
+        Resolved::Image(t) => Some(format!("{i}:{:#x} t{} {}x{}x{} f{}", t.base, t.ty, t.width, t.height, t.depth, t.format)),
+        _ => None,
+    }).collect();
+    // Buffer resources: their guest bytes now (first 12 words) and the bound buffer/offset.
+    let bufs: Vec<String> = p.found.resources.iter().enumerate().filter_map(|(i, r)| match r {
+        Resolved::Buffer(v) => {
+            let words: Vec<String> = (0..12u64).map(|k| v.base + 4 * k).map(|a| if super::super::cp::guest_readable(a, 4) { format!("{:08x}", unsafe { std::ptr::read_volatile(a as *const u32) }) } else { "-".into() }).collect();
+            let bn = p.tr.out.bindings.iter().find(|bd| matches!(bd.kind, BindingKind::Buffer(j) if j == i)).map(|bd| bd.binding);
+            let info = bn.and_then(|bn| b.bufs.iter().find(|(x, _)| *x == bn).map(|(_, inf)| *inf));
+            Some(format!("{i}:{:#x} [{}] bound {}", v.base, words.join(" "), info.map_or("-".into(), |inf| format!("{:x}+{:#x}", inf.buffer.as_raw(), inf.offset))))
+        }
+        _ => None,
+    }).collect();
+    if !bufs.is_empty() {
+        crate::info!("trace ps {:#x} buffers at flip {}: {}", p.addr, crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1, bufs.join(" | "));
+    }
+    let imgs: Vec<String> = b.imgs.iter().filter(|e| e.1 != vk::DescriptorType::SAMPLER).map(|e| format!("b{}={:x}", e.0, e.2.image_view.as_raw())).collect();
+    let images: Vec<String> = b.images.iter().map(|i| format!("{:x}", i.as_raw())).collect();
+    crate::info!(
+        "trace ps {:#x} at flip {}: user {:x?} base inst {:?} images [{}] views [{}] vk images [{}] memo {:?} loads {}",
+        p.addr,
+        crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1,
+        p.user,
+        p.tr.spec.base_instance_sgpr,
+        res.join(", "),
+        imgs.join(" "),
+        images.join(" "),
+        note.map(|n| n.1),
+        super::super::shaders::describe_loads(p).join(" | ")
+    );
 }
 
 fn equal_bias() -> Option<f32> {
@@ -1827,6 +1961,9 @@ impl Exec {
                     }
                 }
                 let depth = if z_test || s_test || clear_z || clear_s { Some(images::target(dsurf.as_ref().unwrap())?) } else { None };
+                if draw_traces() {
+                    trace_depth_attachment(vs.addr, ps.as_ref().map_or(0, |p| p.addr), &depth, z_write);
+                }
                 lap.mark(6);
                 let mem_writes = vs.tr.plan.resources.iter().any(|r| r.written) || ps.as_ref().is_some_and(|p| p.tr.plan.resources.iter().any(|r| r.written));
                 if colors.iter().all(Option::is_none) && !z_write && !s_write && !clear_z && !clear_s && !mem_writes {
@@ -2077,6 +2214,9 @@ impl Exec {
             }
             let mut b = self.bind_stage(p, false)?;
             notes[k] = self.bind_note.take();
+            if draw_traces() {
+                trace_ps_binding(p, &b, notes[k]);
+            }
             // Menu & HUD Size: the composite samples our scaled copy of the interface layer.
             if k == 1 {
                 if let Some((from, to)) = self.ui_sub {
@@ -2166,6 +2306,9 @@ impl Exec {
                 color || ds
             });
             let same = self.rendering.as_ref().is_some_and(|r| r.colors == colors && r.depth == depth);
+            if draw_traces() {
+                trace_ps_targets(ps_addr, &colors, &depth);
+            }
             if (!same || feedback) && expect.is_some() {
                 delta_mismatch(3, vs.addr, ps_addr);
             }
@@ -2250,6 +2393,18 @@ impl Exec {
             self.report(format!("PA_CL_VTE_CNTL {vte:#x} (viewport transform disabled) approximated"));
             vk::Viewport { x: 0.0, y: 0.0, width: area.0 as f32, height: area.1 as f32, min_depth: 0.0, max_depth: 1.0 }
         };
+        if draw_traces() && (trace_ps_addrs().contains(&vs.addr) || trace_bin_match(vs.addr)) {
+            crate::info!(
+                "trace vs {:#x} viewport at flip {}: {:?} xs {xs} xo {xo} ys {ys} yo {yo} zs {zs} zo {zo} vte {vte:#x} clip {:#x} zmin/zmax {}/{} depth ctl {:#x}",
+                vs.addr,
+                crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1,
+                vp,
+                reg(0x28810),
+                f32r(reg(0x282D0)),
+                f32r(reg(0x282D4)),
+                reg(0x28800)
+            );
+        }
         let dyn_before = expect.map(|_| self.dyncache.sig());
         let dc = &mut self.dyncache;
         let untimed;

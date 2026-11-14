@@ -4459,6 +4459,189 @@ pub(super) fn explain_wait(queue: &str, c: (u64, u64), stages: &[&Prepared]) {
     }
 }
 
+/// `DS_TAP_CS=<hex>:<resource>[,...]` (diagnosis): after each dispatch of that compute program,
+/// the first 64 bytes of its buffer resource as bound (what the GPU holds there after the
+/// dispatch) are copied to a host buffer, and logged 32 taps later beside the guest memory's
+/// bytes when the dispatch was recorded and the flip it belongs to (`tap cs` lines).
+struct Tap {
+    buf: vk::Buffer,
+    ptr: *mut u8,
+    next: u64,
+    pending: std::collections::VecDeque<(u64, u64, usize, u64, u64, Vec<u32>)>,
+}
+unsafe impl Send for Tap {}
+static TAP: Mutex<Option<Tap>> = Mutex::new(None);
+const TAP_SLOTS: u64 = 256;
+const TAP_SLOT: u64 = 256;
+
+fn tap_list() -> &'static [(u64, usize)] {
+    static L: std::sync::OnceLock<Vec<(u64, usize)>> = std::sync::OnceLock::new();
+    L.get_or_init(|| {
+        std::env::var("DS_TAP_CS").unwrap_or_default().split([',', ';']).filter_map(|v| {
+            let (a, r) = v.split_once(':')?;
+            Some((u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()?, r.trim().parse().ok()?))
+        }).collect()
+    })
+}
+
+impl Exec {
+    fn tap_cs(&mut self, p: &Prepared, bound: &Bound) {
+        let list = tap_list();
+        if list.is_empty() {
+            return;
+        }
+        for &(addr, res) in list {
+            if addr != p.addr {
+                continue;
+            }
+            let mut g = TAP.lock();
+            if g.is_none() {
+                match ctx().host_buffer(TAP_SLOTS * TAP_SLOT, vk::BufferUsageFlags::TRANSFER_DST) {
+                    Ok((buf, _mem, ptr)) => *g = Some(Tap { buf, ptr, next: 0, pending: Default::default() }),
+                    Err(e) => {
+                        crate::warn!("tap cs: no host buffer ({e})");
+                        return;
+                    }
+                }
+            }
+            let t = g.as_mut().unwrap();
+            let slot = t.next % TAP_SLOTS;
+            let cmd = self.cmd();
+            let (n, cpu, kind) = match p.resources.get(res) {
+                Some(Resolved::Buffer(v)) => {
+                    // The binding of that resource (its descriptor buffer info).
+                    let Some(bn) = p.tr.out.bindings.iter().find(|b| matches!(b.kind, BindingKind::Buffer(i) if i == res)).map(|b| b.binding) else { continue };
+                    let Some(info) = bound.bufs.iter().find(|(x, _)| *x == bn).map(|(_, i)| *i) else { continue };
+                    let n = info.range.min(64);
+                    let mut cpu: Vec<u32> = (0..n / 4).map(|k| v.base + 4 * k).map(|a| if super::cp::guest_readable(a, 4) { unsafe { std::ptr::read_volatile(a as *const u32) } } else { 0xdead_beef }).collect();
+                    // The whole buffer's guest words: how many are not zero (per mille), the
+                    // last word's index that is, and their count (appended to the guest words).
+                    let len = (v.stride.max(4) as u64 * v.num_records as u64).min(64 << 20);
+                    if len >= 4 && super::cp::guest_readable(v.base, len) {
+                        let w = unsafe { std::slice::from_raw_parts(v.base as *const u32, (len / 4) as usize) };
+                        let nz = w.iter().filter(|&&x| x != 0).count();
+                        let last = w.iter().rposition(|&x| x != 0).map_or(u32::MAX, |i| i as u32);
+                        cpu.extend([0xfeed_0000 | (nz * 1000 / w.len()) as u32, last, nz as u32]);
+                    }
+                    self.barrier();
+                    unsafe { ctx().device.cmd_copy_buffer(cmd, info.buffer, t.buf, &[vk::BufferCopy { src_offset: info.offset, dst_offset: slot * TAP_SLOT, size: n }]) };
+                    self.barrier();
+                    (n, cpu, 0u8)
+                }
+                Some(Resolved::Image(ti)) if (ti.format == 71 || ti.format == 22) && ti.ty == 9 => {
+                    // 16 texels of an RGBA16F (or R32F) 2D image along a row in its top sixth (the sky).
+                    let texel = if ti.format == 22 { 4u64 } else { 8 };
+                    let frame = super::FRAMES.load(Ordering::Relaxed);
+                    let Ok((_, image)) = super::images::with(|im| im.view(ti, false, frame)) else { continue };
+                    let y = (ti.height / 6) as i32;
+                    // `DS_TAP_GRID=1`: a 4x4 grid over the image instead (rows top to bottom).
+                    let grid = std::env::var("DS_TAP_GRID").is_ok_and(|v| v == "1");
+                    let regions: Vec<vk::BufferImageCopy> = (0..16u32).map(|k| vk::BufferImageCopy {
+                        buffer_offset: slot * TAP_SLOT + texel * k as u64,
+                        buffer_row_length: 0,
+                        buffer_image_height: 0,
+                        image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
+                        image_offset: if grid { vk::Offset3D { x: ((ti.width / 8) * (2 * (k % 4) + 1)) as i32, y: ((ti.height / 8) * (2 * (k / 4) + 1)) as i32, z: 0 } } else { vk::Offset3D { x: ((ti.width / 16) * k + ti.width / 32) as i32, y, z: 0 } },
+                        image_extent: vk::Extent3D { width: 1, height: 1, depth: 1 },
+                    }).collect();
+                    self.barrier();
+                    unsafe { ctx().device.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::GENERAL, t.buf, &regions) };
+                    self.barrier();
+                    (128, vec![ti.width, ti.height], if ti.format == 22 { 2u8 } else { 1u8 })
+                }
+                Some(Resolved::Image(ti)) if ti.format == 71 && (ti.ty == 10 || ti.ty == 13) => {
+                    // A volume (3D, or a 2D array's layers): 16 texels along its depth at the
+                    // centre column of its top sixth (a sky ray), slice 0 to the last.
+                    let frame = super::FRAMES.load(Ordering::Relaxed);
+                    let Ok((_, image)) = super::images::with(|im| im.view(ti, false, frame)) else { continue };
+                    let d = ti.depth.max(1);
+                    let regions: Vec<vk::BufferImageCopy> = (0..16u32).map(|k| {
+                        let z = (k * (d - 1)) / 15;
+                        vk::BufferImageCopy {
+                            buffer_offset: slot * TAP_SLOT + 8 * k as u64,
+                            buffer_row_length: 0,
+                            buffer_image_height: 0,
+                            image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: if ti.ty == 13 { z } else { 0 }, layer_count: 1 },
+                            image_offset: vk::Offset3D { x: (ti.width / 2) as i32, y: (ti.height / 6) as i32, z: if ti.ty == 10 { z as i32 } else { 0 } },
+                            image_extent: vk::Extent3D { width: 1, height: 1, depth: 1 },
+                        }
+                    }).collect();
+                    self.barrier();
+                    unsafe { ctx().device.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::GENERAL, t.buf, &regions) };
+                    self.barrier();
+                    (128, vec![ti.width, ti.height, (ti.base >> 16) as u32, (ti.base >> 48) as u32], 3u8)
+                }
+                _ => continue,
+            };
+            t.next += 1;
+            let flip = crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1;
+            t.pending.push_back((slot, addr, res, flip, n | (kind as u64) << 32, cpu));
+            while t.pending.len() > 32 {
+                let (s, a, r, f, nk, cpu) = t.pending.pop_front().unwrap();
+                let (n, kind) = (nk & 0xFFFF_FFFF, nk >> 32);
+                let at = |k: u64| unsafe { std::ptr::read_volatile(t.ptr.add((s * TAP_SLOT + k) as usize) as *const u32) };
+                if kind == 0 {
+                    let gpu: Vec<u32> = (0..n / 4).map(|k| at(4 * k)).collect();
+                    let fmt = |w: &[u32]| w.iter().map(|&x| { let f = f32::from_bits(x); if f.is_finite() && f != 0.0 && f.abs() < 1e7 && f.abs() > 1e-7 { format!("{f}") } else { format!("#{x:08x}") } }).collect::<Vec<_>>().join(" ");
+                    let (head, stats) = cpu.split_at(((n / 4) as usize).min(cpu.len()));
+                    let stats = if let [pm, last, nz] = stats { format!("; guest buffer {}.{}% nonzero ({nz} words, the last at word {last})", (pm & 0xFFFF) / 10, (pm & 0xFFFF) % 10) } else { String::new() };
+                    crate::info!("tap cs {a:#x} res {r} for flip {f}: gpu [{}] guest [{}]{stats}", fmt(&gpu), fmt(head));
+                } else if kind == 3 {
+                    // Volume texels along the depth: (r, g, b, a) each.
+                    let base = ((cpu.get(3).copied().unwrap_or(0) as u64) << 48) | ((cpu.get(2).copied().unwrap_or(0) as u64) << 16);
+                    let txt: Vec<String> = (0..16u64).map(|k| {
+                        let (w0, w1) = (at(8 * k), at(8 * k + 4));
+                        let h = |x: u32| super::images::half_to_f32(x as u16);
+                        format!("({:.5} {:.5} {:.5} {:.4})", h(w0), h(w0 >> 16), h(w1), h(w1 >> 16))
+                    }).collect();
+                    crate::info!("tap cs {a:#x} res {r} for flip {f}: volume {base:#x} {}x{} along depth [{}]", cpu.first().copied().unwrap_or(0), cpu.get(1).copied().unwrap_or(0), txt.join(" "));
+                } else if kind == 2 {
+                    let v: Vec<f32> = (0..16u64).map(|k| f32::from_bits(at(4 * k))).collect();
+                    let mean = v.iter().sum::<f32>() / 16.0;
+                    crate::info!("tap cs {a:#x} res {r} for flip {f}: image {}x{} mean {mean:.7} texels [{}]", cpu.first().copied().unwrap_or(0), cpu.get(1).copied().unwrap_or(0), v.iter().map(|l| format!("{l:e}")).collect::<Vec<_>>().join(" "));
+                } else {
+                    // Luminance of each texel (Rec. 709), and their mean.
+                    let lum: Vec<f32> = (0..16u64).map(|k| {
+                        let (w0, w1) = (at(8 * k), at(8 * k + 4));
+                        let (r, g, b) = (super::images::half_to_f32(w0 as u16), super::images::half_to_f32((w0 >> 16) as u16), super::images::half_to_f32(w1 as u16));
+                        0.2126 * r + 0.7152 * g + 0.0722 * b
+                    }).collect();
+                    let mean = lum.iter().sum::<f32>() / 16.0;
+                    crate::info!("tap cs {a:#x} res {r} for flip {f}: image {}x{} mean {mean:.5} texels [{}]", cpu.first().copied().unwrap_or(0), cpu.get(1).copied().unwrap_or(0), lum.iter().map(|l| format!("{l:.4}")).collect::<Vec<_>>().join(" "));
+                }
+            }
+        }
+    }
+}
+
+/// `DS_TRACE_CS_IMAGES=<hex>[,...]` (diagnosis): each dispatch of those compute programs logs,
+/// at the flip it is recorded in, its image resources (T# base, type, size, read or written)
+/// and the image handles it was bound to (`trace cs images` lines).
+fn trace_cs_images(queue: &str, p: &Prepared, bound: &Bound) {
+    static ADDRS: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    let addrs = ADDRS.get_or_init(|| {
+        std::env::var("DS_TRACE_CS_IMAGES").unwrap_or_default().split([',', ';']).filter_map(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()).collect()
+    });
+    if addrs.is_empty() || !addrs.contains(&p.addr) {
+        return;
+    }
+    use ash::vk::Handle;
+    let res: Vec<String> = p.resources.iter().enumerate().filter_map(|(i, r)| match r {
+        Resolved::Image(t) => Some(format!("{i}:{:#x} t{} {}x{}x{} f{}", t.base, t.ty, t.width, t.height, t.depth, t.format)),
+        _ => None,
+    }).collect();
+    let images: Vec<String> = bound.images.iter().map(|i| format!("{:x}", i.as_raw())).collect();
+    let stored: Vec<String> = bound.stored.iter().map(|i| format!("{:x}", i.as_raw())).collect();
+    crate::info!(
+        "trace cs images {:#x} [{queue}] at flip {}: [{}] vk images [{}] stored [{}]",
+        p.addr,
+        crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1,
+        res.join(", "),
+        images.join(" "),
+        stored.join(" ")
+    );
+}
+
 fn trace_loads(queue: &str, p: &Prepared, groups: [u32; 3]) {
     static ADDRS: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     let addrs = ADDRS.get_or_init(|| {
@@ -4472,7 +4655,7 @@ fn trace_loads(queue: &str, p: &Prepared, groups: [u32; 3]) {
     let last = g.get_or_insert_with(HashMap::new).entry(p.addr).or_default();
     if *last != p.sgpr_data {
         *last = p.sgpr_data.clone();
-        crate::info!("trace cs {:#x} [{queue}] {}x{}x{}: {}", p.addr, groups[0], groups[1], groups[2], shaders::describe_loads(p).join(" | "));
+        crate::info!("trace cs {:#x} [{queue}] {}x{}x{} for flip {}: {}", p.addr, groups[0], groups[1], groups[2], crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1, shaders::describe_loads(p).join(" | "));
         crate::info!("trace cs {:#x} resources: {}", p.addr, shaders::describe_resources(p).join(" | "));
     }
 }
@@ -13533,6 +13716,9 @@ impl Exec {
                 }
             };
             let k = c.key;
+            if super::images::trace_clears() {
+                crate::info!("trace clears: {:#x} ({:?}) applied, metadata {:#x} = {v:#x}{} (for flip {}, [{}] before programs {:#x}/{:#x})", k.base, k.format, c.meta, if c.known.is_some() { " (from the fill)" } else { " (read)" }, crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1, self.name, self.sync_readers[0], self.sync_readers[1]);
+            }
             let full = vk::ImageSubresourceRange { aspect_mask: super::images::aspects(k.format), base_mip_level: 0, level_count: vk::REMAINING_MIP_LEVELS, base_array_layer: 0, layer_count: vk::REMAINING_ARRAY_LAYERS };
             let what = if super::images::is_depth(k.format) {
                 // HTILE: 0 = depth and stencil cleared; all ones = expanded.
@@ -17879,6 +18065,8 @@ impl Exec {
         if !batched && p.addr == TAA_CS && indirect.is_none() {
             self.taa_upscale(&p, &bound);
         }
+        trace_cs_images(&self.name, &p, &bound);
+        self.tap_cs(&p, &bound);
         stamp(2);
         lap.mark(12);
         if !lazy_barriers() {

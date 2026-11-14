@@ -5435,6 +5435,14 @@ impl Cp {
         let mut subs: Vec<String> = Vec::new();
         let rec = if indexed { 20 } else { 16 };
         let stride = if p(7) != 0 { p(7) as u64 } else { rec };
+        {
+            let first = self.draw_indirect_base + p(0) as u64;
+            let ta = super::exec::draw::trace_args_addr();
+            if ta != 0 && first & !0xFFF == ta & !0xFFF {
+                let w: Vec<u32> = (0..(count.min(4) as u64 * stride / 4).max(5)).map(|k| first + 4 * k).filter(|&x| valid(x, 4)).map(|x| unsafe { rd32(x) }).collect();
+                crate::info!("trace args {first:#x} [{}] for flip {}: multi ({count_src}, stride {stride}) {w:?} vs {:#x}", self.name, crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1, super::shaders::ngg_addr(self));
+            }
+        }
         // So may the arguments.
         if count > 0 {
             let first = self.draw_indirect_base + p(0) as u64;
@@ -6124,6 +6132,7 @@ impl Cp {
             op::DRAW_INDEX_2 | op::DRAW_INDEX_AUTO | op::DRAW_INDEX_OFFSET_2 | op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT
             | op::DRAW_INDIRECT_MULTI | op::DRAW_INDEX_INDIRECT_MULTI | op::DRAW_INDEX_MULTI_AUTO => {
                 DRAWS.fetch_add(1, Ordering::Relaxed);
+                super::exec::draw::TRACE_DRAW.with(|c| c.set(false));
                 let instances = self.num_instances;
                 let mut multi: Option<String> = None;
                 let mut indirect: Option<String> = None;
@@ -6134,6 +6143,13 @@ impl Cp {
                     op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT => {
                         // Arguments may have been written by earlier GPU work.
                         let a = self.draw_indirect_base + p(0) as u64;
+                        let ta = super::exec::draw::trace_args_addr();
+                        let traced = ta != 0 && a & !0xFFF == ta & !0xFFF;
+                        super::exec::draw::TRACE_DRAW.with(|c| c.set(traced));
+                        if traced && valid(a, 20) {
+                            let w = unsafe { [rd32(a), rd32(a + 4), rd32(a + 8), rd32(a + 12), rd32(a + 16)] };
+                            crate::info!("trace args {a:#x} [{}] for flip {}: {w:?} vs {:#x} ps {:#x} locs {:#x} repeat_ok {}", self.name, crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1, super::shaders::ngg_addr(self), super::shaders::ps_addr(self), p(1), self.repeat_ok);
+                        }
                         let laps = (!self.compute && super::tune::cp_classes()).then(|| {
                             IDRAW_GROUP.with(|g| g.set(if !self.main_gfx { 2 } else if self.past_wait.is_some() { 1 } else { 0 }));
                             Instant::now()
@@ -6422,6 +6438,12 @@ impl Cp {
                 // ahead on promises).
                 self.sync_reads(&[(a, 4)]);
                 let skip = p(3) & 0x3FFF;
+                // DS_TRACE_COND=1 (diagnosis): each COND_EXEC, its word and outcome.
+                static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *TRACE.get_or_init(|| std::env::var("DS_TRACE_COND").is_ok_and(|v| v == "1")) {
+                    let v = if valid(a, 4) { unsafe { rd32(a) } } else { 0xdead_beef };
+                    crate::info!("trace cond [{}] for flip {}: COND_EXEC at {at:#x} word {a:#x} = {v:#x}, {} dwords {}", self.name, crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1, skip, if v == 0 { "skipped" } else { "run" });
+                }
                 if valid(a, 4) && unsafe { rd32(a) } == 0 {
                     return Flow::Skip(skip);
                 }

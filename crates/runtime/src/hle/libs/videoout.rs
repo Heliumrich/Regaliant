@@ -254,6 +254,7 @@ fn vblank_thread() {
                 crate::gpu::capture::note_display_size(a.width, a.height);
             }
             maybe_screenshot(&b, n);
+            crate::gpu::vk::framewatch::SHOWN_FLIP.store(n as u64, std::sync::atomic::Ordering::Relaxed);
             present_buffer(&b);
         }
     }
@@ -270,6 +271,10 @@ fn port<R>(handle: i32, f: impl FnOnce(&mut Port) -> R) -> Result<R, i32> {
     }
 }
 
+/// The flip count the last queued flip will be shown as (`p.count` then; diagnosis traces name
+/// the flip the work they record belongs to by it: the next one).
+pub static QUEUED_FLIP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Queues a flip of `index` (-1 = blank). Used by sceVideoOutSubmitFlip and by
 /// GPU flips (sceAgcDcbSetFlip) when the command processor reaches them.
 pub fn submit_flip(handle: i32, index: i32, arg: i64) -> i32 {
@@ -281,6 +286,7 @@ pub fn submit_flip(handle: i32, index: i32, arg: i64) -> i32 {
             return ERR_FLIP_QUEUE_FULL;
         }
         p.pending.push_back(Flip { index, arg, submit_tsc: unsafe { core::arch::x86_64::_rdtsc() }, ready: true, ticket: 0 });
+        QUEUED_FLIP.store(p.count as u64 + p.pending.len() as u64, std::sync::atomic::Ordering::Relaxed);
         0
     })
     .unwrap_or_else(|e| e)
@@ -301,6 +307,7 @@ pub fn reserve_flip(handle: i32, index: i32, arg: i64) -> Result<u64, i32> {
         }
         let ticket = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         p.pending.push_back(Flip { index, arg, submit_tsc: unsafe { core::arch::x86_64::_rdtsc() }, ready: false, ticket });
+        QUEUED_FLIP.store(p.count as u64 + p.pending.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(ticket)
     })
     .unwrap_or_else(Err)

@@ -28,6 +28,9 @@ const AGREE: i32 = 10;
 const MIN_CELLS: usize = 2;
 
 pub static ON: AtomicBool = AtomicBool::new(false);
+/// The flip count of the frame being presented (`videoout`'s, set before each present): each
+/// recorded frame's goes to `<run dir>/frames-flip.bin` (u64 per frame, in frames-luma.bin's order).
+pub static SHOWN_FLIP: AtomicU64 = AtomicU64::new(0);
 /// Large flashes' frames saved (`DS_FRAME_WATCH=2`).
 pub static SAVE: AtomicBool = AtomicBool::new(false);
 const RING: usize = 8;
@@ -70,6 +73,8 @@ pub struct Watch {
     /// One read-back buffer per presenter slot, and the log time of the frame recorded into it.
     bufs: Vec<(vk::Buffer, vk::DeviceMemory, *mut u8)>,
     pending: Vec<Option<f64>>,
+    pending_flip: Vec<u64>,
+    flip_file: Option<std::fs::File>,
     grids: VecDeque<(f64, [u8; CELLS])>,
     file: Option<std::fs::File>,
     logged: u32,
@@ -113,6 +118,7 @@ impl Watch {
                 bufs.push(c.host_buffer((W * H * 4) as u64, vk::BufferUsageFlags::TRANSFER_DST)?);
             }
             let file = crate::run_dir().and_then(|d| std::fs::File::create(d.join("frames-luma.bin")).ok());
+            let flip_file = crate::run_dir().and_then(|d| std::fs::File::create(d.join("frames-flip.bin")).ok());
             let mut ring = Vec::new();
             let (mut pool, mut one_shot, mut ring_buf) = (None, None, None);
             if SAVE.load(Relaxed) {
@@ -131,7 +137,7 @@ impl Watch {
                 }
             }
             crate::info!("frame watch: on (each presented frame's 16x9 brightness grid; one-frame flashes logged; frames-luma.bin{})", if ring.is_empty() { "" } else { "; large flashes' frames saved" });
-            Ok(Watch { image, memory, bufs, pending: vec![None; slots], grids: VecDeque::new(), file, logged: 0, ring_t: vec![-1.0; ring.len()], ring, ring_next: 0, saved: 0, pool, one_shot, ring_buf })
+            Ok(Watch { image, memory, bufs, pending: vec![None; slots], pending_flip: vec![0; slots], flip_file, grids: VecDeque::new(), file, logged: 0, ring_t: vec![-1.0; ring.len()], ring, ring_next: 0, saved: 0, pool, one_shot, ring_buf })
         }
     }
 
@@ -205,6 +211,7 @@ impl Watch {
             self.ring_t[i] = t;
         }
         self.pending[slot] = Some(t);
+        self.pending_flip[slot] = SHOWN_FLIP.load(Relaxed);
     }
 
     /// Saves the kept frames at the log times `times` (`SAVE`) as `flash_<ms>_<tag>.png`: copied
@@ -275,6 +282,9 @@ impl Watch {
             rec.extend_from_slice(&(t as f32).to_le_bytes());
             rec.extend_from_slice(&grid);
             let _ = f.write_all(&rec);
+        }
+        if let Some(f) = self.flip_file.as_mut() {
+            let _ = f.write_all(&self.pending_flip[slot].to_le_bytes());
         }
         self.grids.push_back((t, grid));
         if self.grids.len() > 3 {

@@ -27,7 +27,8 @@ struct Fix {
     change: Change,
     kind: &'static str,
     why: &'static str,
-    /// Applied only when this environment variable is set (diagnosis).
+    /// Applied only when one of these environment variables (`|`-separated) is set
+    /// (diagnosis); `!NAME`: only when NAME is not set.
     only_with: Option<&'static str>,
 }
 
@@ -146,6 +147,28 @@ const FIXES: &[Fix] = &[
     // list is hashed into CreateScene's generation (`mov rdi,[rbp-0E8h]; mov r8d,811C9DC5h`,
     // the FNV-1a loop's start), where a held spawn enable goes back (and with `DS_VG_DIAG` the
     // list is logged) ...
+    // The job threads' reads of the culled index counts (`cmp dword ptr [r10+rbx*4], 0`,
+    // `cullread`): a record read non-zero in the last two flips is not dropped on a 0 read
+    // between the GPU's clear of the counts and their refill (the intro's sky flashes) ...
+    Fix {
+        name: "culling results held over their per-frame clear",
+        offset: 0xad91de,
+        from: (5, 0x0731273bf58b8b71),
+        change: Change::Insert { at: 0, code: crate::cullread::hold_code },
+        kind: "title timing",
+        why: "the CPU can read the counts between the GPU's clear and refill; a visible object then missed the depth pre-pass",
+        only_with: Some("!DS_CULLREAD_DIAG"),
+    },
+    // ... or, with `DS_CULLREAD_DIAG`, a hook with the same hold and a log of the reads.
+    Fix {
+        name: "culling results read (diagnosis)",
+        offset: 0xad91de,
+        from: (5, 0x0731273bf58b8b71),
+        change: Change::Hook { at: 0, handler: crate::cullread::read_hook },
+        kind: "diagnosis",
+        why: "logs what the title's CPU reads of its GPU culling results",
+        only_with: Some("DS_CULLREAD_DIAG"),
+    },
     Fix {
         name: "VG spawning held after scene resets (per frame)",
         offset: 0xa553c7,
@@ -538,7 +561,11 @@ pub fn apply(p: &mut crate::patch::Patcher, ranges: &[(u64, u64)]) {
     crate::dispmode::init();
     crate::pcsettings::convar::init(p.base, p.image);
     for (i, f) in FIXES.iter().enumerate() {
-        if f.only_with.is_some_and(|v| v.split('|').all(|n| std::env::var_os(n).is_none())) {
+        let unmet = |n: &str| match n.strip_prefix('!') {
+            Some(x) => std::env::var_os(x).is_some(),
+            None => std::env::var_os(n).is_none(),
+        };
+        if f.only_with.is_some_and(|v| v.split('|').all(unmet)) {
             continue;
         }
         if p.image.get(f.offset..f.offset + f.from.0).map(fnv1a) != Some(f.from.1) {
