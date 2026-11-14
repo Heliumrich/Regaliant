@@ -6726,7 +6726,87 @@ pub(super) fn journal_end() -> super::ranges::Ranges {
     PAST_JOURNAL.lock().take().unwrap_or_default()
 }
 
+/// Textures scouts' commands bound: [all, of them read from guest memory (noted as CPU reads)].
+pub static SCOUT_TEXTURES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A scout's journal (`gpu::scout`, docs/SCOUTS.md): what the batches pushed and the CP writes
+/// recorded write from the moment its scout begins a submission (`scout_journal_begin`) until
+/// the main command processor reaches that submission (`scout_journal_freeze`); the scout's CPU
+/// reads are checked against it. `who`: the first writers by range (the census's reports).
+struct ScoutJournal {
+    id: u64,
+    writes: super::ranges::Ranges,
+    open: bool,
+    who: Vec<(u64, u64, String)>,
+}
+
+static SCOUT_JOURNALS: Mutex<Vec<ScoutJournal>> = Mutex::new(Vec::new());
+/// Scout journals still open (what `journal_note` looks at first).
+static SCOUT_JOURNALS_OPEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static SCOUT_JOURNAL_IDS: AtomicU64 = AtomicU64::new(1);
+/// Writers kept per journal.
+const SCOUT_WHO_MAX: usize = 1024;
+
+/// A new open journal: its id.
+pub(super) fn scout_journal_begin() -> u64 {
+    let id = SCOUT_JOURNAL_IDS.fetch_add(1, Ordering::Relaxed);
+    let mut g = SCOUT_JOURNALS.lock();
+    g.push(ScoutJournal { id, writes: super::ranges::Ranges::new(), open: true, who: Vec::new() });
+    SCOUT_JOURNALS_OPEN.fetch_add(1, Ordering::AcqRel);
+    id
+}
+
+/// Journal `id` takes no more writes (the main command processor reached its submission).
+pub(super) fn scout_journal_freeze(id: u64) {
+    let mut g = SCOUT_JOURNALS.lock();
+    if let Some(j) = g.iter_mut().find(|j| j.id == id) {
+        if std::mem::take(&mut j.open) {
+            SCOUT_JOURNALS_OPEN.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+/// Ends journal `id`: what it holds and its first writers.
+pub(super) fn scout_journal_end(id: u64) -> (super::ranges::Ranges, Vec<(u64, u64, String)>) {
+    let mut g = SCOUT_JOURNALS.lock();
+    match g.iter().position(|j| j.id == id) {
+        Some(k) => {
+            let j = g.swap_remove(k);
+            if j.open {
+                SCOUT_JOURNALS_OPEN.fetch_sub(1, Ordering::AcqRel);
+            }
+            (j.writes, j.who)
+        }
+        None => Default::default(),
+    }
+}
+
+fn scout_journal_note(writes: &super::ranges::Ranges, who: &str) {
+    let mut g = SCOUT_JOURNALS.lock();
+    for j in g.iter_mut().filter(|j| j.open) {
+        j.writes.extend(writes);
+        for (a, n) in writes.iter().take(64) {
+            if j.who.len() < SCOUT_WHO_MAX {
+                j.who.push((a, n, who.to_string()));
+            }
+        }
+    }
+}
+
+fn scout_journal_note_one(w: (u64, u64), who: &str) {
+    let mut g = SCOUT_JOURNALS.lock();
+    for j in g.iter_mut().filter(|j| j.open) {
+        j.writes.insert(w.0, w.1);
+        if j.who.len() < SCOUT_WHO_MAX {
+            j.who.push((w.0, w.1, format!("{who} (CP write)")));
+        }
+    }
+}
+
 fn journal_note(writes: &super::ranges::Ranges, who: &str) {
+    if SCOUT_JOURNALS_OPEN.load(Ordering::Acquire) != 0 && !writes.is_empty() {
+        scout_journal_note(writes, who);
+    }
     if PAST_JOURNAL_ON.load(Ordering::Acquire) && !writes.is_empty() {
         if let Some(j) = PAST_JOURNAL.lock().as_mut() {
             j.extend(writes);
@@ -6743,6 +6823,9 @@ fn journal_note(writes: &super::ranges::Ranges, who: &str) {
 }
 
 fn journal_note_one(w: (u64, u64), who: &str) {
+    if SCOUT_JOURNALS_OPEN.load(Ordering::Acquire) != 0 && w.1 > 0 {
+        scout_journal_note_one(w, who);
+    }
     if PAST_JOURNAL_ON.load(Ordering::Acquire) && w.1 > 0 {
         if let Some(j) = PAST_JOURNAL.lock().as_mut() {
             j.insert(w.0, w.1);
@@ -9976,6 +10059,9 @@ pub struct Exec {
     held_run_writes: Option<std::sync::Arc<super::ranges::Ranges>>,
     held_run_keys: Option<std::sync::Arc<HashMap<super::images::ImageKey, u8>>>,
     held_base: usize,
+    /// A scout's executor recording a queued submission ahead (`scout_begin`; until its
+    /// record is committed or dropped).
+    scout: bool,
     pub(crate) stopped: bool,
     /// Why (statistics), and the reason a caller gives a flush that follows.
     pub(crate) stop_why: &'static str,
@@ -11031,6 +11117,7 @@ impl Exec {
                 held_run_writes: None,
                 held_run_keys: None,
                 held_base: 0,
+                scout: false,
                 stopped: false,
                 stop_why: "",
                 flush_why: "",
@@ -14274,7 +14361,17 @@ impl Exec {
     /// work was writing, e.g. the ranges of unbounded global-pointer
     /// bindings: ~2 needless waits of 5-7 ms per frame in the courtyard).
     pub fn sync_textures(&mut self, textures: &[((u64, u64), super::desc::Tsharp)], why: usize) -> bool {
-        if self.held {
+        if self.held && self.scout {
+            // A scout: textures read from guest memory are taken as it is now (CPU reads,
+            // checked at the hand-over); images the GPU owns are read from their Vulkan image
+            // on the GPU, after the work before in program order (docs/SCOUTS.md).
+            let n0 = self.held_reads.len();
+            let guest: Vec<(u64, u64)> = super::images::with(|im| textures.iter().filter(|(_, t)| im.reads_guest(t)).map(|x| x.0).collect());
+            SCOUT_TEXTURES[0].fetch_add(textures.len() as u64, Ordering::Relaxed);
+            SCOUT_TEXTURES[1].fetch_add(guest.len() as u64, Ordering::Relaxed);
+            self.held_reads.extend(guest);
+            self.note_kinds(1, self.held_reads.len() - n0);
+        } else if self.held {
             // Textures are taken from guest memory as it is now.
             self.held_reads.extend(textures.iter().map(|x| x.0));
             self.note_kinds(1, textures.len());
@@ -15572,6 +15669,26 @@ impl Exec {
         self.past_up.clear();
     }
 
+    /// A scout's executor begins a queued title submission (`Cp::scout_run`, docs/SCOUTS.md):
+    /// held from its first packet as the graphics command processor's past a label wait, with
+    /// its forwarded copies its own until the record is committed or dropped (the main command
+    /// processor and other scouts record earlier submissions meanwhile).
+    pub fn scout_begin(&mut self) {
+        self.past_begin();
+        self.scout = true;
+        super::forward::hold_begin();
+        self.past_grow = true;
+        self.past_want_min = u32::MAX;
+        self.past_ranges.clear();
+        self.past_up.clear();
+    }
+
+    /// What a scout's record placed (`scout_begin`): the ranges its checks placed, the pages
+    /// its batches upload, the oldest epoch its checks wanted.
+    pub fn scout_placed(&self) -> (&[(u64, u64)], &HashSet<u64>, u32) {
+        (&self.past_ranges, &self.past_up, self.past_want_min)
+    }
+
     /// Whether what the stretch past a label wait placed is current as of
     /// epoch `need` (`tune past_check`: its label orders the CPU writes
     /// before that epoch ahead of its work, and its checks needed older
@@ -15784,6 +15901,7 @@ impl Exec {
         super::forward::hold_commit();
         self.deferred = false;
         self.held = false;
+        self.scout = false;
         self.past = false;
         self.past_grow = false;
         self.stopped = false;
@@ -15829,6 +15947,7 @@ impl Exec {
         }
         self.deferred = false;
         self.held = false;
+        self.scout = false;
         self.past = false;
         self.past_grow = false;
         self.stopped = false;
@@ -17489,7 +17608,7 @@ impl Exec {
         // program order still: its copies forward as before. As buffer
         // updates, `tune copy_update`, they were level under front end 2 and
         // had corrupted meshes during loads: removed on 2026-11-01.)
-        let forward_here = super::tune::forward_copies() && (!self.deferred || self.past_grow || (self.past && super::forward::held())) && indirect.is_none() && self.name == "gpu-gfx" && !super::resident::mirror_mode();
+        let forward_here = super::tune::forward_copies() && (!self.deferred || self.past_grow || (self.past && super::forward::held())) && indirect.is_none() && (self.name == "gpu-gfx" || (self.past_grow && super::forward::held())) && !super::resident::mirror_mode();
         // Diagnosis (`DS_FE2_CHECK_COPIES=1`): a copy kernel's dispatch on a
         // queue whose copies are not forwarded (compute queues, the graphics
         // queue's workers) is checked once its batch completed against the
@@ -18345,6 +18464,7 @@ pub fn status() -> String {
         + &cpw_lazy_line()
         + &xq_line()
         + &super::cp::past_wait_status()
+        + &super::scout::status()
         + &held_own_line()
         + &super::forward::status_line()
         + &super::par::status()

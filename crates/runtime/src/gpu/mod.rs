@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 176] = [
+    static ALL: [Tunable; 177] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -208,6 +208,7 @@ pub mod tune {
         Tunable { name: "past_repair", env: "DS_PAST_REPAIR", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "held_min", env: "DS_HELD_MIN", default: 192, value: AtomicU64::new(UNSET) },
         Tunable { name: "async_gfx_inline", env: "DS_ASYNC_GFX_INLINE", default: 12, value: AtomicU64::new(UNSET) },
+        Tunable { name: "scouts", env: "DS_SCOUTS", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1430,6 +1431,14 @@ pub mod tune {
         get(175)
     }
 
+    /// Scouts (`gpu::scout`, docs/SCOUTS.md): command processors that record the graphics
+    /// queue's queued title submissions ahead of its own (read once, when the graphics queue
+    /// starts: set it with `DS_SCOUTS`; at most 4). Census stage: their records are checked at
+    /// the command processor's turn and dropped. 0: none.
+    pub fn scouts() -> u64 {
+        get(176)
+    }
+
     /// Whether translations get `rdna::translate::Spec::hw_bounds` (scalar
     /// loads of buffers only they read without a check of each dword): where
     /// robustBufferAccess2 and null descriptors are enabled (since 2026-11-12
@@ -2014,6 +2023,7 @@ pub mod particles;
 pub mod forward;
 pub mod hscensus;
 pub mod par;
+pub mod scout;
 pub mod prio;
 pub mod precache;
 pub mod fe2;
@@ -2679,6 +2689,13 @@ fn worker(q: &'static Queue, name: &str) {
         // (Timelines: how long the submission waited in the queue, how many
         // more wait behind it, and its run: what a planner ahead of the
         // command processor would have to work on, `tools/sublag.py`.)
+        if q.id == GFX {
+            // (Started here: front end 2 is on only once its self-test ran.)
+            if !scout::on() && scout::count() != 0 {
+                scout::start();
+            }
+            scout::main_takes(batch.index, &batch.bufs, &cp);
+        }
         let tl_sub = timeline::mark();
         if tl_sub.is_some() {
             let behind = q.pending.lock().len();
@@ -3031,6 +3048,11 @@ pub fn submit(queue_id: u32, buffers: Vec<(u64, u32)>) {
     // In queue order (under the queue's lock): the replay keeps each queue's.
     replay::note_submitted(queue_id, &buffers);
     g.push_back(Submission { bufs: buffers, hashes, copies, at: std::time::Instant::now(), ctl: None, index });
+    if queue_id == GFX {
+        if let Some(b) = g.back() {
+            scout::queued(b.index, &b.bufs, b.at);
+        }
+    }
     q.cv.notify_one();
     // DS_SUBMIT_SYNC=small (up to SMALL_SUBMIT dwords) or =1 (all),
     // diagnostic: the submit returns once its work completed (no CPU/GPU
@@ -3220,6 +3242,7 @@ pub fn reset_profile() {
     exec::reset_batch_misses();
     cp::reset_wait_stats();
     par::reset_stats();
+    scout::reset_stats();
     cp::past_wait_reset();
     lockstat::reset_stats();
     images::reset_memo_stats();
