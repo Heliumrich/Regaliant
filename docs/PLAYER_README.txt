@@ -60,18 +60,26 @@ In menus the mouse pointer selects what it points at, the left button confirms a
 button goes back. The prompts show the keys you bound. Every key can be changed in the game:
 SETTINGS > PC > Key Bindings.
 
+To enter your character's name the game shows a text box. Type the name and press Enter.
+Escape cancels. With a controller, A confirms and B cancels.
+
 
 PC settings
 -----------
 The game's SETTINGS screen has a PC tab with the port's settings. Most take effect at once.
-- Display: window mode (windowed, borderless or exclusive fullscreen), monitor, resolution and
-  refresh rate, HDR, aspect ratio (16:9, 16:10, 21:9, 32:9), render scale, sharpening.
-- Graphics: quality preset, geometry detail, texture filtering, anti-aliasing (the game's TAA,
-  off, DLSS, FSR or XeSS), bloom, vignette, frame rate limit (30, 60 or uncapped).
-- Game and controls: menu and HUD size, HUD margin, button prompts, mouse sensitivity and
-  inversion, mouse look blur, skip intro logos, the controller speaker's sounds through your
-  speakers (Pad Speaker), save folder, import of a PS5 save, key and controller bindings.
-- Sound: output (headphones, stereo, 5.1, 7.1, Windows Sonic or Dolby Atmos) and device.
+- On the tab: window mode (windowed, borderless or exclusive fullscreen), resolution, render
+  scale, Anti-Aliasing / Upscaler (the game's TAA, off, DLSS, FSR or XeSS), frame rate limit
+  (30, 60 or uncapped), Motion Blur Fix and mouse sensitivity.
+- Graphics & Display: quality preset, geometry detail, texture filtering, sharpening, bloom,
+  vignette, HDR, aspect ratio (16:9, 16:10, 21:9, 32:9), monitor and refresh rate.
+- Controls, Sound & Saves: mouse inversion, menu and HUD size, HUD margin, button prompts,
+  sound output (headphones, stereo, 5.1, 7.1, Windows Sonic or Dolby Atmos) and device, the
+  controller speaker's sounds through your speakers (Pad Speaker), skip intro logos, save
+  folder, import of a PS5 save.
+- Key Bindings and Controller Bindings: every action's key, mouse button and controller button.
+
+Motion Blur Fix is on by default. It turns the game's motion blur off, so plants and detail
+stay sharp while the camera moves. Off uses the game's own Motion Blur setting.
 
 DLSS needs one more file. NVIDIA's nvngx_dlss.dll is under NVIDIA's own license and does not
 come with the port. Copy your own into the "upscalers" folder beside regaliant.exe. Games with DLSS
@@ -85,6 +93,8 @@ Inc.
 The launcher
 ------------
 - Game: the game folder and its check, what your PC brings, and safe mode for the next start.
+- Display: window mode, monitor, fullscreen resolution and refresh rate, render scale and
+  frame rate limit for the next start. The game's PC tab changes the same settings.
   Safe mode starts the game in a window with the default settings and without an upscaler. Use
   it when the game does not start.
 - Shaders: prepares the game's shaders ahead. Without them the game compiles each shader the

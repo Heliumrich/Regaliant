@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 175] = [
+    static ALL: [Tunable; 176] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -182,7 +182,7 @@ pub mod tune {
         Tunable { name: "fe2_back_granule", env: "DS_FE2_BACK_GRANULE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "ballast_ns", env: "DS_BALLAST_NS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "ballast_at", env: "DS_BALLAST_AT", default: 0, value: AtomicU64::new(UNSET) },
-        Tunable { name: "async_compute", env: "DS_ASYNC_COMPUTE", default: 2, value: AtomicU64::new(UNSET) },
+        Tunable { name: "async_compute", env: "DS_ASYNC_COMPUTE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "vram_others", env: "DS_VRAM_OTHERS", default: 512, value: AtomicU64::new(UNSET) },
         Tunable { name: "mirror_cold", env: "DS_MIRROR_COLD", default: 3600, value: AtomicU64::new(UNSET) },
         Tunable { name: "buffer_delta", env: "DS_BUFFER_DELTA", default: 1, value: AtomicU64::new(UNSET) },
@@ -207,6 +207,7 @@ pub mod tune {
         Tunable { name: "held_runs", env: "DS_HELD_RUNS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "past_repair", env: "DS_PAST_REPAIR", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "held_min", env: "DS_HELD_MIN", default: 192, value: AtomicU64::new(UNSET) },
+        Tunable { name: "async_gfx_inline", env: "DS_ASYNC_GFX_INLINE", default: 12, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1422,6 +1423,13 @@ pub mod tune {
         get(174) as usize
     }
 
+    /// Graphics pipelines the store holds made at their first draw, up to this many ms of a
+    /// frame's first uses (`exec::draw`; the rest are left out while a worker makes them, as
+    /// `async_gfx` does with every pipeline); 0: every one left out.
+    pub fn async_gfx_inline() -> u64 {
+        get(175)
+    }
+
     /// Whether translations get `rdna::translate::Spec::hw_bounds` (scalar
     /// loads of buffers only they read without a check of each dword): where
     /// robustBufferAccess2 and null descriptors are enabled (since 2026-11-12
@@ -1678,10 +1686,12 @@ pub mod tune {
     }
 
     /// Ordered async compute (RENDERER.md "Ordered async compute"; the
-    /// default since 2026-11-01): 2, the compute queues' batches on a queue
+    /// default from 2026-11-01 to 2026-11-14): 2, the compute queues' batches on a queue
     /// of a compute-only family (set up when the value is 2 or more at boot:
     /// `vk::async_compute_boot`; live at batch boundaries); 0, every batch on
-    /// the main queue (the fallback); 1, one queue with a census of the waits
+    /// the main queue (the default since 2026-11-14: the 1-1 walk had 886 one-frame
+    /// flashes of 8+ cells of 144 with 2 against 136 with 0, 586 against 26 of 20+, and ran
+    /// x1.089 with 0; FINDINGS.md 2026-11-14); 1, one queue with a census of the waits
     /// the main queue's batches would need, by reason, counted and marked in
     /// the timeline (`after #seq (xq ...)`, `tools/schedmodel.py`).
     #[inline]

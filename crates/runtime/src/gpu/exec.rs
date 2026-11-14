@@ -231,6 +231,11 @@ fn sync_why_status() -> String {
             w(4),
             w(5),
             w(3)
+        ) + &format!(
+            "    stored graphics pipelines made at their first draw (`async_gfx_inline`): {} ({} ms), {} left out once a frame's budget was spent\n",
+            draw::INLINE_STATS[0].load(Ordering::Relaxed),
+            draw::INLINE_STATS[1].load(Ordering::Relaxed) / 1_000_000,
+            draw::INLINE_STATS[2].load(Ordering::Relaxed)
         )
     }
 }

@@ -295,6 +295,17 @@ const FIXES: &[Fix] = &[
         why: "the mouse pointer selects the item under it at once instead of stepping toward it",
         only_with: None,
     },
+    // ... and the input grid's cell selection (UIBehaviorInputGrid, eboot+0xf648b0: rdi the
+    // grid, esi the column, edx the row), at its entry: `push rbp; mov rbp,rsp; push r15`.
+    Fix {
+        name: "menu pointer selects grid cells directly",
+        offset: 0xf648b0,
+        from: (6, 0x82d75a35aabe38aa),
+        change: Change::Hook { at: 0, handler: crate::pcsettings::pointer::grid_hook },
+        kind: "PC controls",
+        why: "the mouse pointer selects the grid cell under it at once instead of stepping toward it",
+        only_with: None,
+    },
     Fix {
         name: "button prompts (glyphs)",
         offset: 0x150e645,

@@ -730,6 +730,32 @@ pub static ASYNC_GFX_STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 /// (sync, capture, verify, replay)].
 pub static ASYNC_GFX_WAITED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
+/// The time first draws spent making stored graphics pipelines themselves this frame
+/// (`tune async_gfx_inline`): (frame, ns); and [pipelines made so, their ns, stored ones left
+/// out once the frame's budget was spent].
+static INLINE_SPENT: parking_lot::Mutex<(u64, u64)> = parking_lot::Mutex::new((u64::MAX, 0));
+pub static INLINE_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Whether a draw makes a stored pipeline itself (within the frame's budget).
+fn inline_ok(frame: u64) -> bool {
+    let budget_ms = super::super::tune::async_gfx_inline();
+    if budget_ms == 0 {
+        return false;
+    }
+    let g = INLINE_SPENT.lock();
+    g.0 != frame || g.1 < budget_ms * 1_000_000
+}
+
+fn inline_spent(frame: u64, ns: u64) {
+    let mut g = INLINE_SPENT.lock();
+    if g.0 != frame {
+        *g = (frame, 0);
+    }
+    g.1 += ns;
+    INLINE_STATS[0].fetch_add(1, Ordering::Relaxed);
+    INLINE_STATS[1].fetch_add(ns, Ordering::Relaxed);
+}
+
 /// Leaves a draw out while its pipeline is made in the background: true when
 /// it is (queued now or before), false when the draw must make or wait for
 /// it itself (its creation failed in the background, or it is made now).
@@ -766,6 +792,16 @@ fn async_gfx_submit(key: &GfxKey, hkey: u64, vs: &Prepared, ps: Option<&Prepared
     ASYNC_GFX_CV.notify_one();
     ASYNC_GFX_STATS[0].fetch_add(1, Ordering::Relaxed);
     true
+}
+
+thread_local! {
+    /// This draw makes a stored pipeline itself (`inline_ok`): its time goes to the budget.
+    static INLINE_MARK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sets this thread's inline mark (`on`), or takes it (false: returns and clears it).
+fn inline_mark(on: bool) -> bool {
+    INLINE_MARK.with(|m| if on { m.set(true); true } else { m.replace(false) })
 }
 
 fn ensure_async_gfx_workers() {
@@ -1871,7 +1907,20 @@ impl Exec {
                             } else {
                                 None
                             };
+                            // A pipeline the store holds is made here within the frame's
+                            // budget (milliseconds; an object left out is missing from the
+                            // frame).
+                            let stored_inline = why.is_none() && crate::gpu::pcache::stored_cheap('g', hkey) && {
+                                let ok = inline_ok(frame as u64);
+                                if !ok {
+                                    INLINE_STATS[2].fetch_add(1, Ordering::Relaxed);
+                                }
+                                ok
+                            };
                             match why {
+                                None if stored_inline => {
+                                    inline_mark(true);
+                                }
                                 None => {
                                     if async_gfx_submit(&key, hkey, &vs, ps.as_ref(), push_mode) {
                                         // A draw that was to measure LOD statistics: its
@@ -1894,6 +1943,9 @@ impl Exec {
                         let t = std::time::Instant::now();
                         let created = std::cell::Cell::new(false);
                         let p = gfx_pipe_with(&key, hkey, (&**vs.tr, vs.addr), ps.as_ref().map(|p| (&**p.tr, p.addr)), push_mode, &created)?;
+                        if inline_mark(false) {
+                            inline_spent(frame as u64, t.elapsed().as_nanos() as u64);
+                        }
                         if compile_trace() {
                             crate::info!("first use: vs {:#x} ps {ps_addr:#x} key {hkey:#x} after {} ms{}", vs.addr, t.elapsed().as_millis(), if created.get() { "" } else { " (made by another thread)" });
                         }

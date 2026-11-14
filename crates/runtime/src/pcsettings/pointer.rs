@@ -150,6 +150,56 @@ pub extern "sysv64" fn select_hook(regs: *const u64, _arg: u32) {
     }
 }
 
+/// The title's input grid cell selection (eboot+0xf648b0, `titlefix`), at its entry: when the
+/// pointer waits for a jump to a cell of this grid (rdi), the move selects that cell: its column
+/// (esi) and row (edx) found with the grid's own lookups, called here on the title's thread
+/// (the row count of a column, eboot+0xf640c0; the cell at a column and row, eboot+0xf63db0;
+/// the columns are the definition's entries of 40 bytes at +0xa0..+0xa8).
+pub extern "sysv64" fn grid_hook(regs: *const u64, _arg: u32) {
+    let mut g = DIRECT.lock();
+    let Some((target, since)) = *g else { return };
+    if since.elapsed() > DIRECT_WAIT {
+        *g = None;
+        return;
+    }
+    let Some(base) = crate::loader::main_module().map(|m| m.base) else { return };
+    let regs = regs as *mut u64;
+    unsafe {
+        let grid = *regs.add(7);
+        if grid < 0x10000 {
+            return;
+        }
+        let def = *((grid + 0x110) as *const u64);
+        if def < 0x10000 {
+            return;
+        }
+        let (cb, ce) = (*((def + 0xa0) as *const u64), *((def + 0xa8) as *const u64));
+        if ce < cb || (ce - cb) % 40 != 0 || ce - cb > 40 * 64 {
+            return;
+        }
+        let rows: extern "sysv64" fn(u64, u32) -> u64 = std::mem::transmute(base + 0xf640c0);
+        let cell: extern "sysv64" fn(u64, u32, u32) -> u64 = std::mem::transmute(base + 0xf63db0);
+        for c in 0..((ce - cb) / 40) as u32 {
+            let nr = rows(grid, c) as u32;
+            if nr == u32::MAX || nr > 512 {
+                continue;
+            }
+            for r in 0..nr {
+                if cell(grid, c, r) == target {
+                    *g = None;
+                    *regs.add(6) = c as u64;
+                    *regs.add(2) = r as u64;
+                    if DIRECT_STATS[0].fetch_add(1, Relaxed) < 4 {
+                        crate::info!("pointer: the title's grid jumps to the cell under the pointer (column {c}, row {r})");
+                    }
+                    return;
+                }
+            }
+        }
+        DIRECT_STATS[1].fetch_add(1, Relaxed);
+    }
+}
+
 /// Status: direct jumps made and moves in lists the hook did not serve.
 pub fn direct_line() -> String {
     let (a, b) = (DIRECT_STATS[0].load(Relaxed), DIRECT_STATS[1].load(Relaxed));
@@ -337,7 +387,30 @@ fn tick_nodes(tree: &std::sync::Arc<uistate::Tree>, want: bool) -> bool {
             .iter()
             .flat_map(|&f| {
                 let group = uistate::parent(f);
-                tree.children.get(&group).map(|v| v.as_slice()).unwrap_or(&[]).iter().map(move |&n| (group, n))
+                let siblings = tree.children.get(&group).map(|v| v.as_slice()).unwrap_or(&[]).iter().map(move |&n| (group, n));
+                // A grid's other columns: the cells under the group's siblings of the focused
+                // cell's size (as placed), taken as the focused group's (the move toward one runs
+                // the grid's own selection, `grid_hook`).
+                let (_, _, fw, fh) = uistate::local(f);
+                let same = move |n: u64| {
+                    let (_, _, w, h) = uistate::local(n);
+                    fw > 1.0 && fh > 1.0 && (w - fw).abs() < 0.5 && (h - fh).abs() < 0.5
+                };
+                let cousins: Vec<(u64, u64)> = match fw.is_finite() {
+                    true => tree
+                        .children
+                        .get(&uistate::parent(group))
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&[])
+                        .iter()
+                        .filter(|&&col| col != group)
+                        .flat_map(|col| tree.children.get(col).map(|v| v.as_slice()).unwrap_or(&[]).iter())
+                        .filter(|&&n| same(n))
+                        .map(|&n| (group, n))
+                        .collect(),
+                    false => Vec::new(),
+                };
+                siblings.chain(cousins)
             })
             .filter_map(|(group, n)| uistate::bounds(tree, n).map(|r| (group, n, r)))
             .filter(|(_, _, r)| x >= r.0 && x < r.2 && y >= r.1 && y < r.3)

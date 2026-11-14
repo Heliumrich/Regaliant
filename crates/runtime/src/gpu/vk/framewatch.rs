@@ -7,7 +7,8 @@
 //! light pools at the player's feet blinking). Flashes are logged; every frame's grid goes to
 //! `<run dir>/frames-luma.bin` (f32 log time in ms, then 144 cells, row by row) for analysis.
 //! `DS_FRAME_WATCH=2` also keeps the last 8 frames at 480x270 and saves the frames before, at
-//! and after a flash of 8 cells or more as `flash_<ms>_{a,b,c}.png` (at most 60).
+//! and after a flash of 8 cells or more as `flash_<ms>_{a,b,c}.png` (at most 60, or
+//! `DS_FRAME_WATCH_SAVES`; from the log time `DS_FRAME_WATCH_FROM` in ms on, when given).
 
 use ash::vk;
 use std::collections::VecDeque;
@@ -34,7 +35,15 @@ const RW: u32 = 480;
 const RH: u32 = 270;
 /// A flash this large saves its frames.
 const SAVE_CELLS: usize = 8;
-const SAVE_MAX: u32 = 60;
+fn save_max() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("DS_FRAME_WATCH_SAVES").ok().and_then(|v| v.parse().ok()).unwrap_or(60))
+}
+
+fn save_from() -> f64 {
+    static T: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var("DS_FRAME_WATCH_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0))
+}
 /// Frames watched, flash frames, flash frames with a quarter of the picture or more.
 pub static STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
@@ -290,7 +299,7 @@ impl Watch {
                 if n >= CELLS / 4 {
                     STATS[2].fetch_add(1, Relaxed);
                 }
-                if n >= SAVE_CELLS && !self.ring.is_empty() && self.saved < SAVE_MAX {
+                if n >= SAVE_CELLS && !self.ring.is_empty() && self.saved < save_max() && tm >= save_from() {
                     let times = [(self.grids[0].0, 'a'), (tm, 'b'), (self.grids[2].0, 'c')];
                     self.save(tm, times);
                 }
