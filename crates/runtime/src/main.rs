@@ -36,6 +36,7 @@ mod jitter;
 mod engine;
 mod thread;
 mod titlefix;
+mod vgdiag;
 mod titlemem;
 mod textbox;
 mod uistate;

@@ -142,6 +142,41 @@ const FIXES: &[Fix] = &[
         why: "the `cam` command lists the camera rigs and their controllers",
         only_with: Some("DS_CAMDEBUG"),
     },
+    // The virtual geometry scene (`vgdiag`): the per-frame update before the active entity
+    // list is hashed into CreateScene's generation (`mov rdi,[rbp-0E8h]; mov r8d,811C9DC5h`,
+    // the FNV-1a loop's start), where a held spawn enable goes back (and with `DS_VG_DIAG` the
+    // list is logged) ...
+    Fix {
+        name: "VG spawning held after scene resets (per frame)",
+        offset: 0xa553c7,
+        from: (13, 0x9cb16a09a6dccd4c),
+        change: Change::Hook { at: 0, handler: crate::vgdiag::list_hook },
+        kind: "title timing",
+        why: "a held spawn enable goes back once the scene has kept its numbering for a few frames",
+        only_with: None,
+    },
+    // ... the reset of the scene's model numbering a new generation makes
+    // (`mov eax,[rbp-131Ch]; mov byte ptr [r14+1],0`) ...
+    Fix {
+        name: "VG spawning held after scene resets (reset)",
+        offset: 0xa656dc,
+        from: (11, 0xeb41e0551ea737db),
+        change: Change::Hook { at: 0, handler: crate::vgdiag::reset_hook },
+        kind: "title timing",
+        why: "plants spawned with a scene numbering a reset replaces a frame later keep the old model numbers (weeds drawn as tall grass out of the tutorial tunnel's walls)",
+        only_with: None,
+    },
+    // ... and the spawn enable CreateScene stores (`mov [r15+1],al; mov rsi,[r15+0B0h]`),
+    // held off for the frames after a reset.
+    Fix {
+        name: "VG spawning held after scene resets (enable)",
+        offset: 0xa66b93,
+        from: (11, 0xda3d353d8164bd25),
+        change: Change::Hook { at: 0, handler: crate::vgdiag::enable_hook },
+        kind: "title timing",
+        why: "spawning waits until the scene's model numbering has held for a few frames",
+        only_with: None,
+    },
     // The TAA's per-view jitter (`jitter`): its function's entry, `mov rax,[rdi+68h]; cmp
     // dword ptr [rax+0AACh],0` (the forced index's test).
     Fix {

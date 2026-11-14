@@ -2240,6 +2240,88 @@ impl<'a, E: Env> Group<'a, E> {
                         self.waves[w].v[vd + k][l] = *x;
                     }
                 }
+                "image_sample_l" | "image_sample_lz" | "image_sample" => {
+                    // 2D and 2D-array sampling at an explicit LOD (`_l`) or LOD 0 (`_lz`, and
+                    // plain sampling: no derivatives in compute), as the sampler filters: point
+                    // or bilinear texels, no, nearest or linear mips, its LOD clamp and wrap
+                    // modes (the check of the spawn programs, 2026-11-14).
+                    if dim != 1 && dim != 5 {
+                        return Err(format!("{:#x}: {name} (dim {dim}) not emulated", ins.pc));
+                    }
+                    if !float {
+                        return Err(format!("{:#x}: {name} of an integer format not emulated", ins.pc));
+                    }
+                    let (uu, vv) = (f(ar(0)), f(ar(1)));
+                    let slice = if dim == 5 { f(ar(2)).round().max(0.0) as u32 } else { 0 };
+                    let lod_in = if name == "image_sample_l" { f(ar(if dim == 5 { 3 } else { 2 })) } else { 0.0 };
+                    let span = t.last_level.saturating_sub(t.base_level);
+                    let (min_lod, max_lod) = (bits(samp[1], 0, 12) as f32 / 256.0, bits(samp[1], 12, 12) as f32 / 256.0);
+                    let lod = lod_in.max(min_lod).min(max_lod).clamp(0.0, span as f32);
+                    let xy_filter = bits(samp[2], if lod > 0.0 { 22 } else { 20 }, 2);
+                    let mips: [(u32, f32); 2] = match bits(samp[2], 26, 2) {
+                        0 => [(0, 1.0), (0, 0.0)],
+                        2 => {
+                            let m0 = lod.floor();
+                            [(m0 as u32, 1.0 - (lod - m0)), ((m0 as u32 + 1).min(span), lod - m0)]
+                        }
+                        _ => [(((lod + 0.5).floor() as u32).min(span), 1.0), (0, 0.0)],
+                    };
+                    let unnorm = ins.mimg_unorm() || bits(samp[0], 15, 1) != 0;
+                    let (clamp_x, clamp_y) = (bits(samp[0], 0, 3), bits(samp[0], 3, 3));
+                    let wrap = |i: i32, n: u32, mode: u32| -> Option<u32> {
+                        let n = n as i32;
+                        match mode {
+                            0 => Some(i.rem_euclid(n) as u32),
+                            1 => {
+                                let k = i.rem_euclid(2 * n);
+                                Some(if k < n { k } else { 2 * n - 1 - k } as u32)
+                            }
+                            2 | 3 => Some(i.clamp(0, n - 1) as u32),
+                            _ => (i >= 0 && i < n).then_some(i as u32),
+                        }
+                    };
+                    let mut acc = [0f32; 4];
+                    for &(m, weight) in &mips {
+                        if weight == 0.0 {
+                            continue;
+                        }
+                        let level = t.base_level + m;
+                        let (wl, hl) = ((t.width >> level).max(1), (t.height >> level).max(1));
+                        let (fx, fy) = if unnorm { (uu, vv) } else { (uu * wl as f32, vv * hl as f32) };
+                        let taps: Vec<(i32, i32, f32)> = if xy_filter & 1 == 0 {
+                            vec![(fx.floor() as i32, fy.floor() as i32, 1.0)]
+                        } else {
+                            let (gx, gy) = (fx - 0.5, fy - 0.5);
+                            let (x0, y0) = (gx.floor(), gy.floor());
+                            let (ax, ay) = (gx - x0, gy - y0);
+                            let (x0, y0) = (x0 as i32, y0 as i32);
+                            vec![(x0, y0, (1.0 - ax) * (1.0 - ay)), (x0 + 1, y0, ax * (1.0 - ay)), (x0, y0 + 1, (1.0 - ax) * ay), (x0 + 1, y0 + 1, ax * ay)]
+                        };
+                        for (i, j, tap) in taps {
+                            let raw = match (wrap(i, wl, clamp_x), wrap(j, hl, clamp_y)) {
+                                (Some(x), Some(y)) => self.env.texel(&tw, x, y, slice, level),
+                                _ => None,
+                            };
+                            let vals = match raw {
+                                Some(r) => {
+                                    let (v, _) = unpack(t.format, &r).ok_or_else(|| format!("{:#x}: image format {} not emulated", ins.pc, t.format))?;
+                                    swizzle(&v, t.dst_sel, float)
+                                }
+                                None => [0; 4],
+                            };
+                            for (a, v) in acc.iter_mut().zip(vals) {
+                                *a += weight * tap * f(v);
+                            }
+                        }
+                    }
+                    let mut k = 0;
+                    for (c, a) in acc.iter().enumerate() {
+                        if dmask >> c & 1 != 0 {
+                            self.waves[w].v[vd + k][l] = u(*a);
+                            k += 1;
+                        }
+                    }
+                }
                 "image_get_resinfo" => {
                     let mip = ar(0);
                     let vals = [(t.width >> mip).max(1), (t.height >> mip).max(1), if t.ty == 13 || t.ty == 12 { t.depth } else { t.depth }, t.last_level - t.base_level + 1];

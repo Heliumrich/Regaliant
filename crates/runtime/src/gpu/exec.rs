@@ -10616,6 +10616,33 @@ pub(crate) const STOPPED: &str = "stopped (parallel run)";
 /// The title's TAA program (01.007.000; `gpu::upscale`): resources 1 colour, 2 depth, 4 motion
 /// vectors, 9 output.
 const TAA_CS: u64 = 0x100893aa00;
+
+/// The title's per-view placement of virtual geometry instances (01.007.000:
+/// vg_createinstancesperviewpermodel, one dispatch a frame over the whole instance pool): it
+/// appends each live instance to its model's slot range of the per-view buffer (48-byte
+/// records), whose draws cover each range's whole capacity and rely on unused slots holding
+/// zero records (discarded: a zero quaternion's vertices come out non-finite). Nothing in the
+/// frame clears the buffer; as the capacities grow while spawning ramps up, the bases shift and
+/// records an earlier placement left fall into other models' ranges (the tutorial tunnel's
+/// weeds drawn as tall thorned grass sticking out of its walls; FINDINGS.md 2026-11-14). The
+/// buffer is zeroed before the placement (`DS_VG_CLEAR=0`: not).
+const VG_PLACEMENT_CS: u64 = 0x10089ad900;
+/// Its first instruction words (the bundle's code), checked before the clear applies.
+const VG_PLACEMENT_CODE: [u32; 8] = [0xbfa00002, 0xd7460008, 0x04010c0e, 0xf4201a80, 0xfa000000, 0xbf8cc07f, 0x7da8106a, 0xbf880021];
+/// Placement clears recorded, and not (a range the in-place fill does not cover).
+pub static VG_CLEARS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+fn vg_clear_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        if std::env::var("DS_VG_CLEAR").ok().as_deref() == Some("0") {
+            return false;
+        }
+        let ok = super::cp::guest_readable(VG_PLACEMENT_CS, 32) && (0..8).all(|i| unsafe { *((VG_PLACEMENT_CS + 4 * i as u64) as *const u32) } == VG_PLACEMENT_CODE[i]);
+        crate::info!("gpu: virtual geometry per-view clear {}", if ok { "on (cs 0x10089ad900 recognized)" } else { "off (the placement program is not at its address)" });
+        ok
+    })
+}
 const TAA_RES: [usize; 4] = [1, 2, 4, 9];
 
 /// Diagnosis (`DS_TAA_PROBE=<n>`): the title's TAA dispatch (cs 0x100893aa00) for its first
@@ -13334,6 +13361,29 @@ impl Exec {
     /// (the kernel runs instead).
     fn fill_in_place(&mut self, base: u64, len: u64, v: u32) -> Result<bool, String> {
         self.fill_in_place_parts(base, len, v, None)
+    }
+
+    /// `VG_PLACEMENT_CS`'s per-view instance buffer (the stride-48 buffer it only writes)
+    /// zeroed in place before the placement runs; the dispatch then waits for the fill.
+    fn vg_placement_clear(&mut self, p: &Prepared) -> Result<(), String> {
+        for (i, r) in p.resources.iter().enumerate() {
+            let Resolved::Buffer(v) = r else { continue };
+            let Some(used) = p.tr.plan.resources.get(i) else { continue };
+            if v.stride != 48 || !used.written || used.read {
+                continue;
+            }
+            let done = self.fill_in_place(v.base, v.extent(), 0)?;
+            self.barrier_wanted = true;
+            let n = VG_CLEARS[done as usize].fetch_add(1, Ordering::Relaxed);
+            if n == 0 {
+                if done {
+                    crate::info!("gpu[{}]: virtual geometry per-view buffer {:#x}+{:#x} zeroed before its placement (first time)", self.name, v.base, v.extent());
+                } else {
+                    crate::warn!("gpu[{}]: virtual geometry per-view buffer {:#x}+{:#x} not zeroed (no single in-place range)", self.name, v.base, v.extent());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `fill_in_place`, storing into guest memory only over `guest` (parts
@@ -17238,6 +17288,11 @@ impl Exec {
         self.keys_scratch = keys;
         if self.stopped {
             return Err(STOPPED.into());
+        }
+        // The title's VG per-view placement: its instance buffer zeroed first
+        // (`VG_PLACEMENT_CS`).
+        if p.addr == VG_PLACEMENT_CS && vg_clear_on() {
+            self.vg_placement_clear(&p)?;
         }
         // The fill kernel over a whole range (`verify::full_fill`): one buffer
         // fill of guest memory in place, without the kernel's VRAM shadow

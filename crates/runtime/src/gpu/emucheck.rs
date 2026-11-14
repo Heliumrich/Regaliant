@@ -1,6 +1,6 @@
 //! Translation check against the reference interpreter (`rdna::emu`).
 //!
-//! `DS_EMU_CHECK=<shader>[,<shader>...][:<groups>[:<min bytes>]]` (hex shader addresses):
+//! `DS_EMU_CHECK=<shader>[,<shader>...][:<groups>[:<min bytes>[:<min groups>]]]` (hex shader addresses):
 //! before the first few direct dispatches of those compute shaders run on the GPU, a sample of
 //! their workgroups (default 32, spread over the grid) is interpreted on the
 //! CPU from the same inputs; after the GPU dispatch, the texels and bytes the
@@ -9,7 +9,8 @@
 //! the list at run time (shaders that load at different addresses per run).
 //! With `<min bytes>`, dispatches whose sample writes fewer buffer bytes (and
 //! no texel) are not compared and do not count: programs that run every frame
-//! with little to do are checked where they do their work.
+//! with little to do are checked where they do their work. With `<min groups>`, dispatches
+//! of fewer workgroups are passed over the same way (one mesh's dispatch among smaller ones).
 
 use super::cp::{Cp, Space};
 use super::desc::Tsharp;
@@ -21,16 +22,23 @@ struct Cfg {
     addrs: Vec<u64>,
     groups: u32,
     min_bytes: usize,
+    min_groups: u64,
 }
 
-/// `<shader>[,<shader>...][:<groups>[:<min bytes>]]`.
+/// `<shader>[,<shader>...][:<groups>[:<min bytes>[:<min groups>]]]`.
 fn parse(v: &str) -> Option<Cfg> {
     let mut it = v.split(':');
     let addrs: Vec<u64> = it.next()?.split(',').filter_map(|a| u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()).collect();
     let groups = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(32);
     let min_bytes = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(0);
-    (!addrs.is_empty()).then_some(Cfg { addrs, groups, min_bytes })
+    let min_groups = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(0);
+    (!addrs.is_empty()).then_some(Cfg { addrs, groups, min_bytes, min_groups })
 }
+
+/// Sequence of `DS_EMU_RES_DUMP` dumps.
+static RES_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Sequence of `DS_DUMP_MEM` snapshots.
+static MEM_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// The active list: `DS_EMU_CHECK` until `arm` replaces it.
 static CFG: parking_lot::RwLock<Option<Cfg>> = parking_lot::RwLock::new(None);
@@ -51,12 +59,12 @@ fn cfg() -> Option<Cfg> {
     CFG.read().clone()
 }
 
-/// `emucheck <shader>[,<shader>...][:<groups>[:<min bytes>]]` / `emucheck off` (control
+/// `emucheck <shader>[,<shader>...][:<groups>[:<min bytes>[:<min groups>]]]` / `emucheck off` (control
 /// command): replaces the list; the next 3 dispatches of each listed shader
 /// are checked.
 pub fn arm(v: &str) -> Result<(), String> {
     cfg();
-    let c = if v.trim() == "off" { None } else { Some(parse(v).ok_or("usage: emucheck <hex shader>[,<hex shader>...][:<groups>[:<min bytes>]] | off")?) };
+    let c = if v.trim() == "off" { None } else { Some(parse(v).ok_or("usage: emucheck <hex shader>[,<hex shader>...][:<groups>[:<min bytes>[:<min groups>]]] | off")?) };
     if let Some(c) = &c {
         let mut done = DONE.lock().unwrap();
         let d = done.get_or_insert_with(HashMap::new);
@@ -192,6 +200,10 @@ pub fn prepare(cp: &Cp, groups: [u32; 3], initiator: u32) -> Option<Pending> {
         // An empty (indirect) dispatch: nothing to compare.
         return None;
     }
+    let total = groups[0] as u64 * groups[1].max(1) as u64 * groups[2].max(1) as u64;
+    if total < c.min_groups {
+        return None;
+    }
     let addr = cs_addr(cp);
     *DONE.lock().unwrap().get_or_insert_with(HashMap::new).entry(addr).or_insert(0) += 1;
     let (insts, _) = match super::shaders::program(addr) {
@@ -211,7 +223,24 @@ pub fn prepare(cp: &Cp, groups: [u32; 3], initiator: u32) -> Option<Pending> {
             let _ = std::fs::write(sdir.join(format!("{addr:012x}.bin")), bytes);
         }
     }
-    let resources = super::shaders::prepare_compute(cp, initiator & (1 << 15) == 0).map(|p| super::shaders::describe_resources(&p)).unwrap_or_default();
+    let prepared = super::shaders::prepare_compute(cp, initiator & (1 << 15) == 0);
+    // `DS_EMU_RES_DUMP=1`: each buffer the dispatch binds, as it reads before the GPU runs, to
+    // emucheck_<shader>_<n>_res<slot>_<address>.bin (up to 64 MiB each).
+    if let (Ok(p), Some(dir)) = (prepared.as_ref(), crate::run_dir()) {
+        if std::env::var("DS_EMU_RES_DUMP").ok().as_deref() == Some("1") {
+            let k = RES_SEQ.fetch_add(1, Ordering::Relaxed);
+            for (slot, r) in p.resources.iter().enumerate() {
+                if let super::shaders::Resolved::Buffer(v) = r {
+                    let n = v.extent().min(64 << 20);
+                    if n > 0 && super::cp::guest_readable(v.base, n) {
+                        let bytes = unsafe { std::slice::from_raw_parts(v.base as *const u8, n as usize) }.to_vec();
+                        let _ = std::fs::write(dir.join(format!("emucheck_{addr:x}_{k}_res{slot}_{:x}.bin", v.base)), bytes);
+                    }
+                }
+            }
+        }
+    }
+    let resources = prepared.map(|p| super::shaders::describe_resources(&p)).unwrap_or_default();
     let sh = |i: u32| cp.reg(Space::Sh, i);
     let rsrc2 = sh(0x213);
     let local = [sh(0x207) & 0xFFFF, sh(0x208) & 0xFFFF, sh(0x209) & 0xFFFF];
@@ -226,7 +255,6 @@ pub fn prepare(cp: &Cp, groups: [u32; 3], initiator: u32) -> Option<Pending> {
         code_base: addr,
         probe: super::shaders::probe_for(addr),
     };
-    let total = groups[0] as u64 * groups[1].max(1) as u64 * groups[2].max(1) as u64;
     let n = (c.groups as u64).min(total).max(1);
     let mut env = Env { writes: BTreeMap::new(), images: HashMap::new(), texels: HashMap::new(), written_images: HashMap::new(), unmapped: 0, missing_images: 0 };
     let mut errors = Vec::new();
@@ -255,6 +283,23 @@ pub fn prepare(cp: &Cp, groups: [u32; 3], initiator: u32) -> Option<Pending> {
                 errors.push(format!("dump group {g:?}: {e}"));
             }
             steps += grp.steps;
+        }
+        // `DS_DUMP_MEM=<sgpr>:<hex bytes>`: the guest memory the 64-bit address in that SGPR
+        // pair of the first wave points at, as the dispatch will read it (a program's constant
+        // table), to emucheck_<shader>_<n>_mem.bin.
+        if let (Some((_, s, _)), Ok(v)) = (regs.get(&0), std::env::var("DS_DUMP_MEM")) {
+            let mut it = v.split(':');
+            let r = it.next().and_then(|x| x.trim().parse::<usize>().ok());
+            let n = it.next().and_then(|x| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok());
+            if let (Some(r), Some(n), Some(dir)) = (r.filter(|&r| r < 127), n.filter(|&n| n > 0 && n <= 1 << 20), crate::run_dir()) {
+                let a = s[r] as u64 | (s[r + 1] as u64) << 32;
+                if super::cp::guest_readable(a, n) {
+                    let bytes = unsafe { std::slice::from_raw_parts(a as *const u8, n as usize) };
+                    let k = MEM_SEQ.fetch_add(1, Ordering::Relaxed);
+                    let _ = std::fs::write(dir.join(format!("emucheck_{addr:x}_{k}_mem.bin")), bytes);
+                    crate::info!("emu check: cs {addr:#x}: {n:#x} bytes at s[{r}:{}] = {a:#x} written (dump {k})", r + 1);
+                }
+            }
         }
         (pc, g, regs, lanes)
     });
@@ -433,6 +478,21 @@ fn compare_dump(addr: u64, pc: u32, g: [u32; 3], regs: &Dump, lanes: usize) {
             }
             let ex: Vec<String> = got.iter().enumerate().filter(|&(_, &x)| x != want).take(3).map(|(l, x)| format!("lane {l} gpu {x:#x}")).collect();
             lines.push(format!("wave {w} s{k}: cpu {want:#x}, {}", ex.join(", ")));
+        }
+    }
+    // The interpreter's scalar registers of the first wave, whatever they compare as: the
+    // dispatch's constants as the program loaded them (reading a program's inputs).
+    if let Some((v, s, _)) = regs.get(&0) {
+        let words: Vec<String> = s.iter().map(|x| format!("{x:08x}")).collect();
+        crate::info!("emu check: cs {addr:#x}: interpreter SGPRs of wave 0 after {pc:#x}: {}", words.join(" "));
+        // `DS_DUMP_V=<vgpr>[;<vgpr>...]`: those VGPRs of the wave's first 16 lanes as well.
+        if let Ok(list) = std::env::var("DS_DUMP_V") {
+            for r in list.split(|c| c == ';' || c == ' ').filter_map(|x| x.trim().trim_start_matches('v').parse::<usize>().ok()) {
+                if let Some(lanes) = v.get(r) {
+                    let words: Vec<String> = lanes.iter().take(16).map(|x| format!("{x:08x}")).collect();
+                    crate::info!("emu check: cs {addr:#x}: interpreter v{r} of wave 0 lanes 0-15 after {pc:#x}: {}", words.join(" "));
+                }
+            }
         }
     }
     if lines.is_empty() {
