@@ -197,6 +197,12 @@ fn is_held(s: &Shared, a: u64) -> bool {
     held_bit(s, a).is_some_and(|(w, m)| w.load(Ordering::Acquire) & m != 0)
 }
 
+/// Whether guest page `a` is held now (no-access while the GPU's newer words are elsewhere: a
+/// read releases it). Lock-free: for sweeps that pass such pages over (`uistate`).
+pub fn page_held(a: u64) -> bool {
+    shared().is_some_and(|s| is_held(s, a))
+}
+
 /// Whether dsport runs under its host.
 pub fn on() -> bool {
     !SHARED.load(Ordering::Acquire).is_null()

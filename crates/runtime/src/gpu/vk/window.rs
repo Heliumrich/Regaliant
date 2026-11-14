@@ -625,7 +625,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     return 0;
                 }
                 let ctrl = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x11) } < 0;
-                if crate::hle::libs::ime_dialog::key_down(wp as u8, repeat, ctrl) {
+                if crate::hle::libs::ime_dialog::key_down(wp as u8, repeat, ctrl, ((lp >> 16) & 0x1FF) as u16) {
                     crate::input::note_device(crate::input::DEVICE_KBM);
                     if !crate::hle::libs::ime_dialog::active() {
                         IME_SWALLOW.store(wp as u32, Ordering::Relaxed);
@@ -675,7 +675,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         // Typed characters go to the system text box while it is open.
-        WM_CHAR if crate::hle::libs::ime_dialog::char_typed(wp as u16) => 0,
+        WM_CHAR if crate::hle::libs::ime_dialog::char_typed(wp as u16, (lp >> 30) & 1 != 0, ((lp >> 16) & 0x1FF) as u16) => 0,
         // Alt with a key (Alt is walk): no menu mnemonic and its beep; Alt+Space
         // still opens the window menu.
         WM_SYSCHAR if wp != b' ' as WPARAM => 0,

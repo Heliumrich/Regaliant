@@ -45,6 +45,9 @@ struct Dialog {
     shift: u8,
     page: u8,
     repeat: Option<(u32, Instant)>,
+    /// The keys (scan codes) pressed since the box opened: a key held from before (the one that
+    /// opened it) does not type its repeats.
+    fresh: Vec<u16>,
 }
 
 static DIALOG: Mutex<Option<Dialog>> = Mutex::new(None);
@@ -83,10 +86,14 @@ pub fn active() -> bool {
     DIALOG.lock().as_ref().is_some_and(|d| d.status == STATUS_RUNNING)
 }
 
-/// A character typed in the game's window (WM_CHAR): true when the box took it.
-pub fn char_typed(c: u16) -> bool {
+/// A character typed in the game's window (WM_CHAR; `repeat`: its key held down, `scan`: its
+/// key's scan code): true when the box took it.
+pub fn char_typed(c: u16, repeat: bool, scan: u16) -> bool {
     let mut g = DIALOG.lock();
     let Some(d) = g.as_mut().filter(|d| d.status == STATUS_RUNNING) else { return false };
+    if repeat && !d.fresh.contains(&scan) {
+        return true;
+    }
     d.pad_mode = false;
     if c >= 0x20 && c != 0x7F && (d.edit.len() as u32) < d.max_len.max(1) {
         d.edit.push(c);
@@ -95,11 +102,18 @@ pub fn char_typed(c: u16) -> bool {
     true
 }
 
-/// A key pressed in the game's window (WM_KEYDOWN; `repeat`: held down): true when the box took
-/// it (every key while it is open: the game sees none).
-pub fn key_down(vk: u8, repeat: bool, ctrl: bool) -> bool {
+/// A key pressed in the game's window (WM_KEYDOWN; `repeat`: held down, `scan`: its scan code):
+/// true when the box took it (every key while it is open: the game sees none).
+pub fn key_down(vk: u8, repeat: bool, ctrl: bool, scan: u16) -> bool {
     let mut g = DIALOG.lock();
     let Some(d) = g.as_mut().filter(|d| d.status == STATUS_RUNNING) else { return false };
+    if !d.fresh.contains(&scan) {
+        if repeat {
+            // Held since before the box opened (the key that opened it): not the box's.
+            return true;
+        }
+        d.fresh.push(scan);
+    }
     if d.pad_mode {
         d.pad_mode = false;
         EDITS.fetch_add(1, Relaxed);
@@ -474,6 +488,7 @@ sysv! {
             shift,
             page: 0,
             repeat: None,
+            fresh: Vec::new(),
         };
         if let Ok(t) = std::env::var("DS_IME_TEXT") {
             crate::info!("ime dialog: text supplied by DS_IME_TEXT");
@@ -552,6 +567,7 @@ mod tests {
             shift: 1,
             page: 0,
             repeat: None,
+            fresh: Vec::new(),
         });
     }
 

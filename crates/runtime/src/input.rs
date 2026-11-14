@@ -222,11 +222,16 @@ pub fn press_now(names: &str, hold: u64) -> Result<(), String> {
 /// execution, so holds counted in flips do not transfer between them.
 static LIVE_TIMED: parking_lot::Mutex<Vec<(std::time::Instant, Step)>> = parking_lot::Mutex::new(Vec::new());
 
+/// The menu pointer's presses (`press_quiet`): the game's alone (the system text box takes the
+/// pad's and the control channel's, never these: a click or a hover step there would cancel
+/// or move it).
+static QUIET_TIMED: parking_lot::Mutex<Vec<(std::time::Instant, Step)>> = parking_lot::Mutex::new(Vec::new());
+
 /// `press_for` without making the pad the device in use (the menu pointer's presses).
 pub fn press_quiet(names: &str, dur: std::time::Duration) -> Result<(), String> {
     let steps = parse_script(&format!("0:{names}:1"))?;
     let now = std::time::Instant::now();
-    let mut live = LIVE_TIMED.lock();
+    let mut live = QUIET_TIMED.lock();
     live.retain(|x| x.0 > now);
     live.extend(steps.into_iter().map(|s| (now + dur, s)));
     Ok(())
@@ -260,8 +265,19 @@ pub fn hold_stick(right: bool, x: i32, y: i32, dur: std::time::Duration) {
     g.push((now + dur, right, x.clamp(-128, 127), y.clamp(-128, 127)));
 }
 
-fn scripted(st: &mut PadState, flip: u64) {
+/// The scripted presses and sticks into `st`; `quiet`: the menu pointer's presses too.
+fn scripted(st: &mut PadState, flip: u64, quiet: bool) {
     let now = std::time::Instant::now();
+    if quiet {
+        for (until, step) in QUIET_TIMED.lock().iter() {
+            if now < *until {
+                st.buttons |= step.buttons;
+                for &s in &step.sticks {
+                    apply_stick(st, s);
+                }
+            }
+        }
+    }
     for &(until, right, x, y) in STICKS.lock().iter() {
         if now < until {
             let (ax, ay) = ((128 + x) as u8, (128 + y) as u8);
@@ -395,6 +411,9 @@ fn xinput(st: &mut PadState) -> (u32, i16, i16) {
     if crate::pcsettings::bindings::pad_input(phys) {
         return (phys, g.sThumbLX, g.sThumbLY);
     }
+    // (The box sees the buttons as held, also those kept from the game: a box opened again while
+    // the button that closed the last one is still down sees no new press.)
+    let held = phys;
     let swallowed = PAD_SWALLOW.load(Relaxed) & phys;
     PAD_SWALLOW.store(swallowed, Relaxed);
     let phys = phys & !swallowed;
@@ -415,7 +434,7 @@ fn xinput(st: &mut PadState) -> (u32, i16, i16) {
     st.ly = axis(g.sThumbLY, true);
     st.rx = axis(g.sThumbRX, false);
     st.ry = axis(g.sThumbRY, true);
-    (phys, g.sThumbLX, g.sThumbLY)
+    (held, g.sThumbLX, g.sThumbLY)
 }
 
 // ---------------------------------------------------------------------------
@@ -1294,7 +1313,7 @@ pub fn pad_state() -> PadState {
     // the control channel's presses (tests) as the pad's; while it is open the game sees no
     // input (as on the console while its keyboard shows) and the window's keys are the box's.
     let mut sc = PadState::default();
-    scripted(&mut sc, crate::gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
+    scripted(&mut sc, crate::gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed), false);
     let mut script_bits = 0u32;
     for (i, &t) in PAD_DEFAULT.iter().enumerate() {
         if sc.buttons & t != 0 {
@@ -1313,7 +1332,7 @@ pub fn pad_state() -> PadState {
     let kept = SCRIPT_KEPT.load(Relaxed) & script_bits;
     SCRIPT_KEPT.store(kept, Relaxed);
     keyboard_mouse(&mut st);
-    scripted(&mut st, crate::gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
+    scripted(&mut st, crate::gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed), true);
     for (i, &t) in PAD_DEFAULT.iter().enumerate() {
         if kept & (1 << i) != 0 {
             st.buttons &= !t;

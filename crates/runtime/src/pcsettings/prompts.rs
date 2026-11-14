@@ -1130,6 +1130,50 @@ fn text_mask(text: &str, cx: f32, cy: f32, max_w: f32, max_h: f32) -> Option<Vec
 mod tests {
     use super::*;
 
+    /// Diagnosis: the entities `variants` gives copies in a UI file (`DS_TEST_CGPR=<file>`):
+    /// their path, names from the root down, and the quad string that made them a target.
+    #[test]
+    #[ignore]
+    fn variant_targets_dump() {
+        use super::super::value::{Body, Node, Payload, h};
+        let Ok(path) = std::env::var("DS_TEST_CGPR") else { return };
+        let f = cgpr::parse(&std::fs::read(path).unwrap()).unwrap();
+        fn walk(f: &cgpr::File, e: &cgpr::Entity, names: &mut Vec<String>, path: &mut Vec<usize>) {
+            names.push(String::from_utf8_lossy(&e.name).into_owned());
+            for (_, i) in &e.comps {
+                let Some(p) = Payload::parse(&f.comps[*i as usize].payload) else { continue };
+                if p.value.hash != h("Quad") {
+                    continue;
+                }
+                let mut strs = Vec::new();
+                fn strings(n: &Node, out: &mut Vec<String>) {
+                    match n {
+                        Node::Str(b) => out.push(String::from_utf8_lossy(b).into_owned()),
+                        Node::Obj { fields, .. } => fields.iter().for_each(|(_, v)| strings(v, out)),
+                        _ => {}
+                    }
+                }
+                if let Body::Fields(fields) = &p.value.body {
+                    fields.iter().for_each(|(_, v)| strings(v, &mut strs));
+                }
+                for s in &strs {
+                    if let Some(t) = direct_target(s) {
+                        println!("{path:?} {} -> {s} ({t})", names.join(" / "));
+                    }
+                }
+            }
+            for (k, kid) in e.kids.iter().enumerate() {
+                path.push(k);
+                walk(f, kid, names, path);
+                path.pop();
+            }
+            names.pop();
+        }
+        for (r, root) in f.roots.iter().enumerate() {
+            walk(&f, root, &mut Vec::new(), &mut vec![r]);
+        }
+    }
+
     #[test]
     fn glyphs_draw() {
         // Every kind draws something inside the glyph, nothing at its corners' edge pixels.

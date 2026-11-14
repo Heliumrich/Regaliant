@@ -162,12 +162,17 @@ pub extern "sysv64" fn select_hook(regs: *const u64, _arg: u32) {
 /// (the row count of a column, eboot+0xf640c0; the cell at a column and row, eboot+0xf63db0;
 /// the columns are the definition's entries of 40 bytes at +0xa0..+0xa8).
 pub extern "sysv64" fn grid_hook(regs: *const u64, _arg: u32) {
-    let mut g = DIRECT.lock();
-    let Some((target, since)) = *g else { return };
-    if since.elapsed() > DIRECT_WAIT {
-        *g = None;
-        return;
-    }
+    // (The request is copied out: DIRECT is not held across the title's own calls below, as the
+    // vblank thread takes it under the guest-reader lock.)
+    let target = {
+        let mut g = DIRECT.lock();
+        let Some((target, since)) = *g else { return };
+        if since.elapsed() > DIRECT_WAIT {
+            *g = None;
+            return;
+        }
+        target
+    };
     let Some(base) = crate::loader::main_module().map(|m| m.base) else { return };
     let regs = regs as *mut u64;
     unsafe {
@@ -192,7 +197,12 @@ pub extern "sysv64" fn grid_hook(regs: *const u64, _arg: u32) {
             }
             for r in 0..nr {
                 if cell(grid, c, r) == target {
-                    *g = None;
+                    {
+                        let mut g = DIRECT.lock();
+                        if g.is_some_and(|(t, _)| t == target) {
+                            *g = None;
+                        }
+                    }
                     *regs.add(6) = c as u64;
                     *regs.add(2) = r as u64;
                     if DIRECT_STATS[0].fetch_add(1, Relaxed) < 4 {
@@ -255,9 +265,9 @@ fn focused(t: &uistate::Tree) -> Vec<u64> {
             // The path runs through the list (its parent), or, in the lists a data provider fills
             // (equipment, inventory), through the selected row's own child.
             let p = uistate::parent(n);
-            (p != 0 && uistate::flags(p) & uistate::FOCUS_PATH != 0) || t.children.get(&n).is_some_and(|k| k.iter().any(|&c| uistate::flags(c) & uistate::FOCUS_PATH != 0))
+            (p != 0 && t.holds(p) && uistate::flags(p) & uistate::FOCUS_PATH != 0) || t.children.get(&n).is_some_and(|k| k.iter().any(|&c| uistate::flags(c) & uistate::FOCUS_PATH != 0))
         })
-        .filter(|&n| uistate::absolute(n).is_some())
+        .filter(|&n| uistate::absolute(t, n).is_some())
         .collect()
 }
 
@@ -296,7 +306,9 @@ pub fn tick() {
     if !STARTED.load(Relaxed) && uistate::menu_depth().unwrap_or(0) > 0 && uistate::tree().is_some() {
         STARTED.store(true, Relaxed);
     }
-    let menu = uistate::menu_depth().unwrap_or(0) > 0;
+    // (Not while the system text box is open over a menu: the character's name. The box takes
+    // the keys; the pointer has nothing to point at there.)
+    let menu = uistate::menu_depth().unwrap_or(0) > 0 && !crate::hle::libs::ime_dialog::active();
     let want = menu && input::last_device() == input::DEVICE_KBM;
     if ACTIVE.swap(want, Relaxed) != want {
         crate::info!("pointer: {}", if want { "on (a menu is open, keyboard and mouse in use)" } else { "off" });
@@ -320,6 +332,7 @@ pub fn tick() {
         if TOP.swap(top, Relaxed) != top && top != 0 && STARTED.load(Relaxed) {
             uistate::rescan_screen();
         }
+        uistate::screen_tick();
     }
     let Some(tree) = uistate::tree() else { return };
     // The nodes are read with their pools held mapped (`uistate::guarded`; a skipped vblank
@@ -416,7 +429,7 @@ fn tick_nodes(tree: &std::sync::Arc<uistate::Tree>, want: bool) -> bool {
                 let cousins: Vec<(u64, u64)> = match fw.is_finite() {
                     true => tree
                         .children
-                        .get(&uistate::parent(group))
+                        .get(&if tree.holds(group) { uistate::parent(group) } else { 0 })
                         .map(|v| v.as_slice())
                         .unwrap_or(&[])
                         .iter()

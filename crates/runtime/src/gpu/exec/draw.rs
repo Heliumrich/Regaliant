@@ -1942,10 +1942,13 @@ impl Exec {
                         }
                         let t = std::time::Instant::now();
                         let created = std::cell::Cell::new(false);
-                        let p = gfx_pipe_with(&key, hkey, (&**vs.tr, vs.addr), ps.as_ref().map(|p| (&**p.tr, p.addr)), push_mode, &created)?;
+                        let p = gfx_pipe_with(&key, hkey, (&**vs.tr, vs.addr), ps.as_ref().map(|p| (&**p.tr, p.addr)), push_mode, &created);
+                        // (The mark is cleared on an error too: it would charge this thread's
+                        // next first use to the budget.)
                         if inline_mark(false) {
                             inline_spent(frame as u64, t.elapsed().as_nanos() as u64);
                         }
+                        let p = p?;
                         if compile_trace() {
                             crate::info!("first use: vs {:#x} ps {ps_addr:#x} key {hkey:#x} after {} ms{}", vs.addr, t.elapsed().as_millis(), if created.get() { "" } else { " (made by another thread)" });
                         }

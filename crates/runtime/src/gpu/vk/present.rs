@@ -86,13 +86,21 @@ impl TextBox {
 /// Draws the system text box (the character's name: `hle::libs::ime_dialog`) over the frame in
 /// `dst` (TRANSFER_DST_OPTIMAL), centred across the picture at 38% of its height.
 unsafe fn draw_text_box(p: &mut Presenter, cmd: vk::CommandBuffer, slot: usize, dst: vk::Image, picture: (u32, u32, u32, u32)) {
+    // A size whose image or staging buffers could not be made, and when: tried again after 2 s,
+    // not every frame.
+    static FAILED: Mutex<Option<((u32, u32), std::time::Instant)>> = Mutex::new(None);
     let Some((generation, content)) = crate::hle::libs::ime_dialog::overlay() else { return };
     let c = ctx();
     let (rx, ry, rw, rh) = picture;
     let (w, h) = crate::textbox::size(rh, content.keys.as_ref().map_or(0, |k| k.rows.len()));
-    if w > rw || h > rh {
+    if w > rw || h > rh || FAILED.lock().is_some_and(|(s, at)| s == (w, h) && at.elapsed() < std::time::Duration::from_secs(2)) {
         return;
     }
+    let failed = || {
+        if FAILED.lock().replace(((w, h), std::time::Instant::now())).is_none_or(|(s, _)| s != (w, h)) {
+            crate::warn!("text box: no image of {w}x{h} for it (tried again every 2 s)");
+        }
+    };
     unsafe {
         if p.text_box.as_ref().is_none_or(|t| (t.w, t.h) != (w, h)) {
             // (The other slot may still read the old one.)
@@ -110,14 +118,19 @@ unsafe fn draw_text_box(p: &mut Presenter, cmd: vk::CommandBuffer, slot: usize, 
                 .samples(vk::SampleCountFlags::TYPE_1)
                 .tiling(vk::ImageTiling::OPTIMAL)
                 .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC);
-            let Ok(image) = c.device.create_image(&ici, None) else { return };
+            let Ok(image) = c.device.create_image(&ici, None) else {
+                failed();
+                return;
+            };
             let Ok(memory) = c.alloc(c.device.get_image_memory_requirements(image), vk::MemoryPropertyFlags::DEVICE_LOCAL) else {
                 c.device.destroy_image(image, None);
+                failed();
                 return;
             };
             if c.device.bind_image_memory(image, memory, 0).is_err() {
                 c.device.destroy_image(image, None);
                 c.device.free_memory(memory, None);
+                failed();
                 return;
             }
             let mut staging = Vec::new();
@@ -127,6 +140,7 @@ unsafe fn draw_text_box(p: &mut Presenter, cmd: vk::CommandBuffer, slot: usize, 
                     Err(e) => {
                         crate::warn!("text box: no staging buffer ({e})");
                         TextBox { image, memory, w, h, staging, key: None }.destroy();
+                        failed();
                         return;
                     }
                 }

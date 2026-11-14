@@ -101,9 +101,20 @@ fn parse(kind: Kind, s: &str) -> Option<u32> {
 pub fn init(path: PathBuf, defs: Vec<Def>) {
     let mut values = HashMap::new();
     let by_name: HashMap<String, (u32, Kind)> = defs.iter().map(|d| (d.name.clone(), (super::setting_hash(&d.name), d.kind))).collect();
+    // Renamed settings: their values carried over unless the new name is set too.
+    let mut carried: Vec<(u32, u32)> = Vec::new();
     if let Ok(text) = std::fs::read_to_string(&path) {
         for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
             let Some((k, v)) = line.split_once('=') else { continue };
+            // Sharpening (until 2026-11-14 an amount 0..1): the Sharpness option nearest to it.
+            if k.trim() == "Setting_PC_Sharpening" && by_name.contains_key("Setting_PC_Sharpness") {
+                if let Some(x) = v.trim().parse::<f32>().ok().filter(|x| x.is_finite()) {
+                    let i = super::SHARPNESS.iter().enumerate().min_by(|a, b| (a.1 - x).abs().total_cmp(&(b.1 - x).abs())).map_or(0, |(i, _)| i as u32);
+                    carried.push((super::setting_hash("Setting_PC_Sharpness"), i));
+                    crate::info!("pc settings: Sharpening {x} carried over as Sharpness option {i}");
+                }
+                continue;
+            }
             match by_name.get(k.trim()) {
                 Some(&(h, kind)) => match parse(kind, v.trim()) {
                     Some(bits) => {
@@ -114,6 +125,9 @@ pub fn init(path: PathBuf, defs: Vec<Def>) {
                 None => crate::warn!("pc settings: {}: unknown setting '{}'", path.display(), k.trim()),
             }
         }
+    }
+    for (h, v) in carried {
+        values.entry(h).or_insert(v);
     }
     let n = values.len();
     let defs: HashMap<u32, Def> = defs.into_iter().map(|d| (super::setting_hash(&d.name), d)).collect();

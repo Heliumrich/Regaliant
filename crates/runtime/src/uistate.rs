@@ -142,9 +142,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub struct Tree {
     pub nodes: Vec<u64>,
     pub children: HashMap<u64, Vec<u64>>,
-    /// The guest ranges the nodes lie in (their objects merged, within the mapping each was
-    /// found in): checked mapped before nodes are read (`guarded`).
+    /// The guest ranges the nodes and their ancestors lie in (their objects merged, within the
+    /// mapping each was found in; sorted): checked mapped before nodes are read (`guarded`).
     pub spans: Vec<(u64, u64)>,
+}
+
+impl Tree {
+    /// Whether a node object at `a` lies in the checked ranges: only such nodes are read (a
+    /// parent pointer read out of a node may lead anywhere, unmapped memory too).
+    pub fn holds(&self, a: u64) -> bool {
+        let i = self.spans.partition_point(|&(s, _)| s <= a);
+        i > 0 && a.saturating_add(NODE_BYTES) <= self.spans[i - 1].1
+    }
 }
 
 /// A node object's bytes the port reads (its fields up to the size at +0x308).
@@ -172,7 +181,7 @@ pub fn tree() -> Option<Arc<Tree>> {
     }
 }
 
-fn start_scan() {
+fn start_scan() -> bool {
     if checked().is_some() && manager().is_some() && !SCANNING.swap(true, Ordering::SeqCst) {
         *LAST_SCAN.lock() = Some(std::time::Instant::now());
         std::thread::Builder::new()
@@ -185,7 +194,9 @@ fn start_scan() {
                 SCANNING.store(false, Ordering::SeqCst);
             })
             .ok();
+        return true;
     }
+    false
 }
 
 /// A new scan (the old tree serves meanwhile), at most every 20 s: nodes the index misses.
@@ -197,14 +208,30 @@ pub fn rescan() {
     start_scan();
 }
 
+/// A screen's scan asked for and not started yet (`rescan_screen`).
+static SCREEN_PENDING: AtomicBool = AtomicBool::new(false);
+
 /// A new scan for a menu screen just opened (its rows may be new nodes: the lists a data
-/// provider fills, as equipment and inventory), at most every 3 s.
+/// provider fills, as equipment and inventory): it starts once no scan runs and 3 s have passed
+/// since the last one started (`screen_tick`), so a screen opened soon after another is not
+/// missed.
 pub fn rescan_screen() {
+    SCREEN_PENDING.store(true, Ordering::SeqCst);
+    screen_tick();
+}
+
+/// Each vblank while a menu is open: starts a screen's scan that waits for its turn.
+pub fn screen_tick() {
+    if !SCREEN_PENDING.load(Ordering::SeqCst) || SCANNING.load(Ordering::SeqCst) {
+        return;
+    }
     if LAST_SCAN.lock().is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(3)) {
         return;
     }
-    crate::info!("uistate: the UI nodes are scanned again (another menu screen)");
-    start_scan();
+    if start_scan() {
+        SCREEN_PENDING.store(false, Ordering::SeqCst);
+        crate::info!("uistate: the UI nodes are scanned again (another menu screen)");
+    }
 }
 
 /// The top of the active menu stack (its entry's first word: the scene), None without a menu.
@@ -253,6 +280,15 @@ fn sweep(word: u64, len: u64, mut f: impl FnMut(u64, (u64, u64))) {
             }
             let mut a = c;
             while a < end && a + len <= hi {
+                // (A page the GPU holds, no-access while its newer words are elsewhere: a read
+                // would force its release, about 3,650 a sweep; UI nodes are never there.)
+                if a & 0xFFF == 0 || a == c {
+                    let page = a & !0xFFF;
+                    if crate::hosted::page_held(page) {
+                        a = page + 0x1000;
+                        continue;
+                    }
+                }
                 if unsafe { std::ptr::read_volatile(a as *const u64) } == word {
                     f(a, (lo, hi));
                 }
@@ -284,16 +320,48 @@ fn scan() -> Tree {
     let mut t = Tree { nodes, children: HashMap::new(), spans };
     let children = guarded(&t, || {
         let mut children: HashMap<u64, Vec<u64>> = HashMap::new();
+        // Ancestors outside the pools (another class's containers, scene roots): readable ones
+        // get spans of their own, each checked once with the operating system (the table's lock
+        // is not taken under the guest-reader lock).
+        let mut extra: Vec<(u64, u64)> = Vec::new();
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for &n in &t.nodes {
             let p = parent(n);
             if p != 0 {
                 children.entry(p).or_default().push(n);
             }
+            let mut a = p;
+            for _ in 0..64 {
+                if a == 0 || !seen.insert(a) {
+                    break;
+                }
+                if !t.holds(a) {
+                    if a & 7 != 0 || !crate::mem::os_readable(a, NODE_BYTES) {
+                        break;
+                    }
+                    extra.push((a, a + NODE_BYTES));
+                }
+                a = parent(a);
+            }
         }
-        children
+        (children, extra)
     });
     match children {
-        Some(c) => t.children = c,
+        Some((c, extra)) => {
+            t.children = c;
+            if !extra.is_empty() {
+                t.spans.extend(extra);
+                t.spans.sort_unstable();
+                let mut merged: Vec<(u64, u64)> = Vec::with_capacity(t.spans.len());
+                for (s, e) in t.spans.drain(..) {
+                    match merged.last_mut() {
+                        Some(m) if s <= m.1 => m.1 = m.1.max(e),
+                        _ => merged.push((s, e)),
+                    }
+                }
+                t.spans = merged;
+            }
+        }
         // The pools changed while the sweep ran: an empty index (scanned again on the next use).
         None => {
             crate::warn!("uistate: the UI's node pools changed during the scan: scanned again later");
@@ -335,7 +403,8 @@ fn rdf(a: u64) -> f32 {
     unsafe { std::ptr::read_volatile(a as *const f32) }
 }
 
-/// A node's parent (0: none). Nodes are pool objects: readable for the whole run.
+/// A node's parent (0: none). Read only for nodes in the index's checked ranges (`Tree::holds`)
+/// under `guarded`.
 pub fn parent(n: u64) -> u64 {
     unsafe { std::ptr::read_volatile((n + 0x2C8) as *const u64) }
 }
@@ -370,13 +439,16 @@ fn placed(v: f32) -> bool {
 }
 
 /// A node's position on the canvas (its and its ancestors' positions summed); None when one of
-/// them is not placed.
-pub fn absolute(n: u64) -> Option<(f32, f32)> {
+/// them is not placed, or lies outside the index's checked ranges (made since the scan).
+pub fn absolute(t: &Tree, n: u64) -> Option<(f32, f32)> {
     let (mut x, mut y) = (0.0f32, 0.0f32);
     let mut a = n;
     for _ in 0..64 {
         if a == 0 {
             return Some((x, y));
+        }
+        if !t.holds(a) {
+            return None;
         }
         let (lx, ly, _, _) = local(a);
         let p = parent(a);
@@ -396,7 +468,7 @@ pub fn absolute(n: u64) -> Option<(f32, f32)> {
 
 /// The canvas rectangle (x0, y0, x1, y1) covering a node and its placed descendants of some size.
 pub fn bounds(t: &Tree, n: u64) -> Option<(f32, f32, f32, f32)> {
-    let (ax, ay) = absolute(n)?;
+    let (ax, ay) = absolute(t, n)?;
     let mut acc: Option<(f32, f32, f32, f32)> = None;
     fn walk(t: &Tree, n: u64, ox: f32, oy: f32, depth: u32, acc: &mut Option<(f32, f32, f32, f32)>) {
         let (_, _, w, h) = local(n);
