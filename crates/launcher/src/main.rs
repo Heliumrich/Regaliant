@@ -279,6 +279,8 @@ fn reset_settings(app: &mut App) {
             failed.push(format!("{}: {e}", f.display()));
         }
     }
+    // (The Display page shows the defaults now.)
+    display::refresh(app);
     if failed.is_empty() {
         app.set_status("Settings reset. The game starts with its defaults.");
     } else {
