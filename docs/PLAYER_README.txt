@@ -159,6 +159,8 @@ Known issues
 - World 8-3 sometimes loads too dark. Restarting the game fixes it.
 - Water outside the Nexus can show bands. Some other rare picture faults are known.
 - At 32:9 the character preview in the equipment menu stands at the right edge.
+- In character creation the header can turn bright cyan after the button prompts change, for
+  example when you switch between the controller and the keyboard. It is only cosmetic.
 - HDR has not been seen on an HDR screen yet.
 - AMD and Intel graphics cards have not been tested.
 - Graphics cards without fragment shader barycentrics draw some surfaces through an extra
