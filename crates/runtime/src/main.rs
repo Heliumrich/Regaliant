@@ -281,7 +281,9 @@ fn parse_args() -> Config {
         trace,
         lenient,
         debug,
-        headless,
+        // The launcher's translation check and shader preparation (and the compile bench) run
+        // no game: no window (each showed an empty one until 2026-11-14) and no message boxes.
+        headless: headless || translation_fingerprint || precompile_all.is_some() || compile_bench.is_some(),
         control,
         cache,
         pipeline_test,
@@ -1499,8 +1501,9 @@ fn fatal_text(code: u32, reason: &str) -> String {
 /// One game session at a time for a data folder (two would share saves, settings and the
 /// shader store): a second start is told and ends. Modes that run no game are not counted.
 fn single_instance(cfg: &Config) {
-    // (The launcher's translation check runs no game either: holding the lock, it turned away
-    // a Play pressed while it ran, 2026-11-14.)
+    // (The launcher's translation check runs no game either and ends before any part of a
+    // session's start-up: holding the lock, it turned away a Play pressed while it ran,
+    // 2026-11-14.)
     if cfg.precompile_all.is_some() || cfg.compile_bench.is_some() || cfg.translation_fingerprint {
         return;
     }
@@ -1673,8 +1676,10 @@ This happens when other software takes that range. Restart the PC and try again.
         std::process::exit(1);
     }
     RUN_DIR.set(cfg.run_dir.clone()).ok();
-    // A session in progress (the launcher's: one left behind did not end normally).
-    if cfg.precompile_all.is_none() {
+    // A session in progress (the launcher's: one left behind did not end normally). Runs of no
+    // game write none (the launcher's check left its marker behind, then read as a session that
+    // did not end normally, or replaced a running game's).
+    if cfg.precompile_all.is_none() && cfg.compile_bench.is_none() && !cfg.translation_fingerprint {
         let _ = std::fs::write(cfg.paths.running_marker(), format!("pid {}\nlog {}\n", std::process::id(), cfg.run_dir.display()));
     }
     log::set_thread_name("host");
@@ -1716,6 +1721,29 @@ This happens when other software takes that range. Restart the PC and try again.
     }
     if let Some((c, cs)) = &cfg.record_bench {
         let code = gpu::exec::record_bench(c, *cs);
+        log::flush();
+        std::process::exit(code);
+    }
+    // The launcher's translation check: the translator's answer for a sample of the game's
+    // compute programs (it depends on the device and the translator only), before any part of a
+    // session: no window, settings, saves or stores. It takes no one-session lock and may run
+    // beside a game session (it ran their start-up until 2026-11-14: a pending Save Folder move
+    // or PS5 import applied under a running game, the stores' unfinished files deleted).
+    if cfg.translation_fingerprint {
+        // (Translations made here are for the game's hosted sessions: their specs as those make
+        // them, `fe2::specs_as_hosted`.)
+        gpu::fe2::specs_as_hosted();
+        let code = match gpu::compbench::translation_fingerprint(&cfg.app) {
+            Ok(fp) => {
+                println!("translation = {fp}");
+                info!("translation fingerprint: {fp}");
+                0
+            }
+            Err(e) => {
+                error!("translation fingerprint: {e}");
+                2
+            }
+        };
         log::flush();
         std::process::exit(code);
     }
@@ -1771,8 +1799,11 @@ This happens when other software takes that range. Restart the PC and try again.
         display::init(cfg.paths.display_file());
     }
     pcsettings::init(cfg.paths.settings_file(), cfg.safe_mode);
-    // The saves: the PC tab's Save Folder (the port's own by default), a PS5 import asked for.
-    hle::libs::savedata::init(pcsettings::saves::start(&cfg.paths, &hle::libs::savedata::title_id()));
+    // The saves: the PC tab's Save Folder (the port's own by default), a PS5 import asked for
+    // (a game session's: the shader preparation leaves them as they are).
+    if cfg.precompile_all.is_none() && cfg.compile_bench.is_none() {
+        hle::libs::savedata::init(pcsettings::saves::start(&cfg.paths, &hle::libs::savedata::title_id()));
+    }
     // Compiled pipelines and learned shader specs: local-data, or the
     // `--cache` directory (Play.bat: one next to the package folder, so a
     // new package starts with what earlier ones learned on this machine).
@@ -1803,26 +1834,11 @@ This happens when other software takes that range. Restart the PC and try again.
     });
     // (Translations made here are for the game's hosted sessions: their specs as those make
     // them, `fe2::specs_as_hosted`.)
-    if cfg.compile_bench.is_some() || cfg.translation_fingerprint || cfg.precompile_all.is_some() {
+    if cfg.compile_bench.is_some() || cfg.precompile_all.is_some() {
         gpu::fe2::specs_as_hosted();
     }
     if let Some(a) = &cfg.compile_bench {
         let code = gpu::compbench::run(a, &cfg.app);
-        log::flush();
-        std::process::exit(code);
-    }
-    if cfg.translation_fingerprint {
-        let code = match gpu::compbench::translation_fingerprint(&cfg.app) {
-            Ok(fp) => {
-                println!("translation = {fp}");
-                info!("translation fingerprint: {fp}");
-                0
-            }
-            Err(e) => {
-                error!("translation fingerprint: {e}");
-                2
-            }
-        };
         log::flush();
         std::process::exit(code);
     }

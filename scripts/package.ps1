@@ -88,7 +88,9 @@ if (-not $NoUpscalers) {
   }
 }
 # Paths and names of this machine must not be in the executables. The computer's name counts as
-# a whole word only (a short one is found inside other text: PCV in the translator's "VopcVop3").
+# a whole word only (a short one is found inside other text: PCV in the translator's "VopcVop3"),
+# and outside machine code (a call's displacement once read "pcV", 2026-11-14): names come into a
+# program as text, which its code sections never hold.
 $needles = @($root, $root.Replace('\', '/'), $cargoHome, $env:USERPROFILE) | Where-Object { $_ }
 if ($env:USERNAME -and $env:USERNAME.Length -ge 4) { $needles += "\$($env:USERNAME)\" }
 $words = @($env:COMPUTERNAME) | Where-Object { $_ }
@@ -100,6 +102,18 @@ foreach ($f in $programs.Keys) {
     $k = $n.ToLowerInvariant()
     if ($text.Contains($k) -or $wide.Contains($k)) { Write-Host "$f contains a path or name of this machine ($n); not packaged"; exit 1 }
   }
+  # (The executable sections blanked for the name: the PE section table's executable flag.)
+  $data = [byte[]]$bytes.Clone()
+  $pe = [BitConverter]::ToInt32($data, 0x3c)
+  $nsec = [BitConverter]::ToUInt16($data, $pe + 6)
+  $opt = [BitConverter]::ToUInt16($data, $pe + 20)
+  for ($i = 0; $i -lt $nsec; $i++) {
+    $s = $pe + 24 + $opt + 40 * $i
+    $size = [BitConverter]::ToInt32($data, $s + 16); $at = [BitConverter]::ToInt32($data, $s + 20)
+    if (([BitConverter]::ToUInt32($data, $s + 36) -band 0x20000000) -and $at -lt $data.Length) { [Array]::Clear($data, $at, [Math]::Min($size, $data.Length - $at)) }
+  }
+  $text = [Text.Encoding]::GetEncoding(28591).GetString($data).ToLowerInvariant()
+  $wide = [Text.Encoding]::Unicode.GetString($data).ToLowerInvariant()
   foreach ($n in $words) {
     $re = '(?<![a-z0-9])' + [regex]::Escape($n.ToLowerInvariant()) + '(?![a-z0-9])'
     if ([regex]::IsMatch($text, $re) -or [regex]::IsMatch($wide, $re)) { Write-Host "$f contains the name of this machine ($n); not packaged"; exit 1 }
