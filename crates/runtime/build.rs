@@ -1,3 +1,6 @@
+// The program icon (`link_icon`), shared with the launcher's build script.
+include!("../icon_res.rs");
+
 fn main() {
     // A profile-instrumented build for PGO passes `--cfg dsport_pgo_gen` with
     // `-Cprofile-generate` (docs/WORKFLOW.md).
@@ -5,6 +8,8 @@ fn main() {
     // Keep bottom-up allocations (heaps, stacks) in the low 4 GiB so the guest
     // address range (16 GiB .. 8 TiB) can be reserved at startup. Image ASLR stays on.
     println!("cargo:rustc-link-arg-bins=/HIGHENTROPYVA:NO");
+    // The program icon, also the game window's (`gpu::vk::window`).
+    link_icon(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/regaliant.ico"));
 
     // Audio decoders (third_party/, see THIRD_PARTY.md).
     let tp = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../third_party");

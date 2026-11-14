@@ -829,7 +829,9 @@ pub fn create(title: &str, width: u32, height: u32) -> Result<&'static Window, S
                 cbClsExtra: 0,
                 cbWndExtra: 0,
                 hInstance: hinst,
-                hIcon: std::ptr::null_mut(),
+                // The program icon (build.rs); the title bar's small one is
+                // picked from the same icon's sizes.
+                hIcon: LoadIconW(hinst, 1 as _),
                 hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
                 hbrBackground: std::ptr::null_mut(),
                 lpszMenuName: std::ptr::null(),

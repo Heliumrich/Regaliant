@@ -416,7 +416,8 @@ fn main() {
             hbrBackground: (windows_sys::Win32::Graphics::Gdi::COLOR_BTNFACE + 1) as usize as _,
             lpszMenuName: std::ptr::null(),
             lpszClassName: class.as_ptr(),
-            hIconSm: LoadIconW(hinst, 1 as _),
+            // (The title bar's small icon: picked from the same icon's sizes.)
+            hIconSm: std::ptr::null_mut(),
         };
         RegisterClassExW(&wc);
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
