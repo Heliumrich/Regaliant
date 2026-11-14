@@ -120,6 +120,21 @@ pub fn span_ago(us: u64, name: impl FnOnce() -> String) {
     }
 }
 
+/// A span on `track` that began `ago` before now and ends now (a title
+/// submission's time in its queue before its command processor took it).
+pub fn span_back(track: &str, ago: std::time::Duration, name: impl FnOnce() -> String) {
+    if !on() {
+        return;
+    }
+    let t1 = now();
+    let t0 = t1 - (ago.as_micros().min(i64::MAX as u128 / 16_000_000) as i64).saturating_mul(freq()) / 1_000_000;
+    if let Some(s) = STATE.lock().as_mut() {
+        if s.spans.len() < MAX_SPANS {
+            s.spans.push(Span { track: track.to_string(), name: name(), t0, t1 });
+        }
+    }
+}
+
 /// Ends a span begun with `mark` on the calling thread's track when it
 /// lasted at least `min_us` (parts too small to list otherwise).
 pub fn end_min(t0: Option<i64>, min_us: i64, name: impl FnOnce() -> String) {

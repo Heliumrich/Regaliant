@@ -903,6 +903,15 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     _ => Err("usage: timeline <flips>".into()),
                 }
             }
+            "labels" => {
+                // `labels <n>`: the last n events of the queues' label log
+                // (waits, CP writes, flips) to labels-<flip>.txt in the run
+                // directory (`gpu::cp::label_dump`, `tools/labelflow.py`).
+                match (parts.next().and_then(|n| n.parse::<usize>().ok()), run_dir()) {
+                    (Some(n), Some(dir)) if n > 0 => std::fs::write(dir.join(format!("labels-{flip}.txt")), gpu::cp::label_dump(n)).map_err(|e| e.to_string()),
+                    _ => Err("usage: labels <events>".into()),
+                }
+            }
             "stacks" => {
                 info!("guest thread stacks:\n{}", thread_summary_ex(true));
                 Ok(())

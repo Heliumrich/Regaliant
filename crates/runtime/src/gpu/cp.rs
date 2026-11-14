@@ -1425,6 +1425,14 @@ struct LabelEvent {
     value: u64,
     reference: u64,
     packet: u64,
+    /// The title submission its command processor was running (`CUR_SUB`).
+    sub: u64,
+}
+
+thread_local! {
+    /// The title submission the calling command processor runs (`Cp::new_submission`;
+    /// the label log's events carry it: `label_dump`).
+    static CUR_SUB: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 static LABEL_LOG: parking_lot::Mutex<std::collections::VecDeque<LabelEvent>> = parking_lot::Mutex::new(std::collections::VecDeque::new());
@@ -1527,7 +1535,23 @@ fn label_event(queue: &str, kind: u8, addr: u64, value: u64, reference: u64, pac
     if g.len() >= LABEL_LOG_CAP {
         g.pop_front();
     }
-    g.push_back(LabelEvent { us, queue: queue.to_string(), kind, addr: a, value, reference, packet });
+    g.push_back(LabelEvent { us, queue: queue.to_string(), kind, addr: a, value, reference, packet, sub: CUR_SUB.with(|c| c.get()) });
+}
+
+/// The last `n` events of the label log, oldest first (control `labels <n>`: the queues'
+/// label choreography over a few frames, `tools/labelflow.py`). Kinds beyond `LabelEvent`'s:
+/// F a flip (value: the title submission), G a wait gone past (a stretch begins), C / D that
+/// stretch committed / dropped, and inside held recording i (memory holds), o (its own held
+/// write), p (a promise), m (a missed write or counter), x (the stretch stops there).
+pub fn label_dump(n: usize) -> String {
+    let g = LABEL_LOG.lock();
+    let mut out = String::with_capacity(n.min(g.len()) * 96);
+    for e in g.iter().skip(g.len().saturating_sub(n)) {
+        let writer = last_write(e.addr).map(|w| w.0).unwrap_or_default();
+        out.push_str(&format!("{} {} {} {} {:#x} {:#x} {:#x} {:#x} {}
+", e.us, e.queue, e.sub, e.kind as char, e.addr, e.value, e.reference, e.packet, if writer.is_empty() { "-" } else { &writer }));
+    }
+    out
 }
 
 /// The recorded history of one label (newest last).
@@ -2346,8 +2370,10 @@ impl Cp {
                 if let Some(e) = self.exec.as_mut() {
                     e.order_after_open_writes();
                 }
+                label_event(&self.name, b'o', a, v, reference, at);
                 return Flow::Next;
             }
+            label_event(&self.name, b'x', a, v, reference, at);
             self.held_stop("label wait (its own value)", at);
             return Flow::Next;
         }
@@ -2355,17 +2381,21 @@ impl Cp {
             if let Some(e) = self.exec.as_mut() {
                 e.note_held_reads(&[(a, if wide { 8 } else { 4 })], 3);
             }
+            label_event(&self.name, b'i', a, read(), reference, at);
             return Flow::Next;
         }
         if let Some((seq, by_cpu, _)) = promised(a, wide, func, mask, reference) {
             if let Some(e) = self.exec.as_mut() {
                 e.depend_on(seq, by_cpu);
             }
+            label_event(&self.name, b'p', a, read(), reference, at);
             return Flow::Next;
         }
         if self.submitted_at.is_some_and(|since| missed_write(a, wide, func, mask, reference, since)) || counter_passed(a, wide, func, mask, reference) {
+            label_event(&self.name, b'm', a, read(), reference, at);
             return Flow::Next;
         }
+        label_event(&self.name, b'x', a, read(), reference, at);
         self.held_stop("label wait", at);
         Flow::Next
     }
@@ -2814,6 +2844,7 @@ impl Cp {
     /// come between submissions, so shared batch-start copies of the
     /// graphics queue are dropped (`gpu::precache`).
     pub fn new_submission(&mut self) {
+        CUR_SUB.with(|c| c.set(self.sub_index));
         if self.held.is_none() || self.past.is_some() || self.past_wait.is_some() {
             super::precache::end_scope(0);
             self.fe2_sync(None);
@@ -3958,6 +3989,7 @@ impl Cp {
             sharing: false,
         }));
         self.held = Some(Box::new(HeldCp { stop: None, commands: 0 }));
+        label_event(&self.name, b'G', a, 0, reference, at);
         super::exec::journal_begin();
         if let Some(e) = self.exec.as_mut() {
             e.past_begin_growing();
@@ -4055,6 +4087,7 @@ impl Cp {
         } else {
             None
         };
+        label_event(&self.name, if dropped.is_some() { b'D' } else { b'C' }, w.a, commands, w.reference, at);
         if let Some(d) = dropped {
             note_why(&PAST_WAIT_DROPS, d);
             if d == "read what other queues wrote" {
@@ -7122,6 +7155,7 @@ impl Cp {
             // completes here as for a flip).
             pop::FLIP if super::replay::replaying() => self.sync(),
             pop::FLIP if super::tune::flip_async() => {
+                label_event(&self.name, b'F', 0, self.sub_index, 0, at);
                 // Queued now, shown once this queue's GPU work before it
                 // completed (as the hardware's CP queues it) instead of the
                 // command processor waiting for that work here.
@@ -7159,6 +7193,7 @@ impl Cp {
             }
             pop::FLIP => {
                 self.sync();
+                label_event(&self.name, b'F', 0, self.sub_index, 0, at);
                 let handle = a(0) as i32;
                 let index = a(1) as i32;
                 let arg = addr64(a(3), a(4)) as i64;

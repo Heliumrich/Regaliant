@@ -2676,7 +2676,17 @@ fn worker(q: &'static Queue, name: &str) {
         if cp.holds_across() {
             kept.push(Kept { index: batch.index, bufs: batch.bufs.clone(), at: batch.at });
         }
+        // (Timelines: how long the submission waited in the queue, how many
+        // more wait behind it, and its run: what a planner ahead of the
+        // command processor would have to work on, `tools/sublag.py`.)
+        let tl_sub = timeline::mark();
+        if tl_sub.is_some() {
+            let behind = q.pending.lock().len();
+            let dwords: u64 = batch.bufs.iter().map(|b| b.1 as u64).sum();
+            timeline::span_back(&format!("{name} queued"), batch.at.elapsed(), || format!("sub {} queued ({} buffers, {dwords} dwords, {behind} behind)", batch.index, batch.bufs.len()));
+        }
         run_submission(&mut cp, &batch, name);
+        timeline::end(&format!("{name} subs"), tl_sub, || format!("sub {} run", batch.index));
         while let Some((s, buf, addr)) = cp.take_rewind_sub() {
             let Some(k) = kept.iter().position(|x| x.index == s) else {
                 crate::error!("gpu[{name}]: a stretch past a label wait or run was dropped but submission {s} is not kept; going on");
