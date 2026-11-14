@@ -158,6 +158,8 @@ Known issues
   playthrough has not been made.
 - World 8-3 sometimes loads too dark. Restarting the game fixes it.
 - Water outside the Nexus can show bands. Some other rare picture faults are known.
+- The fog in the opening cutscene is much darker than on PS5. Some light shafts look softer
+  too.
 - At 32:9 the character preview in the equipment menu stands at the right edge.
 - In character creation the header can turn bright cyan after the button prompts change, for
   example when you switch between the controller and the keyboard. It is only cosmetic.
