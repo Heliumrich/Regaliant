@@ -1499,7 +1499,9 @@ fn fatal_text(code: u32, reason: &str) -> String {
 /// One game session at a time for a data folder (two would share saves, settings and the
 /// shader store): a second start is told and ends. Modes that run no game are not counted.
 fn single_instance(cfg: &Config) {
-    if cfg.precompile_all.is_some() || cfg.compile_bench.is_some() {
+    // (The launcher's translation check runs no game either: holding the lock, it turned away
+    // a Play pressed while it ran, 2026-11-14.)
+    if cfg.precompile_all.is_some() || cfg.compile_bench.is_some() || cfg.translation_fingerprint {
         return;
     }
     use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
