@@ -13546,8 +13546,44 @@ impl Exec {
         self.fill_in_place_parts(base, len, v, None)
     }
 
+    /// Fills front end 2's mirror over guest [base, base+len) with the word `v`, guest memory
+    /// left as it is: for buffers only the GPU reads, whose GPU view is the mirror. False: no
+    /// mirror over the range (fill in place instead).
+    fn fill_mirror_only(&mut self, base: u64, len: u64, v: u32) -> Result<bool, String> {
+        if len == 0 || base % 4 != 0 || len % 4 != 0 || DEVICE_LOST.load(Ordering::Relaxed) || super::homes::overlaps(base, len) || !super::fe2::on() || !super::fe2::in_span(base, len) {
+            return Ok(false);
+        }
+        let Some((m, _)) = super::resident::mirror_buffer() else { return Ok(false) };
+        if super::resident::back(base & !4095, (base + len).next_multiple_of(4096) - (base & !4095)).is_err() {
+            return Ok(false);
+        }
+        self.flush_resident(Some(&[(base, len)]))?;
+        self.begin();
+        if !self.recording {
+            return Ok(false);
+        }
+        self.end_rendering();
+        let cmd = self.cmd();
+        if !lazy_barriers() || self.barrier_wanted || self.cpw_overlaps(base, len) {
+            self.barrier();
+            self.barrier_wanted = false;
+            self.dispatched = false;
+        }
+        unsafe { ctx().device.cmd_fill_buffer(cmd, m, base - super::resident::MIRROR_BASE, len, v) };
+        self.ops[OP_FILLS] += 1;
+        self.ops[OP_FILL_BYTES] += len;
+        if !lazy_barriers() {
+            self.barrier();
+        }
+        Ok(true)
+    }
+
     /// `VG_PLACEMENT_CS`'s per-view instance buffer (the stride-48 buffer it only writes)
-    /// zeroed in place before the placement runs; the dispatch then waits for the fill.
+    /// zeroed before the placement runs; the dispatch then waits for the fill. Only the GPU
+    /// reads it (the placement writes it, the VG draws read it, both through front end 2's
+    /// mirror): the mirror alone is zeroed, 6.75 MiB a frame kept off PCIe (the in-place fill
+    /// of guest memory too made the GPU's frames longer and the title's GPU memory peak ~200
+    /// MB higher in the four-cutscene script). Without a mirror over it: in place.
     fn vg_placement_clear(&mut self, p: &Prepared) -> Result<(), String> {
         for (i, r) in p.resources.iter().enumerate() {
             let Resolved::Buffer(v) = r else { continue };
@@ -13555,12 +13591,19 @@ impl Exec {
             if v.stride != 48 || !used.written || used.read {
                 continue;
             }
-            let done = self.fill_in_place(v.base, v.extent(), 0)?;
+            let mirror = self.fill_mirror_only(v.base, v.extent(), 0)?;
+            let done = mirror || self.fill_in_place(v.base, v.extent(), 0)?;
             self.barrier_wanted = true;
             let n = VG_CLEARS[done as usize].fetch_add(1, Ordering::Relaxed);
             if n == 0 {
                 if done {
-                    crate::info!("gpu[{}]: virtual geometry per-view buffer {:#x}+{:#x} zeroed before its placement (first time)", self.name, v.base, v.extent());
+                    crate::info!(
+                        "gpu[{}]: virtual geometry per-view buffer {:#x}+{:#x} zeroed before its placement ({}; first time)",
+                        self.name,
+                        v.base,
+                        v.extent(),
+                        if mirror { "in front end 2's mirror" } else { "in place" }
+                    );
                 } else {
                     crate::warn!("gpu[{}]: virtual geometry per-view buffer {:#x}+{:#x} not zeroed (no single in-place range)", self.name, v.base, v.extent());
                 }
