@@ -197,6 +197,26 @@ pub fn rescan() {
     start_scan();
 }
 
+/// A new scan for a menu screen just opened (its rows may be new nodes: the lists a data
+/// provider fills, as equipment and inventory), at most every 3 s.
+pub fn rescan_screen() {
+    if LAST_SCAN.lock().is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(3)) {
+        return;
+    }
+    crate::info!("uistate: the UI nodes are scanned again (another menu screen)");
+    start_scan();
+}
+
+/// The top of the active menu stack (its entry's first word: the scene), None without a menu.
+pub fn menu_top() -> Option<u64> {
+    let m = manager()?;
+    let (begin, end) = (rd64(m + 0x1260)?, rd64(m + 0x1268)?);
+    if end <= begin || (end - begin) % ENTRY != 0 || end - begin >= 0x10000 {
+        return None;
+    }
+    rd64(end - ENTRY)
+}
+
 /// Calls `f(a, mapping)` for each 8-byte aligned guest address `a` of the readable mappings whose
 /// first word is `word` and whose `len` bytes lie in its mapping (`mapping`: that mapping's
 /// [start, end) when the sweep began). Memory is read in pieces of 1 MiB, each checked in the

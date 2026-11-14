@@ -130,6 +130,12 @@ pub extern "sysv64" fn select_hook(regs: *const u64, _arg: u32) {
         if begin == 0 || end < begin || (end - begin) % 0x18 != 0 || end - begin > 0x18 * 4096 {
             return;
         }
+        // A list a data provider fills (its pointer at +0x2a0): its rows are recycled, a row's
+        // place is not its item's index: the move steps as before.
+        if *((list + 0x2a0) as *const u64) != 0 {
+            DIRECT_STATS[1].fetch_add(1, Relaxed);
+            return;
+        }
         let n = (end - begin) / 0x18;
         let Some(i) = (0..n).find(|&i| *((begin + i * 0x18) as *const u64) == target) else {
             DIRECT_STATS[1].fetch_add(1, Relaxed);
@@ -246,8 +252,10 @@ fn focused(t: &uistate::Tree) -> Vec<u64> {
         .copied()
         .filter(|&n| uistate::flags(n) & uistate::SELECTED != 0)
         .filter(|&n| {
+            // The path runs through the list (its parent), or, in the lists a data provider fills
+            // (equipment, inventory), through the selected row's own child.
             let p = uistate::parent(n);
-            p != 0 && uistate::flags(p) & uistate::FOCUS_PATH != 0
+            (p != 0 && uistate::flags(p) & uistate::FOCUS_PATH != 0) || t.children.get(&n).is_some_and(|k| k.iter().any(|&c| uistate::flags(c) & uistate::FOCUS_PATH != 0))
         })
         .filter(|&n| uistate::absolute(n).is_some())
         .collect()
@@ -303,6 +311,15 @@ pub fn tick() {
     if !menu {
         *STATE.lock() = None;
         return;
+    }
+    // Another menu screen: its rows may be nodes made for it (lists a data provider fills): the
+    // index is made again (in the background; the old one serves meanwhile).
+    {
+        static TOP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let top = uistate::menu_top().unwrap_or(0);
+        if TOP.swap(top, Relaxed) != top && top != 0 && STARTED.load(Relaxed) {
+            uistate::rescan_screen();
+        }
     }
     let Some(tree) = uistate::tree() else { return };
     // The nodes are read with their pools held mapped (`uistate::guarded`; a skipped vblank
