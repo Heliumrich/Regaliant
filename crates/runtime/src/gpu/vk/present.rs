@@ -89,7 +89,7 @@ unsafe fn draw_text_box(p: &mut Presenter, cmd: vk::CommandBuffer, slot: usize, 
     let Some((generation, content)) = crate::hle::libs::ime_dialog::overlay() else { return };
     let c = ctx();
     let (rx, ry, rw, rh) = picture;
-    let (w, h) = crate::textbox::size(rh);
+    let (w, h) = crate::textbox::size(rh, content.keys.as_ref().map_or(0, |k| k.rows.len()));
     if w > rw || h > rh {
         return;
     }

@@ -2,8 +2,9 @@
 //! (the character's name: `hle::libs::ime_dialog`). The console shows its own keyboard over the
 //! game; here the keyboard types into a box drawn over the frame, in the game's window, so the
 //! game keeps its window and its fullscreen (a separate Windows text box took the foreground and
-//! threw exclusive fullscreen back to the desktop: the user, 2026-11-13). Drawn with GDI into a
-//! bitmap the presenter puts on the frame (`gpu::vk::present`).
+//! threw exclusive fullscreen back to the desktop: the user, 2026-11-13). With a controller it
+//! shows a keyboard of keys to move over (`Keys`). Drawn with GDI into a bitmap the presenter
+//! puts on the frame (`gpu::vk::present`).
 
 use windows_sys::Win32::Foundation::{RECT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::*;
@@ -17,8 +18,26 @@ pub struct Content {
     pub placeholder: String,
     pub max_len: u32,
     pub caret: bool,
+    /// One or two lines.
     pub hint: String,
+    /// The controller's keyboard, when it shows.
+    pub keys: Option<Keys>,
 }
+
+/// The controller's keyboard: rows of keys (label, width in columns of ten, shown as engaged
+/// such as Shift) and the selected key (row, index in its row).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Keys {
+    pub rows: Vec<Vec<(String, u8, bool)>>,
+    pub selected: (usize, usize),
+}
+
+/// Design units (at 1080 lines): the keys' rows start below the field, a row's pitch and a
+/// key's height, the hint's line height.
+const KEYS_TOP: f32 = 146.0;
+const ROW_PITCH: f32 = 58.0;
+const KEY_H: f32 = 50.0;
+const HINT_LINE: f32 = 27.0;
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -28,17 +47,29 @@ const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     r as u32 | (g as u32) << 8 | (b as u32) << 16
 }
 
-/// The box's size at a frame `frame_h` pixels high (designed at 1080 lines).
-pub fn size(frame_h: u32) -> (u32, u32) {
+/// The box's height in design units: the field and one hint line, or with `keys` rows of keys
+/// and two hint lines.
+fn design_height(keys: usize) -> f32 {
+    if keys == 0 {
+        206.0
+    } else {
+        KEYS_TOP + keys as f32 * ROW_PITCH + 12.0 + 2.0 * HINT_LINE + 14.0
+    }
+}
+
+/// The box's size at a frame `frame_h` pixels high (designed at 1080 lines) with `keys` rows of
+/// the controller's keyboard (0: none).
+pub fn size(frame_h: u32, keys: usize) -> (u32, u32) {
     let s = (frame_h as f32 / 1080.0).max(0.5);
-    ((820.0 * s).round() as u32, (206.0 * s).round() as u32)
+    ((820.0 * s).round() as u32, (design_height(keys) * s).round() as u32)
 }
 
 /// The box as top-down BGRA pixels (alpha 255) for a frame `frame_h` pixels high.
 pub fn render(c: &Content, frame_h: u32) -> (Vec<u8>, u32, u32) {
     let s = (frame_h as f32 / 1080.0).max(0.5);
     let px = |v: f32| (v * s).round() as i32;
-    let (w, h) = size(frame_h);
+    let rows = c.keys.as_ref().map_or(0, |k| k.rows.len());
+    let (w, h) = size(frame_h, rows);
     let mut out = vec![0u8; (w * h * 4) as usize];
     unsafe {
         let dc = CreateCompatibleDC(std::ptr::null_mut());
@@ -84,6 +115,7 @@ pub fn render(c: &Content, frame_h: u32) -> (Vec<u8>, u32, u32) {
         let title_font = font(30.0, "Georgia");
         let text_font = font(32.0, "Georgia");
         let hint_font = font(21.0, "Segoe UI");
+        let key_font = font(25.0, "Segoe UI");
         SetBkMode(dc, TRANSPARENT as _);
         let draw = |text: &str, f: HFONT, color: u32, mut r: RECT, flags: DRAW_TEXT_FORMAT| {
             let mut t: Vec<u16> = text.encode_utf16().collect();
@@ -122,7 +154,38 @@ pub fn render(c: &Content, frame_h: u32) -> (Vec<u8>, u32, u32) {
             let x = (text_r.left + sz.cx + px(2.0)).min(text_r.right);
             fill(RECT { left: x, top: field.top + px(12.0), right: x + px(2.0).max(1), bottom: field.bottom - px(12.0) }, rgb(236, 226, 200));
         }
-        draw(&c.hint, hint_font, rgb(168, 160, 146), RECT { left: px(24.0), top: px(140.0), right: wi - px(24.0), bottom: hi - px(12.0) }, single | DT_CENTER | DT_END_ELLIPSIS);
+        if let Some(k) = &c.keys {
+            // Ten columns across the field's width; a key spans its columns less a gap.
+            let pitch = (field.right - field.left) as f32 / 10.0;
+            for (r, row) in k.rows.iter().enumerate() {
+                let top = px(KEYS_TOP + r as f32 * ROW_PITCH);
+                let mut col = 0u32;
+                for (i, (label, width, on)) in row.iter().enumerate() {
+                    let left = field.left + (col as f32 * pitch).round() as i32 + px(3.0);
+                    let right = field.left + ((col + *width as u32) as f32 * pitch).round() as i32 - px(3.0);
+                    col += *width as u32;
+                    let rect = RECT { left, top, right, bottom: top + px(KEY_H) };
+                    let selected = k.selected == (r, i);
+                    let (back, edge, ink) = if selected {
+                        (rgb(150, 134, 104), rgb(236, 226, 200), rgb(12, 11, 10))
+                    } else if *on {
+                        (rgb(48, 43, 35), rgb(150, 134, 104), rgb(236, 206, 140))
+                    } else {
+                        (rgb(24, 23, 26), rgb(66, 61, 52), rgb(226, 216, 194))
+                    };
+                    fill(rect, back);
+                    frame(rect, edge, if selected { px(2.0) } else { 1 });
+                    draw(label, key_font, ink, rect, single | DT_CENTER);
+                }
+            }
+            let hint_top = px(KEYS_TOP + k.rows.len() as f32 * ROW_PITCH + 12.0);
+            for (i, line) in c.hint.lines().take(2).enumerate() {
+                let top = hint_top + px(i as f32 * HINT_LINE);
+                draw(line, hint_font, rgb(168, 160, 146), RECT { left: px(24.0), top, right: wi - px(24.0), bottom: top + px(HINT_LINE) }, single | DT_CENTER | DT_END_ELLIPSIS);
+            }
+        } else {
+            draw(&c.hint, hint_font, rgb(168, 160, 146), RECT { left: px(24.0), top: px(140.0), right: wi - px(24.0), bottom: hi - px(12.0) }, single | DT_CENTER | DT_END_ELLIPSIS);
+        }
         GdiFlush();
         let src = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize);
         out.copy_from_slice(src);
@@ -133,6 +196,7 @@ pub fn render(c: &Content, frame_h: u32) -> (Vec<u8>, u32, u32) {
         DeleteObject(title_font as _);
         DeleteObject(text_font as _);
         DeleteObject(hint_font as _);
+        DeleteObject(key_font as _);
         DeleteObject(bmp as _);
         DeleteDC(dc);
     }

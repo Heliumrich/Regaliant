@@ -61,7 +61,9 @@ button goes back. The prompts show the keys you bound. Every key can be changed 
 SETTINGS > PC > Key Bindings.
 
 To enter your character's name the game shows a text box. Type the name and press Enter.
-Escape cancels. With a controller, A confirms and B cancels.
+Escape cancels. With a controller the box shows a keyboard: the d-pad or left stick moves,
+A types, X erases, Y adds a space, LB is Shift, RB shows accents and symbols, Menu confirms
+and B cancels.
 
 
 PC settings

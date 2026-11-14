@@ -361,10 +361,12 @@ pub fn pad_connected() -> bool {
     PAD_CONNECTED.load(Relaxed)
 }
 
-fn xinput(st: &mut PadState) {
+/// The XInput pad into `st`; returns its buttons held (bit i: PAD_BUTTONS[i]) and its left stick
+/// (XInput's range, y up) for the system text box.
+fn xinput(st: &mut PadState) -> (u32, i16, i16) {
     let s = xinput_state();
     PAD_CONNECTED.store(s.is_some(), Relaxed);
-    let Some(s) = s else { return };
+    let Some(s) = s else { return (0, 0, 0) };
     let g = s.Gamepad;
     // The pad is in use once a button, a trigger or a stick past a dead zone moves.
     let stick = |v: i16| (v as i32).abs() > 12000;
@@ -383,14 +385,15 @@ fn xinput(st: &mut PadState) {
             phys |= 1 << i;
         }
     }
-    // The system text box (the character's name): the pad is its alone while it is open.
-    if crate::hle::libs::ime_dialog::pad_input(phys) {
-        return;
+    // The system text box (the character's name): the pad is its alone while it is open
+    // (`pad_state`).
+    if crate::hle::libs::ime_dialog::active() {
+        return (phys, g.sThumbLX, g.sThumbLY);
     }
     // A controller binding being captured: the pad is the menu's alone (`pcsettings::bindings`);
     // a button held when it ended reaches the game once released and pressed again.
     if crate::pcsettings::bindings::pad_input(phys) {
-        return;
+        return (phys, g.sThumbLX, g.sThumbLY);
     }
     let swallowed = PAD_SWALLOW.load(Relaxed) & phys;
     PAD_SWALLOW.store(swallowed, Relaxed);
@@ -412,6 +415,7 @@ fn xinput(st: &mut PadState) {
     st.ly = axis(g.sThumbLY, true);
     st.rx = axis(g.sThumbRX, false);
     st.ry = axis(g.sThumbRY, true);
+    (phys, g.sThumbLX, g.sThumbLY)
 }
 
 // ---------------------------------------------------------------------------
@@ -1285,14 +1289,36 @@ pub fn cross_presses() -> u32 {
 /// Current combined pad state.
 pub fn pad_state() -> PadState {
     let mut st = PadState::default();
-    xinput(&mut st);
-    // The system text box is open: the game sees no input (as on the console while its
-    // keyboard shows); its keys and buttons are the box's (`ime_dialog`).
-    if crate::hle::libs::ime_dialog::active() {
+    let (phys, lx, ly) = xinput(&mut st);
+    // The system text box (`ime_dialog`) gets the pad's buttons and left stick each poll, with
+    // the control channel's presses (tests) as the pad's; while it is open the game sees no
+    // input (as on the console while its keyboard shows) and the window's keys are the box's.
+    let mut sc = PadState::default();
+    scripted(&mut sc, crate::gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
+    let mut script_bits = 0u32;
+    for (i, &t) in PAD_DEFAULT.iter().enumerate() {
+        if sc.buttons & t != 0 {
+            script_bits |= 1 << i;
+        }
+    }
+    let wide = |v: i32| (v * 256).clamp(-32768, 32767) as i16;
+    let (lx, ly) = if (sc.lx, sc.ly) != (0x80, 0x80) { (wide(sc.lx as i32 - 128), wide(128 - sc.ly as i32)) } else { (lx, ly) };
+    // (The control channel's presses held while the box was open stay its own until released,
+    // as the pad's do: `swallow_pad`.)
+    static SCRIPT_KEPT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if crate::hle::libs::ime_dialog::pad_input(phys | script_bits, lx, ly) {
+        SCRIPT_KEPT.store(script_bits, Relaxed);
         return PadState::default();
     }
+    let kept = SCRIPT_KEPT.load(Relaxed) & script_bits;
+    SCRIPT_KEPT.store(kept, Relaxed);
     keyboard_mouse(&mut st);
     scripted(&mut st, crate::gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
+    for (i, &t) in PAD_DEFAULT.iter().enumerate() {
+        if kept & (1 << i) != 0 {
+            st.buttons &= !t;
+        }
+    }
     if st.l2 > 30 {
         st.buttons |= BTN_L2;
     }

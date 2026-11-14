@@ -347,6 +347,12 @@ fn shown() -> u8 {
     }
 }
 
+/// The glyph set shown now (1 PlayStation, 2 Xbox, 3 keyboard and mouse): the name entry's
+/// controller keyboard names its buttons by it.
+pub fn shown_set() -> u8 {
+    shown()
+}
+
 /// Per title glyph hash: the hashes of its keyboard, Xbox and PlayStation stand-ins (0: keep;
 /// the PlayStation one where the controller's buttons are remapped: the PS5 pad's button in the
 /// place of the one on the target); made again when the layout changes (a rebinding in the menu).
