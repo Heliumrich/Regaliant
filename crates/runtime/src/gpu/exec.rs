@@ -9855,12 +9855,6 @@ pub struct Exec {
     /// (`gpu_cp_write`); the last submitted batch that does.
     gpu_writes_open: bool,
     last_gpu_write_seq: u64,
-    /// The latest index cull recorded into the open batch (`cullread::note_cull_recorded`'s
-    /// ticket; 0: none), passed on when the batch is submitted or closed; the earliest, and a
-    /// clear of the culls' array in it (its ticket; diagnosis).
-    cull_ticket: u64,
-    cull_ticket_min: u64,
-    clear_ticket: u64,
     /// The last batch whose CP writes the CPU performs after it completed:
     /// this queue's own, and another queue's whose promised label a wait
     /// passed on. CP writes the GPU performs are submitted after those ran.
@@ -10812,10 +10806,6 @@ struct Closed {
     /// queue (`Exec::batch_c`).
     xq: (u64, u32, bool),
     on_c: bool,
-    /// `Exec::cull_ticket`, `cull_ticket_min` and `clear_ticket` of the batch.
-    cull_ticket: u64,
-    cull_ticket_min: u64,
-    clear_ticket: u64,
 }
 
 /// Slot sequence of a batch closed but not yet submitted.
@@ -11093,9 +11083,6 @@ impl Exec {
                 eop_unordered: false,
                 gpu_writes_open: false,
                 last_gpu_write_seq: 0,
-                cull_ticket: 0,
-                cull_ticket_min: 0,
-                clear_ticket: 0,
                 cpu_action_seq: 0,
                 cpu_dep_seq: 0,
                 cpu_wait: 0,
@@ -11807,7 +11794,7 @@ impl Exec {
             let cpu = self.span_cpu();
             super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why}{cpu})", self.batch_shaders.len()));
             let lists = std::mem::take(&mut self.batch_lists).then(super::vk::defer::release);
-            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, cpu_wait: std::mem::take(&mut self.cpu_wait), kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises, fe2_up: Vec::new(), fe2_spans: Vec::new(), lists, xq: (self.xq_dep, self.xq_why, self.xq_img), on_c: self.batch_c, cull_ticket: std::mem::take(&mut self.cull_ticket), cull_ticket_min: std::mem::take(&mut self.cull_ticket_min), clear_ticket: std::mem::take(&mut self.clear_ticket) });
+            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, cpu_wait: std::mem::take(&mut self.cpu_wait), kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises, fe2_up: Vec::new(), fe2_spans: Vec::new(), lists, xq: (self.xq_dep, self.xq_why, self.xq_img), on_c: self.batch_c });
             (self.xq_dep, self.xq_why, self.xq_img) = (0, 0, false);
             self.res_mine.clear();
             if let Some(b) = self.closed.last_mut() {
@@ -11917,7 +11904,6 @@ impl Exec {
         self.pending_log.clear();
         INFLIGHT.note_ranges(seq, &writes);
         crate::cullread::note_submitted(seq, &writes);
-        crate::cullread::note_culls_submitted(seq, std::mem::take(&mut self.cull_ticket), std::mem::take(&mut self.cull_ticket_min), std::mem::take(&mut self.clear_ticket));
         note_track_writes(seq, writes.iter());
         drop(note_gate);
         journal_note(&writes, &self.name);
@@ -13791,10 +13777,6 @@ impl Exec {
             super::smalltrack::cp_write(base, len, true);
         }
         let Some((buffer, start, _)) = span(base, len) else { return Ok(false) };
-        if let Some(t) = crate::cullread::note_array_fill(base, len, v, self.noting) {
-            self.cull_ticket = self.cull_ticket.max(t);
-            self.clear_ticket = t;
-        }
         // Resident shadows holding newer data of the range go back first:
         // their merge would undo the fill.
         self.flush_resident(Some(&[(base, len)]))?;
@@ -14833,10 +14815,6 @@ impl Exec {
             self.note_open_write(a, n);
         }
         self.pending.insert(a, n);
-        if let Some(t) = crate::cullread::note_array_write(a, n, self.noting) {
-            self.cull_ticket = self.cull_ticket.max(t);
-            self.clear_ticket = t;
-        }
         if self.hs_seg != 0 && super::hscensus::on() {
             super::hscensus::wrote(a, n, self.hs_seg, self.noting);
         }
@@ -16365,7 +16343,6 @@ impl Exec {
             super::resident::submitted(&b.res_pages, seq);
             INFLIGHT.note_ranges(seq, &b.writes);
             crate::cullread::note_submitted(seq, &b.writes);
-            crate::cullread::note_culls_submitted(seq, b.cull_ticket, b.cull_ticket_min, b.clear_ticket);
             note_track_writes(seq, b.writes.iter());
             drop(note_gate);
             journal_note(&b.writes, &self.name);
@@ -17534,9 +17511,6 @@ impl Exec {
         // ~7 per flip there).
         if indirect.is_none() && groups.contains(&0) {
             ZERO_GROUPS[CPU_INDIRECT.with(|c| c.get()) as usize].fetch_add(1, Ordering::Relaxed);
-            if CULL_CS.contains(&cs_addr(cp)) {
-                crate::cullread::note_cull_skipped(CPU_INDIRECT.with(|c| c.get()));
-            }
             return Ok(());
         }
         let kind = self.cs_kind(indirect.is_some());
@@ -17712,15 +17686,8 @@ impl Exec {
         if p.addr == VG_PLACEMENT_CS && vg_clear_on() {
             self.vg_placement_clear(&p)?;
         }
-        if CULL_CS.contains(&p.addr) {
-            crate::cullread::note_cull_kind(indirect.is_some(), CPU_INDIRECT.with(|c| c.get()));
-            self.cull_ticket = crate::cullread::note_cull_recorded();
-            if self.cull_ticket_min == 0 {
-                self.cull_ticket_min = self.cull_ticket;
-            }
-            if cull_census_on() {
-                note_cull_census(&p);
-            }
+        if cull_census_on() && CULL_CS.contains(&p.addr) {
+            note_cull_census(&p);
         }
         // The fill kernel over a whole range (`verify::full_fill`): one buffer
         // fill of guest memory in place, without the kernel's VRAM shadow

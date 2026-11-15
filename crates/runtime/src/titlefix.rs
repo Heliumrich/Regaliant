@@ -170,6 +170,38 @@ const FIXES: &[Fix] = &[
         why: "logs what the title's CPU reads of its GPU culling results",
         only_with: Some("DS_CULLREAD_DIAG"),
     },
+    // The title's CPU walks of its GPU frustum culling masks (`cullread`, the view masks): the
+    // index culls per object set (eboot+0xa1f560, `cmp qword ptr [rdi+38h],0`), the culling reads
+    // per set (eboot+0xa1f020, `push rbp; mov rbp,rsp; push r15`) and the draws per set
+    // (eboot+0xa1f290, `push r14; push rbx; mov rax,rdi`) first wait for the GPU's writes of the
+    // masks they walk ...
+    Fix {
+        name: "view masks walked after the GPU's writes (culls)",
+        offset: 0xa1f560,
+        from: (5, 0xa4d780dd637582e9),
+        change: Change::Hook { at: 0, handler: crate::cullread::mask_wait_cull },
+        kind: "title timing",
+        why: "the culls walked the GPU's frustum culling masks while our GPU's writes were still landing; culls and draws then numbered objects differently",
+        only_with: None,
+    },
+    Fix {
+        name: "view masks walked after the GPU's writes (reads)",
+        offset: 0xa1f020,
+        from: (6, 0x82d75a35aabe38aa),
+        change: Change::Hook { at: 0, handler: crate::cullread::mask_wait_read },
+        kind: "title timing",
+        why: "the culling reads walked the GPU's frustum culling masks before our GPU's writes landed",
+        only_with: None,
+    },
+    Fix {
+        name: "view masks walked after the GPU's writes (draws)",
+        offset: 0xa1f290,
+        from: (6, 0x7658a7ca3bc5a22c),
+        change: Change::Hook { at: 0, handler: crate::cullread::mask_wait_draw },
+        kind: "title timing",
+        why: "the draws walked the GPU's frustum culling masks before our GPU's writes landed",
+        only_with: None,
+    },
     Fix {
         name: "VG spawning held after scene resets (per frame)",
         offset: 0xa553c7,
