@@ -4519,7 +4519,7 @@ mod tests {
     /// wave reserves the slots counted with v_bcnt of the class masks.
     #[test]
     fn lane0_election_of_mask_counted_append() {
-        let words = [0u32; 83];
+        let Some(words) = crate::title_words("append_kernel") else { return };
         let code = crate::decode_program(&words).unwrap();
         let e = lane0_elections(&code, &cs_spec([8, 8, 1]));
         // v_cmp_lg_u32 vcc, 0, v0 (v0 = ly * 8 + lx): operand 1 is the lane.
@@ -4534,7 +4534,7 @@ mod tests {
     /// atomic, one read of its result; translated without wave-mask mode.
     #[test]
     fn append_per_subgroup() {
-        let words = [0u32; 83];
+        let Some(words) = crate::title_words("append_kernel") else { return };
         let code = crate::decode_program(&words).unwrap();
         let mut spec = cs_spec([8, 8, 1]);
         assert!(has_append(&code));
@@ -4566,7 +4566,7 @@ mod tests {
     /// no workgroup memory, no barrier.
     #[test]
     fn subgroup_waves() {
-        let words = [0u32; 83];
+        let Some(words) = crate::title_words("append_kernel") else { return };
         let code = crate::decode_program(&words).unwrap();
         let mut spec = cs_spec([8, 8, 1]);
         let plan = crate::analysis::analyze(&code, 2, 0);
@@ -4603,7 +4603,7 @@ mod tests {
     /// over a frame capture: `rdnadis --translate` with RDNA_ADDRESSES).
     #[test]
     fn buffers_by_device_address() {
-        let words = [0u32; 83];
+        let Some(words) = crate::title_words("append_kernel") else { return };
         let code = crate::decode_program(&words).unwrap();
         let plan = crate::analysis::analyze(&code, 2, 0);
         let mut spec = cs_spec([8, 8, 1]);
@@ -4635,7 +4635,7 @@ mod tests {
     /// RDNA_MARKS_DUMP=<dir> writes the module for spvval.
     #[test]
     fn write_marks_binding() {
-        let words = [0u32; 83];
+        let Some(words) = crate::title_words("append_kernel") else { return };
         let code = crate::decode_program(&words).unwrap();
         let plan = crate::analysis::analyze(&code, 2, 0);
         assert!(plan.resources.iter().any(|r| r.written));
@@ -5063,7 +5063,7 @@ mod tests {
     /// and v_readlane; its lane 0 adds the wave's total: no election.
     #[test]
     fn lane0_election_not_for_wave_sums() {
-        let words = [0u32; 77];
+        let Some(words) = crate::title_words("count_kernel") else { return };
         let code = crate::decode_program(&words).unwrap();
         assert!(lane0_elections(&code, &cs_spec([8, 8, 1])).is_empty());
     }

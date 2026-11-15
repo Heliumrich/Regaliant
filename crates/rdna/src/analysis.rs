@@ -725,7 +725,7 @@ mod tests {
     /// 0x1008898d00 of PPSA01341 01.007.000).
     #[test]
     fn getpc_descriptor_with_constant_first() {
-        let words = [0u32; 13];
+        let Some(words) = crate::title_words("getpc_table") else { return };
         let code = crate::decode_program(&words).unwrap();
         let plan = analyze(&code, 0, 0);
         assert!(plan.errors.is_empty(), "{:?}", plan.errors);

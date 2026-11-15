@@ -907,6 +907,20 @@ pub fn disasm(inst: &Inst) -> String {
     s
 }
 
+/// The title's own programs used as test inputs (its tile classification's kernels, a program
+/// addressing a table in its code): game code, kept out of this repository. A test that uses
+/// one reads it from local-data/research/rdna-tests/<name>.txt (hex words) and checks nothing
+/// when the file is not there.
+#[cfg(test)]
+pub(crate) fn title_words(name: &str) -> Option<Vec<u32>> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../local-data/research/rdna-tests");
+    let Ok(t) = std::fs::read_to_string(dir.join(format!("{name}.txt"))) else {
+        eprintln!("{name}: the title's program is not in local-data/research/rdna-tests: not checked");
+        return None;
+    };
+    t.split(|c: char| c.is_whitespace() || c == ',').filter(|s| !s.is_empty()).map(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok()).collect()
+}
+
 #[cfg(test)]
 mod name_tests {
     use super::*;

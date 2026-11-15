@@ -111,6 +111,8 @@ struct State {
     jump: Option<(u64, Instant, bool)>,
     /// When the other groups were last searched for the pointer (a search reads every node).
     searched: Instant,
+    /// Presses toward the target in a row that did not move the selection.
+    stuck: u32,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -474,12 +476,27 @@ pub fn tick() {
 static POINTABLE: Mutex<Option<Instant>> = Mutex::new(None);
 const POINTABLE_HOLD: Duration = Duration::from_millis(400);
 
-/// A row of items across the top of the screen (the start menu's tab bar): the pointer does not
-/// switch its tabs as it passes over them; a click does.
-fn tab_like(t: &uistate::Tree, group: u64) -> bool {
-    let Some(kids) = t.children.get(&group) else { return false };
-    let centers: Vec<(f32, f32)> = kids.iter().filter(|&&k| uistate::flags(k) & uistate::NOT_SHOWN == 0).filter_map(|&k| uistate::bounds(t, k)).map(center).collect();
-    centers.len() >= 2 && centers.iter().all(|c| (c.1 - centers[0].1).abs() < 4.0 && c.1 < 200.0)
+/// A row of tabs: items side by side across the top of the screen (the start menu's tab bar)
+/// or above another focused list (the inventory's categories over its items). The pointer does
+/// not switch them as it passes over; a click switches without pressing Cross. The row's top.
+fn tab_row(t: &uistate::Tree, group: u64, found: &[u64]) -> Option<f32> {
+    let kids = t.children.get(&group)?;
+    // (The items' own rectangles, not their subtrees': the selected tab's glow reaches lower.)
+    let rows: Vec<(f32, f32)> = kids
+        .iter()
+        .filter(|&&k| uistate::flags(k) & uistate::NOT_SHOWN == 0)
+        .filter_map(|&k| {
+            let (_, y) = uistate::absolute(t, k)?;
+            let (_, _, _, h) = uistate::local(k);
+            (h.is_finite() && h > 0.0 && h < 1080.0).then_some((y, y + h))
+        })
+        .collect();
+    if rows.len() < 2 || !rows.iter().all(|r| (r.0 - rows[0].0).abs() < 4.0) {
+        return None;
+    }
+    let (top, bottom) = (rows[0].0, rows.iter().map(|r| r.1).fold(f32::MIN, f32::max));
+    let above_list = found.iter().any(|&f| uistate::parent(f) != group && uistate::absolute(t, f).is_some_and(|(_, y)| y >= bottom - 1.0));
+    ((top + bottom) / 2.0 < 200.0 || above_list).then_some(top)
 }
 
 /// A node's scene root (its topmost ancestor in the index) and whether the node and every
@@ -588,6 +605,7 @@ fn tick_nodes(tree: &std::sync::Arc<uistate::Tree>, want: bool, kbm: bool) -> bo
         hold_until: Instant::now(),
         jump: None,
         searched: Instant::now(),
+        stuck: 0,
     });
     let found = focused(tree);
     if !found.is_empty() {
@@ -686,7 +704,7 @@ fn tick_nodes(tree: &std::sync::Arc<uistate::Tree>, want: bool, kbm: bool) -> bo
     let focused_in = |group: u64| found.iter().copied().find(|&n| uistate::parent(n) == group);
     if moved {
         if let Some((group, h)) = hovered {
-            if !tab_like(tree, group) && s.target != Some(h) {
+            if tab_row(tree, group, &found).is_none() && s.target != Some(h) {
                 s.target = Some(h);
                 s.target_group = group;
                 s.chase.clear();
@@ -737,6 +755,23 @@ fn tick_nodes(tree: &std::sync::Arc<uistate::Tree>, want: bool, kbm: bool) -> bo
     for e in events {
         match e {
             Event::Left => match hovered {
+                // A tab: switched to (the presses that move its row), no Cross; the row's
+                // shown tab: nothing to do.
+                Some((group, h)) if tab_row(tree, group, &found).is_some() => {
+                    if focused_in(group) != Some(h) {
+                        if s.target != Some(h) {
+                            s.chase.clear();
+                        }
+                        s.target = Some(h);
+                        s.target_group = group;
+                        s.click = false;
+                        // (The top bar moves with L1/R1: no Left/Right first, which would move
+                        // the page's list.)
+                        if tab_row(tree, group, &found).is_some_and(|top| top < 200.0) {
+                            s.shoulder.insert(group);
+                        }
+                    }
+                }
                 Some((group, h)) if focused_in(group) == Some(h) => {
                     let press = pos.and_then(|p| value_side(tree, h, p)).unwrap_or("cross");
                     if s.logged < 60 {
@@ -822,9 +857,24 @@ fn tick_nodes(tree: &std::sync::Arc<uistate::Tree>, want: bool, kbm: bool) -> bo
                 s.click = false;
                 s.chase.clear();
             }
+            // Presses that left the selection where it was (an empty row below a short list):
+            // after three the chase ends.
+            Some(f) if Instant::now() >= s.next_press && s.tried.is_none() && s.chase.last() == Some(&f) && s.stuck >= 2 => {
+                if s.logged < 60 {
+                    s.logged += 1;
+                    crate::info!("pointer: the item under the pointer cannot be reached (the selection does not move)");
+                }
+                s.target = None;
+                s.click = false;
+                s.chase.clear();
+                s.stuck = 0;
+            }
             Some(f) if Instant::now() >= s.next_press && s.tried.is_none() => {
                 if s.chase.last() != Some(&f) {
                     s.chase.push(f);
+                    s.stuck = 0;
+                } else {
+                    s.stuck += 1;
                 }
                 // A jump the title's list takes in one move (`select_hook`): asked once per
                 // target; a request it did not take within DIRECT_WAIT steps as before.
