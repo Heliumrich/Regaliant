@@ -2766,7 +2766,13 @@ fn worker(q: &'static Queue, name: &str) {
             timeline::span_back(&format!("{name} queued"), batch.at.elapsed(), || format!("sub {} queued ({} buffers, {dwords} dwords, {behind} behind)", batch.index, batch.bufs.len()));
         }
         let snap = (q.id == GFX && snap_range().is_some()).then(|| (SNAP.lock().as_mut().and_then(|m| m.remove(&batch.index)), snap_hash()));
+        if q.id == GFX {
+            crate::cullread::ev(b'R', batch.index, 0);
+        }
         run_submission(&mut cp, &batch, name);
+        if q.id == GFX {
+            crate::cullread::ev(b'r', batch.index, 0);
+        }
         if let Some((Some(h_sub), h_begin)) = snap {
             let h_end = snap_hash();
             SNAP_STATS[0].fetch_add(1, Ordering::Relaxed);

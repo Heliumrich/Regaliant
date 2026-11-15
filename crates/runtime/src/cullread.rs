@@ -88,6 +88,7 @@ pub fn note_submitted(seq: u64, writes: &crate::gpu::ranges::Ranges) {
     let a = ARRAY.load(Ordering::Relaxed);
     if a != 0 && writes.overlaps(a, ARRAY_BYTES) {
         ARRAY_SEQ.fetch_max(seq, Ordering::AcqRel);
+        ev(b'A', seq, 0);
     }
 }
 
@@ -140,6 +141,7 @@ pub fn note_title_submission(index: u64, bufs: &[(u64, u32)]) {
     let t = std::time::Instant::now();
     let mut dwords = 0u64;
     let found = bufs.iter().any(|&(a, n)| sets_cull_program(a, n, 2, &mut dwords));
+    ev(b's', index, found as u64);
     if found {
         LATEST_CULL_SUB.fetch_max(index, Ordering::AcqRel);
         SCANS[1].fetch_add(1, Ordering::Relaxed);
@@ -226,24 +228,154 @@ static BEHIND: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 static CULLS_RECORDED: AtomicU64 = AtomicU64::new(0);
 static CULLS_SUBMITTED: AtomicU64 = AtomicU64::new(0);
 
+/// The latest ticket of a recorded index cull, and of a recorded clear of the array (the same
+/// counter: the later one is the array's latest recorded operation).
+static LAST_CULL_T: AtomicU64 = AtomicU64::new(0);
+static LAST_CLEAR_T: AtomicU64 = AtomicU64::new(0);
+/// The fill kernel the title clears the array with (`cs_memset32`).
+const CLEAR_CS: u64 = 0x10_0888_1200;
+/// The index culls' programs (`gpu::exec::CULL_CS`).
+const CULL_ADDRS: [u64; 4] = [0x10_0899_3700, 0x10_0899_4d00, 0x10_0899_7600, 0x10_0899_8c00];
+/// Mode 12: the culls' noted writes over the array (`Exec::note_write`).
+static CULL_NOTES: AtomicU64 = AtomicU64::new(0);
+/// Mode 12: other writers of the array: (program, address, bytes) -> count.
+static OTHER_WRITERS: parking_lot::Mutex<std::collections::BTreeMap<(u64, u64, u64), u64>> = parking_lot::Mutex::new(std::collections::BTreeMap::new());
+
 /// An index cull recorded into a batch: its ticket.
 pub fn note_cull_recorded() -> u64 {
-    CULLS_RECORDED.fetch_add(1, Ordering::AcqRel) + 1
+    let t = CULLS_RECORDED.fetch_add(1, Ordering::AcqRel) + 1;
+    let prev = LAST_CULL_T.fetch_max(t, Ordering::AcqRel);
+    if scan_on() && LAST_CLEAR_T.load(Ordering::Acquire) > prev {
+        // The first cull recorded after a clear.
+        ev(b'K', t, 0);
+    }
+    t
 }
 
-/// A batch submitted to the GPU with its latest cull's ticket (0: none).
+/// A write the batch being recorded makes (`Exec::note_write`, by the program `writer`): a clear
+/// of the array takes a ticket (returned, for the batch to carry).
 #[inline]
-pub fn note_culls_submitted(ticket: u64) {
+pub fn note_array_write(a: u64, n: u64, writer: u64) -> Option<u64> {
+    let arr = ARRAY.load(Ordering::Relaxed);
+    if arr == 0 || a >= arr + ARRAY_BYTES || arr >= a.saturating_add(n) {
+        return None;
+    }
+    if writer != CLEAR_CS {
+        if scan_on() && CULL_ADDRS.contains(&writer) {
+            CULL_NOTES.fetch_add(1, Ordering::Relaxed);
+        }
+        // Mode 12: writers of the array other than the culls and the clear (logged once each).
+        if scan_on() && !CULL_ADDRS.contains(&writer) {
+            let mut g = OTHER_WRITERS.lock();
+            let e = g.entry((writer, a, n)).or_insert(0);
+            *e += 1;
+            if *e == 1 && g.len() <= 64 {
+                crate::info!("cull array written by {writer:#x}: {a:#x}+{n:#x} at flip {}", crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed));
+            }
+            ev(b'X', writer, a.wrapping_sub(arr) << 32 | n.min(0xFFFF_FFFF));
+        }
+        return None;
+    }
+    let t = CULLS_RECORDED.fetch_add(1, Ordering::AcqRel) + 1;
+    LAST_CLEAR_T.fetch_max(t, Ordering::AcqRel);
+    ev(b'C', t, n);
+    Some(t)
+}
+
+/// A fill of guest memory in place the batch being recorded makes (`Exec::fill_in_place_parts`,
+/// the fill kernel's dispatch as a buffer fill): over the array, a clear's ticket (returned).
+#[inline]
+pub fn note_array_fill(a: u64, n: u64, v: u32, writer: u64) -> Option<u64> {
+    let arr = ARRAY.load(Ordering::Relaxed);
+    if arr == 0 || a >= arr + ARRAY_BYTES || arr >= a.saturating_add(n) {
+        return None;
+    }
+    let t = CULLS_RECORDED.fetch_add(1, Ordering::AcqRel) + 1;
+    LAST_CLEAR_T.fetch_max(t, Ordering::AcqRel);
+    ev(b'C', t, (v as u64) << 32 | n.min(0xFFFF_FFFF));
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    if scan_on() && LOGGED.fetch_add(1, Ordering::Relaxed) < 8 {
+        crate::info!("cull array filled in place: {a:#x}+{n:#x} with {v:#x} (writer {writer:#x}) at flip {}", crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed));
+    }
+    Some(t)
+}
+
+/// A batch submitted to the GPU with its latest cull's or clear's ticket (0: none), its earliest
+/// cull's and its clear's (0: none).
+#[inline]
+pub fn note_culls_submitted(seq: u64, ticket: u64, first: u64, clear: u64) {
     if ticket != 0 {
         CULLS_SUBMITTED.fetch_max(ticket, Ordering::AcqRel);
+        ev(b'B', seq, first << 32 | (ticket & 0xFFFF_FFFF));
+        if clear != 0 {
+            ev(b'Z', seq, clear);
+        }
     }
 }
+
+/// Mode 12's event log, a ring: (microseconds since the first event, kind, two values). Kinds:
+/// `s` the title queued a graphics submission (index, 1 if it sets a cull's program), `R`/`r` the
+/// graphics command processor begins/ends running one, `C` a clear of the array recorded (ticket,
+/// bytes), `K` the first cull recorded after a clear (ticket), `B` a batch with culls or a clear
+/// submitted to the GPU (sequence, latest ticket), `W` a pass's reads begin (flip, done batch),
+/// `w` they ended (reads, blank zero reads << 32 | set zero reads).
+struct Ev {
+    us: u64,
+    kind: u8,
+    a: u64,
+    b: u64,
+}
+static EVENTS: parking_lot::Mutex<std::collections::VecDeque<Ev>> = parking_lot::Mutex::new(std::collections::VecDeque::new());
+static DUMPS: AtomicU64 = AtomicU64::new(0);
+
+fn t0() -> &'static std::time::Instant {
+    static T: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    T.get_or_init(std::time::Instant::now)
+}
+
+/// Notes an event in mode 12's ring.
+pub fn ev(kind: u8, a: u64, b: u64) {
+    if !scan_on() {
+        return;
+    }
+    let us = t0().elapsed().as_micros() as u64;
+    let mut g = EVENTS.lock();
+    if g.len() >= 4096 {
+        g.pop_front();
+    }
+    g.push_back(Ev { us, kind, a, b });
+}
+
+/// Logs the ring's last `n` events (a pass's reads found many blank records).
+fn dump_events(n: usize, why: &str) {
+    if DUMPS.fetch_add(1, Ordering::Relaxed) >= 40 {
+        return;
+    }
+    let g = EVENTS.lock();
+    let end = g.back().map_or(0, |e| e.us);
+    let from = g.len().saturating_sub(n);
+    let mut line = String::new();
+    crate::info!("cull events ({why}): the last {} before now (us before now, kind, values):", g.len() - from);
+    for (k, e) in g.iter().skip(from).enumerate() {
+        line += &format!(" [-{} {} {:#x} {:#x}]", end - e.us, e.kind as char, e.a, e.b);
+        if k % 12 == 11 {
+            crate::info!("cull events:{line}");
+            line.clear();
+        }
+    }
+    if !line.is_empty() {
+        crate::info!("cull events:{line}");
+    }
+}
+
+/// Mode 12, the current pass's reads: [reads, blank zero reads, set zero reads].
+static SESSION: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// Status line: the reads' waits.
 pub fn status() -> String {
     let w: Vec<u64> = READ_WAITS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let s: Vec<u64> = SCANS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    let scans = if s[0] > 0 { format!("    culls' submissions scanned: {} of {} title submissions set a cull's program ({} dwords, {} ms)\n", s[1], s[0], s[2], s[3] / 1_000_000) } else { String::new() };
+    let scans = if s[0] > 0 { format!("    culls' submissions scanned: {} of {} title submissions set a cull's program ({} dwords, {} ms); the culls' noted writes over the array: {}, culls recorded: {}\n", s[1], s[0], s[2], s[3] / 1_000_000, CULL_NOTES.load(Ordering::Relaxed), CULLS_RECORDED.load(Ordering::Relaxed)) } else { String::new() };
     if w[0] == 0 {
         return scans;
     }
@@ -438,6 +570,10 @@ fn wait_pending(r10: u64) {
 pub extern "sysv64" fn read_hook(regs: *const u64, _arg: u32) {
     let r = |i: usize| unsafe { *regs.add(i) };
     let (rbx, r10) = (r(3), r(10));
+    // (The array known as in `read_wait`: the clear and writers' notes need it.)
+    if ARRAY.load(Ordering::Relaxed) == 0 {
+        let _ = ARRAY.compare_exchange(0, r10, Ordering::AcqRel, Ordering::Acquire);
+    }
     if mode() == 7 {
         wait_submitted();
     }
@@ -496,8 +632,27 @@ pub extern "sysv64" fn read_hook(regs: *const u64, _arg: u32) {
         BACKLOG[1].fetch_max(b, Ordering::Relaxed);
     }
     // Mode 12: has the graphics command processor run the latest title submission that sets a
-    // cull's program?
+    // cull's program? (And the event log: a pass's reads begin at record 0.)
     if mode() == 12 {
+        if rbx == 0 {
+            let s: Vec<u64> = SESSION.iter().map(|c| c.swap(0, Ordering::Relaxed)).collect();
+            if s[0] > 0 {
+                ev(b'w', s[0], s[1] << 32 | s[2]);
+                if s[1] >= 50 {
+                    dump_events(260, &format!("a pass's {} reads found {} blank records", s[0], s[1]));
+                }
+            }
+            ev(b'W', flip, crate::gpu::exec::done_now());
+        }
+        SESSION[0].fetch_add(1, Ordering::Relaxed);
+        if v == 0 {
+            if blank && SESSION[1].load(Ordering::Relaxed) == 0 {
+                // The pass's first blank read: its record, the latest batch writing the array
+                // and the latest completed batch.
+                ev(b'b', rbx / 5, ARRAY_SEQ.load(Ordering::Acquire) << 32 | (crate::gpu::exec::done_now() & 0xFFFF_FFFF));
+            }
+            SESSION[if blank { 1 } else { 2 }].fetch_add(1, Ordering::Relaxed);
+        }
         let c = LATEST_CULL_SUB.load(Ordering::Acquire);
         let (_, d) = crate::gpu::gfx_counts();
         if c > d {
