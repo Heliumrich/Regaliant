@@ -475,6 +475,9 @@ pub fn tick() {
 /// When the last screen with items to point at was seen (`tick`'s condition for the pointer).
 static POINTABLE: Mutex<Option<Instant>> = Mutex::new(None);
 const POINTABLE_HOLD: Duration = Duration::from_millis(400);
+/// Since when the screen has had items without a break, and how long before the pointer shows.
+static POINTABLE_SINCE: Mutex<Option<Instant>> = Mutex::new(None);
+const POINTABLE_SETTLE: Duration = Duration::from_millis(120);
 
 /// A row of tabs: items side by side across the top of the screen (the start menu's tab bar)
 /// or above another focused list (the inventory's categories over its items). The pointer does
@@ -608,8 +611,17 @@ fn tick_nodes(tree: &std::sync::Arc<uistate::Tree>, want: bool, kbm: bool) -> bo
         stuck: 0,
     });
     let found = focused(tree);
-    if !found.is_empty() {
-        *POINTABLE.lock() = Some(Instant::now());
+    {
+        // Shown once a screen has had items for a moment, kept while it has them: a cutscene's
+        // first frames can carry the closing menu's items for a frame or two (the pointer
+        // blinked on for 0.2 s as the opening cutscene began, -141417).
+        let now = Instant::now();
+        let mut since = POINTABLE_SINCE.lock();
+        if found.is_empty() {
+            *since = None;
+        } else if ACTIVE.load(Relaxed) || now.duration_since(*since.get_or_insert(now)) >= POINTABLE_SETTLE {
+            *POINTABLE.lock() = Some(now);
+        }
     }
     // (The pointer turns on at the next vblank once the screen has items: `tick`.)
     let _ = kbm;
