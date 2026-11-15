@@ -400,18 +400,26 @@ fn center(r: (f32, f32, f32, f32)) -> (f32, f32) {
     ((r.0 + r.2) / 2.0, (r.1 + r.3) / 2.0)
 }
 
-/// A click on an item's value (a choice's or slider's widget: a descendant in the right part of
-/// the item under the pointer): Left or Right by the side of the widget's centre it lands on.
+/// A click on an item's value widget: Left or Right by the side of the widget it lands on; None
+/// for an item without one (a click there is Cross). The widgets, in the item's right part (the
+/// nodes' own rectangles, shown ones): a choice's two arrows (the only two small parts of one
+/// size, side by side at one height: an inventory row's icons are not a pair) with the value
+/// between them, the side taken from their midpoint; a slider (a thin wide bar with a small knob
+/// on it), the side taken from the knob.
 fn value_side(t: &uistate::Tree, item: u64, (x, y): (f32, f32)) -> Option<&'static str> {
     let ib = uistate::bounds(t, item)?;
     let split = ib.0 + (ib.2 - ib.0) * 0.55;
-    let mut best: Option<(f32, (f32, f32, f32, f32))> = None;
+    // (x0, y0, w, h) of the shown descendants whose centre lies right of the split.
+    let mut parts: Vec<(f32, f32, f32, f32)> = Vec::new();
     let mut stack: Vec<(u64, u32)> = t.children.get(&item).map(|v| v.iter().map(|&k| (k, 0)).collect()).unwrap_or_default();
     while let Some((n, depth)) = stack.pop() {
-        if let Some(r) = uistate::bounds(t, n) {
-            let area = (r.2 - r.0) * (r.3 - r.1);
-            if x >= r.0 && x < r.2 && y >= r.1 && y < r.3 && center(r).0 > split && best.is_none_or(|b| area < b.0) {
-                best = Some((area, r));
+        if uistate::flags(n) & uistate::NOT_SHOWN != 0 {
+            continue;
+        }
+        if let Some((ax, ay)) = uistate::absolute(t, n) {
+            let (_, _, w, h) = uistate::local(n);
+            if w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0 && w < 2000.0 && h < 1080.0 && ax + w / 2.0 > split {
+                parts.push((ax, ay, w, h));
             }
         }
         if depth < 8 {
@@ -420,7 +428,33 @@ fn value_side(t: &uistate::Tree, item: u64, (x, y): (f32, f32)) -> Option<&'stat
             }
         }
     }
-    best.map(|(_, r)| if x < center(r).0 { "left" } else { "right" })
+    // (Nested nodes of one rectangle count once: an arrow and its glyph.)
+    parts.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)).then(a.2.total_cmp(&b.2)).then(a.3.total_cmp(&b.3)));
+    parts.dedup_by(|a, b| (a.0 - b.0).abs() < 1.0 && (a.1 - b.1).abs() < 1.0 && (a.2 - b.2).abs() < 1.0 && (a.3 - b.3).abs() < 1.0);
+    let small = |r: &(f32, f32, f32, f32)| r.2 > 4.0 && r.2 <= 64.0 && r.3 > 4.0 && r.3 <= 64.0;
+    let cx = |r: &(f32, f32, f32, f32)| r.0 + r.2 / 2.0;
+    let cy = |r: &(f32, f32, f32, f32)| r.1 + r.3 / 2.0;
+    // A choice's arrows.
+    for a in parts.iter().filter(|r| small(r)) {
+        let same: Vec<&(f32, f32, f32, f32)> = parts.iter().filter(|b| small(b) && (b.2 - a.2).abs() < 1.0 && (b.3 - a.3).abs() < 1.0 && (cy(b) - cy(a)).abs() < 6.0).collect();
+        if same.len() == 2 {
+            let (l, r) = if cx(same[0]) < cx(same[1]) { (same[0], same[1]) } else { (same[1], same[0]) };
+            if cx(r) - cx(l) >= 150.0 && x >= l.0 - 24.0 && x < r.0 + r.2 + 24.0 && (y - cy(l)).abs() < 48.0 {
+                return Some(if x < (cx(l) + cx(r)) / 2.0 { "left" } else { "right" });
+            }
+        }
+    }
+    // A slider.
+    for bar in parts.iter().filter(|r| r.2 >= 150.0 && r.3 >= 2.0 && r.3 <= 24.0) {
+        if x < bar.0 - 24.0 || x >= bar.0 + bar.2 + 24.0 || (y - cy(bar)).abs() > 40.0 {
+            continue;
+        }
+        let knob = parts.iter().find(|k| small(k) && k.2 <= 48.0 && cx(k) >= bar.0 - 8.0 && cx(k) <= bar.0 + bar.2 + 8.0 && (cy(k) - cy(bar)).abs() < 24.0);
+        if let Some(k) = knob {
+            return Some(if x < cx(k) { "left" } else { "right" });
+        }
+    }
+    None
 }
 
 /// The vblank thread, each vblank.
