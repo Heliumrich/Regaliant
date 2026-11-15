@@ -697,6 +697,46 @@ fn run_gfx(i: usize, keep_ok: bool) {
     }
 }
 
+/// The player's learned work for the launcher's preparation (`compbench::precompile_all`):
+/// every learned compute program whose code the store keeps, with its specs keyed as a session
+/// makes them (`keyed_learned_specs`), and the learned graphics recipes whose stages' code it
+/// keeps (indices for `prepare_gfx`, with their code words). After an update whose translations
+/// differ the store's pipelines no longer serve, but its specs and recipes still name what the
+/// player's sessions used: prepared again, a first session after the update finds them made.
+pub(crate) fn learned_work() -> (Vec<(u64, std::sync::Arc<Vec<u32>>, Vec<Spec>)>, Vec<(usize, usize)>) {
+    load();
+    let codes = CODES.lock().clone().unwrap_or_default();
+    let hashes: Vec<u64> = learned(|m| m.keys().copied().collect());
+    let compute = hashes
+        .into_iter()
+        .filter_map(|h| {
+            let code = codes.get(&h)?.clone();
+            let specs = keyed_learned_specs(h, &code);
+            (!specs.is_empty()).then_some((h, code, specs))
+        })
+        .collect();
+    let gfx = gfx_learned(|g| {
+        g.recipes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (_, r))| {
+                let vs = codes.get(&r.vs)?.len();
+                let ps = if r.ps == 0 { 0 } else { codes.get(&r.ps)?.len() };
+                Some((i, vs + ps))
+            })
+            .collect()
+    });
+    (compute, gfx)
+}
+
+/// Makes learned graphics recipe `i`'s pipeline into the store (the preparation's; as a
+/// session's start does, `run_gfx`): whether it was made or found.
+pub(crate) fn prepare_gfx(i: usize) -> bool {
+    let before = GFX_DONE[3].load(Ordering::Relaxed);
+    run_gfx(i, false);
+    GFX_DONE[3].load(Ordering::Relaxed) == before
+}
+
 /// Graphics pipelines made from objects: [created, their ns, present
 /// already, failed, of the created those of draws measuring LOD statistics
 /// in rotation].

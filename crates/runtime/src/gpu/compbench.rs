@@ -459,6 +459,14 @@ fn bundle_compute_sampled(app: &std::path::Path, sample: u64) -> Vec<(u64, std::
     out
 }
 
+/// A spec's hash (the preparation's duplicates).
+fn spec_hash(s: &rdna::translate::Spec) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
 /// `--precompile-all [threads]`: every compute program of the game's shader
 /// files with a shader object (`bundle_compute`) is translated (not kept)
 /// and its pipeline made through the pipeline store under the key its
@@ -466,6 +474,9 @@ fn bundle_compute_sampled(app: &std::path::Path, sample: u64) -> Vec<(u64, std::
 /// later sessions then find it instead of compiling it at the program's
 /// first dispatch, wherever the dispatch binds what the guess says (86% of
 /// the particle programs' learned specs, FINDINGS.md 2026-11-02 evening).
+/// Then the player's own learned specs and graphics recipes whose code their
+/// store keeps (`precompile::learned_work`): after an update that translates
+/// differently, what their sessions used is made again before they play.
 /// Pipelines already in the store take moments. Progress every 10 s in the log, and every
 /// second in `progress` (the launcher's: `<programs done> <programs>` and `<code words done>
 /// <code words>` lines); when all are done, `marker` records it (the launcher's "prepared": the
@@ -514,8 +525,36 @@ pub fn precompile_all(app: &std::path::Path, threads: usize, progress: Option<&s
     crate::info!("precompile all: {} variants dispatches use first, then {} measuring LOD statistics", first.len(), second.len());
     let mut progs: Vec<(u64, std::sync::Arc<Vec<u32>>, rdna::translate::Spec, usize)> = first;
     progs.extend(second);
-    let total_words: usize = progs.iter().map(|p| p.3).sum();
-    crate::info!("precompile all: {} compute pipelines ({} code words; the engine's image variants {} of them, {} words) on {threads} threads", progs.len(), total_words, variants[0], variants[1]);
+    // The player's own learned specs and graphics recipes (their store's, kept with their
+    // code): what their sessions used, prepared again after an update (`precompile::learned_work`;
+    // a spec equal to a guess is made once, the store then holds it).
+    let (learned, recipes) = super::precompile::learned_work();
+    let guessed = progs.len();
+    {
+        let have: std::collections::HashSet<(u64, u64)> = progs.iter().map(|p| (p.0, spec_hash(&p.2))).collect();
+        let mut extra: Vec<(u64, std::sync::Arc<Vec<u32>>, rdna::translate::Spec, usize)> = Vec::new();
+        for (h, code, specs) in learned {
+            for spec in specs {
+                if !have.contains(&(h, spec_hash(&spec))) {
+                    extra.push((h, code.clone(), spec, code.len()));
+                }
+            }
+        }
+        extra.sort_by(|a, b| b.3.cmp(&a.3));
+        progs.extend(extra);
+    }
+    let learned_n = progs.len() - guessed;
+    let gfx_words: usize = recipes.iter().map(|r| r.1).sum();
+    let total_words: usize = progs.iter().map(|p| p.3).sum::<usize>() + gfx_words;
+    let all = progs.len() + recipes.len();
+    crate::info!(
+        "precompile all: {} compute pipelines ({} code words; the engine's image variants {} of them, {} words; the player's learned specs {learned_n}) and {} learned graphics pipelines on {threads} threads",
+        progs.len(),
+        total_words - gfx_words,
+        variants[0],
+        variants[1],
+        recipes.len()
+    );
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
     let code_done = AtomicU64::new(0);
@@ -532,19 +571,32 @@ pub fn precompile_all(app: &std::path::Path, threads: usize, progress: Option<&s
                     break;
                 }
                 let i = next.fetch_add(1, Relaxed);
-                let Some((h, code, spec, n)) = progs.get(i) else { break };
-                let r = super::shaders::translate_code_unkept(code, *h, spec.clone()).and_then(|tr| super::exec::store_compute_pipeline(&tr));
-                match r {
-                    Ok(d) => {
-                        compile_ns.fetch_add(d.as_nanos() as u64, Relaxed);
-                    }
-                    Err(e) => {
-                        if failed.fetch_add(1, Relaxed) < 8 {
-                            crate::warn!("precompile all: {h:#018x}: {e}");
+                if i >= all {
+                    break;
+                }
+                // (The compute pipelines first, then the learned graphics ones.)
+                if let Some((h, code, spec, n)) = progs.get(i) {
+                    let r = super::shaders::translate_code_unkept(code, *h, spec.clone()).and_then(|tr| super::exec::store_compute_pipeline(&tr));
+                    match r {
+                        Ok(d) => {
+                            compile_ns.fetch_add(d.as_nanos() as u64, Relaxed);
+                        }
+                        Err(e) => {
+                            if failed.fetch_add(1, Relaxed) < 8 {
+                                crate::warn!("precompile all: {h:#018x}: {e}");
+                            }
                         }
                     }
+                    code_done.fetch_add(*n as u64, Relaxed);
+                } else {
+                    let (r, n) = recipes[i - progs.len()];
+                    let t = Instant::now();
+                    if !super::precompile::prepare_gfx(r) {
+                        failed.fetch_add(1, Relaxed);
+                    }
+                    compile_ns.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+                    code_done.fetch_add(n as u64, Relaxed);
                 }
-                code_done.fetch_add(*n as u64, Relaxed);
                 done.fetch_add(1, Relaxed);
             });
         }
@@ -554,7 +606,7 @@ pub fn precompile_all(app: &std::path::Path, threads: usize, progress: Option<&s
         let mut last_file = Instant::now();
         let write_progress = || {
             if let Some(p) = progress {
-                let t = format!("{} {}\n{} {}\n", done.load(Relaxed), progs.len(), code_done.load(Relaxed), total_words);
+                let t = format!("{} {}\n{} {}\n", done.load(Relaxed), all, code_done.load(Relaxed), total_words);
                 let tmp = p.with_extension("tmp");
                 if std::fs::write(&tmp, t).is_ok() {
                     let _ = std::fs::rename(&tmp, p);
@@ -562,15 +614,15 @@ pub fn precompile_all(app: &std::path::Path, threads: usize, progress: Option<&s
             }
         };
         write_progress();
-        while done.load(Relaxed) < progs.len() {
+        while done.load(Relaxed) < all {
             std::thread::sleep(std::time::Duration::from_millis(200));
             if !stop.load(Relaxed) && stop_file.as_ref().is_some_and(|f| f.exists()) {
-                crate::info!("precompile all: stop asked for at {} of {} programs", done.load(Relaxed), progs.len());
+                crate::info!("precompile all: stop asked for at {} of {} programs", done.load(Relaxed), all);
                 stop.store(true, Relaxed);
             }
             if stop.load(Relaxed) {
                 // (Done once the threads in a compile come back.)
-                if next.load(Relaxed) >= progs.len() || done.load(Relaxed) >= next.load(Relaxed).min(progs.len()) {
+                if next.load(Relaxed) >= all || done.load(Relaxed) >= next.load(Relaxed).min(all) {
                     break;
                 }
                 continue;
@@ -584,23 +636,23 @@ pub fn precompile_all(app: &std::path::Path, threads: usize, progress: Option<&s
                 let w = code_done.load(Relaxed) as f64;
                 let el = t_all.elapsed().as_secs_f64();
                 let left = if w > 0.0 { el * (total_words as f64 - w) / w } else { 0.0 };
-                crate::info!("precompile all: {} of {} programs, {:.0}% of the code, {:.0} s, about {:.0} s left", done.load(Relaxed), progs.len(), 100.0 * w / total_words.max(1) as f64, el, left);
+                crate::info!("precompile all: {} of {} programs, {:.0}% of the code, {:.0} s, about {:.0} s left", done.load(Relaxed), all, 100.0 * w / total_words.max(1) as f64, el, left);
             }
         }
     });
     if stop.load(Relaxed) {
-        crate::info!("precompile all: stopped at {} of {} programs ({:.1} s)", done.load(Relaxed), progs.len(), t_all.elapsed().as_secs_f64());
+        crate::info!("precompile all: stopped at {} of {} programs ({:.1} s)", done.load(Relaxed), all, t_all.elapsed().as_secs_f64());
         return 4;
     }
     crate::info!(
         "precompile all: {} programs in {:.1} s ({:.1} s of pipeline creation over the threads; {} failed)",
-        progs.len(),
+        all,
         t_all.elapsed().as_secs_f64(),
         compile_ns.load(Relaxed) as f64 / 1e9,
         failed.load(Relaxed)
     );
     if let Some(p) = progress {
-        let _ = std::fs::write(p, format!("{} {}\n{} {}\n", progs.len(), progs.len(), total_words, total_words));
+        let _ = std::fs::write(p, format!("{} {}\n{} {}\n", all, all, total_words, total_words));
     }
     if let Some(m) = marker {
         let c = super::vk::ctx();
@@ -615,7 +667,7 @@ pub fn precompile_all(app: &std::path::Path, threads: usize, progress: Option<&s
         let t = format!(
             "# The game's shaders prepared ahead (dsport --precompile-all); written when all were done\ndate = {}\nprograms = {}\nfailed = {}\nseconds = {:.0}\ndevice = {}\ndriver = {}\ncache_uuid = {uuid}\ntranslation = {translation}\n",
             crate::utc_stamp(),
-            progs.len(),
+            all,
             failed.load(Relaxed),
             t_all.elapsed().as_secs_f64(),
             c.device_name,
