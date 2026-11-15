@@ -6738,6 +6738,9 @@ struct ScoutJournal {
     writes: super::ranges::Ranges,
     open: bool,
     who: Vec<(u64, u64, String)>,
+    /// The seat whose record it is for: writes by that seat's executors (the record's own
+    /// segments committed before a gate) are left out.
+    owner: String,
 }
 
 static SCOUT_JOURNALS: Mutex<Vec<ScoutJournal>> = Mutex::new(Vec::new());
@@ -6748,10 +6751,10 @@ static SCOUT_JOURNAL_IDS: AtomicU64 = AtomicU64::new(1);
 const SCOUT_WHO_MAX: usize = 1024;
 
 /// A new open journal: its id.
-pub(super) fn scout_journal_begin() -> u64 {
+pub(super) fn scout_journal_begin(owner: &str) -> u64 {
     let id = SCOUT_JOURNAL_IDS.fetch_add(1, Ordering::Relaxed);
     let mut g = SCOUT_JOURNALS.lock();
-    g.push(ScoutJournal { id, writes: super::ranges::Ranges::new(), open: true, who: Vec::new() });
+    g.push(ScoutJournal { id, writes: super::ranges::Ranges::new(), open: true, who: Vec::new(), owner: owner.to_string() });
     SCOUT_JOURNALS_OPEN.fetch_add(1, Ordering::AcqRel);
     id
 }
@@ -6764,6 +6767,12 @@ pub(super) fn scout_journal_freeze(id: u64) {
             SCOUT_JOURNALS_OPEN.fetch_sub(1, Ordering::AcqRel);
         }
     }
+}
+
+/// What journal `id` holds now (it stays open: a record with gates is checked a segment at
+/// a time, each against everything written up to its gate's passing).
+pub(super) fn scout_journal_snapshot(id: u64) -> super::ranges::Ranges {
+    SCOUT_JOURNALS.lock().iter().find(|j| j.id == id).map(|j| j.writes.clone()).unwrap_or_default()
 }
 
 /// Ends journal `id`: what it holds and its first writers.
@@ -6783,7 +6792,7 @@ pub(super) fn scout_journal_end(id: u64) -> (super::ranges::Ranges, Vec<(u64, u6
 
 fn scout_journal_note(writes: &super::ranges::Ranges, who: &str) {
     let mut g = SCOUT_JOURNALS.lock();
-    for j in g.iter_mut().filter(|j| j.open) {
+    for j in g.iter_mut().filter(|j| j.open && !who.starts_with(j.owner.as_str())) {
         j.writes.extend(writes);
         for (a, n) in writes.iter().take(64) {
             if j.who.len() < SCOUT_WHO_MAX {
@@ -6840,7 +6849,17 @@ fn journal_note_one(w: (u64, u64), who: &str) {
 }
 
 /// Kinds of the CPU reads of held recording (`Exec::note_held_reads`).
-pub const HELD_READ_KINDS: [&str; 6] = ["shared copy", "texture", "binding", "CP label poll", "CP read", "register pairs"];
+/// A held executor's own image notes: the fast clears it made pending (image: metadata,
+/// value when known) and the images it overwrote.
+pub type HeldNotes = (HashMap<super::images::ImageKey, (u64, Option<u32>)>, HashSet<super::images::ImageKey>);
+
+/// `bind_stage`'s error for a storage image a held batch may not bind (`Images::
+/// held_storage_view` found none GPU work wrote already).
+const HELD_STORAGE: &str = "held storage image";
+/// Storage images bound by scouts' held batches (`Exec::held_storage`).
+pub static HELD_STORAGE_BINDS: AtomicU64 = AtomicU64::new(0);
+
+pub const HELD_READ_KINDS: [&str; 7] = ["shared copy", "texture", "binding", "CP label poll", "CP read", "register pairs", "copy input"];
 
 /// `DS_TRACE_PAST_DROPS=<n>`: the first n (1: 60) stretches past a label
 /// wait dropped because other queues wrote what they read on the CPU are
@@ -7164,6 +7183,13 @@ pub fn wait_done_for(seq: u64, max: std::time::Duration) -> bool {
         DONE_CV.wait_for(&mut d, (until - now).min(std::time::Duration::from_millis(100)));
     }
     true
+}
+
+/// Whether unfinished GPU work or a deferred CP write still writes one of `ranges` (what
+/// memory holds there is not final: a scout's check of forwarded words at its turn,
+/// `forward::frozen_current`).
+pub fn writes_unfinished(ranges: &[(u64, u64)]) -> bool {
+    INFLIGHT.latest(ranges).is_some() || CP_WRITES.latest(ranges).is_some()
 }
 
 /// The latest unfinished batch that writes guest [a, a+n) (its written
@@ -10024,6 +10050,17 @@ pub struct Exec {
     held_reads: Vec<(u64, u64)>,
     /// Each held read's kind (`HELD_READ_KINDS`), with `DS_TRACE_PAST_DROPS`.
     held_kinds: Vec<u8>,
+    /// Storage images a scout's held batches bound without the image cache's note of the
+    /// write (`Images::held_storage_view`: image, mip level, shader), noted at its commit.
+    held_storage: Vec<(super::images::ImageKey, u32, u64)>,
+    /// How many of them the image cache has (`apply_held_storage`: segments committed
+    /// before a gate).
+    held_storage_done: usize,
+    /// A scout's record with gates: what the image cache has of its fast-clear and overwrite
+    /// notes (`apply_held_notes`: as of its last committed segment).
+    held_applied: HeldNotes,
+    /// A held chunk: the storage images the held work before its run bound so (base, key).
+    held_run_bases: Option<std::sync::Arc<Vec<(u64, super::images::ImageKey)>>>,
     /// GPU-performed CP writes recorded while held (diagnostics).
     cp_written: Vec<(u64, u64)>,
     /// Held past a label wait (`past_begin_growing`): a slot still holding
@@ -11102,6 +11139,10 @@ impl Exec {
                 held_promises: Vec::new(),
                 held_reads: Vec::new(),
                 held_kinds: Vec::new(),
+                held_storage: Vec::new(),
+                held_storage_done: 0,
+                held_applied: Default::default(),
+                held_run_bases: None,
                 cp_written: Vec::new(),
                 past_grow: false,
                 past_want_min: u32::MAX,
@@ -12762,7 +12803,18 @@ impl Exec {
         let t2 = tsc();
         // (Read on the CPU now: checked when held work settles, as a
         // preparation's reads are.)
-        if self.held {
+        if self.held && self.scout {
+            // A scout: the parts its held view covers are its own words (its copies and CP
+            // writes) or walked ones (checked by their content at its turn); the rest is
+            // guest memory as it is now (docs/SCOUTS.md).
+            let left = super::forward::uncovered(reads);
+            let r: &[(u64, u64)] = left.as_deref().unwrap_or(reads);
+            if super::forward::scout_trace() {
+                super::forward::trace_uncovered(r, &self.name, self.sync_readers);
+            }
+            self.held_reads.extend_from_slice(r);
+            self.note_kinds(2, r.len());
+        } else if self.held {
             self.held_reads.extend_from_slice(reads);
             self.note_kinds(2, reads.len());
         }
@@ -14679,6 +14731,15 @@ impl Exec {
                         *HELD_OWN.lock().get_or_insert_with(HashMap::new).entry((self.sync_readers[0], self.sync_readers[1], a, n, by)).or_default() += 1;
                     }
                 }
+                if self.scout {
+                    // (Census: what in its batch wrote what it reads.)
+                    static N: AtomicU64 = AtomicU64::new(0);
+                    if N.fetch_add(1, Ordering::Relaxed) % 97 == 0 && N.load(Ordering::Relaxed) < 97 * 24 {
+                        let hits: Vec<String> = reads.iter().filter(|&&r| self.pending.overlaps_any(&[r]) || self.closed_overlap(&[r])).take(3).map(|&(a, n)| format!("{a:#x}+{n:#x}")).collect();
+                        let cover = super::forward::uncovered(reads).map_or(reads.len(), |l| l.len());
+                        crate::info!("gpu[{}]: scout census: reads its own writes: {} (of {} reads, {} not covered by its view; stages {:#x} {:#x}); its batch's last programs {:x?}; its pending writes {}", self.name, hits.join(", "), reads.len(), cover, self.sync_readers[0], self.sync_readers[1], &self.batch_shaders[self.batch_shaders.len().saturating_sub(6)..], self.pending.iter().take(6).map(|(a, n)| format!("{a:#x}+{n:#x}")).collect::<Vec<_>>().join(" "));
+                    }
+                }
                 if self.past_grow && HELD_OWN_LOGGED.fetch_add(1, Ordering::Relaxed) < 12 {
                     // Diagnostics: what a held executor read of its own held work.
                     let hits: Vec<String> = reads
@@ -14949,6 +15010,11 @@ impl Exec {
         if self.held && self.cp_written.len() < 4096 {
             self.cp_written.push((a, bytes));
         }
+        // A scout: the words are known though memory holds them only once its record ran;
+        // its later reads take them (docs/SCOUTS.md).
+        if self.scout {
+            super::forward::add_cp_write(a, data);
+        }
         if full && !cpw_lazy_here() {
             // The barrier after it orders it before later work.
             self.ordered_since(a, bytes);
@@ -14957,7 +15023,7 @@ impl Exec {
             self.pending_promises.push((a, v, n));
             // (Past a run, a request ends the stretch: `Cp::run` settles it
             // and submits. A parallel worker's batch goes at its turn.)
-            if !(self.deferred && (!self.held || self.par_worker)) {
+            if !(self.deferred && (!self.held || self.par_worker)) && !self.scout {
                 UNSUBMITTED_LABELS.lock().get_or_insert_with(HashMap::new).insert(a & !7, self.submit_request.clone());
                 // Another queue already blocks on it: submit at the next packet.
                 if super::tune::label_early() && super::cp::waited_now(a) {
@@ -15676,11 +15742,121 @@ impl Exec {
     pub fn scout_begin(&mut self) {
         self.past_begin();
         self.scout = true;
-        super::forward::hold_begin();
+        // (Its view of the published copies stays as it is now: `forward::Frozen`.)
+        super::forward::hold_begin_scout();
         self.past_grow = true;
         self.past_want_min = u32::MAX;
         self.past_ranges.clear();
         self.past_up.clear();
+    }
+
+    /// This held executor's own image notes as they are now (fast clears it made pending,
+    /// images it overwrote: `held_note`): a gate's snapshot (`Cp::scout_gate`).
+    pub fn held_notes(&self) -> HeldNotes {
+        (self.held_clears.clone(), self.held_over.clone())
+    }
+
+    /// Whether an image a scout's record used has a fast clear or reload pending that is not
+    /// the record's own (noted by a segment of it committed before: `held_applied`).
+    pub fn held_pending_conflict(&self) -> bool {
+        if self.held_keys.is_empty() || !super::images::any_pending() {
+            return false;
+        }
+        let keys: Vec<super::images::ImageKey> = self.held_keys.iter().copied().collect();
+        super::images::with(|im| im.pending_not_own(&keys, (&self.held_applied.0, &self.held_applied.1)))
+    }
+
+    /// A scout's record is committed up to a gate (`cur`: its image notes there) or to its end
+    /// (None: the notes it has now): the image cache gets what changed since its last segment
+    /// (`Images::apply_held_delta`). False, nothing changed: a fast clear of its own that an
+    /// earlier segment made pending was taken by other work before this segment's own taking
+    /// of it (the segment is refused). At the end its notes are left empty: `past_commit_begin`
+    /// has none to make.
+    pub fn apply_held_notes(&mut self, cur: Option<&HeldNotes>) -> bool {
+        let now;
+        let cur = match cur {
+            Some(c) => c,
+            None => {
+                now = (std::mem::take(&mut self.held_clears), std::mem::take(&mut self.held_over));
+                &now
+            }
+        };
+        if self.held_applied.0.is_empty() && self.held_applied.1.is_empty() && cur.0.is_empty() && cur.1.is_empty() {
+            return true;
+        }
+        if !super::images::with(|im| im.apply_held_delta((&self.held_applied.0, &self.held_applied.1), (&cur.0, &cur.1))) {
+            return false;
+        }
+        self.held_applied = cur.clone();
+        true
+    }
+
+    /// Its storage-image notes so far (`held_storage`).
+    pub fn held_storage_len(&self) -> usize {
+        self.held_storage.len()
+    }
+
+    /// A scout's record committed up to a gate (`Cp::scout_commit`): its storage images'
+    /// writes up to note `upto` are noted in the image cache now (the rest with its later
+    /// segments; `past_commit_begin` notes what is left).
+    pub fn apply_held_storage(&mut self, upto: usize) {
+        let upto = upto.min(self.held_storage.len());
+        if upto > self.held_storage_done {
+            let notes = &self.held_storage[self.held_storage_done..upto];
+            super::images::with(|im| im.note_held_storage(notes));
+            self.held_storage_done = upto;
+        }
+    }
+
+    /// What a scout's record writes (its closed batches and its held runs' chunks): the
+    /// published forward entries under those ranges end at its commit (`forward::
+    /// hold_commit_scout`).
+    pub fn scout_writes(&self) -> Vec<(u64, u64)> {
+        let mut v: Vec<(u64, u64)> = self.held_extra.iter().collect();
+        for b in &self.closed {
+            v.extend(b.writes.iter());
+        }
+        v
+    }
+
+    /// What this queue's later work has to follow (`Cp::scout_turn`: the main command
+    /// processor's, for the scout whose record it takes over): its last batch (and the last
+    /// with CP effects), and the batch whose deferred CPU effects its GPU-performed CP writes
+    /// must come after (0: none).
+    pub fn order_state(&self) -> (u64, u64) {
+        (self.last_seq.max(self.last_action_seq), self.cpu_action_seq.max(self.cpu_dep_seq))
+    }
+
+    /// A scout's executor about to submit its record at a hand-over (`Cp::scout_commit`): the
+    /// record follows the main command processor's work (`order_state` at the turn).
+    pub fn scout_follow(&mut self, last: u64) {
+        if last != 0 {
+            self.depend_on(last, false);
+        }
+    }
+
+    /// The first batch this deferred executor closed waits on the GPU for the deferred CPU
+    /// effects of batch `cpu` (`order_after_cpu`: a scout's record at its hand-over, whose
+    /// GPU-performed CP writes follow the CPU-performed ones of the main command processor's
+    /// earlier batches; the record's other batches follow the first on the queue). False:
+    /// nothing closed, or the effects already ran.
+    pub fn first_closed_after_cpu(&mut self, cpu: u64) -> bool {
+        if cpu <= done_seq() {
+            return true;
+        }
+        match self.closed.first_mut() {
+            Some(b) => {
+                b.cpu_wait = b.cpu_wait.max(cpu);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// A scout's worker records a chunk of its held run (`par::take_chunks`): as the scout's
+    /// executor does (its reads through the scout's view, its textures by owner).
+    pub fn set_scout(&mut self, on: bool) {
+        self.scout = on;
     }
 
     /// What a scout's record placed (`scout_begin`): the ranges its checks placed, the pages
@@ -15910,6 +16086,17 @@ impl Exec {
             let (c, o) = (std::mem::take(&mut self.held_clears), std::mem::take(&mut self.held_over));
             super::images::with(|im| im.apply_held(&c, &o));
         }
+        // (Its storage bindings' writes: noted now, in program order; those of segments
+        // committed before a gate were, `apply_held_storage`.)
+        if !self.held_storage.is_empty() {
+            let notes = std::mem::take(&mut self.held_storage);
+            let done = std::mem::take(&mut self.held_storage_done).min(notes.len());
+            if done < notes.len() {
+                super::images::with(|im| im.note_held_storage(&notes[done..]));
+            }
+        }
+        self.held_storage_done = 0;
+        self.held_applied = Default::default();
         // The open batch's label writes can be asked for now (`gpu_cp_write`).
         if self.recording && !self.pending_promises.is_empty() {
             let mut g = UNSUBMITTED_LABELS.lock();
@@ -15929,6 +16116,10 @@ impl Exec {
     /// closed batches and its open one (begun past the run: the batch
     /// before it was submitted) never go to the GPU.
     pub fn past_drop(&mut self) {
+        self.held_storage.clear();
+        self.held_storage_done = 0;
+        // (What committed segments of a scout's record noted stays noted.)
+        self.held_applied = Default::default();
         super::forward::hold_drop();
         super::forward::drop_entries(&std::mem::take(&mut self.forward_ids));
         self.discard_closed();
@@ -15975,6 +16166,9 @@ impl Exec {
         self.held_over.clear();
         self.held_keys.clear();
         self.held_extra.clear();
+        self.held_storage.clear();
+        self.held_storage_done = 0;
+        self.held_applied = Default::default();
         self.past_stale.clear();
         self.past_stale_err = false;
         self.repair = false;
@@ -15984,7 +16178,8 @@ impl Exec {
     /// command processor's held executor past a label wait does (its image notes its own, its
     /// CPU reads, placed ranges and uploaded pages kept for the stretch's checks), and stops on
     /// a CPU read of `writes` or a use of an image in `keys` (the held work before the run).
-    pub fn held_chunk_begin(&mut self, writes: std::sync::Arc<super::ranges::Ranges>, keys: std::sync::Arc<HashMap<super::images::ImageKey, u8>>) {
+    pub fn held_chunk_begin(&mut self, writes: std::sync::Arc<super::ranges::Ranges>, keys: std::sync::Arc<HashMap<super::images::ImageKey, u8>>, bases: std::sync::Arc<Vec<(u64, super::images::ImageKey)>>) {
+        self.held_run_bases = (!bases.is_empty()).then_some(bases);
         self.held = true;
         self.past_grow = true;
         self.held_reset();
@@ -16019,6 +16214,7 @@ impl Exec {
         self.past_grow = false;
         self.held_run_writes = None;
         self.held_run_keys = None;
+        self.held_run_bases = None;
         self.held_promises.clear();
         self.held_kinds.clear();
         self.cp_written.clear();
@@ -16055,6 +16251,15 @@ impl Exec {
         }
         r.extend(&self.held_extra);
         r
+    }
+
+    /// The images this held executor bound for writing without their notes (`held_storage`):
+    /// base and key (`par::Run::held_bases`: a chunk that uses an alias of one stops).
+    pub fn held_storage_bases(&self) -> Vec<(u64, super::images::ImageKey)> {
+        let mut v: Vec<(u64, super::images::ImageKey)> = self.held_storage.iter().map(|s| (s.0.base, s.0)).collect();
+        v.sort_unstable_by_key(|x| x.0);
+        v.dedup();
+        v
     }
 
     /// The images this held executor notes fast clears (0) or overwrites (1) of (`par::Run::
@@ -16151,6 +16356,16 @@ impl Exec {
         if let Some(&kind) = self.held_run_keys.as_ref().filter(|s| !s.is_empty()).and_then(|s| keys.iter().find_map(|k| s.get(k))) {
             HELD_RUN_STOPS[1 + kind.min(1) as usize].fetch_add(1, Ordering::Relaxed);
             self.stop(if kind == 0 { "an image the held work before its run clears" } else { "an image the held work before its run overwrote" });
+            return true;
+        }
+        // (An image at the base of one this held work bound for writing, under another key:
+        // an alias whose copy from it follows the write's note, which is made at the commit.)
+        if !self.held_storage.is_empty() && keys.iter().any(|k| self.held_storage.iter().any(|s| s.0.base == k.base && s.0 != *k)) {
+            self.stop("an alias of its held storage image");
+            return true;
+        }
+        if self.held_run_bases.as_ref().is_some_and(|b| keys.iter().any(|k| b.iter().any(|s| s.0 == k.base && s.1 != *k))) {
+            self.stop("an alias of a storage image the held work before its run wrote");
             return true;
         }
         self.held_keys.extend(keys.iter().copied());
@@ -16411,7 +16626,20 @@ impl Exec {
         // What the preparation found (its own block, shared with its cache
         // entry), apart from the SGPR data written below.
         let found = p.found.clone();
-        if self.held {
+        if self.held && self.scout {
+            // (A scout: what its view covers of the preparation's reads are its own words, in
+            // program order, or published ones checked at its turn, `forward::Frozen`; the
+            // rest is guest memory as it is now. Noted whole, every read of the per-view
+            // block conflicted with the copies of the submissions before its own: 24% of the
+            // records were refused for them, run -235730.)
+            let left = super::forward::uncovered(&found.reads);
+            let r: &[(u64, u64)] = left.as_deref().unwrap_or(&found.reads);
+            if super::forward::scout_trace() {
+                super::forward::trace_uncovered(r, &self.name, self.sync_readers);
+            }
+            self.held_reads.extend_from_slice(r);
+            self.note_kinds(2, r.len());
+        } else if self.held {
             self.held_reads.extend_from_slice(&found.reads);
             self.note_kinds(2, found.reads.len());
         }
@@ -16934,11 +17162,16 @@ impl Exec {
             return Ok(bound);
         }
         // Held batches: a storage image's binding marks it written in the
-        // image cache, which the work before them would see.
-        if self.held && found.tr.out.bindings.iter().any(|b| matches!(b.kind, BindingKind::StorageImage(_) | BindingKind::StorageImageMips(_))) {
+        // image cache, which the work before them would see. A scout's own executor binds the
+        // ones GPU work wrote already without that note (`Images::held_storage_view`, made at
+        // its commit); a first write stops it too.
+        let held_storage = self.held && found.tr.out.bindings.iter().any(|b| matches!(b.kind, BindingKind::StorageImage(_) | BindingKind::StorageImageMips(_)));
+        if held_storage && !(self.scout && !self.par_worker && super::tune::scouts_storage()) {
             self.stop("storage image");
             return Err(STOPPED.into());
         }
+        let mut storage_notes: Vec<(super::images::ImageKey, u32, u64)> = Vec::new();
+        let binding_shader = p.addr;
         bound.imgs.clear();
         bound.images.clear();
         bound.stored.clear();
@@ -16955,7 +17188,13 @@ impl Exec {
                     }
                     (BindingKind::Image(_) | BindingKind::ImageAlt(_) | BindingKind::StorageImage(_), Some(Resolved::Image(t))) => {
                         let storage = matches!(b.kind, BindingKind::StorageImage(_));
-                        let (view, image) = im.view(t, storage, frame)?;
+                        let (view, image) = if storage && held_storage {
+                            let Some((v, i, k)) = im.held_storage_view(t, frame) else { return Err(HELD_STORAGE.into()) };
+                            storage_notes.push((k, t.base_level, binding_shader));
+                            (v, i)
+                        } else {
+                            im.view(t, storage, frame)?
+                        };
                         let ty = if storage { vk::DescriptorType::STORAGE_IMAGE } else { vk::DescriptorType::SAMPLED_IMAGE };
                         bound.imgs.push((b.binding, ty, vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL }));
                         bound.images.push(image);
@@ -17005,7 +17244,13 @@ impl Exec {
                             let mut tk = *t;
                             tk.base_level = t.base_level + k;
                             tk.raw[3] = (tk.raw[3] & !(0xf << 12)) | (tk.base_level << 12);
-                            let (view, img) = im.view(&tk, true, frame)?;
+                            let (view, img) = if held_storage {
+                                let Some((v, i, key)) = im.held_storage_view(&tk, frame) else { return Err(HELD_STORAGE.into()) };
+                                storage_notes.push((key, tk.base_level, binding_shader));
+                                (v, i)
+                            } else {
+                                im.view(&tk, true, frame)?
+                            };
                             image = img;
                             infos.push(vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL });
                         }
@@ -17034,8 +17279,18 @@ impl Exec {
         for f in failed {
             self.report(f);
         }
+        if r.as_ref().is_err_and(|e| e == HELD_STORAGE) {
+            // (An image no GPU work wrote yet, or not there: not a held batch's to make.)
+            let _ = refreshed;
+            self.stop("storage image (its first write)");
+            return Err(STOPPED.into());
+        }
         r?;
         refreshed?;
+        if !storage_notes.is_empty() {
+            HELD_STORAGE_BINDS.fetch_add(storage_notes.len() as u64, Ordering::Relaxed);
+            self.held_storage.extend(storage_notes);
+        }
         Ok(bound)
     }
 
@@ -17608,7 +17863,7 @@ impl Exec {
         // program order still: its copies forward as before. As buffer
         // updates, `tune copy_update`, they were level under front end 2 and
         // had corrupted meshes during loads: removed on 2026-11-01.)
-        let forward_here = super::tune::forward_copies() && (!self.deferred || self.past_grow || (self.past && super::forward::held())) && indirect.is_none() && (self.name == "gpu-gfx" || (self.past_grow && super::forward::held())) && !super::resident::mirror_mode();
+        let forward_here = super::tune::forward_copies() && (!self.deferred || self.past_grow || (self.past && super::forward::held())) && indirect.is_none() && (self.name == "gpu-gfx" || self.scout) && !super::resident::mirror_mode();
         // Diagnosis (`DS_FE2_CHECK_COPIES=1`): a copy kernel's dispatch on a
         // queue whose copies are not forwarded (compute queues, the graphics
         // queue's workers) is checked once its batch completed against the
@@ -18300,8 +18555,20 @@ impl Exec {
         }
         if forward_here {
             let busy = |r: &[(u64, u64)]| self.overlaps_pending_ro(r) || INFLIGHT.latest(r).is_some() || CP_WRITES.latest(r).is_some();
-            let computed = super::forward::compute(&p, groups, local, busy);
+            // (A scout: its held CP writes and copies are the inputs' words, `forward::
+            // add_cp_write`.)
+            let computed = super::forward::compute_in(&p, groups, local, busy, self.scout);
             if let Some((base, words, from)) = computed {
+                // (A scout: what its view did not cover of the copy's inputs was read from
+                // guest memory as it is now, which a submission before its own may still
+                // write: CPU reads, checked at its turn as its others are.)
+                if self.scout && self.held {
+                    let r = from.ranges();
+                    let left = super::forward::uncovered(&r);
+                    let left: &[(u64, u64)] = left.as_deref().unwrap_or(&r);
+                    self.held_reads.extend_from_slice(left);
+                    self.note_kinds(6, left.len());
+                }
                 // (Diagnostics: how this dispatch bound the destination.)
                 let how = match bound.shadows.iter().find(|s| s.guest <= base && base < s.guest + s.range) {
                     Some(s) if s.reused => "through a resident shadow",

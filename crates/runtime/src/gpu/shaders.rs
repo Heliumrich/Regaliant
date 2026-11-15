@@ -2807,6 +2807,16 @@ pub fn ps_addr_of<R: RegRead + ?Sized>(r: &R) -> u64 {
     ((r.sh(PS_PGM_LO) as u64) | ((r.sh(PS_PGM_LO + 1) as u64 & 0xFF) << 32)) << 8
 }
 
+/// Program address of the compute shader in a register view.
+pub fn cs_addr_of<R: RegRead + ?Sized>(r: &R) -> u64 {
+    ((r.sh(CS_PGM_LO) as u64) | ((r.sh(CS_PGM_LO + 1) as u64 & 0xFF) << 32)) << 8
+}
+
+/// The compute shader's local size in a register view.
+pub fn cs_local_of<R: RegRead + ?Sized>(r: &R) -> [u32; 3] {
+    [r.sh(CS_NUM_THREAD) & 0xFFFF, r.sh(CS_NUM_THREAD + 1) & 0xFFFF, r.sh(CS_NUM_THREAD + 2) & 0xFFFF]
+}
+
 /// Program address of the NGG (vertex) shader in a register view.
 pub fn ngg_addr_of<R: RegRead + ?Sized>(r: &R) -> u64 {
     ((r.sh(ES_PGM_LO) as u64) | ((r.sh(ES_PGM_LO + 1) as u64 & 0xFF) << 32)) << 8

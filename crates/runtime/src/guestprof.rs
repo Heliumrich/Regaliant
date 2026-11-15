@@ -370,7 +370,7 @@ pub fn explain_submit(lo: u64, hi: u64) -> Option<String> {
 }
 
 /// A thread's description (its name as `thread::spawn_host` set it), or "".
-fn thread_description(tid: u32) -> String {
+pub(crate) fn thread_description(tid: u32) -> String {
     use windows_sys::Win32::System::Threading::{GetThreadDescription, OpenThread, THREAD_QUERY_LIMITED_INFORMATION};
     unsafe {
         let h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, tid);

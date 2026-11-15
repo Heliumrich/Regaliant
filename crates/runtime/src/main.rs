@@ -1428,6 +1428,38 @@ fn thread_summary() -> String {
 
 /// Guest threads and their states; with `with_stacks`, each running thread is
 /// sampled (rip, frame chain, guest return addresses) for hang diagnosis.
+/// The stacks of this process's own threads by name (the GPU front end's, front end 2's, the
+/// host's event loop's), for the stall watch (`DS_STALL_WATCH`): the queue threads' workers,
+/// the completion and release threads are in no other dump.
+fn host_thread_stacks() -> String {
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32};
+    let pid = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessId() };
+    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snap == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        return String::new();
+    }
+    let mut tids: Vec<u32> = Vec::new();
+    let mut te: THREADENTRY32 = unsafe { std::mem::zeroed() };
+    te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+    let mut ok = unsafe { Thread32First(snap, &mut te) } != 0;
+    while ok {
+        if te.th32OwnerProcessID == pid {
+            tids.push(te.th32ThreadID);
+        }
+        ok = unsafe { Thread32Next(snap, &mut te) } != 0;
+    }
+    unsafe { windows_sys::Win32::Foundation::CloseHandle(snap) };
+    let mut named: Vec<(String, u32)> = tids.into_iter().map(|t| (guestprof::thread_description(t), t)).filter(|(n, _)| (n.starts_with("gpu") || n.starts_with("fe2") || n.starts_with("host") || n.starts_with("forward")) && !n.starts_with("gpu-precompile")).collect();
+    named.sort();
+    let mut s = String::new();
+    for (name, tid) in named {
+        if let Some(st) = exception::sample_thread(tid, 0) {
+            s.push_str(&format!("    '{name}' ({tid}): {st}\n"));
+        }
+    }
+    s
+}
+
 fn thread_summary_ex(with_stacks: bool) -> String {
     let mut s = String::new();
     let list: Vec<&'static thread::GuestThread> = match thread::THREADS.try_lock() {
@@ -1960,9 +1992,25 @@ This happens when other software takes that range. Restart the PC and try again.
     // boots stalled ~40 s early in the title's start-up, FINDINGS.md
     // 2026-10-18 night; a normal boot flips within ~5 s).
     let mut boot_watch = std::env::var("DS_BOOT_WATCH").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(15);
+    // Stall watch (`DS_STALL_WATCH=<ms>`, diagnosis; 0, the default: off): once frames flip, a
+    // gap of that long without a flip logs every thread's stack and wait record while it lasts
+    // (at most `DS_STALL_WATCH_MAX` times a run, default 4; once a gap).
+    let stall_watch = std::env::var("DS_STALL_WATCH").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let mut stall_left = std::env::var("DS_STALL_WATCH_MAX").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(4);
+    let mut stall_at = (0u64, Instant::now(), false);
     loop {
         std::thread::sleep(Duration::from_millis(250));
         ticks += 1;
+        if stall_watch > 0 && stall_left > 0 {
+            let f = gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+            if f != stall_at.0 {
+                stall_at = (f, Instant::now(), false);
+            } else if f > 30 && gpu::vk::try_ctx().is_some() && !stall_at.2 && stall_at.1.elapsed() >= Duration::from_millis(stall_watch) {
+                stall_at.2 = true;
+                stall_left -= 1;
+                warn!("stall watch: no flip for {} ms after flip {f} (DS_STALL_WATCH); our threads:\n{}the title's threads and the queues:\n{}", stall_at.1.elapsed().as_millis(), host_thread_stacks(), thread_summary_ex(true));
+            }
+        }
         if boot_watch > 0 && start.elapsed() >= Duration::from_secs(boot_watch) {
             if gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed) == 0 && gpu::exec::enabled() {
                 warn!("boot watch: no frame flipped {boot_watch} s after start (DS_BOOT_WATCH); guest thread stacks:\n{}", thread_summary_ex(true));

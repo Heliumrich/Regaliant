@@ -4439,6 +4439,70 @@ impl Images {
         NOTE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
+    /// A scout's record committed a segment at a time (`Exec::apply_held_notes`): its own image
+    /// notes were `prev` when its last segment was committed (the cache has those) and are
+    /// `cur` now. What it noted since is noted here; a fast clear of its own that it took
+    /// since (`resolve_fast_clears`: in `prev`, not in `cur`) is taken here, and must still be
+    /// pending as the record left it. False (nothing changed): other work took or changed it
+    /// first, so the record's own clear of the image would come a second time.
+    pub fn apply_held_delta(
+        &mut self,
+        prev: (&std::collections::HashMap<ImageKey, (u64, Option<u32>)>, &std::collections::HashSet<ImageKey>),
+        cur: (&std::collections::HashMap<ImageKey, (u64, Option<u32>)>, &std::collections::HashSet<ImageKey>),
+    ) -> bool {
+        if prev.0.iter().any(|(k, v)| cur.0.get(k) != Some(v) && self.pending_clears.get(k) != Some(v)) {
+            return false;
+        }
+        let mut changed = false;
+        for (k, v) in prev.0 {
+            if cur.0.get(k) != Some(v) {
+                self.pending_clears.remove(k);
+                self.pending_change += 1;
+                changed = true;
+            }
+        }
+        for (k, v) in cur.0 {
+            if prev.0.get(k) != Some(v) {
+                self.pending_clears.insert(*k, *v);
+                self.pending_change += 1;
+                changed = true;
+            }
+        }
+        // (An image a zero fill of the record cleared since: no longer to be reloaded.)
+        for k in prev.1.iter().filter(|k| !cur.1.contains(*k)) {
+            let Some(img) = self.map.get_mut(k) else { continue };
+            if img.overwritten {
+                img.overwritten = false;
+                self.overwritten_keys.remove(k);
+                self.pending_overwrites = self.pending_overwrites.saturating_sub(1);
+                self.pending_change += 1;
+                changed = true;
+            }
+        }
+        for k in cur.1.iter().filter(|k| !prev.1.contains(*k)) {
+            let Some(img) = self.map.get_mut(k) else { continue };
+            if !img.overwritten {
+                img.overwritten = true;
+                self.overwritten_keys.insert(*k);
+                self.pending_change += 1;
+                self.pending_overwrites += 1;
+                changed = true;
+            }
+        }
+        if changed {
+            self.note_gen += 1;
+            NOTE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+        true
+    }
+
+    /// Whether one of `keys` has a fast clear or a reload pending that is not the asking
+    /// record's own (`own`: what the cache has of its notes, `apply_held_delta`).
+    pub fn pending_not_own(&self, keys: &[ImageKey], own: (&std::collections::HashMap<ImageKey, (u64, Option<u32>)>, &std::collections::HashSet<ImageKey>)) -> bool {
+        (!self.pending_clears.is_empty() && keys.iter().any(|k| self.pending_clears.get(k).is_some_and(|v| own.0.get(k) != Some(v))))
+            || (self.pending_overwrites > 0 && keys.iter().any(|k| !own.1.contains(k) && self.map.get(k).is_some_and(|i| i.overwritten)))
+    }
+
     /// The fast clear of image `k` with metadata at `meta` (`take_clears`'s
     /// entry for a clear a held executor noted itself).
     pub fn fast_clear_of(&self, k: ImageKey, meta: u64, known: Option<u32>) -> Option<FastClear> {
@@ -6029,6 +6093,49 @@ impl Images {
             }
         }
         let key = self.image_for(t, frame, storage)?;
+        self.view_of(t, key, storage, frame, true)
+    }
+
+    /// A storage view for a scout's held batch (`Exec::bind_stage`, docs/SCOUTS.md): only of
+    /// an image that exists for `t` and GPU work wrote already (a depth feed: known as one),
+    /// and without `view`'s notes of the write: the work before the held batch, recorded
+    /// later, must not see a write that comes after it (the image's write generation moves
+    /// its aliases' copies). The notes are made when the batch is committed
+    /// (`note_held_storage`). None: no such image yet (its first write, which changes what
+    /// lookups find: the held batch stops there).
+    pub fn held_storage_view(&mut self, t: &Tsharp, frame: u64) -> Option<(vk::ImageView, vk::Image, ImageKey)> {
+        let key = Self::key_of(t)?;
+        let (k, _) = self.lookup(&key, true)?;
+        if !self.map.get(&k).is_some_and(|i| i.gpu_written) || is_depth(k.format) || self.refreshing.contains_key(&k) {
+            return None;
+        }
+        if matches!(k.format, vk::Format::R32_SFLOAT | vk::Format::R16_UNORM) && !self.depth_feeds.contains(&k.base) {
+            return None;
+        }
+        self.view_of(t, k, true, frame, false).ok().map(|r| (r.0, r.1, k))
+    }
+
+    /// A committed held batch's storage bindings (`held_storage_view`: image, mip level,
+    /// binding shader), in their order: each a write of its image, as `view` notes one.
+    pub fn note_held_storage(&mut self, notes: &[(ImageKey, u32, u64)]) {
+        for &(key, mip, writer) in notes {
+            self.write_seq += 1;
+            let seq = self.write_seq;
+            if let Some(img) = self.map.get_mut(&key) {
+                img.write_gen = seq;
+                let m = mip as usize;
+                if img.mip_gens.len() <= m {
+                    img.mip_gens.resize(m + 1, 0);
+                }
+                img.mip_gens[m] = seq;
+                img.writer = writer;
+            }
+        }
+    }
+
+    /// The view of image `key` that `t` asks for (`view_full`); `note`: a storage view's
+    /// write is noted (false: `held_storage_view`).
+    fn view_of(&mut self, t: &Tsharp, key: ImageKey, storage: bool, frame: u64, note: bool) -> Result<(vk::ImageView, vk::Image, UseStamp), String> {
         let req = vk_format(t.format).unwrap();
         let depth = is_depth(key.format);
         let stencil = depth && req == vk::Format::R8_UINT;
@@ -6054,17 +6161,18 @@ impl Images {
         let sel = |s: u16| -> u8 { (s & 7) as u8 };
         let swz = if storage { [4, 5, 6, 7] } else { [sel(t.dst_sel), sel(t.dst_sel >> 3), sel(t.dst_sel >> 6), sel(t.dst_sel >> 9)] };
         let vkey = (fmt, vt, t.base_level, levels.saturating_sub(t.base_level).max(1), base_layer, layer_count, swz, storage as u8 | (stencil as u8) << 1);
-        if storage {
+        let storage_note = storage && note;
+        if storage_note {
             self.write_seq += 1;
         }
         let seq = self.write_seq;
-        if storage && matches!(key.format, vk::Format::R32_SFLOAT | vk::Format::R16_UNORM) && self.depth_feeds.insert(key.base) {
+        if storage_note && matches!(key.format, vk::Format::R32_SFLOAT | vk::Format::R16_UNORM) && self.depth_feeds.insert(key.base) {
             // A possible compute view of a depth plane: memos of
             // `depth_copies_possible` see it from now on.
             LOOKUP_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
         }
         let img = self.map.get_mut(&key).unwrap();
-        if storage {
+        if storage_note {
             img.write_gen = seq;
             let m = t.base_level as usize;
             if img.mip_gens.len() <= m {
