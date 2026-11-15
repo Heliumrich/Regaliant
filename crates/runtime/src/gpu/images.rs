@@ -1008,6 +1008,12 @@ static EVICTED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::
 const EVICT_AGE: u64 = 120;
 /// Video-memory budget checks at most this often.
 const EVICT_CHECK_MS: u64 = 500;
+/// The share of the budget other processes' memory never pushes eviction
+/// below (percent). With others at ~24.5 GB the 1-1 walk's Castlewall and
+/// Front ran level without that eviction (44.5 / 54.1 against 44.2 / 55.3
+/// flips/s), its p99 frames lower (34-42 against 50-63 ms at Castlewall)
+/// and its detiling about halved (FINDINGS.md 2026-11-15 late night).
+const OTHERS_FLOOR_PCT: u64 = 50;
 
 /// When this process uses more video memory than `tune vram_high` percent of
 /// the device-local budget, evicts the least recently used images until
@@ -1035,13 +1041,17 @@ pub fn maybe_evict() {
     let used = used.saturating_sub(super::slab::idle_bytes());
     let (mut high, mut low) = (budget / 100 * super::tune::vram_high(), budget / 100 * super::tune::vram_low());
     // What the heap leaves beside other processes' dedicated memory, less
-    // `vram_others` MiB (high) and a GiB more (low).
+    // `vram_others` MiB (high) and a GiB more (low), but never under
+    // OTHERS_FLOOR_PCT of the budget: others' memory that grows over a day
+    // (dwm.exe and the NVIDIA overlay held 22 GB on 2026-11-15) otherwise
+    // evicts the scene's own textures every half second.
     let margin = super::tune::vram_others() << 20;
     if margin != 0 {
         if let Some(others) = crate::hostload::others_vram() {
             let room = ctx().device_heap_size().saturating_sub(others);
-            high = high.min(room.saturating_sub(margin));
-            low = low.min(room.saturating_sub(margin + (1 << 30)));
+            let floor = budget / 100 * OTHERS_FLOOR_PCT;
+            high = high.min(room.saturating_sub(margin).max(floor));
+            low = low.min(room.saturating_sub(margin + (1 << 30)).max(floor.saturating_sub(1 << 30)));
         }
     }
     if budget == 0 || used <= high {
