@@ -53,14 +53,17 @@ pub struct Paths {
     pub root: Option<PathBuf>,
 }
 
-/// The checkout whose build output holds `dir`: a folder holding `local-data\`, `Cargo.toml` and
+/// The checkout whose build holds `dir`: a folder holding `local-data\`, `Cargo.toml` and
 /// `crates\` together (a stray folder of one name above a player's folder is not one), `dir`
-/// under its `target\` (a package copied into the checkout's `dist\` is not a development build).
+/// under its `target\` (cargo's output) or `local-data\` (the run scripts' copy of the build,
+/// `local-data\bin`): a package copied into the checkout's `dist\` is an install. (On
+/// 2026-11-15 a rule of `target\` alone ran the scripts' copy as an install, in the user's
+/// folders.)
 fn dev_root(dir: &Path) -> Option<PathBuf> {
     let mut p = Some(dir);
     while let Some(d) = p {
         if d.join("local-data").is_dir() && d.join("Cargo.toml").is_file() && d.join("crates").is_dir() {
-            return dir.starts_with(d.join("target")).then(|| d.to_path_buf());
+            return (dir.starts_with(d.join("target")) || dir.starts_with(d.join("local-data"))).then(|| d.to_path_buf());
         }
         p = d.parent();
     }
@@ -262,6 +265,11 @@ mod tests {
             assert_eq!(p.shaders(), dev.join("local-data"));
             assert_eq!(p.upscalers(), dev.join("local-data").join("upscalers"));
 
+            // (The run scripts' copy of the build in local-data\bin: the development layout.)
+            let bin = dev.join("local-data").join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let p = Paths::for_exe(&bin.join(GAME_EXE_DEV));
+            assert_eq!(p.layout, Layout::Dev);
             // (A package in the checkout's dist\: an install, not the development layout.)
             let pkg = dev.join("dist").join("Regaliant-0.1.0");
             std::fs::create_dir_all(&pkg).unwrap();
