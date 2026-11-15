@@ -849,6 +849,7 @@ fn run(addr: u64) {
 pub(crate) fn keyed_learned_specs(h: u64, code: &[u32]) -> Vec<Spec> {
     let seen = learned(|m| m.get(&h).map(|e| e.1.clone())).unwrap_or_default();
     let Ok(insts) = rdna::decode_program(code) else { return Vec::new() };
+    super::shaders::note_program(code, &insts, h);
     let mut plans: Vec<(u16, rdna::analysis::Plan)> = Vec::new();
     super::shaders::seed_formats(h, &seen.iter().map(|s| s.resources.as_slice()).collect::<Vec<_>>());
     let mut done: Vec<Spec> = Vec::new();
@@ -877,6 +878,9 @@ fn run_code(h: u64) {
     let Some(code) = code_of(h) else { return };
     let seen = learned(|m| m.get(&h).map(|e| e.1.clone())).unwrap_or_default();
     let insts = rdna::decode_program(&code).ok();
+    if let Some(i) = &insts {
+        super::shaders::note_program(&code, i, h);
+    }
     let mut plans: Vec<(u16, rdna::analysis::Plan)> = Vec::new();
     super::shaders::seed_formats(h, &seen.iter().map(|s| s.resources.as_slice()).collect::<Vec<_>>());
     let mut done: Vec<Spec> = Vec::new();

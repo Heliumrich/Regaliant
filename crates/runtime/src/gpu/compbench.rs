@@ -108,6 +108,7 @@ fn guess_report(app: &std::path::Path) -> i32 {
     let mut var_equal = [0u64; 5];
     for (h, code, specs) in super::precompile::learned_compute() {
         let Ok(insts) = rdna::decode_program(&code) else { continue };
+        super::shaders::note_program(&code, &insts, h);
         let is_engine = engine.contains_key(&h);
         engine_learned += is_engine as u64;
         for spec in &specs {
@@ -362,8 +363,9 @@ const FINGERPRINT_SAMPLE: u64 = 509;
 /// `fe2::specs_as_hosted`, 2026-11-13; 6: the materials' shader bundles too, 2026-11-13; 7:
 /// written 3D images as 2D, `shaders::guess_d3_variant`, 2026-11-13; 8: compute images bound
 /// 2D or as 2D arrays keyed by their instructions' dimension, `shaders::d2_resources`, and every
-/// combination of up to three compared images' depth views, 2026-11-15).
-const PREPARATION_RULES: u32 = 8;
+/// combination of up to three compared images' depth views, 2026-11-15; 9: programs noted in
+/// the special-mode lists before their guess, `shaders::note_program`, 2026-11-15 night).
+const PREPARATION_RULES: u32 = 9;
 
 /// The translation fingerprint of the prepared shaders: a sample of the game's compute
 /// programs (`FINGERPRINT_SAMPLE`) translated as `precompile_all` translates them, their
@@ -435,6 +437,8 @@ fn bundle_compute_sampled(app: &std::path::Path, sample: u64) -> Vec<(u64, std::
                 continue;
             };
             let Ok(insts) = rdna::decode_program(&p.code) else { continue };
+            // (Its special translation modes noted first, as the title's load would.)
+            super::shaders::note_program(&p.code, &insts, p.hash);
             let user_sgprs = ((rsrc2 >> 1) & 0x1F).min(16) as u16;
             let plan = rdna::analysis::analyze_opts(&insts, user_sgprs, 0, false);
             let spec = super::shaders::guess_compute_spec(0, &insts, &plan, p.hash, rsrc2, local);

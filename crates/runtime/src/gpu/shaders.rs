@@ -1474,6 +1474,11 @@ fn fmt_run_time(key_spec: &Spec, specialized: u64, plan_key: u64, addr: u64, ins
                 };
                 let stored = super::exec::compute_key_stored(plan_key ^ gh.rotate_left(1));
                 crate::info!("fmt miss: cs {addr:#x} code {code_hash:#x} rsrc2 {:#x} local {:?} user_base {}: guess stored {stored}, guess == run-time {}; differs: {}", rt.cs_rsrc2, rt.cs_local_size, rt.user_base, g == rt, super::exec::spec_diff(&g, &rt));
+                // (`DS_FMT_MISS_SPEC=1`: the run-time variant's whole spec, to set beside the
+                // preparation's `prep obj:` line, `DS_CB_OBJ`.)
+                if std::env::var("DS_FMT_MISS_SPEC").ok().as_deref() == Some("1") {
+                    crate::info!("fmt miss spec: cs {addr:#x} code {code_hash:#x}: {rt:?}");
+                }
             }
         }
         return None;
@@ -2119,6 +2124,17 @@ fn note_append(addr: u64, insts: &[rdna::Inst], hash: u64) {
             Err(_) => {}
         }
     }
+}
+
+/// A program known by its code alone (the preparation's shader files, the learned store's kept
+/// code): noted in the program lists as the title's own loads note theirs (`program_checked`),
+/// so the specs made for it (per lane, subgroup waves, without lockstep, appends) are the ones
+/// its dispatches key. Until 2026-11-15 night the preparation's guesses for those programs (the
+/// fog scatter per lane, the GI reinsert as subgroup waves: the largest, 1-5 s compiles) never
+/// matched a dispatch.
+pub(crate) fn note_program(code: &[u32], insts: &[rdna::Inst], hash: u64) {
+    note_per_lane(0, code, hash);
+    note_append(0, insts, hash);
 }
 
 /// Notes a decoded program found in PER_LANE_PROGRAMS, NO_LOCKSTEP_PROGRAMS
