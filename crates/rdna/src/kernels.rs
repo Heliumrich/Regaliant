@@ -577,8 +577,6 @@ pub fn mirror_scatter_held() -> Vec<u32> {
 }
 
 fn build_scatter(reset: bool, count: bool, hold: bool, same: u8, split: bool, skip_held: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
-    // (`skip_held` reads the held-page bitmap as the hold census does.)
-    let read_held = hold || skip_held;
     let lit = Operand::LiteralBit32;
     let mut b = Builder::new();
     b.set_version(1, 3);
@@ -603,8 +601,9 @@ fn build_scatter(reset: bool, count: bool, hold: bool, same: u8, split: bool, sk
     let p_dev = b.type_pointer(None, StorageClass::PhysicalStorageBuffer, u32t);
     let p_dev64 = b.type_pointer(None, StorageClass::PhysicalStorageBuffer, u64t);
     // (The skipping write-back: 6-7 the other family's table, whose entry
-    // of a page this one stores is cleared.)
-    let pc_members = if same == 2 { 8 } else if read_held { 6 } else { 4 };
+    // of a page this one stores is cleared. 8-9: the zero-known bitmap,
+    // every variant.)
+    let pc_members = 10;
     let pc = b.type_struct(vec![u32t; pc_members]);
     b.decorate(pc, Decoration::Block, []);
     for k in 0..pc_members as u32 {
@@ -723,6 +722,38 @@ fn build_scatter(reset: bool, count: bool, hold: bool, same: u8, split: bool, sk
     let c_pages = c(&mut b, ((crate::translate::PT_END - crate::translate::PT_BASE) >> crate::translate::PT_PAGE_SHIFT) as u32);
     let page_in = b.u_less_than(bool_, None, page, c_pages)?;
     let page = b.select(u32t, None, page_in, page, c0)?;
+    // The page's bit in the zero-known bitmap (push constants 8-9: a bit per
+    // page of the span, bit i of word i / 32; 0: none) cleared by the first
+    // invocation: once the write-back stores into the page, guest memory's
+    // copy may hold other words than zeros (`zero_store`; the runtime's
+    // `gpu::zk`). Every listed page, stored now or held: a held page's words
+    // reach guest memory later.
+    {
+        let c8 = c(&mut b, 8);
+        let c9 = c(&mut b, 9);
+        let zlo = pc_at(&mut b, c8)?;
+        let zhi = pc_at(&mut b, c9)?;
+        let zmap = addr64(&mut b, zlo, zhi)?;
+        let has = b.i_not_equal(bool_, None, zmap, c0_64)?;
+        let go = b.logical_and(bool_, None, is0, page_in)?;
+        let go = b.logical_and(bool_, None, go, has)?;
+        let (l_z, l_zd) = (b.id(), b.id());
+        b.selection_merge(l_zd, SelectionControl::NONE)?;
+        b.branch_conditional(go, l_z, l_zd, [])?;
+        b.begin_block(Some(l_z))?;
+        let zw = b.shift_right_logical(u32t, None, page, c5)?;
+        let zw64 = b.u_convert(u64t, None, zw)?;
+        let c4_64z = b.constant_bit64(u64t, 4);
+        let zoff = b.i_mul(u64t, None, zw64, c4_64z)?;
+        let za = b.i_add(u64t, None, zmap, zoff)?;
+        let zp = b.convert_u_to_ptr(p_dev, None, za)?;
+        let zbit = b.bitwise_and(u32t, None, page, c31)?;
+        let one = b.shift_left_logical(u32t, None, c1, zbit)?;
+        let mask = b.not(u32t, None, one)?;
+        b.atomic_and(u32t, None, zp, scope_dev, sem_none, mask)?;
+        b.branch(l_zd)?;
+        b.begin_block(Some(l_zd))?;
+    }
     // (`same`: whether any stored dword differs from guest memory's copy,
     // workgroup memory set to 0 by invocation 0 first.)
     let shared2 = if same != 0 {
@@ -1199,6 +1230,240 @@ fn build_scatter(reset: bool, count: bool, hold: bool, same: u8, split: bool, sk
     Ok(b.module().assemble())
 }
 
+/// Workgroup size of `zero_store`: invocation t stores dwords t, t + 256,
+/// t + 512 and t + 768 of its page (a subgroup's stores consecutive dwords:
+/// one transfer across PCIe).
+pub const ZERO_STORE_LOCAL_SIZE: u32 = 256;
+
+/// Counters of `zero_store` (at the device address in push constants 4-5):
+/// pages stored, pages left out as known zero, dwords found non-zero in pages
+/// left out (`flags` bit 0, audit), one unused.
+pub const ZERO_STORE_COUNTERS: u32 = 4;
+
+/// A zero fill's stores into guest memory (the runtime's `gpu::zk`):
+/// workgroup g takes the g-th 4 KiB page of the fill (its first page at
+/// index `first` of the span), whose bytes [lead, lead + len) relative to
+/// that first page's start are zeroed; guest memory's copy of the fill's
+/// first byte is at device address `dst`. A page whose bit in the
+/// zero-known bitmap (`zk`: a bit per page of the span, bit i of word
+/// i / 32) is set holds zeros in guest memory already (stored by an earlier
+/// zero store, nothing stored into it since: every other writer of guest
+/// memory clears the bit first, the write-back in its kernel) and is left
+/// out; any other page has its part of the fill stored, and a page the
+/// fill covers whole gets its bit. With `flags` bit 0 (audit) the dwords of
+/// pages left out are read and those found non-zero counted (counter 2): a
+/// writer that left the bit set. Push constants `{dst (low, high), zk (low,
+/// high), counters (low, high), first, lead, len, flags}`; no bindings.
+pub fn zero_store() -> Vec<u32> {
+    build_zero_store().expect("zero store kernel")
+}
+
+fn build_zero_store() -> Result<Vec<u32>, rspirv::dr::Error> {
+    let lit = Operand::LiteralBit32;
+    let mut b = Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.capability(Capability::Int64);
+    b.capability(Capability::PhysicalStorageBufferAddresses);
+    b.extension("SPV_KHR_physical_storage_buffer");
+    b.memory_model(spirv::AddressingModel::PhysicalStorageBuffer64, spirv::MemoryModel::GLSL450);
+    let void = b.type_void();
+    let bool_ = b.type_bool();
+    let u32t = b.type_int(32, 0);
+    let u64t = b.type_int(64, 0);
+    let v3 = b.type_vector(u32t, 3);
+    let p_dev = b.type_pointer(None, StorageClass::PhysicalStorageBuffer, u32t);
+    let pc = b.type_struct(vec![u32t; 10]);
+    b.decorate(pc, Decoration::Block, []);
+    for k in 0..10u32 {
+        b.member_decorate(pc, k, Decoration::Offset, [lit(4 * k)]);
+    }
+    let p_pc = b.type_pointer(None, StorageClass::PushConstant, pc);
+    let p_pcu = b.type_pointer(None, StorageClass::PushConstant, u32t);
+    let p_in = b.type_pointer(None, StorageClass::Input, v3);
+    let lid_v = global(&mut b, p_in, StorageClass::Input);
+    b.decorate(lid_v, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::LocalInvocationId)]);
+    let wid_v = global(&mut b, p_in, StorageClass::Input);
+    b.decorate(wid_v, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::WorkgroupId)]);
+    let p_wg = b.type_pointer(None, StorageClass::Workgroup, u32t);
+    let known_sh = global(&mut b, p_wg, StorageClass::Workgroup);
+    let pcv = global(&mut b, p_pc, StorageClass::PushConstant);
+    let c = |b: &mut Builder, v: u32| b.constant_bit32(u32t, v);
+    let (c0, c1, c2, c5, c31) = (c(&mut b, 0), c(&mut b, 1), c(&mut b, 2), c(&mut b, 5), c(&mut b, 31));
+    let c4096 = c(&mut b, 4096);
+    let c12 = c(&mut b, 12);
+    let c32_64 = b.constant_bit64(u64t, 32);
+    let c4_64 = b.constant_bit64(u64t, 4);
+    let c8_64 = b.constant_bit64(u64t, 8);
+    let scope_dev = c1;
+    let scope_wg = c2;
+    let sem_none = c0;
+    // AcquireRelease | WorkgroupMemory: invocation 0's store seen by all.
+    let sem_sh = c(&mut b, 0x8 | 0x100);
+    let fty = b.type_function(void, []);
+    let f = b.begin_function(void, None, FunctionControl::NONE, fty)?;
+    b.begin_block(None)?;
+    let l = b.load(v3, None, lid_v, None, [])?;
+    let lid = b.composite_extract(u32t, None, l, [0])?;
+    let w = b.load(v3, None, wid_v, None, [])?;
+    let g = b.composite_extract(u32t, None, w, [0])?;
+    let pc_at = |b: &mut Builder, k: u32| -> Result<Word, rspirv::dr::Error> {
+        let kc = b.constant_bit32(u32t, k);
+        let p = b.access_chain(p_pcu, None, pcv, [kc])?;
+        b.load(u32t, None, p, None, [])
+    };
+    let addr64 = |b: &mut Builder, lo: Word, hi: Word| -> Result<Word, rspirv::dr::Error> {
+        let lo64 = b.u_convert(u64t, None, lo)?;
+        let hi64 = b.u_convert(u64t, None, hi)?;
+        let hi64 = b.shift_left_logical(u64t, None, hi64, c32_64)?;
+        b.bitwise_or(u64t, None, lo64, hi64)
+    };
+    let (dlo, dhi) = (pc_at(&mut b, 0)?, pc_at(&mut b, 1)?);
+    let dst = addr64(&mut b, dlo, dhi)?;
+    let (zlo, zhi) = (pc_at(&mut b, 2)?, pc_at(&mut b, 3)?);
+    let zk = addr64(&mut b, zlo, zhi)?;
+    let (klo, khi) = (pc_at(&mut b, 4)?, pc_at(&mut b, 5)?);
+    let cnt = addr64(&mut b, klo, khi)?;
+    let first = pc_at(&mut b, 6)?;
+    let lead = pc_at(&mut b, 7)?;
+    let len = pc_at(&mut b, 8)?;
+    let flags = pc_at(&mut b, 9)?;
+    // The page and the fill's bytes in it, relative to the first page.
+    let page = b.i_add(u32t, None, first, g)?;
+    let pstart = b.shift_left_logical(u32t, None, g, c12)?;
+    let pend = b.i_add(u32t, None, pstart, c4096)?;
+    let end = b.i_add(u32t, None, lead, len)?;
+    let lo_ge = b.u_greater_than_equal(bool_, None, lead, pstart)?;
+    let lo = b.select(u32t, None, lo_ge, lead, pstart)?;
+    let hi_le = b.u_less_than_equal(bool_, None, end, pend)?;
+    let hi = b.select(u32t, None, hi_le, end, pend)?;
+    let full_lo = b.i_equal(bool_, None, lo, pstart)?;
+    let full_hi = b.i_equal(bool_, None, hi, pend)?;
+    let full = b.logical_and(bool_, None, full_lo, full_hi)?;
+    let is0 = b.i_equal(bool_, None, lid, c0)?;
+    // The page's bitmap word and bit.
+    let zw = b.shift_right_logical(u32t, None, page, c5)?;
+    let zw64 = b.u_convert(u64t, None, zw)?;
+    let zoff = b.i_mul(u64t, None, zw64, c4_64)?;
+    let za = b.i_add(u64t, None, zk, zoff)?;
+    let zbit = b.bitwise_and(u32t, None, page, c31)?;
+    let one = b.shift_left_logical(u32t, None, c1, zbit)?;
+    // Invocation 0 reads the bit for the workgroup.
+    let (l_r, l_rd) = (b.id(), b.id());
+    b.selection_merge(l_rd, SelectionControl::NONE)?;
+    b.branch_conditional(is0, l_r, l_rd, [])?;
+    b.begin_block(Some(l_r))?;
+    let zp = b.convert_u_to_ptr(p_dev, None, za)?;
+    let word = b.load(u32t, None, zp, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
+    let kb = b.bitwise_and(u32t, None, word, one)?;
+    b.store(known_sh, kb, None, [])?;
+    b.branch(l_rd)?;
+    b.begin_block(Some(l_rd))?;
+    b.control_barrier(scope_wg, scope_wg, sem_sh)?;
+    let kv = b.load(u32t, None, known_sh, None, [])?;
+    let known = b.i_not_equal(bool_, None, kv, c0)?;
+    let fa = b.bitwise_and(u32t, None, flags, c1)?;
+    let audit = b.i_not_equal(bool_, None, fa, c0)?;
+    // A dword of the page this invocation takes (r: its round): whether the
+    // fill covers it, its address in guest memory.
+    let dword = |b: &mut Builder, r: u32| -> Result<(Word, Word), rspirv::dr::Error> {
+        let cr = b.constant_bit32(u32t, r * ZERO_STORE_LOCAL_SIZE);
+        let d = b.i_add(u32t, None, lid, cr)?;
+        let d4 = b.shift_left_logical(u32t, None, d, c2)?;
+        let byte = b.i_add(u32t, None, pstart, d4)?;
+        let ge = b.u_greater_than_equal(bool_, None, byte, lo)?;
+        let lt = b.u_less_than(bool_, None, byte, hi)?;
+        let inside = b.logical_and(bool_, None, ge, lt)?;
+        let rel = b.i_sub(u32t, None, byte, lead)?;
+        let rel64 = b.u_convert(u64t, None, rel)?;
+        let a = b.i_add(u64t, None, dst, rel64)?;
+        Ok((inside, a))
+    };
+    let (l_known, l_store, l_done) = (b.id(), b.id(), b.id());
+    b.selection_merge(l_done, SelectionControl::NONE)?;
+    b.branch_conditional(known, l_known, l_store, [])?;
+    // Known zero: left out (counted; the audit reads the page).
+    b.begin_block(Some(l_known))?;
+    {
+        let (l_a, l_ad) = (b.id(), b.id());
+        b.selection_merge(l_ad, SelectionControl::NONE)?;
+        b.branch_conditional(audit, l_a, l_ad, [])?;
+        b.begin_block(Some(l_a))?;
+        for r in 0..4u32 {
+            let (inside, a) = dword(&mut b, r)?;
+            let (l_i, l_id) = (b.id(), b.id());
+            b.selection_merge(l_id, SelectionControl::NONE)?;
+            b.branch_conditional(inside, l_i, l_id, [])?;
+            b.begin_block(Some(l_i))?;
+            let p = b.convert_u_to_ptr(p_dev, None, a)?;
+            let v = b.load(u32t, None, p, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
+            let nz = b.i_not_equal(bool_, None, v, c0)?;
+            let (l_n, l_nd) = (b.id(), b.id());
+            b.selection_merge(l_nd, SelectionControl::NONE)?;
+            b.branch_conditional(nz, l_n, l_nd, [])?;
+            b.begin_block(Some(l_n))?;
+            let ca = b.i_add(u64t, None, cnt, c8_64)?;
+            let cp = b.convert_u_to_ptr(p_dev, None, ca)?;
+            b.atomic_i_add(u32t, None, cp, scope_dev, sem_none, c1)?;
+            b.branch(l_nd)?;
+            b.begin_block(Some(l_nd))?;
+            b.branch(l_id)?;
+            b.begin_block(Some(l_id))?;
+        }
+        b.branch(l_ad)?;
+        b.begin_block(Some(l_ad))?;
+        let (l_c, l_cd) = (b.id(), b.id());
+        b.selection_merge(l_cd, SelectionControl::NONE)?;
+        b.branch_conditional(is0, l_c, l_cd, [])?;
+        b.begin_block(Some(l_c))?;
+        let ca = b.i_add(u64t, None, cnt, c4_64)?;
+        let cp = b.convert_u_to_ptr(p_dev, None, ca)?;
+        b.atomic_i_add(u32t, None, cp, scope_dev, sem_none, c1)?;
+        b.branch(l_cd)?;
+        b.begin_block(Some(l_cd))?;
+        b.branch(l_done)?;
+    }
+    // Not known zero: the page's part of the fill stored; a whole page gets
+    // its bit.
+    b.begin_block(Some(l_store))?;
+    {
+        for r in 0..4u32 {
+            let (inside, a) = dword(&mut b, r)?;
+            let (l_i, l_id) = (b.id(), b.id());
+            b.selection_merge(l_id, SelectionControl::NONE)?;
+            b.branch_conditional(inside, l_i, l_id, [])?;
+            b.begin_block(Some(l_i))?;
+            let p = b.convert_u_to_ptr(p_dev, None, a)?;
+            b.store(p, c0, Some(spirv::MemoryAccess::ALIGNED), [lit(4)])?;
+            b.branch(l_id)?;
+            b.begin_block(Some(l_id))?;
+        }
+        let (l_c, l_cd) = (b.id(), b.id());
+        b.selection_merge(l_cd, SelectionControl::NONE)?;
+        b.branch_conditional(is0, l_c, l_cd, [])?;
+        b.begin_block(Some(l_c))?;
+        let cp = b.convert_u_to_ptr(p_dev, None, cnt)?;
+        b.atomic_i_add(u32t, None, cp, scope_dev, sem_none, c1)?;
+        let (l_f, l_fd) = (b.id(), b.id());
+        b.selection_merge(l_fd, SelectionControl::NONE)?;
+        b.branch_conditional(full, l_f, l_fd, [])?;
+        b.begin_block(Some(l_f))?;
+        let zp2 = b.convert_u_to_ptr(p_dev, None, za)?;
+        b.atomic_or(u32t, None, zp2, scope_dev, sem_none, one)?;
+        b.branch(l_fd)?;
+        b.begin_block(Some(l_fd))?;
+        b.branch(l_cd)?;
+        b.begin_block(Some(l_cd))?;
+        b.branch(l_done)?;
+    }
+    b.begin_block(Some(l_done))?;
+    b.ret()?;
+    b.end_function()?;
+    b.entry_point(ExecutionModel::GLCompute, f, "main", [lid_v, wid_v]);
+    b.execution_mode(f, ExecutionMode::LocalSize, [ZERO_STORE_LOCAL_SIZE, 1, 1]);
+    Ok(b.module().assemble())
+}
+
 /// A GPU timestamp stored in the title's GPU clock (an end-of-pipe
 /// RELEASE_MEM timestamp performed by the GPU): one invocation reads the
 /// 64-bit timestamp at index `query` of binding 0 (copied from a query pool,
@@ -1442,6 +1707,16 @@ mod tests {
         if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
             let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
             std::fs::write(std::path::Path::new(&dir).join("mirror_gather.spv"), bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn zero_store_kernel_assembles() {
+        let w = super::zero_store();
+        assert_eq!(w[0], 0x0723_0203);
+        if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
+            let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(std::path::Path::new(&dir).join("zero_store.spv"), bytes).unwrap();
         }
     }
 

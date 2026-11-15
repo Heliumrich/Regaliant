@@ -521,11 +521,6 @@ pub struct Via<'a> {
     pub binaries: Option<&'a [super::vk::pbin::Binary]>,
 }
 
-/// Creates the pipeline of `key` (`kind` 'c' compute, 'g' graphics) through
-/// the store: with pipeline binaries on (`vk::pipeline_binaries`), from its
-/// stored binaries when it has them (and they were made from the same code,
-/// `fp`), else made anew with its binaries captured into the store; without
-/// them through its cache file (`with_cache`).
 thread_local! {
     /// What this thread is having the driver compile (`Crumb`): named in the log when the
     /// driver faults inside it (`exception::veh_body`; the driver's compiler crashed so in
@@ -581,6 +576,11 @@ pub fn crumb_report() -> Option<String> {
     })
 }
 
+/// Creates the pipeline of `key` (`kind` 'c' compute, 'g' graphics) through
+/// the store: with pipeline binaries on (`vk::pipeline_binaries`), from its
+/// stored binaries when it has them (and they were made from the same code,
+/// `fp`), else made anew with its binaries captured into the store; without
+/// them through its cache file (`with_cache`).
 pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result<vk::Pipeline, String>) -> Result<vk::Pipeline, String> {
     let Some(pb) = ctx().pbin.as_ref() else {
         return with_cache(kind, key, |cache| create(Via { cache, capture: false, binaries: None }));

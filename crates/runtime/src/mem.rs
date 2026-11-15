@@ -1521,7 +1521,53 @@ pub fn take_written(base: u64, size: u64, out: &mut Vec<u64>, who: usize) -> Opt
     if ww_census_on() && out.len() > first {
         ww_census(&out[first..]);
     }
+    // (Pages found written lose their zero-known bits before the next zero store over them:
+    // the take resets what the store's own query would see.)
+    if out.len() > first {
+        crate::gpu::zk::cpu_written(&out[first..]);
+    }
     r
+}
+
+/// The pages of guest [lo, hi) written since their last take, into `out` (page addresses in
+/// order), resetting nothing (`gpu::zk`: the pages of a zero store the CPU wrote); None where a
+/// query cannot tell (no write watching, section-backed memory, a view window, whose writes
+/// faults tell).
+pub fn written_pages(lo: u64, hi: u64, out: &mut Vec<u64>) -> Option<()> {
+    if !write_watched() || crate::sections::on() || hi <= lo {
+        return None;
+    }
+    let mut addrs = vec![std::ptr::null_mut::<std::ffi::c_void>(); 4096];
+    let mut query = |a: u64, e: u64, out: &mut Vec<u64>| -> Option<()> {
+        let mut at = a;
+        while at < e {
+            let mut count: usize = addrs.len();
+            let mut gran = 0u32;
+            if unsafe { GetWriteWatch(0, at as _, (e - at) as usize, addrs.as_mut_ptr(), &mut count, &mut gran) } != 0 {
+                return None;
+            }
+            out.extend(addrs[..count].iter().map(|&p| p as u64));
+            if count < addrs.len() {
+                break;
+            }
+            at = addrs[count - 1] as u64 + 4096;
+        }
+        Some(())
+    };
+    let (lo, hi) = (lo & !4095, hi.next_multiple_of(4096));
+    if mixed() {
+        for (a, e) in window_pieces(lo, hi) {
+            if view_window(a) {
+                return None;
+            }
+            if mixed_made(a) {
+                query(a, e, out)?;
+            }
+        }
+    } else {
+        query(lo, hi, out)?;
+    }
+    Some(())
 }
 
 /// `DS_WW_CENSUS=1` (diagnosis; docs/FRONTEND3.md, sizing a take per title

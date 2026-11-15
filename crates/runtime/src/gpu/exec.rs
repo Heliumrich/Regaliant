@@ -12234,6 +12234,7 @@ impl Exec {
         for (a, n, hb, off) in parts {
             for (dst, dst_off, ga, len) in guest_pieces(a, n) {
                 unsafe { c.device.cmd_copy_buffer(cmd, hb.buf, dst, &[vk::BufferCopy { src_offset: off + (ga - a), dst_offset: dst_off, size: len }]) };
+                super::zk::clear(cmd, ga, len);
                 super::homes::WRITE_BACK_BYTES.fetch_add(len, Ordering::Relaxed);
             }
             self.slots[self.cur].homes.push(hb);
@@ -12296,6 +12297,7 @@ impl Exec {
         for (a, n, hb, off) in parts {
             for (dst, dst_off, ga, len) in guest_pieces(a, n) {
                 unsafe { c.device.cmd_copy_buffer(cmd, hb.buf, dst, &[vk::BufferCopy { src_offset: off + (ga - a), dst_offset: dst_off, size: len }]) };
+                super::zk::clear(cmd, ga, len);
                 super::homes::WRITE_BACK_BYTES.fetch_add(len, Ordering::Relaxed);
             }
             self.slots[self.cur].homes.push(hb);
@@ -12336,6 +12338,7 @@ impl Exec {
         for (a, n, hb, off) in parts {
             for (dst, dst_off, ga, len) in guest_pieces(a, n) {
                 unsafe { c.device.cmd_copy_buffer(cmd, hb.buf, dst, &[vk::BufferCopy { src_offset: off + (ga - a), dst_offset: dst_off, size: len }]) };
+                super::zk::clear(cmd, ga, len);
                 super::homes::WRITE_BACK_BYTES.fetch_add(len, Ordering::Relaxed);
             }
             self.slots[self.cur].homes.push(hb);
@@ -13855,7 +13858,21 @@ impl Exec {
             self.barrier_wanted = false;
             self.dispatched = false;
         }
-        let store = |x: u64, e: u64| unsafe { ctx().device.cmd_fill_buffer(cmd, buffer, x - start, e - x, v) };
+        // (Zero fills of the render-target pool's memory: pages guest memory holds as zeros
+        // already left out, `zk`; any other store clears the pages' bits.)
+        let zk = v == 0 && super::zk::on() && super::zk::eligible(base, len);
+        let dst0 = if zk { ctx().buffer_address(buffer) } else { 0 };
+        let mut zk_pipe = None;
+        let mut store = |x: u64, e: u64| {
+            if dst0 != 0 {
+                if let Some(p) = super::zk::record_store(cmd, dst0 + (x - start), x, e - x) {
+                    zk_pipe = Some(p);
+                    return;
+                }
+            }
+            unsafe { ctx().device.cmd_fill_buffer(cmd, buffer, x - start, e - x, v) };
+            super::zk::clear(cmd, x, e - x);
+        };
         match guest {
             Some(parts) => {
                 for &(x, e) in parts {
@@ -13867,6 +13884,12 @@ impl Exec {
                 }
             }
             None => store(base, base + len),
+        }
+        if let Some(p) = zk_pipe {
+            // The next dispatch binds its own pipeline and descriptors.
+            self.dyncache.cs_pipeline = p;
+        } else if v == 0 && len >= FILL_SKIP_MIN {
+            super::zk::note_plain();
         }
         // (`DS_PROFILE_GPU_STAMPS=seg`: the guest and the mirror parts timed apart, as
         // barrier-only segments by their sites.)
@@ -15015,6 +15038,8 @@ impl Exec {
             if let Some((m, off)) = fe2_mirror {
                 unsafe { ctx().device.cmd_update_buffer(cmd, m, off, &raw) };
             }
+            // (Guest memory's copy written: its zero-known bits cleared where set.)
+            super::zk::clear(cmd, a, bytes);
         };
         self.taint_resident(a, bytes);
         if end_of_pipe {

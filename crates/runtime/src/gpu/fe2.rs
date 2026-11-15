@@ -4040,9 +4040,9 @@ fn make_scatter(marks: vk::Buffer, marks_c: Option<vk::Buffer>) -> Result<Scatte
             .collect();
         let set_layout = c.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).map_err(|e| format!("scatter set layout: {e}"))?;
         let layouts = [set_layout];
-        // (32 bytes: the mirror's and the table's addresses; the rest
-        // unused.)
-        let ranges = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 32 }];
+        // (40 bytes: the mirror's and the table's addresses, the variants'
+        // own, the zero-known bitmap's at 32.)
+        let ranges = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 40 }];
         let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(&ranges), None).map_err(|e| format!("scatter layout: {e}"))?;
         // (The kernel empties the touched-page list itself; `DS_WB_BUCKETS`
         // also counts by bucket.)
@@ -4207,6 +4207,8 @@ static HASH_CLEAR: AtomicU32 = AtomicU32::new(0);
 /// before each family's next write-back (an upload may not precede GPU work
 /// that only writes there).
 pub fn hash_clear_range(base: u64, len: u64) {
+    // (The zero-known bits too: guest memory's copy may be other than zeros.)
+    super::zk::cpu_dirty_range(base, len);
     if HASHES.get().is_none() || len == 0 {
         return;
     }
@@ -4959,7 +4961,10 @@ pub fn record_scatter_at(cmd: vk::CommandBuffer, on_c: bool, site: u8) -> Option
             }
         }
     }
-    let pc: Vec<u8> = [m as u32, (m >> 32) as u32, t as u32, (t >> 32) as u32, h as u32, (h >> 32) as u32, other as u32, (other >> 32) as u32].iter().flat_map(|x| x.to_le_bytes()).collect();
+    // (The zero-known bitmap at 8-9: the kernel clears the bits of the pages it lists, with
+    // `tune zk` off too, so that the bits stay true when it is switched on again.)
+    let zk = super::zk::address();
+    let pc: Vec<u8> = [m as u32, (m >> 32) as u32, t as u32, (t >> 32) as u32, h as u32, (h >> 32) as u32, other as u32, (other >> 32) as u32, zk as u32, (zk >> 32) as u32].iter().flat_map(|x| x.to_le_bytes()).collect();
     let pipeline = s.pipeline;
     unsafe {
         let all = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
@@ -5201,6 +5206,7 @@ pub fn init() {
     match make_scatter(marks, super::resident::marks_for(true)) {
         Ok(s) => {
             let _ = SCATTER.set(s);
+            super::zk::init();
         }
         Err(e) => {
             crate::error!("fe2: write-back kernel: {e}; front end 2 off");
@@ -6930,6 +6936,10 @@ fn c4_release_pages(pages: &[u64]) -> Result<(), String> {
         }
         for (buf, regions) in &by_buf {
             c.device.cmd_copy_buffer(cmd, mbuf, *buf, regions);
+        }
+        // (Guest memory's copies of the pages change: their zero-known bits cleared.)
+        for &p in pages.iter() {
+            super::zk::clear(cmd, p, PAGE);
         }
         if let Some((sbuf, _, _)) = &staged {
             let regions: Vec<vk::BufferCopy> = cpu.iter().enumerate().map(|(j, &i)| vk::BufferCopy { src_offset: pages[i] - MIRROR_BASE, dst_offset: j as u64 * PAGE, size: PAGE }).collect();

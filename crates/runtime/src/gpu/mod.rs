@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 176] = [
+    static ALL: [Tunable; 177] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -208,6 +208,7 @@ pub mod tune {
         Tunable { name: "past_repair", env: "DS_PAST_REPAIR", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "held_min", env: "DS_HELD_MIN", default: 192, value: AtomicU64::new(UNSET) },
         Tunable { name: "async_gfx_inline", env: "DS_ASYNC_GFX_INLINE", default: 12, value: AtomicU64::new(UNSET) },
+        Tunable { name: "zk", env: "DS_ZK", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1430,6 +1431,13 @@ pub mod tune {
         get(175)
     }
 
+    /// Zero fills' stores into guest memory left out where guest memory holds zeros already
+    /// (`gpu::zk`; off with the ordered compute queue on, whose batches would order the bitmap's
+    /// writes apart).
+    pub fn zk() -> bool {
+        get(176) != 0 && async_compute() == 0
+    }
+
     /// Whether translations get `rdna::translate::Spec::hw_bounds` (scalar
     /// loads of buffers only they read without a check of each dword): where
     /// robustBufferAccess2 and null descriptors are enabled (since 2026-11-12
@@ -2017,6 +2025,7 @@ pub mod par;
 pub mod prio;
 pub mod precache;
 pub mod fe2;
+pub mod zk;
 pub mod kco;
 pub mod fe2census;
 pub mod precompile;
@@ -3565,5 +3574,6 @@ pub fn status_ex(with_stacks: bool) -> String {
     s.push_str(&gpures::status());
     s.push_str(&profile_summary());
     s.push_str(&exec::shader_profile());
+    s.push_str(&zk::status_line());
     s
 }
