@@ -157,6 +157,14 @@ fn vblank_thread() {
     let mut next = Instant::now() + period;
     let mut last_flip = Instant::now();
     let mut last_cap = 0;
+    // Locked to the display (`displayclock::lock`): the title's vblank just after every Nth of
+    // the display's (the frame flipped then is presented at once and shown at the next refresh,
+    // so each frame stays N refreshes), the display's vblank it ticks at next, and N (0: the
+    // thread's own timer). Not while uncapped or at a diagnosis rate.
+    const LOCK_DELAY: Duration = Duration::from_micros(300);
+    let mut lock_target: u64 = 0;
+    let mut locked_n: u32 = 0;
+    crate::displayclock::start();
     loop {
         // The PC settings' console variables (changed values, objects the title builds later).
         crate::input::motion_tick();
@@ -173,6 +181,28 @@ fn vblank_thread() {
             next = Instant::now() + period;
             crate::info!("vblank at {:.2} Hz ({})", 1.0 / period.as_secs_f64(), if period == uncapped_period { "the frame rate uncapped" } else { "the frame rate capped at the vblanks" });
         }
+        let lock = if hz.is_none() && period != uncapped_period { crate::displayclock::lock() } else { None };
+        match lock {
+            Some((n, s)) => {
+                if locked_n != n {
+                    crate::info!("vblank locked to the display: at every {n} of its vblanks ({:.3} Hz measured)", 1.0 / s.period.as_secs_f64());
+                    crate::displayclock::LOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    locked_n = n;
+                    lock_target = 0;
+                }
+                // (At the start, or behind by two steps or more: the display's next vblank.)
+                if lock_target == 0 || lock_target + 2 * n as u64 <= s.count {
+                    lock_target = s.count + 1;
+                }
+                next = s.last + s.period * lock_target.saturating_sub(s.count) as u32 + LOCK_DELAY;
+            }
+            None if locked_n != 0 => {
+                crate::info!("vblank on its own timer again ({:.2} Hz)", 1.0 / period.as_secs_f64());
+                locked_n = 0;
+                next = Instant::now() + period;
+            }
+            None => {}
+        }
         let now = Instant::now();
         let wake = if grid { next } else { next.min(now + FLIP_TICK) };
         if wake > now {
@@ -181,7 +211,13 @@ fn vblank_thread() {
         let now = Instant::now();
         let tick = now >= next;
         if tick {
-            next += period;
+            if locked_n != 0 {
+                lock_target += locked_n as u64;
+                // (Recomputed from the display's vblanks at the next pass.)
+                next = now + period;
+            } else {
+                next += period;
+            }
             // Uncapped, a vblank thread held up (the presenter waiting for the display) skips
             // the vblanks it missed instead of ticking them in a burst.
             if period == uncapped_period && next < now {
@@ -255,6 +291,7 @@ fn vblank_thread() {
             }
             maybe_screenshot(&b, n);
             crate::gpu::vk::framewatch::SHOWN_FLIP.store(n as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::displayclock::note_present();
             present_buffer(&b);
         }
     }

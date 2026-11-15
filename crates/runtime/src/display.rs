@@ -62,6 +62,10 @@ pub fn wanted_mode(device: &str) -> Option<Mode> {
     }
     let rate = if hz != 0 {
         at.iter().min_by_key(|m| (m.hz as i64 - hz as i64).abs()).map(|m| m.hz)
+    } else if let Some(r) = paced_rate(&at) {
+        // (Automatic with the frame rate limited (60 or 30): a rate that shows each frame for
+        // the same number of refreshes, which the vblank then follows (`displayclock`).)
+        Some(r)
     } else if (w, h) == (desk.w, desk.h) {
         Some(desk.hz)
     } else {
@@ -69,6 +73,18 @@ pub fn wanted_mode(device: &str) -> Option<Mode> {
     }?;
     let m = Mode { w, h, hz: rate };
     (m != desk).then_some(m)
+}
+
+/// Automatic refresh with the frame rate limited (the PC tab's 60 or 30 FPS, not Uncapped): the
+/// highest of the rates `at` that is a whole multiple of 60 Hz (59, 60, 119, 120, 239, 240:
+/// within 2%), so every frame is shown the same number of refreshes; None when there is none
+/// (or uncapped: the highest rate serves). On a 165 Hz screen 60 fps frames alternate 2 and 3
+/// refreshes (the user, 2026-11-15: "near 60 it didn't feel all that smooth"); at 120 each is 2.
+fn paced_rate(at: &[Mode]) -> Option<u32> {
+    if crate::gpu::tune::uncapped() {
+        return None;
+    }
+    at.iter().map(|m| m.hz).filter(|&r| r >= 59 && ((r as f64 / 60.0) - (r as f64 / 60.0).round()).abs() < 0.02).max()
 }
 
 /// Sets `device` to `mode` for exclusive fullscreen (until `restore`); false when Windows

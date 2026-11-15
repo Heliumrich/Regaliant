@@ -357,6 +357,12 @@ pub fn apply() {
         crate::gpu::tune::set_default("frame_cap", if limit == 0 { 30 } else { 0 });
         crate::gpu::tune::set_default("uncapped", (limit == 2) as u64);
         crate::info!("pc settings: Frame Rate Limit {}", ["30 FPS", "60 FPS", "Uncapped"][limit as usize]);
+        // (In exclusive fullscreen at the Automatic refresh rate the mode follows the limit:
+        // a whole multiple of 60 Hz while limited, the highest rate uncapped: `display`.)
+        let uncapped_changed = if was == u32::MAX { limit == 2 } else { (was == 2) != (limit == 2) };
+        if uncapped_changed && crate::gpu::vk::window::window_mode() == 2 {
+            crate::gpu::vk::window::reapply_mode();
+        }
     }
     UI_SIZE.store(UI_SIZES.get(get("UiSize").unwrap_or(0) as usize).copied().unwrap_or(100), std::sync::atomic::Ordering::Relaxed);
     // Option 0: the title's own render size (0); 1-9 the percentages.

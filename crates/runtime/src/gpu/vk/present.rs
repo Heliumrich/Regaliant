@@ -55,6 +55,96 @@ struct Presenter {
     watch_failed: bool,
     /// The system text box drawn over the frame (`crate::textbox`), made on first use.
     text_box: Option<TextBox>,
+    /// The last present's id on this swapchain (`DS_PRESENT_STATS=1`: `waiter`).
+    present_id: u64,
+}
+
+/// On-screen frame times (`DS_PRESENT_STATS=1`): each present's id goes to a thread that waits
+/// until it is shown and counts how many of the display's refreshes each frame stayed. The
+/// swapchain is not destroyed while it waits (`PW_LOCK`, and `PW_GEN` drops older waits).
+static PW_LOCK: Mutex<()> = Mutex::new(());
+static PW_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PW_TX: Mutex<Option<std::sync::mpsc::Sender<(u64, u64, u64)>>> = Mutex::new(None);
+/// Frames by refreshes shown (1 to 7, 8 and more), all intervals and those over 25 ms.
+static PW_STATS: Mutex<([u64; 9], u64, u64)> = Mutex::new(([0; 9], 0, 0));
+
+fn present_waiter(rx: std::sync::mpsc::Receiver<(u64, u64, u64)>) {
+    crate::log::set_thread_name("present-wait");
+    let c = ctx();
+    let pw = ash::khr::present_wait::Device::new(&c.instance, &c.device);
+    let mut prev: Option<std::time::Instant> = None;
+    let mut missed = 0u32;
+    while let Ok(first) = rx.recv() {
+        // (Behind, after a wait that timed out: only the newest present is waited for.)
+        let (mut generation, mut sc, mut id) = first;
+        while let Ok(m) = rx.try_recv() {
+            (generation, sc, id) = m;
+            prev = None;
+        }
+        let start = std::time::Instant::now();
+        loop {
+            let g = PW_LOCK.lock();
+            if PW_GEN.load(std::sync::atomic::Ordering::Relaxed) != generation {
+                prev = None;
+                break;
+            }
+            use ash::vk::Handle;
+            let r = unsafe { pw.wait_for_present(vk::SwapchainKHR::from_raw(sc), id, 20_000_000) };
+            drop(g);
+            match r {
+                Ok(()) => {
+                    let now = std::time::Instant::now();
+                    if let Some(p) = prev {
+                        let gap = now.duration_since(p).as_secs_f64();
+                        let refresh = crate::displayclock::snapshot().map_or(1.0 / 60.0, |s| s.period.as_secs_f64());
+                        let n = ((gap / refresh).round() as usize).clamp(1, 8);
+                        let mut s = PW_STATS.lock();
+                        s.0[n] += 1;
+                        s.1 += 1;
+                        s.2 += (gap > 0.025) as u64;
+                    }
+                    prev = Some(now);
+                    break;
+                }
+                Err(vk::Result::TIMEOUT) if start.elapsed() < std::time::Duration::from_secs(1) => continue,
+                r => {
+                    // (A window covered by others: its presents may never be shown.)
+                    missed += 1;
+                    if missed <= 3 {
+                        crate::warn!("present waits: present {id} not shown within a second ({r:?}){}", if missed == 3 { "; not logged again" } else { "" });
+                    }
+                    prev = None;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// The on-screen counts afresh (`profile reset`).
+pub fn reset_stats() {
+    *PW_STATS.lock() = ([0; 9], 0, 0);
+}
+
+/// Status: the frames shown and for how many refreshes each stayed (`DS_PRESENT_STATS=1`).
+pub fn stats_line() -> String {
+    let s = PW_STATS.lock();
+    if s.1 == 0 {
+        return String::new();
+    }
+    let pct = |n: u64| 100.0 * n as f64 / s.1 as f64;
+    let refresh = crate::displayclock::snapshot().map_or(1000.0 / 60.0, |x| x.period.as_secs_f64() * 1e3);
+    format!(
+        "    on screen (present waits): {} frame intervals; shown 1 refresh {:.1}%, 2 {:.1}%, 3 {:.1}%, 4 {:.1}%, 5+ {:.1}% (a refresh {:.2} ms); over 25 ms {}\n",
+        s.1,
+        pct(s.0[1]),
+        pct(s.0[2]),
+        pct(s.0[3]),
+        pct(s.0[4]),
+        pct(s.0[5..].iter().sum()),
+        refresh,
+        s.2
+    )
 }
 
 /// The system text box's image (BGRA8 UNORM), its staging buffers (one per presenter slot) and
@@ -307,12 +397,16 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
                 let q = c.queue.lock();
                 c.device.queue_wait_idle(*q).ok();
             }
+            // (No present wait on it meanwhile, and none after: `present_waiter`.)
+            let _pw = PW_LOCK.lock();
+            PW_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             c.swapchain_d.destroy_swapchain(old, None);
             for s in p.done.drain(..) {
                 c.device.destroy_semaphore(s, None);
             }
         }
         p.swapchain = sc;
+        p.present_id = 0;
         p.hdr = fmt.color_space == vk::ColorSpaceKHR::HDR10_ST2084_EXT;
         if p.hdr {
             if let Some(m) = c.hdr_metadata.as_ref() {
@@ -400,6 +494,7 @@ pub fn init(title: &str) -> Result<(), String> {
             watch: None,
             watch_failed: false,
             text_box: None,
+            present_id: 0,
         };
         super::framewatch::init_from_env();
         create_swapchain(&mut p)?;
@@ -631,7 +726,17 @@ pub fn present(src: Source) -> bool {
         let scs = [p.swapchain];
         let idxs = [idx];
         let waits = [done];
-        let pi = vk::PresentInfoKHR::default().wait_semaphores(&waits).swapchains(&scs).image_indices(&idxs);
+        // (`DS_PRESENT_STATS=1`: the present's id for `present_waiter`.)
+        let pw = super::PRESENT_WAIT.load(std::sync::atomic::Ordering::Relaxed);
+        if pw {
+            p.present_id += 1;
+        }
+        let ids = [p.present_id];
+        let mut pid = vk::PresentIdKHR::default().present_ids(&ids);
+        let mut pi = vk::PresentInfoKHR::default().wait_semaphores(&waits).swapchains(&scs).image_indices(&idxs);
+        if pw {
+            pi = pi.push_next(&mut pid);
+        }
         let q = c.queue.lock();
         // (Through Streamline's present once DLSS runs: its per-frame bookkeeping.)
         let presented = match crate::gpu::upscale::present_hook() {
@@ -642,6 +747,19 @@ pub fn present(src: Source) -> bool {
             },
             None => c.swapchain_d.queue_present(*q, &pi),
         };
+        drop(q);
+        if pw && presented.is_ok() {
+            use ash::vk::Handle;
+            let mut tx = PW_TX.lock();
+            if tx.is_none() {
+                let (s, r) = std::sync::mpsc::channel();
+                std::thread::Builder::new().name("present-wait".into()).spawn(move || present_waiter(r)).ok();
+                *tx = Some(s);
+            }
+            if let Some(s) = tx.as_ref() {
+                s.send((PW_GEN.load(std::sync::atomic::Ordering::Relaxed), p.swapchain.as_raw(), p.present_id)).ok();
+            }
+        }
         match presented {
             Ok(false) => {}
             Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => window::RESIZED.store(true, std::sync::atomic::Ordering::SeqCst),

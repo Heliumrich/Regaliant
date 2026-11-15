@@ -196,6 +196,8 @@ pub fn name_object<H: vk::Handle>(handle: H, name: &str) {
 
 /// The device takes the mirror-once sampler address mode (`samplerMirrorClampToEdge`, enabled).
 static MIRROR_CLAMP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The device waits for presents (`DS_PRESENT_STATS=1`: VK_KHR_present_id and present_wait).
+pub static PRESENT_WAIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether samplers may use `MIRROR_CLAMP_TO_EDGE` (`Images::sampler`).
 pub fn mirror_clamp() -> bool {
@@ -401,6 +403,25 @@ fn init_inner() -> Result<(), String> {
         if has_fse {
             dexts.push(ash::ext::full_screen_exclusive::NAME.as_ptr());
         }
+        // On-screen frame times (`DS_PRESENT_STATS=1`, diagnosis): each present's id waited for
+        // until it is shown (VK_KHR_present_id, VK_KHR_present_wait; `present::stats_line`).
+        let has_pw = std::env::var("DS_PRESENT_STATS").ok().as_deref() == Some("1") && dev_has(ash::khr::present_id::NAME) && dev_has(ash::khr::present_wait::NAME) && {
+            let mut a = vk::PhysicalDevicePresentIdFeaturesKHR::default();
+            let mut b = vk::PhysicalDevicePresentWaitFeaturesKHR::default();
+            let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut a).push_next(&mut b);
+            instance.get_physical_device_features2(pdev, &mut f2);
+            a.present_id != 0 && b.present_wait != 0
+        };
+        if has_pw {
+            dexts.push(ash::khr::present_id::NAME.as_ptr());
+            dexts.push(ash::khr::present_wait::NAME.as_ptr());
+        }
+        PRESENT_WAIT.store(has_pw, std::sync::atomic::Ordering::Relaxed);
+        if std::env::var("DS_PRESENT_STATS").ok().as_deref() == Some("1") {
+            crate::info!("present waits (DS_PRESENT_STATS=1): {}", if has_pw { "on" } else { "the device has no present id or present wait" });
+        }
+        let mut pid_f = vk::PhysicalDevicePresentIdFeaturesKHR::default().present_id(true);
+        let mut pw_f = vk::PhysicalDevicePresentWaitFeaturesKHR::default().present_wait(true);
         let has_hdr_meta = colorspaces && dev_has(ash::ext::hdr_metadata::NAME);
         if has_hdr_meta {
             dexts.push(ash::ext::hdr_metadata::NAME.as_ptr());
@@ -716,6 +737,9 @@ fn init_inner() -> Result<(), String> {
         }
         if has_robust2 {
             dci = dci.push_next(&mut r2);
+        }
+        if has_pw {
+            dci = dci.push_next(&mut pid_f).push_next(&mut pw_f);
         }
         if barycentric {
             dci = dci.push_next(&mut bary);

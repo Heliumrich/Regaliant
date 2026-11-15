@@ -32,6 +32,7 @@ mod jobidle;
 mod camhook;
 mod dispmode;
 mod display;
+mod displayclock;
 mod jitter;
 mod engine;
 mod thread;
@@ -1501,6 +1502,8 @@ fn thread_summary_ex(with_stacks: bool) -> String {
         }
     }
     s.push_str(&gpu::status_ex(with_stacks));
+    s.push_str(&displayclock::status_line());
+    s.push_str(&gpu::vk::present::stats_line());
     s.push_str(&audio::status());
     s.push_str(&hle::libs::audio2::status());
     s.push_str(&hle::libs::ajm::status());

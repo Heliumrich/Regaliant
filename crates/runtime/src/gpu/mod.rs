@@ -3296,6 +3296,8 @@ pub fn start_profiler() {
 
 /// Clears the samples and dispatch timings (`profile reset` control command).
 pub fn reset_profile() {
+    crate::displayclock::reset_cadence();
+    vk::present::reset_stats();
     slotcensus::reset();
     cp::reset_classes();
     exec::wb_census_reset();
@@ -3410,6 +3412,8 @@ pub fn profile_report() -> String {
     s.push_str(&shaders::fmt_line());
     s.push_str(&vk::framewatch::line());
     s.push_str(&crate::pcsettings::pointer::direct_line());
+    s.push_str(&crate::displayclock::status_line());
+    s.push_str(&vk::present::stats_line());
     s.push_str(&exec::import_window_line());
     s.push_str(&crate::mem::host_calls_line());
     s.push_str(&xwait::status());
