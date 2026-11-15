@@ -3180,6 +3180,8 @@ thread_local! {
     static LOCAL_STORE_FORMATS: std::cell::RefCell<super::fx::Map<u64, u64>> = std::cell::RefCell::new(super::fx::Map::default());
     /// `d3_resources` per plan.
     static LOCAL_DIM3: std::cell::RefCell<super::fx::Map<u64, u64>> = std::cell::RefCell::new(super::fx::Map::default());
+    /// `d2_resources` per plan.
+    static LOCAL_DIM2: std::cell::RefCell<super::fx::Map<u64, (u64, u64)>> = std::cell::RefCell::new(super::fx::Map::default());
 }
 
 /// The resources of `plan` whose V# format and swizzle the translation
@@ -3230,6 +3232,7 @@ pub(crate) fn format_store_resources(insts: &[rdna::Inst], plan: &Plan) -> u64 {
 pub(crate) fn key_learned(code: u64, insts: &[rdna::Inst], plan: &Plan, resources: &mut [ResSpec]) {
     let stored = format_store_resources(insts, plan);
     let d3 = d3_resources(insts, plan);
+    let (only2d, only2da) = if dim_by_instructions() { d2_resources(insts, plan) } else { (0, 0) };
     for (i, r) in resources.iter_mut().enumerate() {
         match *r {
             // (A program's one format kept, as preparations keep it:
@@ -3242,9 +3245,47 @@ pub(crate) fn key_learned(code: u64, insts: &[rdna::Inst], plan: &Plan, resource
             ResSpec::Image { dim: ImageDim::D2 | ImageDim::D3, class, depth } if i < 64 && d3 & (1 << i) != 0 && plan.resources.get(i).is_some_and(|x| x.kind == ResKind::Image && !x.written) => {
                 *r = ResSpec::Image { dim: ImageDim::D3OrD2, class, depth };
             }
+            // (2D and 2D arrays by the instructions' dimension, `d2_resources`.)
+            ResSpec::Image { dim: ImageDim::D2 | ImageDim::D2Array, class, depth } if i < 64 && (only2d | only2da) & (1 << i) != 0 && plan.resources.get(i).is_some_and(|x| x.kind == ResKind::Image && !x.written) => {
+                let dim = if only2da & (1 << i) != 0 { ImageDim::D2Array } else { ImageDim::D2 };
+                *r = ResSpec::Image { dim, class, depth };
+            }
             _ => {}
         }
     }
+}
+
+/// The resources of `plan` its image instructions address only as 2D, and those they address
+/// only as 2D arrays (their DIM fields; a bit per resource, none past 64). A compute program's
+/// sampled or loaded image is keyed by that dimension whatever the T# binds of the two
+/// (`dim_by_instructions`): the hardware reads a 2D texture's only slice for a 2D-array
+/// address and an array's base slice for a 2D one, as a 1-layer array view and a 2D view of the
+/// base slice do, so one translation serves both (2026-11-15 night: the fog scatter's resource
+/// 11, 2D-array-addressed, came bound as 2D and as a 2D array: two keys, 1.1-2.0 s compiles).
+pub(crate) fn d2_resources(insts: &[rdna::Inst], plan: &Plan) -> (u64, u64) {
+    let (mut d2, mut d2a, mut other) = (0u64, 0u64, 0u64);
+    for i in insts {
+        if i.enc != rdna::Enc::Mimg {
+            continue;
+        }
+        if let Some(&(r, _)) = plan.inst_res.get(&i.pc) {
+            if r < 64 {
+                match i.mimg_dim() {
+                    1 => d2 |= 1 << r,
+                    5 => d2a |= 1 << r,
+                    _ => other |= 1 << r,
+                }
+            }
+        }
+    }
+    (d2 & !d2a & !other, d2a & !d2 & !other)
+}
+
+/// Whether compute images bound as 2D or 2D arrays are keyed by their instructions'
+/// dimension (`d2_resources`; `DS_IMG_DIM_INST=0`: by the T#'s type, as before 2026-11-15).
+pub(crate) fn dim_by_instructions() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_IMG_DIM_INST").ok().as_deref() != Some("0"))
 }
 
 /// The resources of `plan` its image instructions address as 3D (their DIM
@@ -3585,15 +3626,17 @@ pub(crate) fn guess_compute_spec(addr: u64, insts: &[rdna::Inst], plan: &Plan, c
 /// 341 learned specs, its 2D-array instructions on 2D textures in 309, compared images bound
 /// with colour textures). The guess with every cube image as a cube array, with every 2D array as
 /// 2D, and with both; each of those and the guess also with every depth view a colour view.
-pub(crate) fn guess_dim_variants(guess: &Spec) -> Vec<Spec> {
-    let has = |d: ImageDim| guess.resources.iter().any(|r| matches!(r, ResSpec::Image { dim, .. } if *dim == d));
+pub(crate) fn guess_dim_variants(guess: &Spec, keyed2d: u64) -> Vec<Spec> {
+    // (2D arrays the dispatches key by their instructions, `keyed2d`, are not flipped.)
+    let flippable = |i: usize| i >= 64 || keyed2d & (1 << i) == 0;
+    let has = |d: ImageDim| guess.resources.iter().enumerate().any(|(i, r)| matches!(r, ResSpec::Image { dim, .. } if *dim == d && (d != ImageDim::D2Array || flippable(i))));
     let flip = |cube: bool, array: bool| {
         let mut s = guess.clone();
-        for r in s.resources.iter_mut() {
+        for (i, r) in s.resources.iter_mut().enumerate() {
             if let ResSpec::Image { dim, .. } = r {
                 if cube && *dim == ImageDim::Cube {
                     *dim = ImageDim::CubeArray;
-                } else if array && *dim == ImageDim::D2Array {
+                } else if array && *dim == ImageDim::D2Array && flippable(i) {
                     *dim = ImageDim::D2;
                 }
             }
@@ -3611,19 +3654,27 @@ pub(crate) fn guess_dim_variants(guess: &Spec) -> Vec<Spec> {
     if cube && array {
         v.push(flip(true, true));
     }
-    // Each also with every depth view as a colour view (a compared image the title binds with a
-    // colour texture: the report's depth-view differences, 141 more specs).
-    if guess.resources.iter().any(|r| matches!(r, ResSpec::Image { depth: true, .. })) {
+    // Each also with its compared images' depth views as colour views (a compared image the
+    // title binds with a colour texture: the report's depth-view differences, 141 more specs):
+    // every combination of up to three of them (the fog scatter's three shadow textures came in
+    // three of their eight, 2026-11-15 night), else all of them at once.
+    let compared: Vec<usize> = guess.resources.iter().enumerate().filter(|(_, r)| matches!(r, ResSpec::Image { depth: true, .. })).map(|(i, _)| i).collect();
+    if !compared.is_empty() {
         let mut all = vec![guess.clone()];
         all.extend(v.iter().cloned());
+        let masks: Vec<u32> = if compared.len() <= 3 { (1..(1u32 << compared.len())).collect() } else { vec![(1u32 << compared.len().min(31)) - 1] };
         for s in all {
-            let mut s = s.clone();
-            for r in s.resources.iter_mut() {
-                if let ResSpec::Image { depth, .. } = r {
-                    *depth = false;
+            for &m in &masks {
+                let mut s = s.clone();
+                for (k, &i) in compared.iter().enumerate() {
+                    if m & (1 << k.min(31)) != 0 {
+                        if let Some(ResSpec::Image { depth, .. }) = s.resources.get_mut(i) {
+                            *depth = false;
+                        }
+                    }
                 }
+                v.push(s);
             }
-            v.push(s);
         }
     }
     v
@@ -3931,6 +3982,8 @@ struct PlanRec {
     fmt: Option<u64>,
     store_fmt: Option<u64>,
     dim3: Option<u64>,
+    /// `d2_resources` (2D-addressed, 2D-array-addressed).
+    dim2: Option<(u64, u64)>,
     cmp: Option<u64>,
     last_tr: Option<Arc<Local<Translated>>>,
     /// The stage template number `last_tr`'s spec came from (0: unknown).
@@ -4149,6 +4202,24 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
                         != 0
                 {
                     ImageDim::D3OrD2
+                } else {
+                    dim
+                };
+                // (Compute: a sampled or loaded 2D or 2D-array texture keyed by the dimension
+                // its instructions address, `d2_resources`; the binding's view follows the key.)
+                let dim = if spec.stage == Stage::Compute && matches!(dim, ImageDim::D2 | ImageDim::D2Array) && !res.written && dim_by_instructions() {
+                    let (only2d, only2da) = match rec.get_mut() {
+                        Some(r) => *r.dim2.get_or_insert_with(|| LOCAL_DIM2.with(|c| *c.borrow_mut().entry(plan_key).or_insert_with(|| d2_resources(&insts, &plan)))),
+                        None => LOCAL_DIM2.with(|c| *c.borrow_mut().entry(plan_key).or_insert_with(|| d2_resources(&insts, &plan))),
+                    };
+                    let bit = 1u64 << i.min(63);
+                    if only2da & bit != 0 {
+                        ImageDim::D2Array
+                    } else if only2d & bit != 0 {
+                        ImageDim::D2
+                    } else {
+                        dim
+                    }
                 } else {
                     dim
                 };

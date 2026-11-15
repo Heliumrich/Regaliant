@@ -229,7 +229,7 @@ fn guess_report(app: &std::path::Path) -> i32 {
                 };
                 if norm(&g) == actual {
                     var_equal[1] += 1;
-                } else if super::shaders::guess_dim_variants(&g).iter().any(|v| norm(v) == actual) {
+                } else if super::shaders::guess_dim_variants(&g, if super::shaders::dim_by_instructions() { let (a, b) = super::shaders::d2_resources(&insts, &plan); a | b } else { 0 }).iter().any(|v| norm(v) == actual) {
                     var_equal[0] += 1;
                 } else if g.resources.len() == actual.resources.len() {
                     // Upper bounds: the guess with every image's dimension as learned, then also
@@ -360,8 +360,10 @@ const FINGERPRINT_SAMPLE: u64 = 509;
 /// programs' image-dimension variants, `shaders::guess_dim_variants`, 2026-11-13; 4: their
 /// depth-view variants too, 2026-11-13; 5: specs as a hosted session makes them,
 /// `fe2::specs_as_hosted`, 2026-11-13; 6: the materials' shader bundles too, 2026-11-13; 7:
-/// written 3D images as 2D, `shaders::guess_d3_variant`, 2026-11-13).
-const PREPARATION_RULES: u32 = 7;
+/// written 3D images as 2D, `shaders::guess_d3_variant`, 2026-11-13; 8: compute images bound
+/// 2D or as 2D arrays keyed by their instructions' dimension, `shaders::d2_resources`, and every
+/// combination of up to three compared images' depth views, 2026-11-15).
+const PREPARATION_RULES: u32 = 8;
 
 /// The translation fingerprint of the prepared shaders: a sample of the game's compute
 /// programs (`FINGERPRINT_SAMPLE`) translated as `precompile_all` translates them, their
@@ -445,7 +447,14 @@ fn bundle_compute_sampled(app: &std::path::Path, sample: u64) -> Vec<(u64, std::
             // (The guess first; the engine's image-dimension variants after it.)
             let mut specs = vec![spec];
             if engine {
-                specs.extend(super::shaders::guess_dim_variants(&specs[0]));
+                // (2D arrays the dispatches key by their instructions are not flipped to 2D.)
+                let keyed2d = if super::shaders::dim_by_instructions() {
+                    let (a, b) = super::shaders::d2_resources(&insts, &plan);
+                    a | b
+                } else {
+                    0
+                };
+                specs.extend(super::shaders::guess_dim_variants(&specs[0], keyed2d));
                 variants += specs.len() as u64 - 1;
             }
             if let Some(v) = super::shaders::guess_d3_variant(&specs[0]) {

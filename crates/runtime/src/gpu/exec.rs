@@ -17093,7 +17093,14 @@ impl Exec {
                     }
                     (BindingKind::Image(_) | BindingKind::ImageAlt(_) | BindingKind::StorageImage(_), Some(Resolved::Image(t))) => {
                         let storage = matches!(b.kind, BindingKind::StorageImage(_));
-                        let (view, image) = im.view(t, storage, frame)?;
+                        // (A translation keyed by its instructions' dimension, `shaders::d2_resources`:
+                        // the view its variable takes.)
+                        let want = match b.kind_resource().and_then(|i| found.tr.spec.resources.get(i)) {
+                            Some(rdna::translate::ResSpec::Image { dim: rdna::translate::ImageDim::D2Array, .. }) if t.ty == 9 => Some(vk::ImageViewType::TYPE_2D_ARRAY),
+                            Some(rdna::translate::ResSpec::Image { dim: rdna::translate::ImageDim::D2, .. }) if t.ty == 13 => Some(vk::ImageViewType::TYPE_2D),
+                            _ => None,
+                        };
+                        let (view, image) = im.view_as(t, storage, frame, want)?;
                         let ty = if storage { vk::DescriptorType::STORAGE_IMAGE } else { vk::DescriptorType::SAMPLED_IMAGE };
                         bound.imgs.push((b.binding, ty, vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL }));
                         bound.images.push(image);

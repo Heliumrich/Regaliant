@@ -573,6 +573,8 @@ pub fn texel_bytes(f: vk::Format) -> u32 {
 /// GPU-owned images cleared right after a zero fill of their memory
 /// (`Images::zero_filled`).
 pub static ZERO_FILL_CLEARS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// `Images::keyed_views`.
+static KEYED_VIEWS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 pub fn is_depth(f: vk::Format) -> bool {
     matches!(f, vk::Format::D16_UNORM | vk::Format::D32_SFLOAT | vk::Format::D32_SFLOAT_S8_UINT | vk::Format::D16_UNORM_S8_UINT | vk::Format::D24_UNORM_S8_UINT | vk::Format::S8_UINT)
@@ -5947,9 +5949,26 @@ impl Images {
     }
 
     /// View of a T# (format, type, levels/layers, swizzle) for sampling or storage.
+    /// Bindings of a view in its translation's dimension, not the T#'s (`view_as`): [2D textures
+    /// as 1-layer arrays, arrays' base slices as 2D] (status).
+    pub fn keyed_views() -> [u64; 2] {
+        [KEYED_VIEWS[0].load(std::sync::atomic::Ordering::Relaxed), KEYED_VIEWS[1].load(std::sync::atomic::Ordering::Relaxed)]
+    }
+
     pub fn view(&mut self, t: &Tsharp, storage: bool, frame: u64) -> Result<(vk::ImageView, vk::Image), String> {
-        if storage {
-            return self.view_full(t, storage, frame).map(|r| (r.0, r.1));
+        self.view_as(t, storage, frame, None)
+    }
+
+    /// `view` as `want` where the binding's translation keys the image by its instructions'
+    /// dimension (`shaders::d2_resources`): a 2D texture as a 1-layer 2D-array view, a 2D
+    /// array's base slice as a 2D view (what the hardware reads for such addresses).
+    pub fn view_as(&mut self, t: &Tsharp, storage: bool, frame: u64, want: Option<vk::ImageViewType>) -> Result<(vk::ImageView, vk::Image), String> {
+        // (A view of another type than the T#'s: the full lookup, no memo (keyed by the T#).)
+        if want.is_some() {
+            KEYED_VIEWS[(want == Some(vk::ImageViewType::TYPE_2D)) as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if storage || want.is_some() {
+            return self.view_full(t, storage, frame, want).map(|r| (r.0, r.1));
         }
         // Generations read first, the image's region's too when the image
         // exists: a change during the full lookup (its refresh) makes the
@@ -5978,7 +5997,7 @@ impl Images {
                 return Ok((m.view, m.image));
             }
         }
-        let r = self.view_full(t, storage, frame)?;
+        let r = self.view_full(t, storage, frame, None)?;
         // The region of the image found (an alias of another format, or a
         // GPU-written image, has none): known before the lookup, or the
         // entry is good for this call only.
@@ -6005,7 +6024,7 @@ impl Images {
         !self.refreshing.is_empty() && self.refreshing.keys().any(|k| self.map.get(k).is_some_and(|m| m.image == image))
     }
 
-    fn view_full(&mut self, t: &Tsharp, storage: bool, frame: u64) -> Result<(vk::ImageView, vk::Image, UseStamp), String> {
+    fn view_full(&mut self, t: &Tsharp, storage: bool, frame: u64, want: Option<vk::ImageViewType>) -> Result<(vk::ImageView, vk::Image, UseStamp), String> {
         if storage {
             // DS_TRACE_IMAGE_WRITERS=<hex base> or <w>x<h>x<depth>: each
             // shader that binds such an image for writing, once.
@@ -6042,6 +6061,10 @@ impl Images {
         let _ = levels;
         let (vt, base_layer, layer_count) = if key.ty3d {
             (vk::ImageViewType::TYPE_3D, 0, 1)
+        } else if t.ty == 9 && want == Some(vk::ImageViewType::TYPE_2D_ARRAY) {
+            (vk::ImageViewType::TYPE_2D_ARRAY, 0, 1)
+        } else if t.ty == 13 && want == Some(vk::ImageViewType::TYPE_2D) {
+            (vk::ImageViewType::TYPE_2D, t.base_array, 1)
         } else {
             match t.ty {
                 11 if t.depth > 6 && !storage => (vk::ImageViewType::CUBE_ARRAY, 0, t.depth / 6 * 6),

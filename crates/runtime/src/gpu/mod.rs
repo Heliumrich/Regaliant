@@ -3575,5 +3575,12 @@ pub fn status_ex(with_stacks: bool) -> String {
     s.push_str(&profile_summary());
     s.push_str(&exec::shader_profile());
     s.push_str(&zk::status_line());
+    {
+        let k = images::Images::keyed_views();
+        if k[0] + k[1] > 0 {
+            s.push_str(&format!("    compute images bound in their instructions' dimension (`shaders::d2_resources`): 2D textures as 1-layer arrays {}, arrays' base slices as 2D {}
+", k[0], k[1]));
+        }
+    }
     s
 }
