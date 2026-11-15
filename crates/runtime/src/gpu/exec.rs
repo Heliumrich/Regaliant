@@ -3776,6 +3776,7 @@ pub(super) fn push_line() -> String {
     ) + &batch_miss_line()
         + &format!("    front end 2's placement memo: {} repeats answered, {} placements made
 ", PLACE_MEMO[0].load(Ordering::Relaxed), PLACE_MEMO[1].load(Ordering::Relaxed))
+        + &place_census_line()
 }
 
 /// Why batched programs' commands did not join the open batched dispatch
@@ -8901,6 +8902,8 @@ pub(super) fn prog_note(class: u8, a: u64, b: u64, ns: u64) {
 }
 
 /// Slots of an executor's placement memo (`Exec::fe2_place`).
+/// (2,048 slots measured x0.947 at Castlewall turning against 128: the larger arrays' cache
+/// footprint cost more than the extra answers saved, FINDINGS.md 2026-11-15 small hours.)
 const PLACE_MEMO_SLOTS: usize = 128;
 
 /// A placement of the executor's batch (`Exec::fe2_place`).
@@ -8932,6 +8935,41 @@ fn place_memo_slot(base: u64, size: u64, written: bool) -> usize {
 /// The placement memo's [hits, misses] (`Exec::fe2_place`), added per
 /// thread every 4,096.
 pub static PLACE_MEMO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Batch starts' census (`DS_PLACE_CENSUS=1`, diagnosis): placements the memo did not answer,
+/// [the batch's first command, later ones] x [the memo's slot holds the same range, epoch,
+/// wanted state and mappings from an earlier batch of this executor (a memo across batches
+/// would answer it), the same range otherwise, another range or none] x [count, ns of the
+/// placement]; and shader-read waits [first command, later] x [count, ns]. `profile reset`
+/// clears them.
+static PLACE_CENSUS: [[[AtomicU64; 2]; 3]; 2] = [const { [const { [const { AtomicU64::new(0) }; 2] }; 3] }; 2];
+static READ_WAITS_BY_PLACE: [[AtomicU64; 2]; 2] = [const { [const { AtomicU64::new(0) }; 2] }; 2];
+
+fn place_census_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_PLACE_CENSUS").ok().as_deref() == Some("1"))
+}
+
+fn place_census_line() -> String {
+    if !place_census_on() {
+        return String::new();
+    }
+    let v = |f: usize, c: usize, k: usize| PLACE_CENSUS[f][c][k].load(Ordering::Relaxed);
+    let part = |f: usize| -> String {
+        const WHAT: [&str; 3] = ["from an earlier batch at the same epoch, wanted state and mappings", "the same range otherwise", "other"];
+        (0..3).map(|c| format!("{} {} ({:.1} us each)", WHAT[c], v(f, c, 0), v(f, c, 1) as f64 / 1e3 / v(f, c, 0).max(1) as f64)).collect::<Vec<_>>().join(", ")
+    };
+    let w = |f: usize, k: usize| READ_WAITS_BY_PLACE[f][k].load(Ordering::Relaxed);
+    format!(
+        "    batch starts' census (`DS_PLACE_CENSUS`): placements the memo did not answer, at a batch's first command: {}; at later commands: {}; shader-read waits at first commands {} ({:.0} us each), at later ones {} ({:.0} us each)\n",
+        part(0),
+        part(1),
+        w(0, 0),
+        w(0, 1) as f64 / 1e3 / w(0, 0).max(1) as f64,
+        w(1, 0),
+        w(1, 1) as f64 / 1e3 / w(1, 0).max(1) as f64
+    )
+}
 
 thread_local! {
     static PLACE_MEMO_LOCAL: std::cell::Cell<[u64; 2]> = const { std::cell::Cell::new([0; 2]) };
@@ -9522,7 +9560,7 @@ pub fn reset_shader_profile() {
     for c in DRAW_STEPS.iter().flatten().chain(DRAW_STEPS_GPU.iter().flatten()).chain(HAZARD_STEPS.iter().flatten()).chain(CS_STEPS.iter().flatten()).chain(COPY_STEPS.iter().flatten()).chain(DRAW_STEPS_FIRST.iter().flatten()).chain(CS_STEPS_FIRST.iter().flatten()).chain(SYNC_STEPS.iter()).chain(WAIT_NS.iter()).chain(BIND_STEPS_BY.iter().flatten()).chain(PRE_STEPS_BY.iter().flatten()) {
         c.store(0, Ordering::Relaxed);
     }
-    for c in CS_PHASES.iter().chain(DRAW_PHASES.iter()).chain(PLACE_PHASES.iter().flatten().flatten()) {
+    for c in CS_PHASES.iter().chain(DRAW_PHASES.iter()).chain(PLACE_PHASES.iter().flatten().flatten()).chain(PLACE_CENSUS.iter().flatten().flatten()).chain(READ_WAITS_BY_PLACE.iter().flatten()) {
         c.store(0, Ordering::Relaxed);
     }
     for (r, c) in SYNC_WHY_AT_RESET.iter().zip(SYNC_WHY.iter()) {
@@ -12302,6 +12340,40 @@ impl Exec {
     /// reaching past the end of its mapping is placed up to there (the rest
     /// reads 0). None: nothing of it is mapped, or no video memory.
     fn fe2_place(&mut self, base: u64, size: u64, written: bool) -> Option<(vk::Buffer, u64, u64)> {
+        if place_census_on() && !self.stopped && !self.past_grow && !super::fe2::callers_on() && super::fe2::slow_place_us() == 0 {
+            return self.fe2_place_census(base, size, written);
+        }
+        self.fe2_place_memo(base, size, written)
+    }
+
+    /// `fe2_place_memo` with the batch starts' census (`PLACE_CENSUS`).
+    fn fe2_place_census(&mut self, base: u64, size: u64, written: bool) -> Option<(vk::Buffer, u64, u64)> {
+        let ep = super::precache::epoch() as u32;
+        let want = self.fe2_want(ep);
+        let map_gen = crate::mem::MAP_GEN.load(Ordering::Acquire);
+        let m = self.place_memo[place_memo_slot(base, size, written)];
+        let first = !self.recording || self.batch_shaders.is_empty();
+        let hit = self.recording && m.batch == self.batch_count && m.base == base && m.size == size && m.written == written && m.ep == ep && m.want == want && m.map_gen == map_gen;
+        let class = if m.batch != 0 && m.base == base && m.size == size && m.written == written {
+            if m.ep == ep && m.want == want && m.map_gen == map_gen {
+                0
+            } else {
+                1
+            }
+        } else {
+            2
+        };
+        let t = std::time::Instant::now();
+        let r = self.fe2_place_memo(base, size, written);
+        if !hit {
+            let c = &PLACE_CENSUS[!first as usize][class];
+            c[0].fetch_add(1, Ordering::Relaxed);
+            c[1].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        r
+    }
+
+    fn fe2_place_memo(&mut self, base: u64, size: u64, written: bool) -> Option<(vk::Buffer, u64, u64)> {
         // A repeat of a placement of this batch at the same epoch, view and
         // mappings: its result. Its checks found the range current for every
         // CPU write before that epoch began (what the batch's work needs) and
@@ -14415,6 +14487,11 @@ impl Exec {
         if let Some(t0) = waited {
             WAIT_NS[0].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
             WAIT_NS[1].fetch_add(1, Ordering::Relaxed);
+            if place_census_on() {
+                let c = &READ_WAITS_BY_PLACE[!self.batch_shaders.is_empty() as usize];
+                c[0].fetch_add(1, Ordering::Relaxed);
+                c[1].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
             note_queue_wait(&self.name, 0, t0.elapsed());
             SYNC_WHY[why.min(SYNC_WHY.len() - 1)].fetch_add(1, Ordering::Relaxed);
             if let Some(((a, n), src)) = culprit.filter(|_| !live || super::tune::take_trace_sync()) {
