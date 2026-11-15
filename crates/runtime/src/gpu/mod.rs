@@ -1432,10 +1432,10 @@ pub mod tune {
     }
 
     /// Zero fills' stores into guest memory left out where guest memory holds zeros already
-    /// (`gpu::zk`; off with the ordered compute queue on, whose batches would order the bitmap's
-    /// writes apart).
+    /// (`gpu::zk`; with the ordered compute queue on, its batches store their fills whole and
+    /// only the main queue's zero stores set bits: `Exec::fill_in_place_parts`).
     pub fn zk() -> bool {
-        get(176) != 0 && async_compute() == 0
+        get(176) != 0
     }
 
     /// Whether translations get `rdna::translate::Spec::hw_bounds` (scalar

@@ -6682,6 +6682,8 @@ fn xq_queued(seq: u64, x: XqBatch, name: &str) -> u64 {
     let undo = if ups.is_empty() { None } else { XC_WRITES.latest(&ups).filter(|&s| s > done) };
     if x.compute && (x.on_c || super::tune::async_compute() == 1) {
         slot.store(seq | XQ_COMPUTE, Ordering::Release);
+        // (The trace's view of the uploads, before this batch's own writes are noted.)
+        let traced = undo.and_then(|u| xq_trace_prologue(name, seq, u, XQ_LAST[(x.acb & 0xFF) as usize].load(Ordering::Acquire), &ups));
         XC_WRITES.note_ranges(seq, x.writes);
         XQ_LAST[(x.acb & 0xFF) as usize].fetch_max(seq, Ordering::AcqRel);
         XQ_STATS[0].fetch_add(1, Ordering::Relaxed);
@@ -6691,6 +6693,9 @@ fn xq_queued(seq: u64, x: XqBatch, name: &str) -> u64 {
         }
         if undo.is_some() {
             XQ_STATS[XS_PRE_WAITS].fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(t) = traced {
+            crate::info!("{t}");
         }
         return undo.unwrap_or(0);
     }
@@ -6722,6 +6727,32 @@ fn xq_queued(seq: u64, x: XqBatch, name: &str) -> u64 {
         super::timeline::end(name, t, || format!("after #{dep} (xq {why:#x})"));
     }
     dep
+}
+
+/// `DS_XQ_TRACE=<n>` (diagnosis): the first n compute prologues that wait for
+/// an unfinished compute batch whose writes their uploads would undo: the
+/// executor, its batch, the batch waited for (and whether that is its own
+/// compute queue's previous batch), and each upload range with the
+/// unfinished compute batch writing into it.
+fn xq_trace_prologue(name: &str, seq: u64, undo: u64, prev_own: u64, ups: &[(u64, u64)]) -> Option<String> {
+    static LEFT: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
+    let left = LEFT.get_or_init(|| AtomicU64::new(std::env::var("DS_XQ_TRACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0)));
+    left.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1)).ok()?;
+    let done = done_seq();
+    let parts: Vec<String> = ups
+        .iter()
+        .take(8)
+        .map(|&(a, n)| match XC_WRITES.latest(&[(a, n)]).filter(|&s| s > done) {
+            Some(s) => format!("{a:#x}+{n:#x} by #{s}"),
+            None => format!("{a:#x}+{n:#x}"),
+        })
+        .collect();
+    Some(format!(
+        "xq trace: {name} batch #{seq}'s prologue waits for compute batch #{undo} ({}; done through {done}): {} upload range(s) {}",
+        if undo == prev_own { "its own queue's previous batch" } else { "another compute batch" },
+        ups.len(),
+        parts.join(", ")
+    ))
 }
 
 /// Ordered async compute's status line ("" while it never ran).
@@ -13859,8 +13890,10 @@ impl Exec {
             self.dispatched = false;
         }
         // (Zero fills of the render-target pool's memory: pages guest memory holds as zeros
-        // already left out, `zk`; any other store clears the pages' bits.)
-        let zk = v == 0 && super::zk::on() && super::zk::eligible(base, len);
+        // already left out, `zk`; any other store clears the pages' bits. Only on the main
+        // queue: the bits it sets and the clears recorded on both queues then meet in the
+        // title's own order, which the compute queue's batches keep with the main queue's.)
+        let zk = v == 0 && super::zk::on() && !self.batch_c && super::zk::eligible(base, len);
         let dst0 = if zk { ctx().buffer_address(buffer) } else { 0 };
         let mut zk_pipe = None;
         let mut store = |x: u64, e: u64| {
