@@ -157,13 +157,18 @@ fn vblank_thread() {
     let mut next = Instant::now() + period;
     let mut last_flip = Instant::now();
     let mut last_cap = 0;
-    // Locked to the display (`displayclock::lock`): the title's vblank just after every Nth of
-    // the display's (the frame flipped then is presented at once and shown at the next refresh,
-    // so each frame stays N refreshes), the display's vblank it ticks at next, and N (0: the
-    // thread's own timer). Not while uncapped or at a diagnosis rate.
+    // Locked to the display (`displayclock::lock`): the title's vblank just after every `step`
+    // of the display's (the frame flipped then is presented at once and shown at the next
+    // refresh), the display's vblank it ticks at next, and the lock (n, step; n 0: the thread's
+    // own timer). On the fine grid (step 1) flips stay at least n of them apart (60 fps), so a
+    // frame done late shows at the next refresh after its due one, not a whole 60 Hz frame
+    // later. Not while uncapped or at a diagnosis rate.
     const LOCK_DELAY: Duration = Duration::from_micros(300);
     let mut lock_target: u64 = 0;
     let mut locked_n: u32 = 0;
+    let mut locked_step: u32 = 0;
+    // (The vblank's period while locked: the display's times the step.)
+    let mut lock_period = Duration::ZERO;
     crate::displayclock::start();
     loop {
         // The PC settings' console variables (changed values, objects the title builds later).
@@ -183,15 +188,22 @@ fn vblank_thread() {
         }
         let lock = if hz.is_none() && period != uncapped_period { crate::displayclock::lock() } else { None };
         match lock {
-            Some((n, s)) => {
-                if locked_n != n {
-                    crate::info!("vblank locked to the display: at every {n} of its vblanks ({:.3} Hz measured)", 1.0 / s.period.as_secs_f64());
+            Some((n, step, s)) => {
+                if locked_n != n || locked_step != step {
+                    let hz = 1.0 / s.period.as_secs_f64();
+                    if step < n {
+                        crate::info!("vblank locked to the display: at each of its vblanks ({hz:.3} Hz measured), flips at least {n} apart");
+                    } else {
+                        crate::info!("vblank locked to the display: at every {n} of its vblanks ({hz:.3} Hz measured)");
+                    }
                     crate::displayclock::LOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     locked_n = n;
+                    locked_step = step.max(1);
                     lock_target = 0;
                 }
+                lock_period = s.period * locked_step;
                 // (At the start, or behind by two steps or more: the display's next vblank.)
-                if lock_target == 0 || lock_target + 2 * n as u64 <= s.count {
+                if lock_target == 0 || lock_target + 2 * locked_step as u64 <= s.count {
                     lock_target = s.count + 1;
                 }
                 next = s.last + s.period * lock_target.saturating_sub(s.count) as u32 + LOCK_DELAY;
@@ -199,6 +211,7 @@ fn vblank_thread() {
             None if locked_n != 0 => {
                 crate::info!("vblank on its own timer again ({:.2} Hz)", 1.0 / period.as_secs_f64());
                 locked_n = 0;
+                locked_step = 0;
                 next = Instant::now() + period;
             }
             None => {}
@@ -212,7 +225,7 @@ fn vblank_thread() {
         let tick = now >= next;
         if tick {
             if locked_n != 0 {
-                lock_target += locked_n as u64;
+                lock_target += locked_step as u64;
                 // (Recomputed from the display's vblanks at the next pass.)
                 next = now + period;
             } else {
@@ -234,13 +247,15 @@ fn vblank_thread() {
                 p.vblank_time = crate::hle::kernel::time::process_time_us();
                 p.vblank_tsc = unsafe { core::arch::x86_64::_rdtsc() };
             }
-            let mut interval = p.flip_rate as u64 + 1;
+            // (On the display's fine grid the title's flip rate counts 60 Hz vblanks: n of its.)
+            let (vperiod, per_vblank) = if locked_n != 0 { (lock_period, (locked_n / locked_step).max(1) as u64) } else { (period, 1) };
+            let mut interval = (p.flip_rate as u64 + 1) * per_vblank;
             // A frame cap (`tune frame_cap`): at least 1/cap between flips,
             // on the grid the whole number of vblanks that keeps under it.
             let cap = crate::gpu::tune::frame_cap();
             let min_gap = if cap > 0 { Duration::from_secs_f64(1.0 / cap as f64) } else { Duration::ZERO };
             if cap > 0 {
-                interval = interval.max((min_gap.as_secs_f64() / period.as_secs_f64() - 0.01).ceil().max(1.0) as u64);
+                interval = interval.max((min_gap.as_secs_f64() / vperiod.as_secs_f64() - 0.01).ceil().max(1.0) as u64);
             }
             if cap != last_cap {
                 last_cap = cap;
@@ -250,7 +265,7 @@ fn vblank_thread() {
             // flip. Off it: once `interval` vblank periods (and 1/cap) have
             // passed since the last flip (half a millisecond early is close
             // enough).
-            let due = if grid { tick && p.vblanks - p.last_flip_vblank >= interval } else { now.duration_since(last_flip) + Duration::from_micros(500) >= (period * interval as u32).max(min_gap) };
+            let due = if grid { tick && p.vblanks - p.last_flip_vblank >= interval } else { now.duration_since(last_flip) + Duration::from_micros(500) >= (vperiod * interval as u32).max(min_gap) };
             if p.pending.front().is_some_and(|f| f.ready) && due {
                 let f = p.pending.pop_front().unwrap();
                 p.current = f.index;

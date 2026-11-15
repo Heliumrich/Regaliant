@@ -1,6 +1,9 @@
 //! The translator's source hash (`SOURCE_HASH`): the runtime keeps
-//! translations across runs under it, so any change to this crate's code
-//! starts a new store.
+//! translations across runs under it, so a change to the code that makes them
+//! starts a new store. Left out: `src/bin/` (the disassembler) and, of
+//! `src/kernels.rs` (the runtime's own kernels), all but its constants (the
+//! written-bit map's layout, which translations use): a kernel's edit kept every
+//! player's prepared shaders until 2026-11-15.
 
 use std::path::{Path, PathBuf};
 
@@ -26,7 +29,24 @@ fn main() {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for f in &files {
         let name = f.to_string_lossy().replace('\\', "/");
-        for b in name.bytes().chain(std::fs::read(f).unwrap_or_default()) {
+        if name.starts_with("src/bin/") {
+            continue;
+        }
+        let bytes = std::fs::read(f).unwrap_or_default();
+        let bytes = if name == "src/kernels.rs" {
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    t.starts_with("pub const ") || t.starts_with("const ")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                .into_bytes()
+        } else {
+            bytes
+        };
+        for b in name.bytes().chain(bytes) {
             h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3);
         }
     }

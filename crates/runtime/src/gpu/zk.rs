@@ -160,6 +160,19 @@ pub fn eligible(base: u64, len: u64) -> bool {
     true
 }
 
+/// Whether any MiB of [lo, hi) is the render-target pool's (where zero stores set bits).
+fn rt_touched(lo: u64, hi: u64) -> bool {
+    let Some(rt) = rt_owner() else { return false };
+    let mut m = lo >> 20;
+    while m <= (hi - 1) >> 20 {
+        if crate::engine::owner(m << 20) == rt {
+            return true;
+        }
+        m += 1;
+    }
+    false
+}
+
 fn page_of(a: u64) -> u64 {
     (a - MIRROR_BASE) / PAGE
 }
@@ -189,7 +202,9 @@ pub fn clear(cmd: vk::CommandBuffer, base: u64, len: u64) {
     }
     let (lo, hi) = (base.max(MIRROR_BASE), base.saturating_add(len).min(MIRROR_END));
     let (p0, p1) = (page_of(lo), page_of(hi - 1) + 1);
-    if !tracked(p0 / 32, p1.div_ceil(32)) {
+    // (Tracked words, and the render-target pool's memory: a writer recorded beside the first
+    // zero store of a word, before it marked the word tracked, still clears in GPU order.)
+    if !tracked(p0 / 32, p1.div_ceil(32)) && !rt_touched(lo, hi) {
         return;
     }
     STATS[3].fetch_add(1, Ordering::Relaxed);
@@ -221,8 +236,16 @@ pub fn cpu_dirty_range(base: u64, len: u64) {
     }
     let (lo, hi) = (base.max(MIRROR_BASE), base.saturating_add(len).min(MIRROR_END));
     let d = dirty();
-    for p in page_of(lo)..page_of(hi - 1) + 1 {
-        d[(p / 64) as usize].fetch_or(1 << (p % 64), Ordering::Relaxed);
+    // (Words no zero store tracks hold no set bit: skipped.)
+    let (p0, p1) = (page_of(lo), page_of(hi - 1) + 1);
+    let mut w = p0 / 32;
+    while w < p1.div_ceil(32) {
+        if TRACKED[(w / 64) as usize].load(Ordering::Relaxed) & (1 << (w % 64)) != 0 {
+            for p in (w * 32).max(p0)..((w + 1) * 32).min(p1) {
+                d[(p / 64) as usize].fetch_or(1 << (p % 64), Ordering::Relaxed);
+            }
+        }
+        w += 1;
     }
 }
 

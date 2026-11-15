@@ -89,15 +89,27 @@ pub fn snapshot() -> Option<Snap> {
     STATE.lock().as_ref().and_then(|s| s.snap)
 }
 
-/// The lock's ratio: every how many of the display's vblanks the title's vblank ticks, with the
-/// clock's state; None where the refresh is not a whole multiple of ~60 Hz (within 1%: 59.94 to
-/// 60.5 Hz a step), the clock has no second of vblanks yet, or variable refresh is suspected.
-/// `DS_VBLANK_LOCK=<n>` (diagnosis) locks to every nth vblank whatever the rate (3 on a 165 Hz
-/// screen: 55 Hz); `=0` never.
-pub fn lock() -> Option<(u32, Snap)> {
-    static FORCED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-    let forced = *FORCED.get_or_init(|| std::env::var("DS_VBLANK_LOCK").ok().and_then(|v| v.parse::<u32>().ok()));
-    if forced == Some(0) {
+/// The lock: the display's vblanks a 60 Hz frame spans (`n`, the flips' least distance) and how
+/// many of them the title's vblank ticks at (`step`), with the clock's state. Where the refresh
+/// is a whole multiple of ~60 Hz (within 1%: 59.94 to 60.5 Hz a step) the vblank ticks at each
+/// of the display's (`step` 1, the fine grid): at 120 Hz a frame done late shows after 25 ms
+/// instead of 33 (2 and 3 refreshes rather than 2 and 4), one of 17-25 ms keeps 40 fps instead
+/// of 30. None where the refresh is no such multiple, the clock has no second of vblanks yet, or
+/// variable refresh is suspected. Diagnosis: `DS_VBLANK_LOCK=<n>` ticks at every nth vblank
+/// whatever the rate (3 on a 165 Hz screen: 55 Hz), `=f<n>` at each with flips n apart (`f3` at
+/// 165 Hz: 55 fps on its finer grid), `=0` never; `DS_VBLANK_FINE=0` ticks every nth (the coarse
+/// lock) where the fine one would.
+pub fn lock() -> Option<(u32, u32, Snap)> {
+    // (Forced: Some((n, fine)); n 0: never.)
+    static FORCED: std::sync::OnceLock<Option<(u32, bool)>> = std::sync::OnceLock::new();
+    let forced = *FORCED.get_or_init(|| {
+        let v = std::env::var("DS_VBLANK_LOCK").ok()?;
+        match v.strip_prefix('f') {
+            Some(n) => n.parse::<u32>().ok().map(|n| (n, true)),
+            None => v.parse::<u32>().ok().map(|n| (n, false)),
+        }
+    });
+    if forced.is_some_and(|f| f.0 == 0) {
         return None;
     }
     let s = snapshot()?;
@@ -109,12 +121,14 @@ pub fn lock() -> Option<(u32, Snap)> {
     if s.mode_hz > 0 && (hz / s.mode_hz as f64 - 1.0).abs() > 0.02 {
         return None;
     }
-    if let Some(n) = forced.filter(|&n| n > 0) {
-        return Some((n, s));
+    if let Some((n, fine)) = forced {
+        return Some((n, if fine { 1 } else { n }, s));
     }
+    static FINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let fine = *FINE.get_or_init(|| std::env::var("DS_VBLANK_FINE").ok().as_deref() != Some("0"));
     let n = (hz / 59.94).round();
-    let step = hz / n;
-    (n >= 1.0 && n <= 8.0 && (59.94 * 0.999..=60.5).contains(&step)).then_some((n as u32, s))
+    let per = hz / n;
+    (n >= 1.0 && n <= 8.0 && (59.94 * 0.999..=60.5).contains(&per)).then_some((n as u32, if fine { 1 } else { n as u32 }, s))
 }
 
 fn monitor_hz(device: &str) -> u32 {
@@ -273,7 +287,8 @@ pub fn window_clause() -> String {
     let Some(s) = snapshot().filter(|_| total > 0) else { return String::new() };
     let parts: Vec<String> = c.iter().enumerate().filter(|(_, n)| **n > 0).map(|(i, n)| format!("{}{}:{n}", i, if i == 8 { "+" } else { "" })).collect();
     format!("; display refreshes between presents ({:.0} Hz, {}): {}", 1.0 / s.period.as_secs_f64(), match lock() {
-        Some((n, _)) => format!("locked every {n}"),
+        Some((n, step, _)) if step < n => format!("locked each, flips {n} apart"),
+        Some((n, _, _)) => format!("locked every {n}"),
         None => "timer".into(),
     }, parts.join(" "))
 }
@@ -298,7 +313,8 @@ pub fn status_line() -> String {
         s.mode_hz,
         s.count,
         match lock {
-            Some((n, _)) => format!("ticks at every {n} of them"),
+            Some((n, step, _)) if step < n => format!("ticks at each of them, flips at least {n} apart"),
+            Some((n, _, _)) => format!("ticks at every {n} of them"),
             None if std::env::var("DS_VBLANK_LOCK").ok().as_deref() == Some("0") => "keeps its own timer (DS_VBLANK_LOCK=0)".into(),
             None => "keeps its own timer (the refresh is no whole multiple of ~60 Hz, or varies)".into(),
         },
