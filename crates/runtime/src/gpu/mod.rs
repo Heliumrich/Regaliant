@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 176] = [
+    static ALL: [Tunable; 178] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -208,6 +208,8 @@ pub mod tune {
         Tunable { name: "past_repair", env: "DS_PAST_REPAIR", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "held_min", env: "DS_HELD_MIN", default: 192, value: AtomicU64::new(UNSET) },
         Tunable { name: "async_gfx_inline", env: "DS_ASYNC_GFX_INLINE", default: 12, value: AtomicU64::new(UNSET) },
+        Tunable { name: "record_delay", env: "DS_RECORD_DELAY", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "submit_wait", env: "DS_SUBMIT_WAIT", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1430,6 +1432,20 @@ pub mod tune {
         get(175)
     }
 
+    /// Diagnosis (`tune record_delay <us>`, 0 off): each command processor records a title
+    /// submission only once it has been queued that long (the title writing what a submission
+    /// reads after queuing it would no longer race the recording).
+    pub fn record_delay() -> u64 {
+        get(176)
+    }
+
+    /// Diagnosis (`tune submit_wait`, live): 1 a title submission returns once its command
+    /// processor recorded it, 2 once its GPU work completed too (as `DS_SUBMIT_SYNC=1`); bounded
+    /// as that is, and not while the command processor polls a label. 0 off.
+    pub fn submit_wait() -> u64 {
+        get(177)
+    }
+
     /// Whether translations get `rdna::translate::Spec::hw_bounds` (scalar
     /// loads of buffers only they read without a check of each dword): where
     /// robustBufferAccess2 and null descriptors are enabled (since 2026-11-12
@@ -2195,6 +2211,33 @@ pub(crate) fn enqueue(queue_id: u32, bufs: Vec<(u64, u32)>, ctl: Option<Ctl>) {
     q.cv.notify_one();
 }
 
+/// Waits until the graphics command processor has run every title submission queued so far
+/// (`cullread`'s diagnosis): None when it had, else whether it got there within `max` (false
+/// also when it polls a label meanwhile: the label may come from the waiting thread's work).
+pub(crate) fn wait_gfx_caught_up(max: std::time::Duration) -> Option<bool> {
+    let q = {
+        let qs = QUEUES.lock();
+        *qs.iter().find(|q| q.id == GFX)?
+    };
+    let target = q.submitted.load(Ordering::SeqCst);
+    if q.done.load(Ordering::SeqCst) >= target {
+        return None;
+    }
+    let t0 = std::time::Instant::now();
+    let mut g = q.pending.lock();
+    while q.done.load(Ordering::SeqCst) < target {
+        if q.cp_waiting.load(Ordering::SeqCst) || shutting_down() {
+            return Some(false);
+        }
+        let left = max.saturating_sub(t0.elapsed());
+        if left.is_zero() {
+            return Some(false);
+        }
+        q.done_cv.wait_for(&mut g, left.min(std::time::Duration::from_millis(5)));
+    }
+    Some(true)
+}
+
 /// The queues created so far.
 pub(crate) fn queue_ids() -> Vec<u32> {
     QUEUES.lock().iter().map(|q| q.id).collect()
@@ -2249,6 +2292,45 @@ fn buffer_copy(addr: u64, size: u32) -> Vec<u32> {
         return Vec::new();
     }
     unsafe { std::slice::from_raw_parts(addr as *const u32, size as usize) }.to_vec()
+}
+
+/// Diagnosis (`DS_SNAP_CHECK=<hex address>:<hex bytes>`): a sampled hash (every 16th dword) of a
+/// CPU-written range at each graphics submission, compared when the graphics command processor
+/// begins and ends recording it (`snap check: ...`): did the title rewrite what the submission
+/// reads between submitting it and our recording?
+fn snap_range() -> Option<(u64, u64)> {
+    static R: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    *R.get_or_init(|| {
+        let v = std::env::var("DS_SNAP_CHECK").ok()?;
+        let (a, n) = v.split_once(':')?;
+        let p = |x: &str| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok();
+        Some((p(a)?, p(n)?))
+    })
+}
+
+fn snap_hash() -> u64 {
+    let Some((a, n)) = snap_range() else { return 0 };
+    if !cp::guest_readable(a, n) {
+        return 0;
+    }
+    let mut h = fx::FxHasher::default();
+    for k in (0..n / 4).step_by(16) {
+        std::hash::Hasher::write_u32(&mut h, unsafe { std::ptr::read_volatile((a + 4 * k) as *const u32) });
+    }
+    std::hash::Hasher::finish(&h)
+}
+
+/// The graphics submissions' hashes by number; [checked, changed before recording, changed
+/// during recording].
+static SNAP: Mutex<Option<std::collections::HashMap<u64, u64>>> = Mutex::new(None);
+static SNAP_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+fn snap_line() -> String {
+    if snap_range().is_none() {
+        return String::new();
+    }
+    let v: Vec<u64> = SNAP_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    format!("    snap check (`DS_SNAP_CHECK`): {} graphics submissions, the range changed before their recording in {}, during it in {}\n", v[0], v[1], v[2])
 }
 
 /// `DS_TRACE_SUBMIT=1`: logs submissions and their completion.
@@ -2667,6 +2749,14 @@ fn worker(q: &'static Queue, name: &str) {
             q.done_cv.notify_all();
             continue;
         }
+        // (Diagnosis, `tune record_delay`: the submission recorded only once it is that old.)
+        let delay = std::time::Duration::from_micros(tune::record_delay());
+        if !delay.is_zero() {
+            let age = batch.at.elapsed();
+            if age < delay {
+                std::thread::sleep(delay - age);
+            }
+        }
         if q.id == GFX && frameprobe::on() {
             frameprobe::submission(&batch.bufs);
         }
@@ -2685,7 +2775,35 @@ fn worker(q: &'static Queue, name: &str) {
             let dwords: u64 = batch.bufs.iter().map(|b| b.1 as u64).sum();
             timeline::span_back(&format!("{name} queued"), batch.at.elapsed(), || format!("sub {} queued ({} buffers, {dwords} dwords, {behind} behind)", batch.index, batch.bufs.len()));
         }
+        let snap = (q.id == GFX && snap_range().is_some()).then(|| (SNAP.lock().as_mut().and_then(|m| m.remove(&batch.index)), snap_hash()));
         run_submission(&mut cp, &batch, name);
+        if let Some((Some(h_sub), h_begin)) = snap {
+            let h_end = snap_hash();
+            SNAP_STATS[0].fetch_add(1, Ordering::Relaxed);
+            let before = h_begin != h_sub;
+            let during = h_end != h_begin;
+            if before {
+                SNAP_STATS[1].fetch_add(1, Ordering::Relaxed);
+            }
+            if during {
+                SNAP_STATS[2].fetch_add(1, Ordering::Relaxed);
+            }
+            static LOGGED: AtomicU64 = AtomicU64::new(0);
+            if (before || during) && LOGGED.fetch_add(1, Ordering::Relaxed) < 400 {
+                crate::info!(
+                    "snap check: submission {} ({} buffers) at flip {}: the range changed {} ({} ms after its submission)",
+                    batch.index,
+                    batch.bufs.len(),
+                    crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed),
+                    match (before, during) {
+                        (true, true) => "before and during its recording",
+                        (true, false) => "before its recording",
+                        _ => "during its recording",
+                    },
+                    batch.at.elapsed().as_millis()
+                );
+            }
+        }
         timeline::end(&format!("{name} subs"), tl_sub, || format!("sub {} run", batch.index));
         while let Some((s, buf, addr)) = cp.take_rewind_sub() {
             let Some(k) = kept.iter().position(|x| x.index == s) else {
@@ -2714,7 +2832,7 @@ fn worker(q: &'static Queue, name: &str) {
         } else {
             kept.clear();
         }
-        if throttle() || waits_for_completion(&batch.bufs) {
+        if throttle() || waits_for_completion(&batch.bufs) || tune::submit_wait() >= 2 {
             cp.finish();
         }
         let _g = q.pending.lock();
@@ -3028,6 +3146,10 @@ pub fn submit(queue_id: u32, buffers: Vec<(u64, u32)>) {
             }
         }
     }
+    if queue_id == GFX && snap_range().is_some() {
+        let h = snap_hash();
+        SNAP.lock().get_or_insert_with(std::collections::HashMap::new).insert(index, h);
+    }
     // In queue order (under the queue's lock): the replay keeps each queue's.
     replay::note_submitted(queue_id, &buffers);
     g.push_back(Submission { bufs: buffers, hashes, copies, at: std::time::Instant::now(), ctl: None, index });
@@ -3036,7 +3158,7 @@ pub fn submit(queue_id: u32, buffers: Vec<(u64, u32)>) {
     // diagnostic: the submit returns once its work completed (no CPU/GPU
     // overlap for those submissions; about halves the frame rate). Bounded,
     // and not while the CP polls a label that may come from the submitter.
-    if waits_for_completion(&g.back().map(|b| b.bufs.clone()).unwrap_or_default()) {
+    if tune::submit_wait() != 0 || waits_for_completion(&g.back().map(|b| b.bufs.clone()).unwrap_or_default()) {
         let t0 = std::time::Instant::now();
         while q.done.load(Ordering::SeqCst) < index && !q.cp_waiting.load(Ordering::SeqCst) && t0.elapsed() < THROTTLE_MAX {
             q.done_cv.wait_for(&mut g, std::time::Duration::from_millis(5));
@@ -3450,6 +3572,7 @@ pub fn status_ex(with_stacks: bool) -> String {
         )
     ));
     s.push_str(&format!("    {}\n", throttle_status()));
+    s.push_str(&snap_line());
     s.push_str(&pm4_census_line());
     s.push_str(&exec::status());
     s.push_str(&pagetable::status());

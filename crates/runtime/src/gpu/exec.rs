@@ -6219,6 +6219,11 @@ fn done_seq() -> u64 {
     DONE_ATOMIC.load(Ordering::Acquire)
 }
 
+/// The completed sequence's address (code inserted into the title compares it: `cullread`).
+pub fn done_atomic_addr() -> u64 {
+    &DONE_ATOMIC as *const AtomicU64 as u64
+}
+
 /// Highest completed batch sequence (all earlier ones completed too).
 pub fn completed_seq() -> u64 {
     done_seq()
@@ -11829,6 +11834,7 @@ impl Exec {
         let writes = std::mem::take(&mut self.pending);
         self.pending_log.clear();
         INFLIGHT.note_ranges(seq, &writes);
+        crate::cullread::note_submitted(seq, &writes);
         note_track_writes(seq, writes.iter());
         drop(note_gate);
         journal_note(&writes, &self.name);
@@ -14126,6 +14132,16 @@ impl Exec {
         self.sync_for(reads, SYNC_CP)
     }
 
+    /// `DS_ARGS_CHECK=1`: the words an indirect draw read at `addr`, checked against guest
+    /// memory when the batch holding the draw completes (`verify::args_check`).
+    pub fn add_args_check(&mut self, addr: u64, words: &[u32], vs: u64) {
+        if !self.recording || self.stopped {
+            return;
+        }
+        let flip = crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1;
+        self.checks.push(verify::args_check(addr, words, vs, flip));
+    }
+
     /// Whether GPU work is recorded or not yet completed.
     pub fn busy(&self) -> bool {
         self.recording || self.last_seq > done_seq()
@@ -16257,6 +16273,7 @@ impl Exec {
             super::precache::submitted(&b.shared, seq);
             super::resident::submitted(&b.res_pages, seq);
             INFLIGHT.note_ranges(seq, &b.writes);
+            crate::cullread::note_submitted(seq, &b.writes);
             note_track_writes(seq, b.writes.iter());
             drop(note_gate);
             journal_note(&b.writes, &self.name);
@@ -17600,6 +17617,18 @@ impl Exec {
         if p.addr == VG_PLACEMENT_CS && vg_clear_on() {
             self.vg_placement_clear(&p)?;
         }
+        // (`DS_VG_COUNT=1`: its per-model counters, the read-write stride-4 buffer, read after
+        // its batch.)
+        if p.addr == VG_PLACEMENT_CS && verify::vg_count_on() && self.recording && !self.stopped {
+            for (i, r) in p.resources.iter().enumerate() {
+                let Resolved::Buffer(v) = r else { continue };
+                let Some(used) = p.tr.plan.resources.get(i) else { continue };
+                if v.stride == 4 && used.written && used.read && v.extent() <= 4 << 12 {
+                    let flip = crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1;
+                    self.checks.push(verify::vg_count_check(v.base, (v.extent() / 4) as usize, flip));
+                }
+            }
+        }
         // The fill kernel over a whole range (`verify::full_fill`): one buffer
         // fill of guest memory in place, without the kernel's VRAM shadow
         // (a copy in, then a merge kernel storing every dword back across
@@ -18425,6 +18454,7 @@ pub fn status() -> String {
         + &held_own_line()
         + &super::forward::status_line()
         + &super::par::status()
+        + &verify::args_line()
         + &wb_empty_line()
         + &format!(
             "    batches submitted together (`tune submit_coalesce` {}): {} calls with {} batches; fused into one command buffer (`tune submit_fuse` {}): {} submissions with {} batches, {} groups' first batch alone (the main queue idle)

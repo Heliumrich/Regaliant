@@ -14,11 +14,15 @@
 //! drawn as the tall thorned grass models, sticking out of the walls and ceiling (the
 //! "starburst"), beside the weeds spawned again with the new numbering. The console shows none.
 //!
-//! The fix holds spawning for a few frames after each reset: the rebuild's enable store
-//! (eboot+0xa66b93) is kept at 0 and the title's own value saved; the per-frame update's
+//! The fix holds spawning for a few frames after a scene's first reset (its generation was 0:
+//! the scene was just made) and after any reset while that hold is on: the rebuild's enable
+//! store (eboot+0xa66b93) is kept at 0 and the title's own value saved; the per-frame update's
 //! hook (eboot+0xa553c7, before the active list is hashed, the context in [rbp-0xE8]) puts the
 //! saved value back once the scene has held its generation that long, so plants spawn only
-//! with a numbering that held. `DS_VG_HOLD=<frames>` sets the hold (default 4; 0 off).
+//! with a numbering that held. Resets in play do not hold (`reset_hook`): the active entities
+//! change as the camera turns, every few frames while it moves, and a hold after each kept new
+//! plants out the whole time (2026-11-15). `DS_VG_HOLD=<frames>` sets the hold (default 4; 0
+//! off).
 //! `DS_VG_DIAG=<lines>` logs the active entity lists, resets and enable values.
 
 use parking_lot::Mutex;
@@ -44,6 +48,12 @@ static HOLDS: Mutex<Vec<Hold>> = Mutex::new(Vec::new());
 fn hold_frames() -> u32 {
     static H: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *H.get_or_init(|| std::env::var("DS_VG_HOLD").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4))
+}
+
+/// `DS_VG_HOLD_ALL=1` (comparison, temporary): a hold after every reset, as before 2026-11-15.
+fn hold_all() -> bool {
+    static H: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *H.get_or_init(|| std::env::var("DS_VG_HOLD_ALL").ok().as_deref() == Some("1"))
 }
 
 fn diag_limit() -> u64 {
@@ -115,23 +125,32 @@ pub extern "sysv64" fn list_hook(regs: *const u64, _arg: u32) {
     }
 }
 
-/// The scene's model numbering reset (a new generation): the hold starts.
+/// The scene's model numbering reset (a new generation): the hold starts when the scene was
+/// just made (generation 0 before) or a hold is still on (a reset again within it: the
+/// starburst's two numberings two frames apart). Resets in play (the active entities change
+/// as the camera turns: every few frames while it moves, 2026-11-15) do not hold: spawning held
+/// 4 frames after each kept new plants out while the camera moved (the user's foliage "in and
+/// out of existence" in 0.1.0's videos), and the console spawns at once.
 pub extern "sysv64" fn reset_hook(regs: *const u64, _arg: u32) {
     let r = |i: usize| unsafe { *regs.add(i) };
     let ctx = r(14);
     let new = r(3) as u32;
     let old = unsafe { *((ctx + 8) as *const u32) };
-    {
+    let held = {
         let mut holds = HOLDS.lock();
-        let h = Hold { ctx, since: 0, generation: new, saved: None };
+        let on = holds.iter().any(|h| h.ctx == ctx && h.since < hold_frames());
+        let hold = old == 0 || on || hold_all();
+        // (A reset in play ends a hold's wait for its generation: no value to put back.)
+        let h = Hold { ctx, since: if hold { 0 } else { u32::MAX }, generation: new, saved: None };
         match holds.iter_mut().find(|h| h.ctx == ctx) {
             Some(e) => *e = h,
             None => holds.push(h),
         }
-    }
+        hold
+    };
     let n = RESETS.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 3 || n <= diag_limit() {
-        crate::info!("vg scene: numbering reset {n} at flip {} (context {ctx:#x}, generation {old:#x} -> {new:#x})", flip());
+        crate::info!("vg scene: numbering reset {n} at flip {} (context {ctx:#x}, generation {old:#x} -> {new:#x}{})", flip(), if held { "; spawning held" } else { "" });
     }
 }
 

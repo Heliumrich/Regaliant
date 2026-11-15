@@ -148,15 +148,16 @@ const FIXES: &[Fix] = &[
     // the FNV-1a loop's start), where a held spawn enable goes back (and with `DS_VG_DIAG` the
     // list is logged) ...
     // The job threads' reads of the culled index counts (`cmp dword ptr [r10+rbx*4], 0`,
-    // `cullread`): a record read non-zero in the last two flips is not dropped on a 0 read
-    // between the GPU's clear of the counts and their refill (the intro's sky flashes) ...
+    // `cullread`): a read waits for the GPU work in flight that writes the counts, and a record
+    // read non-zero in the last two flips is not dropped on a 0 read between the GPU's clear of
+    // the counts and their refill (the intro's sky flashes, walls missing for a frame) ...
     Fix {
-        name: "culling results held over their per-frame clear",
+        name: "culling results read after the GPU's writes, held over their clear",
         offset: 0xad91de,
         from: (5, 0x0731273bf58b8b71),
         change: Change::Insert { at: 0, code: crate::cullread::hold_code },
         kind: "title timing",
-        why: "the CPU can read the counts between the GPU's clear and refill; a visible object then missed the depth pre-pass",
+        why: "the CPU read the counts while the GPU's culling was still landing; a visible object then missed the depth pre-pass",
         only_with: Some("!DS_CULLREAD_DIAG"),
     },
     // ... or, with `DS_CULLREAD_DIAG`, a hook with the same hold and a log of the reads.
@@ -604,5 +605,5 @@ pub fn status() -> String {
         .map(|(i, f)| format!("'{}' ran {} times", f.name, RUNS[i].load(Ordering::Relaxed)))
         .collect();
     let fixes = if runs.is_empty() { String::new() } else { format!("    title fixes: {}\n", runs.join(", ")) };
-    fixes + &crate::jobidle::status() + &crate::camhook::status() + &crate::dispmode::status() + &crate::pcsettings::store::status()
+    fixes + &crate::cullread::status() + &crate::jobidle::status() + &crate::camhook::status() + &crate::dispmode::status() + &crate::pcsettings::store::status()
 }

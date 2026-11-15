@@ -1785,6 +1785,9 @@ impl Exec {
             self.last_draw_where = here;
             note_prep_repeat(&vs, ps.as_ref());
         }
+        if let Some((lo, hi)) = view_census_range() {
+            note_view_census(cp, lo, hi, &vs, ps.as_ref());
+        }
         let t_prep = since(t0);
         // Buffer-delta draws (`tune buffer_delta`, RENDERER.md): a draw right
         // after a full draw of the same programs, images and samplers with
@@ -3384,6 +3387,115 @@ fn note_draw_diff(last: &mut [u64; 5], sig: [u64; 5], consecutive: bool) -> usiz
     }
     *last = sig;
     k
+}
+
+/// Diagnosis (`DS_VIEW_CENSUS=<hex lo>-<hex hi>`): the words a draw's stages read inside that
+/// range (the title's per-view block: one version per pass), kept per (frame: the graphics CP's
+/// flips executed, depth target, colour target 0) by address; from frame 300 on, a frame's
+/// target pair whose draws read two values at one address is logged once the frame is 3 behind
+/// (`view census: ...`: the addresses that differ, each value's draws, first vertex program and
+/// recording threads; at most 400 lines).
+fn view_census_range() -> Option<(u64, u64)> {
+    static R: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    *R.get_or_init(|| {
+        let v = std::env::var("DS_VIEW_CENSUS").ok()?;
+        let (a, b) = v.split_once('-')?;
+        let p = |x: &str| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok();
+        Some((p(a)?, p(b)?))
+    })
+}
+
+/// A value's draws: [count, first vertex program], the recording threads seen.
+type ViewValue = (u64, u64, Vec<String>);
+#[allow(clippy::type_complexity)]
+static VIEW_CENSUS: parking_lot::Mutex<Option<std::collections::BTreeMap<u64, HashMap<(u64, u64, [u32; 4]), std::collections::BTreeMap<u64, HashMap<u32, ViewValue>>>>>> = parking_lot::Mutex::new(None);
+static VIEW_CENSUS_LOGGED: AtomicU64 = AtomicU64::new(0);
+/// Minority signatures logged so far (pass, value, vertex program) -> times: each at most 30.
+#[allow(clippy::type_complexity)]
+static VIEW_CENSUS_SIGS: parking_lot::Mutex<Option<HashMap<(u64, u64, [u32; 4], u32, u64), u32>>> = parking_lot::Mutex::new(None);
+
+fn note_view_census(cp: &Cp, lo: u64, hi: u64, vs: &shaders::Prepared, ps: Option<&shaders::Prepared>) {
+    let frame = super::super::FRAMES.load(Ordering::Relaxed);
+    if frame < 300 {
+        return;
+    }
+    let mut seen: Vec<(u64, u32)> = Vec::new();
+    for p in std::iter::once(vs).chain(ps) {
+        let mut k = 0usize;
+        for &(a, len) in &p.found.reads {
+            let m = (len / 4) as usize;
+            for j in 0..m {
+                let addr = a + 4 * j as u64;
+                if addr >= lo && addr < hi {
+                    if let Some(&w) = p.found.words.get(k + j) {
+                        seen.push((addr, w));
+                    }
+                }
+            }
+            k += m;
+        }
+    }
+    if seen.is_empty() {
+        return;
+    }
+    let depth = depth_surface(cp).map_or(0, |s| s.base);
+    let cb0 = (ctx_reg(cp, 0x28C60) as u64) << 8 | ((ctx_reg(cp, 0x28E40) as u64 & 0xFF) << 40);
+    // (The viewport too: a shadow atlas's cascades share a depth target, each with its own view.)
+    let vport = [ctx_reg(cp, 0x2843C), ctx_reg(cp, 0x28440), ctx_reg(cp, 0x28444), ctx_reg(cp, 0x28448)];
+    let thread = crate::log::thread_name();
+    let mut g = VIEW_CENSUS.lock();
+    let m = g.get_or_insert_with(std::collections::BTreeMap::new);
+    let t = m.entry(frame).or_default().entry((depth, cb0, vport)).or_default();
+    for (addr, w) in seen {
+        let e = t.entry(addr).or_default().entry(w).or_insert_with(|| (0, vs.addr, Vec::new()));
+        e.0 += 1;
+        if e.2.len() < 4 && !e.2.contains(&thread) {
+            e.2.push(thread.clone());
+        }
+    }
+    // Frames 3 behind: logged where an address read two values, then dropped.
+    while let Some((&f, _)) = m.iter().next() {
+        if f + 3 > frame {
+            break;
+        }
+        let targets = m.remove(&f).unwrap();
+        for ((d, c, vp), addrs) in targets {
+            let differing: Vec<(&u64, &HashMap<u32, ViewValue>)> = addrs.iter().filter(|(_, vals)| vals.len() > 1).collect();
+            if differing.is_empty() || VIEW_CENSUS_LOGGED.load(Ordering::Relaxed) >= 2000 {
+                continue;
+            }
+            // (Logged where one value holds most of the group's draws and others are few: the
+            // shape of draws that took another pass's view.)
+            let (_, vals0) = differing[0];
+            let total: u64 = vals0.values().map(|x| x.0).sum();
+            let top = vals0.values().map(|x| x.0).max().unwrap_or(0);
+            if top * 10 < total * 7 {
+                continue;
+            }
+            VIEW_CENSUS_LOGGED.fetch_add(1, Ordering::Relaxed);
+            let (a0, vals) = differing[0];
+            let mut v: Vec<(&u32, &ViewValue)> = vals.iter().collect();
+            v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+            // (Each minority signature at most 30 times: steady ones stop, rare ones stay.)
+            {
+                let mut sg = VIEW_CENSUS_SIGS.lock();
+                let sm = sg.get_or_insert_with(HashMap::new);
+                let mut fresh = false;
+                for (w, x) in v.iter().skip(1) {
+                    let n = sm.entry((d, c, vp, **w, x.1)).or_insert(0);
+                    *n += 1;
+                    if *n <= 30 {
+                        fresh = true;
+                    }
+                }
+                if !fresh {
+                    continue;
+                }
+            }
+            let parts: Vec<String> = v.iter().map(|(w, x)| format!("{w:08x}: {} draws (vs {:#x}; {})", x.0, x.1, x.2.join(" "))).collect();
+            crate::info!("view census: frame {f} depth {d:#x} cb0 {c:#x} viewport {:08x} {:08x} {:08x} {:08x}: {} of {} addresses read two or more values; at {a0:#x}: {}", vp[0], vp[1], vp[2], vp[3], differing.len(), addrs.len(), parts.join("; "));
+        }
+    }
 }
 
 /// Draws with the programs and user data of a draw of a recent flip:

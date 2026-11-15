@@ -245,6 +245,8 @@ pub struct Cp {
     pub name: String,
     /// Outcome of the last draw (frame captures; no allocation per draw).
     pub last_draw: std::borrow::Cow<'static, str>,
+    /// `DS_ARGS_CHECK`: the address and words the indirect draw being executed read.
+    args_checked: Option<(u64, [u32; 5])>,
     /// The last packet was an indexed indirect draw with GPU-read arguments
     /// that the executor can repeat (`tune draw_repeat`): no other packet
     /// (but NOPs) since, so the registers are the same.
@@ -2148,6 +2150,7 @@ impl Cp {
         Cp {
             name: name.to_string(),
             last_draw: std::borrow::Cow::Borrowed(""),
+            args_checked: None,
             repeat_ok: false,
             ctx_dirty: true,
             last_draw_progs: (0, 0, 0),
@@ -6206,6 +6209,9 @@ impl Cp {
                             }
                             Some((super::exec::DrawArgs { count: w[0], instances: w[1], index: None, base_vertex: Some(w[2] as i32), first_instance: w[3], base_inst: None }, w[2], w[3]))
                         } else if let Some(w) = (opcode == op::DRAW_INDEX_INDIRECT && valid(a, 20)).then(|| unsafe { [rd32(a), rd32(a + 4), rd32(a + 8), rd32(a + 12), rd32(a + 16)] }).and_then(|w| self.checked_index_args(a, w)) {
+                            if super::verify::args_check_on() {
+                                self.args_checked = Some((a, w));
+                            }
                             if super::capture::capturing() {
                                 let ty = self.reg(Space::Uc, crate::hle::libs::agc_cmd::REG_VGT_INDEX_TYPE) & 3;
                                 indirect = Some(format!("args {w:?} locs {vtx_loc:#x}/{inst_loc:#x} index {:#x} type {ty} size {}{}", self.index_base, self.index_count, self.index_range(w[2], w[0])));
@@ -6250,6 +6256,7 @@ impl Cp {
                     }
                 };
                 self.last_draw = multi.take().map_or(std::borrow::Cow::Borrowed("not executed"), std::borrow::Cow::Owned);
+                let args_checked = self.args_checked.take();
                 match args {
                     Some(a) => {
                         self.draw(a);
@@ -6264,6 +6271,13 @@ impl Cp {
                         self.note("draws with 8-bit indices are not rendered yet")
                     }
                     None => {}
+                }
+                // (`DS_ARGS_CHECK`: the arguments read, checked when the draw's batch completes.)
+                if let Some((aa, w)) = args_checked {
+                    let vs = super::shaders::ngg_addr(self);
+                    if let Some(e) = self.exec.as_mut() {
+                        e.add_args_check(aa, &w, vs);
+                    }
                 }
                 if super::capture::capturing() {
                     let what = match opcode {
