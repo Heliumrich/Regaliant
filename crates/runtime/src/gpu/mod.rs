@@ -2201,8 +2201,15 @@ pub(crate) fn enqueue(queue_id: u32, bufs: Vec<(u64, u32)>, ctl: Option<Ctl>) {
 /// also when it polls a label meanwhile: the label may come from the waiting thread's work).
 /// The graphics queue's title submissions not yet run by its command processor (diagnosis).
 pub(crate) fn gfx_backlog() -> u64 {
+    let (s, d) = gfx_counts();
+    s.saturating_sub(d)
+}
+
+/// The graphics queue's title submissions queued and run by its command processor so far
+/// (`cullread`).
+pub(crate) fn gfx_counts() -> (u64, u64) {
     let qs = QUEUES.lock();
-    qs.iter().find(|q| q.id == GFX).map_or(0, |q| q.submitted.load(Ordering::SeqCst).saturating_sub(q.done.load(Ordering::SeqCst)))
+    qs.iter().find(|q| q.id == GFX).map_or((0, 0), |q| (q.submitted.load(Ordering::SeqCst), q.done.load(Ordering::SeqCst)))
 }
 
 pub(crate) fn wait_gfx_caught_up(max: std::time::Duration) -> Option<bool> {
@@ -3135,6 +3142,9 @@ pub fn submit(queue_id: u32, buffers: Vec<(u64, u32)>) {
     }
     // In queue order (under the queue's lock): the replay keeps each queue's.
     replay::note_submitted(queue_id, &buffers);
+    if queue_id == GFX {
+        crate::cullread::note_title_submission(index, &buffers);
+    }
     g.push_back(Submission { bufs: buffers, hashes, copies, at: std::time::Instant::now(), ctl: None, index });
     q.cv.notify_one();
     // DS_SUBMIT_SYNC=small (up to SMALL_SUBMIT dwords) or =1 (all),

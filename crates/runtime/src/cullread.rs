@@ -118,13 +118,136 @@ pub extern "sysv64" fn read_wait(r10: u64) {
     }
 }
 
+/// The title's index culls (`gpu::exec::CULL_CS`) as COMPUTE_PGM_LO values (address >> 8).
+const CULL_PGM_LO: [u32; 4] = [0x1008_9937, 0x1008_994d, 0x1008_9976, 0x1008_998c];
+/// The latest graphics submission of the title found to set an index cull's program (its
+/// queue index; 0: none yet), and the scan's totals: [submissions, of them with culls, dwords,
+/// ns].
+static LATEST_CULL_SUB: AtomicU64 = AtomicU64::new(0);
+static SCANS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+fn scan_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("DS_CULLREAD_DIAG").ok().as_deref(), Some("12")))
+}
+
+/// A graphics submission queued by the title (`gpu::submit`, its queue index): whether its
+/// command buffers (and those they call, two levels) set an index cull's program is noted.
+pub fn note_title_submission(index: u64, bufs: &[(u64, u32)]) {
+    if !scan_on() {
+        return;
+    }
+    let t = std::time::Instant::now();
+    let mut dwords = 0u64;
+    let found = bufs.iter().any(|&(a, n)| sets_cull_program(a, n, 2, &mut dwords));
+    if found {
+        LATEST_CULL_SUB.fetch_max(index, Ordering::AcqRel);
+        SCANS[1].fetch_add(1, Ordering::Relaxed);
+    }
+    SCANS[0].fetch_add(1, Ordering::Relaxed);
+    SCANS[2].fetch_add(dwords, Ordering::Relaxed);
+    SCANS[3].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// Whether the command buffer at `addr` (`size` dwords) sets COMPUTE_PGM_LO to an index cull's
+/// program (SET_SH_REG or a register load's pairs), following INDIRECT_BUFFER packets and the
+/// HLE's private branches `depth` levels deep.
+fn sets_cull_program(addr: u64, size: u32, depth: u32, dwords: &mut u64) -> bool {
+    use crate::hle::libs::agc_cmd::{op, pop, DS_MAGIC};
+    if size == 0 || !crate::gpu::cp::guest_readable(addr, 4 * size as u64) {
+        return false;
+    }
+    *dwords += size as u64;
+    let w = unsafe { std::slice::from_raw_parts(addr as *const u32, size as usize) };
+    let mut i = 0usize;
+    while i < w.len() {
+        let h = w[i];
+        if h >> 30 != 3 {
+            i += 1;
+            continue;
+        }
+        let count = ((h >> 16) & 0x3FFF) as usize;
+        if count == 0x3FFF {
+            i += 1;
+            continue;
+        }
+        let n = count + 1;
+        let p = |k: usize| w.get(i + 1 + k).copied().unwrap_or(0);
+        match (h >> 8) & 0xFF {
+            op::SET_SH_REG | op::SET_SH_REG_INDEX => {
+                let first = p(0) & 0xFFFF;
+                for k in 1..n {
+                    if first + (k - 1) as u32 == 0x20C && CULL_PGM_LO.contains(&p(k)) {
+                        return true;
+                    }
+                }
+            }
+            op::LOAD_SH_REG_INDEX => {
+                let (a, cnt) = (p(0) as u64 | (p(1) as u64 & 0xFFFF) << 32, p(2) as u64);
+                if cnt > 0 && cnt < 4096 && crate::gpu::cp::guest_readable(a & !3, 8 * cnt) {
+                    for k in 0..cnt {
+                        let (o, v) = unsafe { (*((a & !3) as *const u32).add(2 * k as usize), *((a & !3) as *const u32).add(2 * k as usize + 1)) };
+                        if o & 0xFFFF == 0x20C && CULL_PGM_LO.contains(&v) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            op::INDIRECT_BUFFER if depth > 0 => {
+                let target = (p(0) & !3) as u64 | ((p(1) as u64 & 0xFFFF) << 32);
+                let dw = p(2) & 0xF_FFFF;
+                if target != 0 && sets_cull_program(target, dw, depth - 1, dwords) {
+                    return true;
+                }
+            }
+            op::NOP if depth > 0 && n >= 15 && p(0) == DS_MAGIC && p(1) == pop::BRANCH => {
+                for (lo, hi, sz) in [(p(9), p(10), p(11)), (p(12), p(13), p(14))] {
+                    let target = lo as u64 | (hi as u64) << 32;
+                    if target != 0 && sets_cull_program(target, sz & 0x0FFF_FFFF, depth - 1, dwords) {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += n + 1;
+    }
+    false
+}
+
+/// Mode 12, per flip: [reads while the latest submission setting a cull's program was not yet
+/// run by the graphics command processor, reads after, the most it was behind (submissions),
+/// reads while index culls recorded were not yet submitted to the GPU, the most such culls].
+static BEHIND: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Index culls recorded by the command processors (a ticket each, in recording order) and the
+/// latest ticket of a batch submitted to the GPU (`gpu::exec`: a batch carries its latest cull's
+/// ticket from recording, through a deferred executor's closed list, to its submission).
+static CULLS_RECORDED: AtomicU64 = AtomicU64::new(0);
+static CULLS_SUBMITTED: AtomicU64 = AtomicU64::new(0);
+
+/// An index cull recorded into a batch: its ticket.
+pub fn note_cull_recorded() -> u64 {
+    CULLS_RECORDED.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+/// A batch submitted to the GPU with its latest cull's ticket (0: none).
+#[inline]
+pub fn note_culls_submitted(ticket: u64) {
+    if ticket != 0 {
+        CULLS_SUBMITTED.fetch_max(ticket, Ordering::AcqRel);
+    }
+}
+
 /// Status line: the reads' waits.
 pub fn status() -> String {
     let w: Vec<u64> = READ_WAITS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let s: Vec<u64> = SCANS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let scans = if s[0] > 0 { format!("    culls' submissions scanned: {} of {} title submissions set a cull's program ({} dwords, {} ms)\n", s[1], s[0], s[2], s[3] / 1_000_000) } else { String::new() };
     if w[0] == 0 {
-        return String::new();
+        return scans;
     }
-    format!("    culling results read by the title: {} reads waited for the GPU's writes ({} ms in all, {} after 100 ms)\n", w[0], w[1] / 1000, w[2])
+    format!("    culling results read by the title: {} reads waited for the GPU's writes ({} ms in all, {} after 100 ms)\n{scans}", w[0], w[1] / 1000, w[2])
 }
 
 /// The code inserted before the read (registers kept, flags clobbered: the displaced `cmp`
@@ -248,6 +371,20 @@ static BACKLOG: [AtomicU64; 4] = [AtomicU64::new(u64::MAX), AtomicU64::new(0), A
 static SET_SEEN_IDX: [AtomicU64; 2] = [AtomicU64::new(u64::MAX), AtomicU64::new(0)];
 /// Zero reads by (record blank, read non-zero within `HOLD_FLIPS`): index blank << 1 | seen.
 static ZERO_KIND: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Mode 11: per object (the set's table in rdi, the object's index in rax at the read), the words
+/// 1-4 of the last non-blank record it read, behind a tag: [(tag << 32) | word 1, word 2, word 3,
+/// word 4].
+fn ident_table() -> &'static [[AtomicU64; 4]] {
+    static T: std::sync::OnceLock<Box<[[AtomicU64; 4]]>> = std::sync::OnceLock::new();
+    T.get_or_init(|| (0..1usize << 20).map(|_| [const { AtomicU64::new(0) }; 4]).collect())
+}
+/// Mode 11, per flip: [non-blank reads whose record holds another base vertex than the object's
+/// last, of those reading 0, zero reads of a record with the object's own base vertex, non-blank
+/// reads with it, blank reads, objects without a last, reads whose word 1 differs, word 2, word 4,
+/// of the word-2 ones reading 0].
+static IDENT: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+/// Mode 11: a few records' words logged (the first reads of the run).
+static IDENT_SAMPLES: AtomicU64 = AtomicU64::new(0);
 static STATS: parking_lot::Mutex<Vec<(u64, u64, u64, u64)>> = parking_lot::Mutex::new(Vec::new());
 
 fn mode() -> u32 {
@@ -358,6 +495,60 @@ pub extern "sysv64" fn read_hook(regs: *const u64, _arg: u32) {
         let _ = BACKLOG[0].compare_exchange(u64::MAX, b, Ordering::Relaxed, Ordering::Relaxed);
         BACKLOG[1].fetch_max(b, Ordering::Relaxed);
     }
+    // Mode 12: has the graphics command processor run the latest title submission that sets a
+    // cull's program?
+    if mode() == 12 {
+        let c = LATEST_CULL_SUB.load(Ordering::Acquire);
+        let (_, d) = crate::gpu::gfx_counts();
+        if c > d {
+            BEHIND[0].fetch_add(1, Ordering::Relaxed);
+            BEHIND[2].fetch_max(c - d, Ordering::Relaxed);
+        } else {
+            BEHIND[1].fetch_add(1, Ordering::Relaxed);
+        }
+        let (rec, sub) = (CULLS_RECORDED.load(Ordering::Acquire), CULLS_SUBMITTED.load(Ordering::Acquire));
+        if rec > sub {
+            BEHIND[3].fetch_add(1, Ordering::Relaxed);
+            BEHIND[4].fetch_max(rec - sub, Ordering::Relaxed);
+        }
+    }
+    // Mode 11: does the record belong to the object reading it (its base vertex as at the
+    // object's last non-blank read)?
+    if mode() == 11 {
+        let (rax, rdi) = (r(0), r(7));
+        let (w1, w2, w3, w4) = (w(1), w(2), w(3), w(4));
+        if IDENT_SAMPLES.fetch_add(1, Ordering::Relaxed) % 50_000 < 8 {
+            crate::info!("cull read sample: set {rdi:#x} object {rax} record {} at flip {flip}: [{v} {w1} {w2} {w3} {w4}]", rbx / 5);
+        }
+        let tag = (rdi as u32) ^ (rax as u32).rotate_left(16) ^ 0x8000_0001;
+        let slot = ((rdi.wrapping_mul(HASH) ^ rax.wrapping_mul(0xC2B2_AE3D_27D4_EB4F)) >> 44) as usize;
+        let e = &ident_table()[slot];
+        if blank {
+            IDENT[4].fetch_add(1, Ordering::Relaxed);
+        } else {
+            let last = e[0].load(Ordering::Relaxed);
+            if last >> 32 != tag as u64 {
+                IDENT[5].fetch_add(1, Ordering::Relaxed);
+            } else {
+                if e[2].load(Ordering::Relaxed) as u32 != w3 {
+                    IDENT[0].fetch_add(1, Ordering::Relaxed);
+                    IDENT[1].fetch_add((v == 0) as u64, Ordering::Relaxed);
+                } else {
+                    IDENT[3].fetch_add(1, Ordering::Relaxed);
+                    IDENT[2].fetch_add((v == 0) as u64, Ordering::Relaxed);
+                }
+                IDENT[6].fetch_add((last as u32 != w1) as u64, Ordering::Relaxed);
+                let d2 = e[1].load(Ordering::Relaxed) as u32 != w2;
+                IDENT[7].fetch_add(d2 as u64, Ordering::Relaxed);
+                IDENT[9].fetch_add((d2 && v == 0) as u64, Ordering::Relaxed);
+                IDENT[8].fetch_add((e[3].load(Ordering::Relaxed) as u32 != w4) as u64, Ordering::Relaxed);
+            }
+            e[0].store(((tag as u64) << 32) | w1 as u64, Ordering::Relaxed);
+            e[1].store(w2 as u64, Ordering::Relaxed);
+            e[2].store(w3 as u64, Ordering::Relaxed);
+            e[3].store(w4 as u64, Ordering::Relaxed);
+        }
+    }
     // Mode 9: the record's first instance against the one it held at its last read.
     if mode() == 9 && rbx < HOLD_LEN as u64 && rbx % 5 == 0 {
         let first = w(4);
@@ -419,6 +610,14 @@ pub extern "sysv64" fn read_hook(regs: *const u64, _arg: u32) {
         if mode() == 9 {
             let m: Vec<u64> = MOVED.iter().map(|c| c.swap(0, Ordering::Relaxed)).collect();
             waits += &format!("; records holding another first instance than at their last read: {} (set zero reads: {} moved, {} kept)", m[0], m[1], m[2]);
+        }
+        if mode() == 12 {
+            let b: Vec<u64> = BEHIND.iter().map(|c| c.swap(0, Ordering::Relaxed)).collect();
+            waits += &format!("; reads before the command processor ran the latest culls' submission: {} (after: {}, most behind {}); reads while recorded culls were not yet submitted: {} (most {})", b[0], b[1], b[2], b[3], b[4]);
+        }
+        if mode() == 11 {
+            let i: Vec<u64> = IDENT.iter().map(|c| c.swap(0, Ordering::Relaxed)).collect();
+            waits += &format!("; records of another base vertex than the object's last: {} ({} read 0); own: {} ({} read 0); blank {}; new objects {}; word 1 changed {}, word 2 {} ({} read 0), word 4 {}", i[0], i[1], i[3], i[2], i[4], i[5], i[6], i[7], i[9], i[8]);
         }
         if mode() == 10 {
             let b: Vec<u64> = BACKLOG.iter().map(|c| c.swap(0, Ordering::Relaxed)).collect();
