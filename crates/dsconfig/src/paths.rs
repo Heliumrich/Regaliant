@@ -1,8 +1,11 @@
 //! Where the port keeps its files.
 //!
-//! - Development checkout (the executable under a folder holding `local-data\`, the workspace's
-//!   `Cargo.toml` and `crates\`): everything in `<root>\local-data` (not in Git), logs in
-//!   `local-data\runs`, the game in `<root>\Game\...` unless another folder is chosen.
+//! - Development checkout (the executable in the build output `<root>\target\...` of a folder
+//!   holding `local-data\`, the workspace's `Cargo.toml` and `crates\`): everything in
+//!   `<root>\local-data` (not in Git), logs in `local-data\runs`, the game in `<root>\Game\...`
+//!   unless another folder is chosen. A package elsewhere in the checkout (its `dist\`) is an
+//!   install: 2026-11-15, one run from there took the development layout, whose GPU work is off
+//!   unless the run sets DS_GPU=1, and showed a black screen.
 //! - Portable (`portable.txt` beside the executable, or `DSPORT_HOME=<folder>`): everything in
 //!   `<exe folder>\user` (or that folder).
 //! - Installed (anything else): settings, key bindings, saves and their backups in
@@ -50,13 +53,14 @@ pub struct Paths {
     pub root: Option<PathBuf>,
 }
 
-/// The checkout around `dir`: a folder holding `local-data\`, `Cargo.toml` and `crates\`
-/// together (a stray folder of one name above a player's folder is not one).
+/// The checkout whose build output holds `dir`: a folder holding `local-data\`, `Cargo.toml` and
+/// `crates\` together (a stray folder of one name above a player's folder is not one), `dir`
+/// under its `target\` (a package copied into the checkout's `dist\` is not a development build).
 fn dev_root(dir: &Path) -> Option<PathBuf> {
     let mut p = Some(dir);
     while let Some(d) = p {
         if d.join("local-data").is_dir() && d.join("Cargo.toml").is_file() && d.join("crates").is_dir() {
-            return Some(d.to_path_buf());
+            return dir.starts_with(d.join("target")).then(|| d.to_path_buf());
         }
         p = d.parent();
     }
@@ -257,6 +261,12 @@ mod tests {
             assert_eq!(p.logs(), dev.join("local-data").join("runs"));
             assert_eq!(p.shaders(), dev.join("local-data"));
             assert_eq!(p.upscalers(), dev.join("local-data").join("upscalers"));
+
+            // (A package in the checkout's dist\: an install, not the development layout.)
+            let pkg = dev.join("dist").join("Regaliant-0.1.0");
+            std::fs::create_dir_all(&pkg).unwrap();
+            let p = Paths::for_exe(&pkg.join(GAME_EXE));
+            assert_eq!(p.layout, Layout::Installed);
 
             let rel = tmp.join("Games").join("Regaliant");
             std::fs::create_dir_all(&rel).unwrap();
