@@ -193,22 +193,44 @@ pub extern "sysv64" fn select_hook(regs: *const u64, _arg: u32) {
             // panels) runs the focused list's move, which must not take the step.)
             let n = (end - begin) / 0x18;
             let here = (0..n).any(|i| *((begin + i * 0x18) as *const u64) == target);
-            match step {
-                Some((t, d)) if here && t == target && sel >= 0 && sel as i64 + d >= 0 && d != 0 => {
+            let Some(d) = step.filter(|&(t, d)| here && t == target && sel >= 0 && d != 0).map(|s| s.1) else {
+                DIRECT_STATS[1].fetch_add(1, Relaxed);
+                return;
+            };
+            let idx = sel as i64 + d;
+            // The provider's item count, as this function reads it right after (an index past it
+            // would select the first item: hovering an empty row below a short list): its
+            // cached handle when the scene's generation still matches (eboot+0xd21350 reads
+            // [[list+0x18]+0x10]; the generation at +0x18 of that, the handle's at +0x2a8), the
+            // count from eboot+0xf30540 (a virtual call on the title's thread, DIRECT released).
+            drop(g);
+            let Some(base) = crate::loader::main_module().map(|m| m.base) else { return };
+            let scene = *((list + 0x18) as *const u64);
+            let ctx = if scene > 0x10000 { *((scene + 0x10) as *const u64) } else { 0 };
+            let prov = *((list + 0x2a0) as *const u64);
+            if ctx < 0x10000 || *((ctx + 0x18) as *const i32) != *((list + 0x2a8) as *const i32) {
+                DIRECT_STATS[1].fetch_add(1, Relaxed);
+                return;
+            }
+            let count: extern "sysv64" fn(u64, u32) -> u32 = std::mem::transmute(base + 0xf30540);
+            if idx < 0 || idx >= count(prov, 0) as i64 {
+                DIRECT_STATS[1].fetch_add(1, Relaxed);
+                return;
+            }
+            {
+                let mut g = DIRECT.lock();
+                if g.is_some_and(|(t, _)| t == target) {
                     *g = None;
-                    *regs.add(6) = (sel as i64 + d) as u64;
-                    *regs.add(2) = 0;
-                    *regs.add(1) = 0;
-                    *regs.add(8) = 0;
-                    let fx = ((regs as u64 - 8) & !15) - 512;
-                    std::ptr::write_bytes((fx + 160) as *mut u8, 0, 16);
-                    if DIRECT_STATS[2].fetch_add(1, Relaxed) < 4 {
-                        crate::info!("pointer: the title's data list jumps {d:+} rows to the item under the pointer (index {sel} -> {})", sel as i64 + d);
-                    }
                 }
-                _ => {
-                    DIRECT_STATS[1].fetch_add(1, Relaxed);
-                }
+            }
+            *regs.add(6) = idx as u64;
+            *regs.add(2) = 0;
+            *regs.add(1) = 0;
+            *regs.add(8) = 0;
+            let fx = ((regs as u64 - 8) & !15) - 512;
+            std::ptr::write_bytes((fx + 160) as *mut u8, 0, 16);
+            if DIRECT_STATS[2].fetch_add(1, Relaxed) < 4 {
+                crate::info!("pointer: the title's data list jumps {d:+} rows to the item under the pointer (index {sel} -> {idx})");
             }
             return;
         }
@@ -329,7 +351,9 @@ fn grid_cell_at(t: &uistate::Tree, found: &[u64], (x, y): (f32, f32)) -> Option<
     cells
         .iter()
         .copied()
-        .filter(|&c| t.holds(c) && uistate::flags(c) & uistate::NOT_SHOWN == 0)
+        // (Shown with every ancestor, not disabled (0x10): the title's own navigation skips
+        // such cells, and its cell selection does not check.)
+        .filter(|&c| t.holds(c) && uistate::flags(c) & (uistate::NOT_SHOWN | 0x10) == 0 && root_shown(t, c).1)
         .filter_map(|c| uistate::bounds(t, c).map(|r| (c, r)))
         .filter(|(_, r)| x >= r.0 && x < r.2 && y >= r.1 && y < r.3)
         .min_by(|a, b| ((a.1 .2 - a.1 .0) * (a.1 .3 - a.1 .1)).total_cmp(&((b.1 .2 - b.1 .0) * (b.1 .3 - b.1 .1))))
@@ -496,8 +520,14 @@ pub fn tick() {
     {
         static TOP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let top = uistate::menu_top().unwrap_or(0);
-        if TOP.swap(top, Relaxed) != top && top != 0 && STARTED.load(Relaxed) {
-            uistate::rescan_screen();
+        if TOP.swap(top, Relaxed) != top {
+            // (Another screen: an earlier grid's cells and a step counted for an earlier list
+            // no longer apply; node pools are reused across screens.)
+            *GRID_CELLS.lock() = None;
+            *DIRECT_STEP.lock() = None;
+            if top != 0 && STARTED.load(Relaxed) {
+                uistate::rescan_screen();
+            }
         }
         uistate::screen_tick();
     }
@@ -623,6 +653,7 @@ fn jump_to(s: &mut State, t: &uistate::Tree, found: &[u64], item: u64, click: bo
     let dir = if (ty - fy).abs() >= (tx - fx).abs() { if ty > fy { "down" } else { "up" } } else if tx > fx { "right" } else { "left" };
     s.target = None;
     s.click = false;
+    *DIRECT_STEP.lock() = None;
     *DIRECT.lock() = Some((item, Instant::now()));
     s.queue.push_back(dir);
     s.jump = Some((item, Instant::now() + Duration::from_millis(500), click));
@@ -763,6 +794,8 @@ fn tick_nodes(tree: &std::sync::Arc<uistate::Tree>, want: bool, kbm: bool) -> bo
                 s.target = Some(h);
                 s.target_group = group;
                 s.chase.clear();
+                // (A click goes to the item it was made on: moved on to another, it is dropped.)
+                s.click = false;
             }
         }
     }
@@ -856,22 +889,24 @@ fn tick_nodes(tree: &std::sync::Arc<uistate::Tree>, want: bool, kbm: bool) -> bo
                         // A page on the right of the lists in focus: into it with
                         // Cross as a pad does, then the click there. (Nothing to the left: Circle
                         // would close a top-level menu.)
-                        // Only from a single column of items (the SETTINGS categories, whose
-                        // Cross opens the page): from a grid Cross acts on the item (the storage
-                        // screen's Deposit).
-                        Some((_, (px, _))) => {
+                        // Only from a narrow column of items at the left (the SETTINGS
+                        // categories, whose Cross opens the page) into a page of another scene:
+                        // from a grid Cross acts on the item (the storage screen's Deposit), and
+                        // beside a wide list a passive detail panel keeps selected rows too (a
+                        // shop's or the equipment's: Cross there would buy or equip; a review).
+                        Some(((_, _, same_scene), (px, _))) if !same_scene => {
                             let column = |g: u64| {
                                 let xs: Vec<f32> = tree.children.get(&g).map(|v| v.as_slice()).unwrap_or(&[]).iter().filter(|&&k| uistate::flags(k) & uistate::NOT_SHOWN == 0).filter_map(|&k| uistate::absolute(tree, k).map(|p| p.0)).collect();
                                 xs.len() >= 2 && xs.iter().all(|x| (x - xs[0]).abs() < 4.0)
                             };
-                            let fx = found.iter().map(|&f| uistate::parent(f)).filter(|&g| column(g)).filter_map(|g| uistate::bounds(tree, g)).map(|r| r.2).fold(f32::NAN, f32::max);
+                            let fx = found.iter().map(|&f| uistate::parent(f)).filter(|&g| column(g)).filter_map(|g| uistate::bounds(tree, g)).filter(|r| r.2 < 768.0).map(|r| r.2).fold(f32::NAN, f32::max);
                             if !fx.is_nan() && px >= fx {
                                 s.queue.push_back("cross");
                                 s.across = Some((found.iter().map(|&f| uistate::parent(f)).collect(), Instant::now() + Duration::from_millis(900)));
                                 s.target = None;
                             }
                         }
-                        None => {}
+                        _ => {}
                     }
                 }
             },
@@ -916,7 +951,7 @@ fn tick_nodes(tree: &std::sync::Arc<uistate::Tree>, want: bool, kbm: bool) -> bo
             }
             // Presses that left the selection where it was (an empty row below a short list):
             // after three the chase ends.
-            Some(f) if Instant::now() >= s.next_press && s.tried.is_none() && s.chase.last() == Some(&f) && s.stuck >= 2 => {
+            Some(f) if Instant::now() >= s.next_press.max(s.hold_until) && s.tried.is_none() && s.chase.last() == Some(&f) && s.stuck >= 2 => {
                 if s.logged < 60 {
                     s.logged += 1;
                     crate::info!("pointer: the item under the pointer cannot be reached (the selection does not move)");
@@ -926,7 +961,8 @@ fn tick_nodes(tree: &std::sync::Arc<uistate::Tree>, want: bool, kbm: bool) -> bo
                 s.chase.clear();
                 s.stuck = 0;
             }
-            Some(f) if Instant::now() >= s.next_press && s.tried.is_none() => {
+            // (Not before `hold_until`: a page coming in drops presses.)
+            Some(f) if Instant::now() >= s.next_press.max(s.hold_until) && s.tried.is_none() => {
                 if s.chase.last() != Some(&f) {
                     s.chase.push(f);
                     s.stuck = 0;

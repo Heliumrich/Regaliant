@@ -1341,10 +1341,11 @@ unsafe fn veh_body(info: *mut EXCEPTION_POINTERS) -> i32 {
             // code, e.g. the C runtime's memcpy given a bad guest pointer.
             // Exceptions deeper inside system code are left to its handlers
             // (and reported by `unhandled` when none takes them).
-            // (An integer division by zero in a driver's code is fatal there too: reported with
-            // our frames that called it; the NVIDIA driver crashed so on 2026-11-15, with the
-            // scouts of that day: FINDINGS.md.)
-            if code != 0xC0000094 && (code != 0xC0000005 || !called_from_our_code(ctx, 3)) {
+            // (An integer division by zero called from our code is ours too: reported with our
+            // frames; the NVIDIA driver crashed so on 2026-11-15, with the scouts of that day:
+            // FINDINGS.md. Deeper in another module it is left to that module's own handlers, as
+            // an access violation is: a 2026-11-15 review.)
+            if !matches!(code, 0xC0000005 | 0xC0000094) || !called_from_our_code(ctx, 3) {
                 return EXCEPTION_CONTINUE_SEARCH;
             }
         }

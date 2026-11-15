@@ -918,7 +918,11 @@ pub(crate) fn title_words(name: &str) -> Option<Vec<u32>> {
         eprintln!("{name}: the title's program is not in local-data/research/rdna-tests: not checked");
         return None;
     };
-    t.split(|c: char| c.is_whitespace() || c == ',').filter(|s| !s.is_empty()).map(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok()).collect()
+    let words: Option<Vec<u32>> = t.split(|c: char| c.is_whitespace() || c == ',').filter(|s| !s.is_empty()).map(|s| u32::from_str_radix(s.trim_start_matches("0x").trim_start_matches("0X"), 16).ok()).collect();
+    if words.is_none() {
+        eprintln!("{name}: local-data/research/rdna-tests/{name}.txt holds something not a hex word: not checked");
+    }
+    words
 }
 
 #[cfg(test)]
