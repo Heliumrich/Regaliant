@@ -977,7 +977,12 @@ pub fn first_translation(addr: u64, insts: &[rdna::Inst], plan: &rdna::analysis:
         return;
     }
     let n = STATS[DIFF + why].fetch_add(1, Ordering::Relaxed);
-    if n < 2 {
+    // (`DS_GUESS_TRACE=1`, diagnosis: every program's first translation against the guess its
+    // preparation made, field by field, with its code hash.)
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *TRACE.get_or_init(|| std::env::var("DS_GUESS_TRACE").ok().as_deref() == Some("1")) {
+        crate::info!("guess trace: cs {addr:#x} code {code_hash:#018x} first differs in {}; fields: {}", DIFF_NAMES[why], super::exec::spec_diff(&guess, actual));
+    } else if n < 2 {
         crate::info!("gpu: precompile guess for cs {addr:#x} differs in {}: guess resources {:?}; actual {:?}", DIFF_NAMES[why], guess.resources, actual.resources);
     }
 }
