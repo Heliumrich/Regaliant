@@ -193,7 +193,11 @@ pub extern "sysv64" fn select_hook(regs: *const u64, _arg: u32) {
             // panels) runs the focused list's move, which must not take the step.)
             let n = (end - begin) / 0x18;
             let here = (0..n).any(|i| *((begin + i * 0x18) as *const u64) == target);
+            static REFUSED: AtomicU32 = AtomicU32::new(0);
             let Some(d) = step.filter(|&(t, d)| here && t == target && sel >= 0 && d != 0).map(|s| s.1) else {
+                if REFUSED.fetch_add(1, Relaxed) < 8 {
+                    crate::info!("pointer: a data list jump left to the title's step: the item in this list {here}, the step {:?} for {target:#x}, selected index {sel}", step);
+                }
                 DIRECT_STATS[1].fetch_add(1, Relaxed);
                 return;
             };
@@ -208,12 +212,16 @@ pub extern "sysv64" fn select_hook(regs: *const u64, _arg: u32) {
             let scene = *((list + 0x18) as *const u64);
             let ctx = if scene > 0x10000 { *((scene + 0x10) as *const u64) } else { 0 };
             let prov = *((list + 0x2a0) as *const u64);
-            if ctx < 0x10000 || *((ctx + 0x18) as *const i32) != *((list + 0x2a8) as *const i32) {
-                DIRECT_STATS[1].fetch_add(1, Relaxed);
-                return;
-            }
+            // (The generation is the frame's: the handle is current only when the list was
+            // already moved this frame. Otherwise the item's being one of the list's rows in use
+            // bounds the index: an empty row below a short list is none of them.)
+            let (gen_now, gen_held) = if ctx > 0x10000 { (*((ctx + 0x18) as *const i32), *((list + 0x2a8) as *const i32)) } else { (0, -1) };
             let count: extern "sysv64" fn(u64, u32) -> u32 = std::mem::transmute(base + 0xf30540);
-            if idx < 0 || idx >= count(prov, 0) as i64 {
+            let n_items = if gen_now == gen_held && prov > 0x10000 { count(prov, 0) as i64 } else { i64::MAX };
+            if idx < 0 || idx >= n_items {
+                if REFUSED.fetch_add(1, Relaxed) < 8 {
+                    crate::info!("pointer: a data list jump left to the title's step: index {idx} outside its {n_items} items");
+                }
                 DIRECT_STATS[1].fetch_add(1, Relaxed);
                 return;
             }
@@ -543,8 +551,9 @@ pub fn tick() {
 /// When the last screen with items to point at was seen (`tick`'s condition for the pointer).
 static POINTABLE: Mutex<Option<Instant>> = Mutex::new(None);
 const POINTABLE_HOLD: Duration = Duration::from_millis(400);
-/// Items larger than this (canvas units squared) are panels, not the pointer's targets.
-const PANEL_AREA: f32 = 150_000.0;
+/// Items at least this wide and this tall (canvas units) are panels, not the pointer's targets
+/// (the storage screen's are 505x700 and 625x700; a wide list's rows are ~1200x132).
+const PANEL_SIDE: f32 = 400.0;
 
 /// Since when the screen has had items without a break, and how long before the pointer shows.
 static POINTABLE_SINCE: Mutex<Option<Instant>> = Mutex::new(None);
@@ -783,7 +792,7 @@ fn tick_nodes(tree: &std::sync::Arc<uistate::Tree>, want: bool, kbm: bool) -> bo
             .filter(|(_, _, r)| x >= r.0 && x < r.2 && y >= r.1 && y < r.3)
             // (Not whole panels: the storage screen's Inventory and Storage Box are the two items
             // of a list that a screen's own button switches, not a pointer's target.)
-            .filter(|(_, _, r)| (r.2 - r.0) * (r.3 - r.1) < PANEL_AREA)
+            .filter(|(_, _, r)| !(r.2 - r.0 >= PANEL_SIDE && r.3 - r.1 >= PANEL_SIDE))
             .min_by(|a, b| dist(a.2).total_cmp(&dist(b.2)))
             .map(|(group, n, _)| (group, n))
     });
