@@ -2,8 +2,10 @@
 //! translations across runs under it, so a change to the code that makes them
 //! starts a new store. Left out: `src/bin/` (the disassembler) and, of
 //! `src/kernels.rs` (the runtime's own kernels), all but its constants (the
-//! written-bit map's layout, which translations use): a kernel's edit kept every
-//! player's prepared shaders until 2026-11-15.
+//! written-bit map's layout, which translations use): until 2026-11-15 a kernel's
+//! edit made every stored translation cold (translated again at its first use). The
+//! pipeline store does not depend on this hash (a binary is taken by its key and the
+//! SPIR-V it was made from).
 
 use std::path::{Path, PathBuf};
 
