@@ -145,10 +145,123 @@ pub fn note_title_submission(index: u64, bufs: &[(u64, u32)]) {
     if found {
         LATEST_CULL_SUB.fetch_max(index, Ordering::AcqRel);
         SCANS[1].fetch_add(1, Ordering::Relaxed);
+        // The culls' per-object descriptors (their user data): the range and its hash now.
+        let mut range = (u64::MAX, 0u64, 0u64);
+        for &(a, n) in bufs {
+            cull_user_data(a, n, &mut range);
+        }
+        if range.1 > range.0 && range.1 - range.0 <= 1 << 22 {
+            let h = hash_range(range.0, range.1 - range.0);
+            *DESC.lock() = Some(Desc { sub: index, base: range.0, end: range.1, dispatches: range.2, at_submit: h, at_run: None });
+            ev(b'd', range.0, (range.1 - range.0) << 32 | range.2);
+        }
     }
     SCANS[0].fetch_add(1, Ordering::Relaxed);
     SCANS[2].fetch_add(dwords, Ordering::Relaxed);
     SCANS[3].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// Mode 12: the latest culls' submission's per-object descriptors (the USER_DATA_0 pointers of its
+/// dispatches): their range, dispatch count and hashes when the title queued the submission and
+/// when the graphics command processor finished running it.
+struct Desc {
+    sub: u64,
+    base: u64,
+    end: u64,
+    dispatches: u64,
+    at_submit: u64,
+    at_run: Option<u64>,
+}
+static DESC: parking_lot::Mutex<Option<Desc>> = parking_lot::Mutex::new(None);
+/// Mode 12, at passes' first reads: [checks, descriptors changed since the submission was queued,
+/// since the CP ran it, the CP had not run it yet].
+static DESC_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+fn hash_range(a: u64, n: u64) -> u64 {
+    if !crate::gpu::cp::guest_readable(a, n) {
+        return 0;
+    }
+    let w = unsafe { std::slice::from_raw_parts(a as *const u64, (n / 8) as usize) };
+    w.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &x| (h ^ x).wrapping_mul(0x100_0000_01b3).rotate_left(5))
+}
+
+/// The graphics command processor finished running title submission `index` (`gpu::worker`): for
+/// the culls' submission, its descriptors' hash then (did the title write them after queueing it?).
+pub fn note_run_end(index: u64) {
+    if !scan_on() {
+        return;
+    }
+    let mut g = DESC.lock();
+    if let Some(d) = g.as_mut().filter(|d| d.sub == index) {
+        let h = hash_range(d.base, d.end - d.base);
+        d.at_run = Some(h);
+        ev(b'h', (h != d.at_submit) as u64, 0);
+    }
+}
+
+/// At a pass's first read: the descriptors' hash against the one when the CP ran the submission
+/// (changed: the title wrote them after the GPU may have read them).
+fn check_desc_at_read() {
+    let g = DESC.lock();
+    if let Some(d) = g.as_ref() {
+        let h = hash_range(d.base, d.end - d.base);
+        let (since_submit, since_run, not_run) = (h != d.at_submit, d.at_run.is_some_and(|r| r != h), d.at_run.is_none());
+        ev(b'H', d.sub, since_submit as u64 | (since_run as u64) << 1 | (not_run as u64) << 2);
+        DESC_STATS[0].fetch_add(1, Ordering::Relaxed);
+        DESC_STATS[1].fetch_add(since_submit as u64, Ordering::Relaxed);
+        DESC_STATS[2].fetch_add(since_run as u64, Ordering::Relaxed);
+        DESC_STATS[3].fetch_add(not_run as u64, Ordering::Relaxed);
+    }
+}
+
+/// The culls' dispatches in the command buffer at `addr` (`size` dwords; not following calls):
+/// the lowest and highest USER_DATA_0 value set before a dispatch after a cull's program was
+/// loaded, and the dispatch count, into `range` (low, high + 40, count).
+fn cull_user_data(addr: u64, size: u32, range: &mut (u64, u64, u64)) {
+    use crate::hle::libs::agc_cmd::op;
+    if size == 0 || !crate::gpu::cp::guest_readable(addr, 4 * size as u64) {
+        return;
+    }
+    let w = unsafe { std::slice::from_raw_parts(addr as *const u32, size as usize) };
+    let (mut culling, mut ud) = (false, 0u64);
+    let mut i = 0usize;
+    while i < w.len() {
+        let h = w[i];
+        if h >> 30 != 3 {
+            i += 1;
+            continue;
+        }
+        let count = ((h >> 16) & 0x3FFF) as usize;
+        if count == 0x3FFF {
+            i += 1;
+            continue;
+        }
+        let n = count + 1;
+        let p = |k: usize| w.get(i + 1 + k).copied().unwrap_or(0);
+        match (h >> 8) & 0xFF {
+            op::LOAD_SH_REG_INDEX => {
+                let (a, cnt) = (p(0) as u64 | (p(1) as u64 & 0xFFFF) << 32, p(2) as u64);
+                if cnt > 0 && cnt < 4096 && crate::gpu::cp::guest_readable(a & !3, 8 * cnt) {
+                    for k in 0..cnt {
+                        let (o, v) = unsafe { (*((a & !3) as *const u32).add(2 * k as usize), *((a & !3) as *const u32).add(2 * k as usize + 1)) };
+                        if o & 0xFFFF == 0x20C {
+                            culling = CULL_PGM_LO.contains(&v);
+                        }
+                    }
+                }
+            }
+            op::SET_SH_REG if n >= 3 && p(0) & 0xFFFF == 0x240 => {
+                ud = p(1) as u64 | (p(2) as u64 & 0xFFFF) << 32;
+            }
+            op::DISPATCH_DIRECT if culling && ud != 0 => {
+                range.0 = range.0.min(ud);
+                range.1 = range.1.max(ud + 40);
+                range.2 += 1;
+            }
+            _ => {}
+        }
+        i += n + 1;
+    }
 }
 
 /// Whether the command buffer at `addr` (`size` dwords) sets COMPUTE_PGM_LO to an index cull's
@@ -180,6 +293,12 @@ fn sets_cull_program(addr: u64, size: u32, depth: u32, dwords: &mut u64) -> bool
                 let first = p(0) & 0xFFFF;
                 for k in 1..n {
                     if first + (k - 1) as u32 == 0x20C && CULL_PGM_LO.contains(&p(k)) {
+                        static DUMPED: AtomicU64 = AtomicU64::new(0);
+                        if DUMPED.fetch_add(1, Ordering::Relaxed) < 3 {
+                            let from = i.saturating_sub(24);
+                            let words: Vec<String> = w[from..(i + 60).min(w.len())].iter().map(|x| format!("{x:08x}")).collect();
+                            crate::info!("cull program set in a submission at {:#x} (dword {i}): dwords from {from}: {}", addr + 4 * i as u64, words.join(" "));
+                        }
                         return true;
                     }
                 }
@@ -190,6 +309,13 @@ fn sets_cull_program(addr: u64, size: u32, depth: u32, dwords: &mut u64) -> bool
                     for k in 0..cnt {
                         let (o, v) = unsafe { (*((a & !3) as *const u32).add(2 * k as usize), *((a & !3) as *const u32).add(2 * k as usize + 1)) };
                         if o & 0xFFFF == 0x20C && CULL_PGM_LO.contains(&v) {
+                            static DUMPED: AtomicU64 = AtomicU64::new(0);
+                            if DUMPED.fetch_add(1, Ordering::Relaxed) < 3 {
+                                let from = i.saturating_sub(16);
+                                let words: Vec<String> = w[from..(i + 64).min(w.len())].iter().map(|x| format!("{x:08x}")).collect();
+                                let pairs: Vec<String> = (0..cnt.min(24)).map(|j| unsafe { format!("{:x}={:08x}", *((a & !3) as *const u32).add(2 * j as usize), *((a & !3) as *const u32).add(2 * j as usize + 1)) }).collect();
+                                crate::info!("cull program loaded in a submission at {:#x} (dword {i} of {size}; pairs at {a:#x}, {cnt}: {}): dwords from {from}: {}", addr + 4 * i as u64, pairs.join(" "), words.join(" "));
+                            }
                             return true;
                         }
                     }
@@ -240,6 +366,61 @@ const CULL_ADDRS: [u64; 4] = [0x10_0899_3700, 0x10_0899_4d00, 0x10_0899_7600, 0x
 static CULL_NOTES: AtomicU64 = AtomicU64::new(0);
 /// Mode 12: other writers of the array: (program, address, bytes) -> count.
 static OTHER_WRITERS: parking_lot::Mutex<std::collections::BTreeMap<(u64, u64, u64), u64>> = parking_lot::Mutex::new(std::collections::BTreeMap::new());
+
+/// Index culls with no groups left out by the command processor: [direct, indirect with the
+/// arguments read on the CPU].
+static CULLS_SKIPPED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Mode 12: a title call setting COMPUTE_PGM_LO (`hle::libs::agc_cmd`): for an index cull's
+/// program, the guest frames of the first few distinct callers are logged.
+pub fn note_program_set(lo: u32, via: &str) {
+    if !scan_on() || !CULL_PGM_LO.contains(&lo) {
+        return;
+    }
+    static SEEN: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+    let frames = crate::exception::current_guest_frames(10);
+    let key = frames.iter().take(3).cloned().collect::<Vec<_>>().join(" < ");
+    let mut g = SEEN.lock();
+    if g.len() < 6 && !g.contains(&key) {
+        g.push(key);
+        crate::info!("cull program {lo:#x} set by the title ({via}) at flip {}: {}", crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed), frames.join(" < "));
+    }
+}
+
+/// Mode 12: a DISPATCH_DIRECT the title emitted through the HLE (`sceAgcCbDispatch`, at `p`): the
+/// 96 dwords before it are searched for a SET_SH_REG of an index cull's program (its callers
+/// logged by `note_program_set`).
+pub fn note_dispatch_emitted(p: u64) {
+    if !scan_on() || p < 4 * 96 || !crate::gpu::cp::guest_readable(p - 4 * 96, 4 * 96) {
+        return;
+    }
+    let w = unsafe { std::slice::from_raw_parts((p - 4 * 96) as *const u32, 96) };
+    for i in 0..w.len().saturating_sub(2) {
+        if w[i] >> 30 == 3 && (w[i] >> 8) & 0xFF == 0x76 {
+            let n = ((w[i] >> 16) & 0x3FFF) as usize;
+            let first = w[i + 1] & 0xFFFF;
+            for k in 0..n {
+                if first + k as u32 == 0x20C && i + 2 + k < w.len() {
+                    note_program_set(w[i + 2 + k], "a dispatch after SET_SH_REG");
+                }
+            }
+        }
+    }
+}
+
+/// Index culls recorded by kind: [direct, indirect read on the CPU, indirect read by the GPU].
+static CULL_KINDS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// An index cull recorded: indirect with the GPU reading its arguments, or the CPU.
+pub fn note_cull_kind(gpu_indirect: bool, cpu_indirect: bool) {
+    CULL_KINDS[if gpu_indirect { 2 } else { cpu_indirect as usize }].fetch_add(1, Ordering::Relaxed);
+}
+
+/// An index cull dispatch left out for its zero groups (`indirect`: arguments the CPU read).
+pub fn note_cull_skipped(indirect: bool) {
+    CULLS_SKIPPED[indirect as usize].fetch_add(1, Ordering::Relaxed);
+    ev(b'S', indirect as u64, 0);
+}
 
 /// An index cull recorded into a batch: its ticket.
 pub fn note_cull_recorded() -> u64 {
@@ -370,12 +551,50 @@ fn dump_events(n: usize, why: &str) {
 
 /// Mode 12, the current pass's reads: [reads, blank zero reads, set zero reads].
 static SESSION: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Mode 12: per pass (its cull info, rcx at the read), the object sets its reads went through in
+/// order (the set's table, rdi, with its first and last record and its reads), for the current
+/// and the previous session of each pass.
+#[derive(Clone, Default)]
+struct SetRun {
+    table: u64,
+    first: u64,
+    last: u64,
+    reads: u64,
+    blank: u64,
+}
+static SETS: parking_lot::Mutex<Option<std::collections::HashMap<u64, (Vec<SetRun>, Vec<SetRun>)>>> = parking_lot::Mutex::new(None);
+
+fn note_set(info: u64, table: u64, record: u64, blank: bool, start: bool) {
+    let mut g = SETS.lock();
+    let m = g.get_or_insert_with(std::collections::HashMap::new);
+    let e = m.entry(info).or_default();
+    if start {
+        e.1 = std::mem::take(&mut e.0);
+    }
+    match e.0.last_mut() {
+        Some(r) if r.table == table => {
+            r.last = r.last.max(record);
+            r.reads += 1;
+            r.blank += blank as u64;
+        }
+        _ => e.0.push(SetRun { table, first: record, last: record, reads: 1, blank: blank as u64 }),
+    }
+}
+
+fn sets_line(info: u64) -> String {
+    let g = SETS.lock();
+    let Some((cur, prev)) = g.as_ref().and_then(|m| m.get(&info)) else { return String::new() };
+    let f = |v: &Vec<SetRun>| v.iter().map(|r| format!("{:#x} {}..{} ({} reads, {} blank)", r.table, r.first, r.last, r.reads, r.blank)).collect::<Vec<_>>().join("; ");
+    format!("pass {info:#x}: this time [{}]; before [{}]", f(cur), f(prev))
+}
+static LAST_INFO: AtomicU64 = AtomicU64::new(0);
 
 /// Status line: the reads' waits.
 pub fn status() -> String {
     let w: Vec<u64> = READ_WAITS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let s: Vec<u64> = SCANS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    let scans = if s[0] > 0 { format!("    culls' submissions scanned: {} of {} title submissions set a cull's program ({} dwords, {} ms); the culls' noted writes over the array: {}, culls recorded: {}\n", s[1], s[0], s[2], s[3] / 1_000_000, CULL_NOTES.load(Ordering::Relaxed), CULLS_RECORDED.load(Ordering::Relaxed)) } else { String::new() };
+    let scans = if s[0] > 0 { format!("    culls' submissions scanned: {} of {} title submissions set a cull's program ({} dwords, {} ms); the culls' noted writes over the array: {}, culls recorded: {}, left out with no groups: {} direct, {} indirect read on the CPU\n", s[1], s[0], s[2], s[3] / 1_000_000, CULL_NOTES.load(Ordering::Relaxed), CULLS_RECORDED.load(Ordering::Relaxed), CULLS_SKIPPED[0].load(Ordering::Relaxed), CULLS_SKIPPED[1].load(Ordering::Relaxed)) + &format!("    culls' descriptors at passes' first reads: {} checks, changed since the submission was queued {}, since the CP ran it {}, not yet run {}\n", DESC_STATS[0].load(Ordering::Relaxed), DESC_STATS[1].load(Ordering::Relaxed), DESC_STATS[2].load(Ordering::Relaxed), DESC_STATS[3].load(Ordering::Relaxed)) + &format!("    culls recorded by kind: {} direct, {} indirect read on the CPU, {} indirect read by the GPU
+", CULL_KINDS[0].load(Ordering::Relaxed), CULL_KINDS[1].load(Ordering::Relaxed), CULL_KINDS[2].load(Ordering::Relaxed)) } else { String::new() };
     if w[0] == 0 {
         return scans;
     }
@@ -634,16 +853,24 @@ pub extern "sysv64" fn read_hook(regs: *const u64, _arg: u32) {
     // Mode 12: has the graphics command processor run the latest title submission that sets a
     // cull's program? (And the event log: a pass's reads begin at record 0.)
     if mode() == 12 {
+        let info = r(1);
         if rbx == 0 {
             let s: Vec<u64> = SESSION.iter().map(|c| c.swap(0, Ordering::Relaxed)).collect();
             if s[0] > 0 {
                 ev(b'w', s[0], s[1] << 32 | s[2]);
                 if s[1] >= 50 {
+                    let last = LAST_INFO.load(Ordering::Relaxed);
+                    if DUMPS.load(Ordering::Relaxed) < 40 {
+                        crate::info!("cull sets: {}", sets_line(last));
+                    }
                     dump_events(260, &format!("a pass's {} reads found {} blank records", s[0], s[1]));
                 }
             }
             ev(b'W', flip, crate::gpu::exec::done_now());
+            check_desc_at_read();
         }
+        LAST_INFO.store(info, Ordering::Relaxed);
+        note_set(info, r(7), rbx / 5, blank, rbx == 0);
         SESSION[0].fetch_add(1, Ordering::Relaxed);
         if v == 0 {
             if blank && SESSION[1].load(Ordering::Relaxed) == 0 {

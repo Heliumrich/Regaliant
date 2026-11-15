@@ -368,10 +368,21 @@ fn release_mem(cb: u64, compute: bool, action: u32, gcr: u32, dst: u32, cache_po
 
 fn set_reg(cb: u64, compute: bool, opcode: u32, r: u64) -> u64 {
     let (off, val) = split_reg(r);
+    if opcode == op::SET_SH_REG && off & 0xFFFF == 0x20C {
+        crate::cullread::note_program_set(val, "SetShRegisterDirect");
+    }
     emit(cb, &[hdr(opcode, 2, compute), off & 0xFFFF, val])
 }
 
 fn set_regs_indirect(cb: u64, compute: bool, opcode: u32, regs: u64, n: u32) -> u64 {
+    if opcode == op::LOAD_SH_REG_INDEX && n > 0 && n < 4096 && crate::gpu::cp::guest_readable(regs & !3, 8 * n as u64) {
+        for i in 0..n as u64 {
+            let (o, v) = unsafe { (*((regs & !3) as *const u32).add(2 * i as usize), *((regs & !3) as *const u32).add(2 * i as usize + 1)) };
+            if o & 0xFFFF == 0x20C {
+                crate::cullread::note_program_set(v, "SetShRegistersIndirect");
+            }
+        }
+    }
     emit(cb, &[hdr(opcode, 3, compute), lo(regs), hi(regs), n])
 }
 
@@ -383,6 +394,9 @@ unsafe fn set_regs_direct(cb: u64, compute: bool, opcode: u32, regs: *const u32,
     let mut v = Vec::with_capacity(3 * n as usize);
     for i in 0..n as usize {
         let (off, val) = unsafe { (*regs.add(2 * i), *regs.add(2 * i + 1)) };
+        if opcode == op::SET_SH_REG && off & 0xFFFF == 0x20C {
+            crate::cullread::note_program_set(val, "SetShRegistersDirect");
+        }
         v.extend_from_slice(&[hdr(opcode, 2, compute), off & 0xFFFF, val]);
     }
     emit(cb, &v)
@@ -393,6 +407,10 @@ unsafe fn set_regs_direct(cb: u64, compute: bool, opcode: u32, regs: *const u32,
 unsafe fn set_reg_range(cb: u64, compute: bool, opcode: u32, offset: u32, values: *const u32, n: u32) -> u64 {
     if n == 0 || n > 0x3FF0 {
         return 0;
+    }
+    let o = offset & 0xFFFF;
+    if opcode == op::SET_SH_REG && !values.is_null() && o <= 0x20C && 0x20C < o + n {
+        crate::cullread::note_program_set(unsafe { *values.add((0x20C - o) as usize) }, "SetShRegisterRangeDirect");
     }
     let mut v = vec![hdr(opcode, 1 + n, compute), offset & 0xFFFF];
     if values.is_null() {
@@ -600,7 +618,9 @@ sysv! {
 
     // ---- dispatches
     fn sceAgcCbDispatch(cb: u64, x: u32, y: u32, z: u32, modifier: u32) -> u64 {
-        emit(cb, &[hdr(op::DISPATCH_DIRECT, 4, ACB), x, y, z, dispatch_initiator(modifier)])
+        let p = emit(cb, &[hdr(op::DISPATCH_DIRECT, 4, ACB), x, y, z, dispatch_initiator(modifier)]);
+        crate::cullread::note_dispatch_emitted(p);
+        p
     }
     fn sceAgcCbDispatchGetSize() -> u64 { 20 }
     fn sceAgcDcbDispatchIndirect(cb: u64, offset: u32, flags: u32) -> u64 {

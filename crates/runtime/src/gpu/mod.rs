@@ -2772,6 +2772,7 @@ fn worker(q: &'static Queue, name: &str) {
         run_submission(&mut cp, &batch, name);
         if q.id == GFX {
             crate::cullread::ev(b'r', batch.index, 0);
+            crate::cullread::note_run_end(batch.index);
         }
         if let Some((Some(h_sub), h_begin)) = snap {
             let h_end = snap_hash();

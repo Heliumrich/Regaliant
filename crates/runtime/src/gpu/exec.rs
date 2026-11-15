@@ -17534,6 +17534,9 @@ impl Exec {
         // ~7 per flip there).
         if indirect.is_none() && groups.contains(&0) {
             ZERO_GROUPS[CPU_INDIRECT.with(|c| c.get()) as usize].fetch_add(1, Ordering::Relaxed);
+            if CULL_CS.contains(&cs_addr(cp)) {
+                crate::cullread::note_cull_skipped(CPU_INDIRECT.with(|c| c.get()));
+            }
             return Ok(());
         }
         let kind = self.cs_kind(indirect.is_some());
@@ -17710,6 +17713,7 @@ impl Exec {
             self.vg_placement_clear(&p)?;
         }
         if CULL_CS.contains(&p.addr) {
+            crate::cullread::note_cull_kind(indirect.is_some(), CPU_INDIRECT.with(|c| c.get()));
             self.cull_ticket = crate::cullread::note_cull_recorded();
             if self.cull_ticket_min == 0 {
                 self.cull_ticket_min = self.cull_ticket;
