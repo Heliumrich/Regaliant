@@ -526,6 +526,61 @@ pub struct Via<'a> {
 /// stored binaries when it has them (and they were made from the same code,
 /// `fp`), else made anew with its binaries captured into the store; without
 /// them through its cache file (`with_cache`).
+thread_local! {
+    /// What this thread is having the driver compile (`Crumb`): named in the log when the
+    /// driver faults inside it (`exception::veh_body`; the driver's compiler crashed so in
+    /// mass rebuilds: FINDINGS.md 2026-11-15 evening), with its stages' SPIR-V saved into the
+    /// run directory under `DS_PIPELINE_CRUMBS=1`.
+    static CRUMB: std::cell::RefCell<Option<(String, Vec<(&'static str, Vec<u32>)>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A pipeline compile's note (`CRUMB`) for as long as it lives.
+pub struct Crumb;
+
+impl Crumb {
+    pub fn set(what: impl FnOnce() -> String, code: impl FnOnce() -> Vec<(&'static str, Vec<u32>)>) -> Crumb {
+        static KEEP: OnceLock<bool> = OnceLock::new();
+        let keep = *KEEP.get_or_init(|| std::env::var("DS_PIPELINE_CRUMBS").ok().as_deref() == Some("1"));
+        let code = if keep { code() } else { Vec::new() };
+        CRUMB.with(|c| {
+            if let Ok(mut g) = c.try_borrow_mut() {
+                *g = Some((what(), code));
+            }
+        });
+        Crumb
+    }
+}
+
+impl Drop for Crumb {
+    fn drop(&mut self) {
+        CRUMB.with(|c| {
+            if let Ok(mut g) = c.try_borrow_mut() {
+                *g = None;
+            }
+        });
+    }
+}
+
+/// The driver faulted on this thread (`exception::veh_body`, at first chance): what it was
+/// compiling, with the files its SPIR-V went to.
+pub fn crumb_report() -> Option<String> {
+    CRUMB.with(|c| {
+        let g = c.try_borrow().ok()?;
+        let (what, code) = g.as_ref()?;
+        let mut files = Vec::new();
+        if let Some(dir) = crate::run_dir() {
+            for (stage, words) in code {
+                let p = dir.join(format!("fault-{stage}-{:016x}.spv", fingerprint(&[words])));
+                let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                if std::fs::write(&p, bytes).is_ok() {
+                    files.push(p.display().to_string());
+                }
+            }
+        }
+        Some(if files.is_empty() { what.clone() } else { format!("{what}; SPIR-V in {}", files.join(", ")) })
+    })
+}
+
 pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result<vk::Pipeline, String>) -> Result<vk::Pipeline, String> {
     let Some(pb) = ctx().pbin.as_ref() else {
         return with_cache(kind, key, |cache| create(Via { cache, capture: false, binaries: None }));

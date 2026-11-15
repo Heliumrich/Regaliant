@@ -1346,6 +1346,15 @@ unsafe fn veh_body(info: *mut EXCEPTION_POINTERS) -> i32 {
             // FINDINGS.md. Deeper in another module it is left to that module's own handlers, as
             // an access violation is: a 2026-11-15 review.)
             if !matches!(code, 0xC0000005 | 0xC0000094) || !called_from_our_code(ctx, 3) {
+                // (A fault inside the driver while it compiles one of our pipelines: which one,
+                // logged at first chance; its handlers, or none, decide the rest.)
+                if matches!(code, 0xC0000005 | 0xC0000094 | 0xC000001D) {
+                    if let Some(what) = crate::gpu::pcache::crumb_report() {
+                        let module = module_offset(rip).map_or_else(|| format!("{rip:#x}"), |(m, o)| format!("{m}+{o:#x}"));
+                        crate::warn!("driver fault {code:#010x} at {module} while compiling {what}");
+                        crate::log::try_flush();
+                    }
+                }
                 return EXCEPTION_CONTINUE_SEARCH;
             }
         }

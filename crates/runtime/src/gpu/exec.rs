@@ -3379,6 +3379,7 @@ fn compute_pipeline(out: &rdna::translate::Output, push_mode: bool, cache_key: O
                 }
                 c.device.create_compute_pipelines(via.cache, &[ci], None).map(|v| v[0]).map_err(|(_, e)| format!("compute pipeline: {e}"))
             };
+            let _crumb = super::pcache::Crumb::set(|| format!("compute pipeline c{:016x}", cache_key.unwrap_or(0)), || vec![("cs", out.spirv.clone())]);
             let pipeline = match cache_key {
                 Some(k) => super::pcache::create_with('c', k, super::pcache::fingerprint(&[&out.spirv]), make),
                 None => make(super::pcache::Via { cache: vk::PipelineCache::null(), capture: false, binaries: None }),
@@ -5344,6 +5345,55 @@ static MERGE_FROM: AtomicU64 = AtomicU64::new(0);
 
 /// Buffer fills in place by range (DS_PROFILE_GPU): (base, len) -> [fills, value].
 static FILL_BY: Mutex<Option<HashMap<(u64, u64), [u64; 2]>>> = Mutex::new(None);
+
+/// Large zero fills' guest memory as each next fill of the range is recorded (DS_PROFILE_GPU):
+/// (base, len) -> [fills, fills finding a non-zero word, pages found non-zero], sampled four
+/// dwords a page. Guest memory still zero from the last fill means nothing stored into it
+/// since (write-backs, the CPU): the fill's guest stores were redundant there.
+static ZF_CENSUS: Mutex<Option<HashMap<(u64, u64), [u64; 3]>>> = Mutex::new(None);
+
+fn zero_fill_census(base: u64, len: u64) {
+    if !super::cp::guest_readable(base, len) {
+        return;
+    }
+    let mut pages = 0u64;
+    let mut a = base & !4095;
+    while a < base + len {
+        let hit = [0u64, 1024, 2048, 3072].iter().any(|&o| {
+            let w = a + o;
+            w >= base && w + 4 <= base + len && unsafe { std::ptr::read_volatile(w as *const u32) } != 0
+        });
+        pages += hit as u64;
+        a += 4096;
+    }
+    let mut g = ZF_CENSUS.lock();
+    let e = g.get_or_insert_with(HashMap::new).entry((base, len)).or_insert([0; 3]);
+    e[0] += 1;
+    e[1] += (pages > 0) as u64;
+    e[2] += pages;
+}
+
+fn zero_fill_census_line() -> String {
+    let g = ZF_CENSUS.lock();
+    let Some(m) = g.as_ref() else { return String::new() };
+    let mut v: Vec<(&(u64, u64), &[u64; 3])> = m.iter().collect();
+    v.sort_by(|a, b| (b.1[0] * b.0 .1).cmp(&(a.1[0] * a.0 .1)));
+    let (fills, dirty): (u64, u64) = v.iter().fold((0, 0), |s, x| (s.0 + x.1[0], s.1 + x.1[1]));
+    let clean_bytes: u64 = v.iter().map(|x| (x.1[0] - x.1[1]) * x.0 .1).sum();
+    let all_bytes: u64 = v.iter().map(|x| x.1[0] * x.0 .1).sum();
+    let parts: Vec<String> = v
+        .iter()
+        .take(12)
+        .map(|((b, n), x)| format!("{b:#x}+{n:#x} {}/{} ({:.0} pages)", x[1], x[0], x[2] as f64 / x[0].max(1) as f64))
+        .collect();
+    format!(
+        "    large zero fills' guest memory at their recording (4 dwords a page sampled): {dirty} of {fills} found written since ({} of {} MiB zero already); by range, found written/fills (pages a fill): {}
+",
+        clean_bytes >> 20,
+        all_bytes >> 20,
+        parts.join(", ")
+    )
+}
 
 fn fill_by_lines(flips: u64) -> String {
     let g = FILL_BY.lock();
@@ -9525,6 +9575,7 @@ pub fn reset_shader_profile() {
     *SEG_TIME.lock() = None;
     *MERGE_BY.lock() = None;
     *FILL_BY.lock() = None;
+    *ZF_CENSUS.lock() = None;
     *FLUSH_SITES.lock() = None;
     MERGE_FROM.store(super::FRAMES.load(Ordering::Relaxed), Ordering::Relaxed);
     *SEG_EMPTY.lock() = None;
@@ -9618,6 +9669,7 @@ pub fn shader_profile() -> String {
     }
     s.push_str(&merge_by_lines(super::FRAMES.load(Ordering::Relaxed).saturating_sub(MERGE_FROM.load(Ordering::Relaxed))));
     s.push_str(&fill_by_lines(super::FRAMES.load(Ordering::Relaxed).saturating_sub(MERGE_FROM.load(Ordering::Relaxed))));
+    s.push_str(&zero_fill_census_line());
     s.push_str(&flush_site_lines(super::FRAMES.load(Ordering::Relaxed).saturating_sub(MERGE_FROM.load(Ordering::Relaxed))));
     s.push_str(&batch_by_lines());
     s.push_str(&begin_stats_line());
@@ -12198,6 +12250,11 @@ impl Exec {
     fn clear_images_zero(&mut self, images: &[(vk::Image, vk::Format)]) {
         self.begin();
         self.end_rendering();
+        // (`DS_PROFILE_GPU_STAMPS=seg`: the clears timed apart, a barrier-only segment by its
+        // sites.)
+        if seg_stamps() {
+            self.barrier();
+        }
         let d = &ctx().device;
         let cmd = self.cmd();
         unsafe {
@@ -12213,6 +12270,9 @@ impl Exec {
             }
             let a = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
             d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[a], &[], &[]);
+        }
+        if seg_stamps() {
+            self.barrier();
         }
     }
 
@@ -13795,23 +13855,32 @@ impl Exec {
             self.barrier_wanted = false;
             self.dispatched = false;
         }
+        let store = |x: u64, e: u64| unsafe { ctx().device.cmd_fill_buffer(cmd, buffer, x - start, e - x, v) };
         match guest {
             Some(parts) => {
                 for &(x, e) in parts {
                     // (Stored bytes rounded outward to dwords, within the fill.)
                     let (x, e) = (x.max(base) & !3, e.min(base + len).next_multiple_of(4).min(base + len));
                     if x < e {
-                        unsafe { ctx().device.cmd_fill_buffer(cmd, buffer, x - start, e - x, v) };
+                        store(x, e);
                     }
                 }
             }
-            None => unsafe { ctx().device.cmd_fill_buffer(cmd, buffer, base - start, len, v) },
+            None => store(base, base + len),
+        }
+        // (`DS_PROFILE_GPU_STAMPS=seg`: the guest and the mirror parts timed apart, as
+        // barrier-only segments by their sites.)
+        if seg_stamps() {
+            self.barrier();
         }
         // Front end 2: the mirror too (its later write-back of dwords marked
         // before the fill copies the filled values).
         if super::fe2::on() && super::fe2::in_span(base, len) {
             if let (Some((m, _)), Ok(())) = (super::resident::mirror_buffer(), super::resident::back(base & !4095, (base + len).next_multiple_of(4096) - (base & !4095))) {
-                unsafe { ctx().device.cmd_fill_buffer(cmd, m, base - super::resident::MIRROR_BASE, len, v) };
+                unsafe { ctx().device.cmd_fill_buffer(self.cmd(), m, base - super::resident::MIRROR_BASE, len, v) };
+            }
+            if seg_stamps() {
+                self.barrier();
             }
         }
         if profiling() {
@@ -17712,6 +17781,7 @@ impl Exec {
                     FILL_SKIPS[0].fetch_add(1, Ordering::Relaxed);
                     FILL_SKIPS[1].fetch_add(len, Ordering::Relaxed);
                 } else if v == 0 && len >= FILL_SKIP_MIN && profiling() {
+                    zero_fill_census(base, len);
                     // Why a large zero fill stores into guest memory (a range's
                     // 1st and 300th time, the first 24 ranges; `DS_PROFILE_GPU=1`).
                     static SEEN: Mutex<Vec<(u64, u64, u64)>> = Mutex::new(Vec::new());

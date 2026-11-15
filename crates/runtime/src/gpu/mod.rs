@@ -1430,7 +1430,6 @@ pub mod tune {
         get(175)
     }
 
-
     /// Whether translations get `rdna::translate::Spec::hw_bounds` (scalar
     /// loads of buffers only they read without a check of each dword): where
     /// robustBufferAccess2 and null descriptors are enabled (since 2026-11-12

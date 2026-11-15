@@ -1244,6 +1244,16 @@ fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, 
                 None => crate::gpu::pcache::fingerprint(&[&vs.0.out.spirv, &gs, ps_code]),
             }
         };
+        let _crumb = crate::gpu::pcache::Crumb::set(
+            || format!("graphics pipeline g{hkey:016x}: vs {:#x} (translation {:016x}), ps {}, rect-list gs {:?}, barycentric gs {}", vs.1, vs.0.key, ps.map_or("none".to_string(), |p| format!("{:#x} (translation {:016x})", p.1, p.0.key)), key.rect_gs, bary_gs_of(key, vs, ps).is_some()),
+            || {
+                let mut v = vec![("vs", vs.0.out.spirv.clone())];
+                if let Some(p) = ps {
+                    v.push(("ps", p.0.out.spirv.clone()));
+                }
+                v
+            },
+        );
         let r = crate::gpu::pcache::create_with('g', hkey, fp, |via| {
             let mut gpci = gpci;
             let mut f2 = vk::PipelineCreateFlags2CreateInfoKHR::default().flags(vk::PipelineCreateFlags2KHR::from_raw(gpci.flags.as_raw() as u64 | crate::gpu::vk::pbin::CAPTURE_DATA));
