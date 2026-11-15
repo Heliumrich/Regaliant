@@ -17617,18 +17617,6 @@ impl Exec {
         if p.addr == VG_PLACEMENT_CS && vg_clear_on() {
             self.vg_placement_clear(&p)?;
         }
-        // (`DS_VG_COUNT=1`: its per-model counters, the read-write stride-4 buffer, read after
-        // its batch.)
-        if p.addr == VG_PLACEMENT_CS && verify::vg_count_on() && self.recording && !self.stopped {
-            for (i, r) in p.resources.iter().enumerate() {
-                let Resolved::Buffer(v) = r else { continue };
-                let Some(used) = p.tr.plan.resources.get(i) else { continue };
-                if v.stride == 4 && used.written && used.read && v.extent() <= 4 << 12 {
-                    let flip = crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1;
-                    self.checks.push(verify::vg_count_check(v.base, (v.extent() / 4) as usize, flip));
-                }
-            }
-        }
         // The fill kernel over a whole range (`verify::full_fill`): one buffer
         // fill of guest memory in place, without the kernel's VRAM shadow
         // (a copy in, then a merge kernel storing every dword back across

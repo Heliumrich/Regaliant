@@ -42,35 +42,6 @@ enum Kind {
     /// compared with guest memory once the draw's batch completed (its write-backs and every
     /// earlier batch's landed), so a read made before a write it should have waited for shows.
     Args,
-    /// The VG per-view placement's per-model counters (`DS_VG_COUNT=1`): read once its batch
-    /// completed, their sum logged (the plant instances the frame draws).
-    VgCount,
-}
-
-/// `DS_VG_COUNT=1` (diagnosis): the VG placement's counters read after each placement.
-pub fn vg_count_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("DS_VG_COUNT").ok().as_deref() == Some("1"))
-}
-
-/// A read of the `n` counters at `addr` after the placement recorded at flip `flip`.
-pub fn vg_count_check(addr: u64, n: usize, flip: u64) -> Check {
-    Check { kind: Kind::VgCount, addr, threads: 0, user: vec![0; n], expected: Some((flip, 0, Vec::new())), writes_mark: 0, overwritten: false, staging: None }
-}
-
-fn vg_count(name: &str, c: &Check) {
-    let n = c.user.len();
-    if !super::cp::guest_readable(c.addr, 4 * n as u64) {
-        return;
-    }
-    let w: Vec<u32> = (0..n).map(|i| unsafe { std::ptr::read_volatile((c.addr + 4 * i as u64) as *const u32) }).collect();
-    let sum: u64 = w.iter().map(|&x| x as u64).sum();
-    let models = w.iter().filter(|&&x| x != 0).count();
-    let flip = c.expected.as_ref().map_or(0, |e| e.0);
-    static LOGGED: AtomicU64 = AtomicU64::new(0);
-    if LOGGED.fetch_add(1, Ordering::Relaxed) < 100_000 {
-        crate::info!("vg count: flip {flip}: {sum} instances in {models} models ({:#x}{}; {name})", c.addr, if c.overwritten { ", counters written again later in the batch" } else { "" });
-    }
 }
 
 /// `DS_ARGS_CHECK=1` (diagnosis): indirect draws' arguments checked after their batch.
@@ -325,7 +296,7 @@ pub fn dest_range(c: &Check) -> (u64, u64) {
         Kind::Copy => Vsharp::decode(&c.user[4..8]),
         // Compared where the GPU copied both: later writes do not matter.
         Kind::Shared => return (0, 0),
-        Kind::Args | Kind::VgCount => return (c.addr, 4 * c.user.len() as u64),
+        Kind::Args => return (c.addr, 4 * c.user.len() as u64),
     };
     (v.base, v.num_records as u64 * v.stride.max(1) as u64)
 }
@@ -334,7 +305,7 @@ pub fn dest_range(c: &Check) -> (u64, u64) {
 /// constant buffer).
 pub fn source_ranges(c: &Check) -> Vec<(u64, u64)> {
     match c.kind {
-        Kind::Fill | Kind::Shared | Kind::Args | Kind::VgCount => Vec::new(),
+        Kind::Fill | Kind::Shared | Kind::Args => Vec::new(),
         Kind::Copy => {
             let src = Vsharp::decode(&c.user[0..4]);
             let cb = Vsharp::decode(&c.user[8..12]);
@@ -418,10 +389,6 @@ fn outcome(name: &str, c: &Check, r: Result<String, String>) {
 
 /// Runs a check after the dispatch completed.
 pub fn run(name: &str, c: &Check) {
-    if matches!(c.kind, Kind::VgCount) {
-        vg_count(name, c);
-        return;
-    }
     if c.overwritten {
         outcome(name, c, Err("unverifiable: destination written again by later work".into()));
         return;
@@ -434,7 +401,7 @@ pub fn run(name: &str, c: &Check) {
         Kind::Fill => fill(c),
         Kind::Copy => copy(c),
         Kind::Shared => shared(c),
-        Kind::Args | Kind::VgCount => unreachable!(),
+        Kind::Args => unreachable!(),
     };
     outcome(name, c, r);
 }

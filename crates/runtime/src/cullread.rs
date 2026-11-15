@@ -34,7 +34,10 @@
 //! that writes the array (at most 100 ms); 5 that wait without the hold; 7 as 4, and first a
 //! wait until the graphics command processor has run every title submission queued before the
 //! read (at most 100 ms; not while it polls a label); 8 as 4, with one in 4 reads of a set
-//! record at 0 that read non-zero lately read again for up to 3 ms.
+//! record at 0 that read non-zero lately read again for up to 3 ms; 9 as 4, counting records
+//! whose first-instance field changed since their last read (it is a per-frame offset: ~40%
+//! change every flip); 10 as 4, with the graphics queue's backlog of title submissions not yet
+//! run at the flip's reads and at its set zero reads of records seen lately.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -238,6 +241,9 @@ fn last_first() -> &'static [std::sync::atomic::AtomicU32] {
     T.get_or_init(|| (0..(HOLD_LEN as usize) / 5 + 1).map(|_| std::sync::atomic::AtomicU32::new(0)).collect())
 }
 static MOVED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Mode 10, per flip: [the graphics queue's backlog at the first read (u64::MAX: none yet), the
+/// largest, set zero reads seen lately with a backlog, without].
+static BACKLOG: [AtomicU64; 4] = [AtomicU64::new(u64::MAX), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 /// Mode 8: the lowest and highest first-dword index of the flip's set zero reads seen lately.
 static SET_SEEN_IDX: [AtomicU64; 2] = [AtomicU64::new(u64::MAX), AtomicU64::new(0)];
 /// Zero reads by (record blank, read non-zero within `HOLD_FLIPS`): index blank << 1 | seen.
@@ -315,6 +321,10 @@ pub extern "sysv64" fn read_hook(regs: *const u64, _arg: u32) {
             e != 0 && e & 0xFFFF_FFFF == r10 & 0xFFFF_FFFF && (flip as u32).wrapping_sub((e >> 32) as u32) <= HOLD_FLIPS
         };
         ZERO_KIND[(blank as usize) << 1 | seen as usize].fetch_add(1, Ordering::Relaxed);
+        if mode() == 10 && !blank && seen {
+            let b = crate::gpu::gfx_backlog();
+            BACKLOG[if b > 0 { 2 } else { 3 }].fetch_add(1, Ordering::Relaxed);
+        }
         if mode() == 9 && !blank && rbx < HOLD_LEN as u64 && rbx % 5 == 0 {
             let first = w(4);
             let prev = last_first()[(rbx / 5) as usize].load(Ordering::Relaxed);
@@ -342,6 +352,11 @@ pub extern "sysv64" fn read_hook(regs: *const u64, _arg: u32) {
         if rbx == 0 && mode() == 3 {
             crate::info!("cull read: flip {flip}: record 0 reads 0: [{} {} {} {}] after it", w(1), w(2), w(3), w(4));
         }
+    }
+    if mode() == 10 {
+        let b = crate::gpu::gfx_backlog();
+        let _ = BACKLOG[0].compare_exchange(u64::MAX, b, Ordering::Relaxed, Ordering::Relaxed);
+        BACKLOG[1].fetch_max(b, Ordering::Relaxed);
     }
     // Mode 9: the record's first instance against the one it held at its last read.
     if mode() == 9 && rbx < HOLD_LEN as u64 && rbx % 5 == 0 {
@@ -404,6 +419,11 @@ pub extern "sysv64" fn read_hook(regs: *const u64, _arg: u32) {
         if mode() == 9 {
             let m: Vec<u64> = MOVED.iter().map(|c| c.swap(0, Ordering::Relaxed)).collect();
             waits += &format!("; records holding another first instance than at their last read: {} (set zero reads: {} moved, {} kept)", m[0], m[1], m[2]);
+        }
+        if mode() == 10 {
+            let b: Vec<u64> = BACKLOG.iter().map(|c| c.swap(0, Ordering::Relaxed)).collect();
+            waits += &format!("; graphics submissions not yet run at the reads: first {}, most {}; set zero reads seen lately with a backlog {}, without {}", b[0], b[1], b[2], b[3]);
+            BACKLOG[0].store(u64::MAX, Ordering::Relaxed);
         }
         crate::info!(
             "cull read: flip {last}: {}{refill}; zero records: blank {} ({} seen lately), set {} ({} seen lately){waits}",

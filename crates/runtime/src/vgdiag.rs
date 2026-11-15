@@ -50,12 +50,6 @@ fn hold_frames() -> u32 {
     *H.get_or_init(|| std::env::var("DS_VG_HOLD").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4))
 }
 
-/// `DS_VG_HOLD_ALL=1` (comparison, temporary): a hold after every reset, as before 2026-11-15.
-fn hold_all() -> bool {
-    static H: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *H.get_or_init(|| std::env::var("DS_VG_HOLD_ALL").ok().as_deref() == Some("1"))
-}
-
 fn diag_limit() -> u64 {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| std::env::var("DS_VG_DIAG").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0))
@@ -139,7 +133,7 @@ pub extern "sysv64" fn reset_hook(regs: *const u64, _arg: u32) {
     let held = {
         let mut holds = HOLDS.lock();
         let on = holds.iter().any(|h| h.ctx == ctx && h.since < hold_frames());
-        let hold = old == 0 || on || hold_all();
+        let hold = old == 0 || on;
         // (A reset in play ends a hold's wait for its generation: no value to put back.)
         let h = Hold { ctx, since: if hold { 0 } else { u32::MAX }, generation: new, saved: None };
         match holds.iter_mut().find(|h| h.ctx == ctx) {
