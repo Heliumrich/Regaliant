@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 185] = [
+    static ALL: [Tunable; 176] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -208,15 +208,6 @@ pub mod tune {
         Tunable { name: "past_repair", env: "DS_PAST_REPAIR", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "held_min", env: "DS_HELD_MIN", default: 192, value: AtomicU64::new(UNSET) },
         Tunable { name: "async_gfx_inline", env: "DS_ASYNC_GFX_INLINE", default: 12, value: AtomicU64::new(UNSET) },
-        Tunable { name: "scouts", env: "DS_SCOUTS", default: 0, value: AtomicU64::new(UNSET) },
-        Tunable { name: "scouts_commit", env: "DS_SCOUTS_COMMIT", default: 0, value: AtomicU64::new(UNSET) },
-        Tunable { name: "scouts_far", env: "DS_SCOUTS_FAR", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "scouts_wait", env: "DS_SCOUTS_WAIT", default: 0, value: AtomicU64::new(UNSET) },
-        Tunable { name: "scouts_storage", env: "DS_SCOUTS_STORAGE", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "scout_seats", env: "DS_SCOUT_SEATS", default: 3, value: AtomicU64::new(UNSET) },
-        Tunable { name: "scouts_gates", env: "DS_SCOUTS_GATES", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "scouts_stretch", env: "DS_SCOUTS_STRETCH", default: 0, value: AtomicU64::new(UNSET) },
-        Tunable { name: "scouts_clears", env: "DS_SCOUTS_CLEARS", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1439,80 +1430,6 @@ pub mod tune {
         get(175)
     }
 
-    /// Scouts (`gpu::scout`, docs/SCOUTS.md): command processors that record the graphics
-    /// queue's queued title submissions ahead of its own (how many: read once, when the graphics
-    /// queue starts, from `DS_SCOUTS`, at most 8; set to 0 later, they idle until set again).
-    /// Their records are handed over with `tune scouts_commit`, else checked at the command
-    /// processor's turn and dropped (the census). 0: none.
-    pub fn scouts() -> u64 {
-        get(176)
-    }
-
-    /// Scouts' records are handed over (`gpu::scout::turn`): a record that passes its checks at
-    /// the main command processor's turn goes to the GPU in its place, and the main command
-    /// processor goes on from where it ended. 0 (the default): the census (checked, counted,
-    /// dropped). Live (`tune scouts_commit`): in-run A/Bs with scouts running.
-    #[inline]
-    pub fn scouts_commit() -> bool {
-        get(177) != 0
-    }
-
-    /// Which queued submission a free scout takes (`gpu::scout::take_job`): 1 (the default)
-    /// the newest it can (the most time before the main command processor reaches it), 0 the
-    /// oldest behind the queue's head (the main command processor waited ~0.56 ms a hand-over
-    /// for records begun one submission ahead: Castlewall Front x0.96, run 20261115-000926).
-    #[inline]
-    pub fn scouts_far() -> bool {
-        get(178) != 0
-    }
-
-    /// How long the main command processor waits at its turn for a record its scout has not
-    /// finished, us (0, the default: not at all: the scout is told to stop and the main
-    /// command processor records the submission itself).
-    #[inline]
-    pub fn scouts_wait() -> u64 {
-        get(179)
-    }
-
-    /// A scout's held batches bind storage images GPU work wrote already (`Images::
-    /// held_storage_view`; 0: its record ends at the first dispatch that writes one, as a
-    /// stretch past a label wait does: 21% of the stream's dwords lay behind those stops,
-    /// docs/SCOUTS.md).
-    #[inline]
-    pub fn scouts_storage() -> bool {
-        get(180) != 0
-    }
-
-    /// Seats a scout has (`gpu::scout::Seat`, read when the scouts start): the records it can
-    /// keep waiting for their turns while it records the next submission.
-    #[inline]
-    pub fn scout_seats() -> u64 {
-        get(181)
-    }
-
-    /// A scout's record goes on behind a label wait that has not passed yet (`Cp::scout_gate`:
-    /// a gate; the main command processor takes the record a segment at a time). 0: it ends
-    /// there (half the records made far ahead did: run 20261115-001616).
-    #[inline]
-    pub fn scouts_gates() -> bool {
-        get(182) != 0
-    }
-
-    /// With scouts handing their records over (`tune scouts_commit`), the main command
-    /// processor still goes past label waits in stretches of its own (`Cp::past_wait_ok`).
-    /// 0 (the default): it waits at them; what follows is the scouts' to record.
-    #[inline]
-    pub fn scouts_stretch() -> bool {
-        get(183) != 0
-    }
-
-    /// A scout's own executor takes pending fast clears of earlier work at its images' first
-    /// uses (`Exec::resolve_fast_clears`, checked at its commit). 0: its record ends there.
-    #[inline]
-    pub fn scouts_clears() -> bool {
-        get(184) != 0
-    }
-
     /// Whether translations get `rdna::translate::Spec::hw_bounds` (scalar
     /// loads of buffers only they read without a check of each dword): where
     /// robustBufferAccess2 and null descriptors are enabled (since 2026-11-12
@@ -2097,7 +2014,6 @@ pub mod particles;
 pub mod forward;
 pub mod hscensus;
 pub mod par;
-pub mod scout;
 pub mod prio;
 pub mod precache;
 pub mod fe2;
@@ -2763,39 +2679,14 @@ fn worker(q: &'static Queue, name: &str) {
         // (Timelines: how long the submission waited in the queue, how many
         // more wait behind it, and its run: what a planner ahead of the
         // command processor would have to work on, `tools/sublag.py`.)
-        // The graphics queue's scouts (`gpu::scout`): the submission's scout, if it has one,
-        // gets its turn, and with `tune scouts_commit` its record is taken over.
-        let handed = if q.id == GFX {
-            // (Started here: front end 2 is on only once its self-test ran.)
-            if !scout::on() && scout::count() != 0 {
-                scout::start();
-            }
-            scout::turn(batch.index, &batch.bufs, &mut cp)
-        } else {
-            scout::Handed::No
-        };
         let tl_sub = timeline::mark();
         if tl_sub.is_some() {
             let behind = q.pending.lock().len();
             let dwords: u64 = batch.bufs.iter().map(|b| b.1 as u64).sum();
             timeline::span_back(&format!("{name} queued"), batch.at.elapsed(), || format!("sub {} queued ({} buffers, {dwords} dwords, {behind} behind)", batch.index, batch.bufs.len()));
         }
-        match handed {
-            scout::Handed::No => run_submission(&mut cp, &batch, name),
-            // (The whole submission is its scout's record.)
-            scout::Handed::Whole => {
-                cp.submitted_at = Some(batch.at);
-                cp.sub_index = batch.index;
-            }
-            // (On from where the record ended.)
-            scout::Handed::From(buf, addr) => run_kept(&mut cp, &Kept { index: batch.index, bufs: batch.bufs.clone(), at: batch.at }, Some((buf, addr)), name),
-        }
-        timeline::end(&format!("{name} subs"), tl_sub, || format!("sub {} run{}", batch.index, match handed {
-            scout::Handed::No if scout::on() => format!(" ({})", scout::last_outcome()),
-            scout::Handed::No => String::new(),
-            scout::Handed::Whole => " (its scout's record)".to_string(),
-            scout::Handed::From(..) => " (from its scout's record on)".to_string(),
-        }));
+        run_submission(&mut cp, &batch, name);
+        timeline::end(&format!("{name} subs"), tl_sub, || format!("sub {} run", batch.index));
         while let Some((s, buf, addr)) = cp.take_rewind_sub() {
             let Some(k) = kept.iter().position(|x| x.index == s) else {
                 crate::error!("gpu[{name}]: a stretch past a label wait or run was dropped but submission {s} is not kept; going on");
@@ -3140,11 +3031,6 @@ pub fn submit(queue_id: u32, buffers: Vec<(u64, u32)>) {
     // In queue order (under the queue's lock): the replay keeps each queue's.
     replay::note_submitted(queue_id, &buffers);
     g.push_back(Submission { bufs: buffers, hashes, copies, at: std::time::Instant::now(), ctl: None, index });
-    if queue_id == GFX {
-        if let Some(b) = g.back() {
-            scout::queued(b.index, &b.bufs, b.at);
-        }
-    }
     q.cv.notify_one();
     // DS_SUBMIT_SYNC=small (up to SMALL_SUBMIT dwords) or =1 (all),
     // diagnostic: the submit returns once its work completed (no CPU/GPU
@@ -3334,7 +3220,6 @@ pub fn reset_profile() {
     exec::reset_batch_misses();
     cp::reset_wait_stats();
     par::reset_stats();
-    scout::reset_stats();
     cp::past_wait_reset();
     lockstat::reset_stats();
     images::reset_memo_stats();

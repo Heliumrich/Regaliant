@@ -68,20 +68,6 @@ pub struct Inputs {
     modulus: u64,
 }
 
-impl Inputs {
-    /// The words they were read as, by where: the control block's two, the source's records
-    /// (a scout keeps them for its content check, `Exec::note_content`).
-    pub fn words(&self) -> Vec<(u64, Vec<u32>)> {
-        let mut v = vec![(self.cb, vec![self.count as u32, self.modulus as u32])];
-        if self.stride == 4 {
-            v.push((self.src, self.src_words.clone()));
-        } else {
-            v.extend(self.src_words.iter().enumerate().map(|(j, &w)| (self.src + j as u64 * self.stride, vec![w])));
-        }
-        v
-    }
-}
-
 static ENTRIES: RwLock<Vec<Entry>> = RwLock::new(Vec::new());
 static COUNT: AtomicUsize = AtomicUsize::new(0);
 static GEN: AtomicU64 = AtomicU64::new(1);
@@ -204,7 +190,7 @@ thread_local! {
     static HERE: Cell<bool> = const { Cell::new(false) };
     /// This thread's copy of the entries: (generation, [(base, bytes,
     /// copied words, old words)], the span [lo, hi) they lie in).
-    static LOCAL: RefCell<(u64, Vec<LocalEntry>, (u64, u64), Option<Arc<Frozen>>)> = const { RefCell::new((0, Vec::new(), (0, 0), None)) };
+    static LOCAL: RefCell<(u64, Vec<LocalEntry>, (u64, u64))> = const { RefCell::new((0, Vec::new(), (0, 0))) };
 }
 
 /// Diagnostics (traced waits): the forwarding state over [a, a+n) as this
@@ -226,77 +212,8 @@ pub fn describe(a: u64, n: u64) -> String {
 struct Held {
     entries: Vec<Entry>,
     hidden: Vec<u64>,
-    /// Bumped at each change (this thread's view is cached by it and GEN); begun at a value
-    /// no other view has (`next_version`).
+    /// Bumped at each change (this thread's view is cached by it and GEN).
     version: u64,
-    /// A scout's view (`hold_begin_scout`): the published entries as its record found them.
-    frozen: Option<Arc<Frozen>>,
-    /// `DS_SCOUT_TRACE`: its entries that ended (destination, words, the write that ended
-    /// them: its start and bytes; 0, 0: replaced or dropped).
-    gone: Vec<(u64, usize, u64, u64)>,
-}
-
-/// `DS_SCOUT_TRACE=<n>` (diagnosis): the first n CPU reads of scouts and their workers that
-/// their view did not cover although copies were forwarded around them (`DEST_SPAN`), with
-/// the view's entries on the read's page and the ones that ended there (`trace_uncovered`).
-pub fn scout_trace() -> bool {
-    static ON: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("DS_SCOUT_TRACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0)) != 0
-}
-
-/// Where copies of at most 4,096 words were forwarded so far: [lowest destination, highest
-/// end) (the per-view blocks; `scout_trace`).
-static DEST_SPAN: [AtomicU64; 2] = [AtomicU64::new(u64::MAX), AtomicU64::new(0)];
-
-/// A scout's or its worker's CPU reads `reads` that its view left uncovered (`scout_trace`).
-pub fn trace_uncovered(reads: &[(u64, u64)], who: &str, stages: [u64; 2]) {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let (lo, hi) = (DEST_SPAN[0].load(Ordering::Relaxed), DEST_SPAN[1].load(Ordering::Relaxed));
-    let Some(&(a, n)) = reads.iter().find(|&&(a, n)| a < hi && lo < a + n) else { return };
-    // (`DS_SCOUT_TRACE_FROM=<flip>`: from that flip on.)
-    static FROM: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
-    let num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-    let (limit, from) = *FROM.get_or_init(|| (num("DS_SCOUT_TRACE"), num("DS_SCOUT_TRACE_FROM")));
-    if super::FRAMES.load(Ordering::Relaxed) < from || N.fetch_add(1, Ordering::Relaxed) >= limit {
-        return;
-    }
-    let (page, end) = (a & !0xFFF, (a + n).next_multiple_of(0x1000));
-    let line = HELD.with(|h| match h.borrow().as_ref() {
-        None => "no held view".to_string(),
-        Some(x) => {
-            let own: Vec<String> = x.entries.iter().filter(|e| e.base < end && page < e.base + 4 * e.words.len() as u64).map(|e| format!("{:#x}+{:#x}{}", e.base, 4 * e.words.len(), if e.how == HOW_CP_WRITE { " (CP write)" } else { "" })).collect();
-            let gone: Vec<String> = x.gone.iter().filter(|g| g.0 < end && page < g.0 + 4 * g.1 as u64).map(|g| format!("{:#x}+{:#x} by {:#x}+{:#x}", g.0, 4 * g.1, g.2, g.3)).collect();
-            let frozen: Vec<String> = x.frozen.as_ref().map_or_else(Vec::new, |f| f.entries.iter().filter(|e| e.1 < end && page < e.1 + 4 * e.2.len() as u64).map(|e| format!("{:#x}+{:#x}{}", e.1, 4 * e.2.len(), if x.hidden.contains(&e.0) { " (hidden)" } else { "" })).collect());
-            format!("its entries on the page: [{}]; ended there: [{}]; published when it began: [{}]; {} entries in all, {} hidden", own.join(", "), gone.join(", "), frozen.join(", "), x.entries.len(), x.hidden.len())
-        }
-    });
-    crate::info!("forward: scout trace: {who} read {a:#x}+{n:#x} from memory (stages {:#x} {:#x}; {} uncovered reads here): {line}", stages[0], stages[1], reads.len());
-}
-
-/// The published entries as a scout's record found them when it began (id, destination,
-/// words). A scout records a later submission than the main command processor, which goes on
-/// publishing copies of the submissions between: the scout reads through this snapshot for
-/// its whole record (so every read of it sees one state); the words it takes from it are kept
-/// with its other binding reads and checked by content at its turn (`Exec::note_content`,
-/// `content_changed`). Its own entries (its copies and CP writes) come first. Both are served
-/// as they are: memory under them moves with the earlier submissions' copies meanwhile, so
-/// `before_copy` says nothing here.
-struct Frozen {
-    entries: Vec<(u64, u64, Arc<[u32]>)>,
-}
-
-/// How a thread's copy of an entry is served (`LocalEntry`'s last field): checked against
-/// memory (`before_copy`), or as it is: a scout's own entry, or entry k of its snapshot
-/// (`SERVE_FROZEN` + k).
-const SERVE_CHECKED: u8 = 0;
-const SERVE_OWN: u8 = 1;
-const SERVE_FROZEN: u8 = 2;
-
-/// A held view's first version: no two views of a thread share one (a view's cached copy is
-/// found by its version: a new view that began at 0 again could find the last one's copy).
-fn next_version() -> u64 {
-    static V: AtomicU64 = AtomicU64::new(1 << 24);
-    V.fetch_add(1 << 24, Ordering::Relaxed)
 }
 
 thread_local! {
@@ -310,214 +227,7 @@ pub fn held() -> bool {
 
 /// A held stretch begins on this thread (the graphics CP past a run).
 pub fn hold_begin() {
-    HELD.with(|h| *h.borrow_mut() = Some(Held { version: next_version(), ..Default::default() }));
-}
-
-/// A scout's record begins on this thread (`Exec::scout_begin`): held, reading through the
-/// published entries as they are now (`Frozen`).
-pub fn hold_begin_scout() {
-    let entries: Vec<(u64, u64, Arc<[u32]>)> = ENTRIES.read().iter().map(|e| (e.id, e.base, e.words.clone())).collect();
-    HELD.with(|h| *h.borrow_mut() = Some(Held { version: next_version(), frozen: Some(Arc::new(Frozen { entries })), ..Default::default() }));
-}
-
-/// The scout's record on this thread is committed (`Cp::scout_commit`, in place of
-/// `hold_commit`): `writes`, what its batches write, ends the published entries they overlap
-/// (its writes come after them in program order; entries published since its record began
-/// are not in its view, so its recording could not hide them), then its copies become
-/// everyone's. Each one's old and earlier words are taken anew: what memory can hold there
-/// before the copy runs is what it holds now and the words of the published copies this
-/// record's writes end, not what the scout found when it recorded.
-pub fn hold_commit_scout(writes: &[(u64, u64)]) {
-    let Some(held) = HELD.with(|h| h.borrow_mut().take()) else { return };
-    let over = |base: u64, len: usize| writes.iter().any(|&(a, n)| base < a + n && a < base + 4 * len as u64);
-    let mut g = ENTRIES.write();
-    let (gone, keep): (Vec<Entry>, Vec<Entry>) = std::mem::take(&mut *g).into_iter().partition(|e| held.hidden.contains(&e.id) || over(e.base, e.words.len()));
-    *g = keep;
-    for e in held.entries.into_iter().filter(|e| e.how != HOW_CP_WRITE && e.how != HOW_WALKED) {
-        let n = e.words.len();
-        let end = e.base + 4 * n as u64;
-        let old: Arc<[u32]> = if super::cp::guest_readable(e.base, 4 * n as u64) {
-            let mut v = vec![0u32; n];
-            unsafe { read_words(e.base, &mut v) };
-            v.into()
-        } else {
-            Arc::from(Vec::new())
-        };
-        let mut earlier: Vec<Arc<[u32]>> = Vec::new();
-        for x in gone.iter().filter(|x| x.base == e.base && x.words.len() == n) {
-            earlier.extend(x.earlier.iter().cloned());
-            earlier.push(x.words.clone());
-        }
-        earlier.extend(e.earlier.iter().cloned());
-        if earlier.len() > 2 * EARLIER_MAX {
-            earlier.drain(..earlier.len() - 2 * EARLIER_MAX);
-        }
-        g.retain(|x| !(x.base < end && e.base < x.base + 4 * x.words.len() as u64));
-        if g.len() >= MAX_ENTRIES {
-            g.remove(0);
-        }
-        g.push(Entry { old, earlier: earlier.into(), ..e });
-        HELD_STATS[1].fetch_add(1, Ordering::Relaxed);
-    }
-    COUNT.store(g.len(), Ordering::Release);
-    note_span(&g);
-    GEN.fetch_add(1, Ordering::AcqRel);
-}
-
-/// A held view off its thread (`park`, `unpark`): a scout's finished record's, until the
-/// thread that commits or drops the record takes it.
-pub struct Parked(Held);
-
-/// Takes this thread's held view off it (None: it has none).
-pub fn park() -> Option<Parked> {
-    HELD.with(|h| h.borrow_mut().take()).map(Parked)
-}
-
-/// This thread reads and commits through `p` from now on (it had no held view).
-pub fn unpark(p: Parked) {
-    HELD.with(|h| *h.borrow_mut() = Some(p.0));
-}
-
-/// A scout's record refused at a gate after earlier segments of it were committed: `writes`
-/// (what the record writes) ends the published entries they overlap, as its commit would
-/// have; its own entries are forgotten with this thread's view (readers of its committed
-/// copies wait for their batches).
-pub fn hold_end_scout(writes: &[(u64, u64)]) {
-    let Some(held) = HELD.with(|h| h.borrow_mut().take()) else { return };
-    let over = |base: u64, len: usize| writes.iter().any(|&(a, n)| base < a + n && a < base + 4 * len as u64);
-    let mut g = ENTRIES.write();
-    let before = g.len();
-    g.retain(|e| !(held.hidden.contains(&e.id) || over(e.base, e.words.len())));
-    if g.len() != before {
-        COUNT.store(g.len(), Ordering::Release);
-        note_span(&g);
-        GEN.fetch_add(1, Ordering::AcqRel);
-    }
-}
-
-thread_local! {
-    /// The span of this thread's held view's own entries, by the view's version
-    /// (`uncovered_by_own`): (version, lowest destination, highest end).
-    static OWN_SPAN: Cell<(u64, u64, u64)> = const { Cell::new((u64::MAX, 0, 0)) };
-}
-
-/// Appends to `out` the parts of [a, a + n) that this thread's held view's own entries do not
-/// cover (a scout's: its copies and CP writes, before the reader in program order); without a
-/// held view the whole range.
-pub fn uncovered_by_own(a: u64, n: u64, out: &mut Vec<(u64, u64)>) {
-    let end = a + n;
-    HELD.with(|h| {
-        let h = h.borrow();
-        let Some(x) = h.as_ref() else {
-            out.push((a, n));
-            return;
-        };
-        let (v, lo, hi) = OWN_SPAN.with(|s| s.get());
-        let (lo, hi) = if v == x.version {
-            (lo, hi)
-        } else {
-            let (lo, hi) = x.entries.iter().fold((u64::MAX, 0u64), |(lo, hi), e| (lo.min(e.base), hi.max(e.base + 4 * e.words.len() as u64)));
-            OWN_SPAN.with(|s| s.set((x.version, lo, hi)));
-            (lo, hi)
-        };
-        if end <= lo || hi <= a {
-            out.push((a, n));
-            return;
-        }
-        let mut over: Vec<(u64, u64)> = x.entries.iter().filter(|e| e.base < end && a < e.base + 4 * e.words.len() as u64).map(|e| (a.max(e.base), end.min(e.base + 4 * e.words.len() as u64))).collect();
-        if over.is_empty() {
-            out.push((a, n));
-            return;
-        }
-        over.sort_unstable();
-        let mut at = a;
-        for (s, e) in over {
-            if s > at {
-                out.push((at, s - at));
-            }
-            at = at.max(e);
-        }
-        if at < end {
-            out.push((at, end - at));
-        }
-    });
-}
-
-/// The parts of `ranges` no published entry covers: what a reader in program order takes
-/// from guest memory there (a scout's content check waits for their unfinished writers
-/// first, `exec::words_now`).
-pub fn uncovered_published(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
-    let mut out = Vec::new();
-    if COUNT.load(Ordering::Acquire) == 0 {
-        out.extend_from_slice(ranges);
-        return out;
-    }
-    let g = ENTRIES.read();
-    for &(a, n) in ranges {
-        let end = a + n;
-        let mut over: Vec<(u64, u64)> = g.iter().filter(|e| e.base < end && a < e.base + 4 * e.words.len() as u64).map(|e| (a.max(e.base), end.min(e.base + 4 * e.words.len() as u64))).collect();
-        over.sort_unstable();
-        let mut at = a;
-        for (s, e) in over {
-            if s > at {
-                out.push((at, s - at));
-            }
-            at = at.max(e);
-        }
-        if at < end {
-            out.push((at, end - at));
-        }
-    }
-    out
-}
-
-/// What a reader in program order takes at [base, base + 4 n) now: the published entries'
-/// words over guest memory (as `overlay` serves them); None where that is not known: the
-/// range unreadable, or a part no entry covers still written by unfinished work (`busy`).
-pub(super) fn reader_words(base: u64, n: usize, busy: &impl Fn(&[(u64, u64)]) -> bool) -> Option<Vec<u32>> {
-    if !super::cp::guest_readable(base, 4 * n as u64) {
-        return None;
-    }
-    let end = base + 4 * n as u64;
-    // (The entries held still while memory is read: one that retires meanwhile would leave
-    // its words neither here nor there.)
-    let g = ENTRIES.read();
-    let mut covered: Vec<(u64, u64)> = g.iter().filter(|e| e.base < end && base < e.base + 4 * e.words.len() as u64).map(|e| (base.max(e.base), end.min(e.base + 4 * e.words.len() as u64))).collect();
-    covered.sort_unstable();
-    let mut left: Vec<(u64, u64)> = Vec::new();
-    let mut at = base;
-    for &(s, e) in &covered {
-        if s > at {
-            left.push((at, s - at));
-        }
-        at = at.max(e);
-    }
-    if at < end {
-        left.push((at, end - at));
-    }
-    if !left.is_empty() && busy(&left) {
-        return None;
-    }
-    let mut out = vec![0u32; n];
-    unsafe { read_words(base, &mut out) };
-    for e in g.iter() {
-        let (lo, hi) = (base.max(e.base), end.min(e.base + 4 * e.words.len() as u64));
-        if lo >= hi {
-            continue;
-        }
-        let ok = (lo..hi).step_by(4).all(|a| {
-            let (i, k) = (((a - base) / 4) as usize, ((a - e.base) / 4) as usize);
-            out[i] == e.words[k] || before_copy(&e.old, &e.earlier, k, out[i])
-        });
-        if !ok {
-            // (A reader would end the entry and take memory, which unfinished work may write.)
-            return None;
-        }
-        for a in (lo..hi).step_by(4) {
-            out[((a - base) / 4) as usize] = e.words[((a - e.base) / 4) as usize];
-        }
-    }
-    Some(out)
+    HELD.with(|h| *h.borrow_mut() = Some(Held::default()));
 }
 
 /// The held stretch is committed: its entries become global (submitted with
@@ -536,9 +246,7 @@ fn publish(held: Held) {
     }
     let mut g = ENTRIES.write();
     g.retain(|e| !held.hidden.contains(&e.id));
-    // (A held CP write's words are its thread's alone, `add_cp_write`: once its batch is
-    // submitted, readers find the write as any CP write.)
-    for e in held.entries.into_iter().filter(|e| e.how != HOW_CP_WRITE && e.how != HOW_WALKED) {
+    for e in held.entries {
         let end = e.base + 4 * e.words.len() as u64;
         g.retain(|x| !(x.base < end && e.base < x.base + 4 * x.words.len() as u64));
         if g.len() >= MAX_ENTRIES {
@@ -572,10 +280,10 @@ pub fn enable_here() {
 /// Whether reads on this thread may take forwarded words now (cheap).
 #[inline]
 pub fn active() -> bool {
-    (COUNT.load(Ordering::Acquire) != 0 || HELD.with(|h| h.borrow().as_ref().is_some_and(|x| !x.entries.is_empty() || x.frozen.as_ref().is_some_and(|f| !f.entries.is_empty())))) && HERE.with(|h| h.get())
+    (COUNT.load(Ordering::Acquire) != 0 || HELD.with(|h| h.borrow().as_ref().is_some_and(|x| !x.entries.is_empty()))) && HERE.with(|h| h.get())
 }
 
-type LocalEntry = (u64, u64, Arc<[u32]>, Arc<[u32]>, Arc<[Arc<[u32]>]>, u8);
+type LocalEntry = (u64, u64, Arc<[u32]>, Arc<[u32]>, Arc<[Arc<[u32]>]>);
 
 /// Earlier copies' words an entry keeps (`Entry::earlier`).
 const EARLIER_MAX: usize = 8;
@@ -597,45 +305,26 @@ fn before_copy(old: &[u32], earlier: &[Arc<[u32]>], k: usize, mem: u32) -> bool 
 /// outside it overlaps none: the entries are destinations within the
 /// per-view block).
 fn with_local_span<R>(f: impl FnOnce(&[LocalEntry], (u64, u64)) -> R) -> R {
-    with_local_view(|v, span, _| f(v, span))
-}
-
-/// `with_local_span`, with a scout's snapshot (its entries are in the copy, served as they
-/// are: `SERVE_FROZEN`).
-fn with_local_view<R>(f: impl FnOnce(&[LocalEntry], (u64, u64), Option<&Frozen>) -> R) -> R {
-    // A held view's own version is mixed in (its entries and hidden ones); a scout's view
-    // does not follow the published entries at all.
-    let (version, frozen) = HELD.with(|h| h.borrow().as_ref().map_or((0, false), |x| (x.version, x.frozen.is_some())));
-    let generation = if frozen { version.wrapping_mul(0xC2B2_AE3D_27D4_EB4F) ^ 0x5C0F } else { GEN.load(Ordering::Acquire).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ version.wrapping_mul(0xC2B2_AE3D_27D4_EB4F) };
+    // A held view's own generation is mixed in (its entries and hidden ones).
+    let held_gen = HELD.with(|h| h.borrow().as_ref().map_or(0, |x| x.version.wrapping_add(1) << 40));
+    let generation = GEN.load(Ordering::Acquire) ^ held_gen;
     LOCAL.with(|l| {
         let mut l = l.borrow_mut();
         if l.0 != generation {
-            let local = |e: &Entry, serve: u8| -> LocalEntry { (e.base, 4 * e.words.len() as u64, e.words.clone(), e.old.clone(), e.earlier.clone(), serve) };
-            let (v, fr): (Vec<LocalEntry>, Option<Arc<Frozen>>) = HELD.with(|h| match h.borrow().as_ref() {
-                None => (ENTRIES.read().iter().map(|e| local(e, SERVE_CHECKED)).collect(), None),
-                Some(x) => {
-                    let under = |base: u64, len: usize| x.entries.iter().any(|p| p.base < base + 4 * len as u64 && base < p.base + 4 * p.words.len() as u64);
-                    match x.frozen.as_ref() {
-                        None => {
-                            let g = ENTRIES.read();
-                            (x.entries.iter().chain(g.iter().filter(|e| !x.hidden.contains(&e.id) && !under(e.base, e.words.len()))).map(|e| local(e, SERVE_CHECKED)).collect(), None)
-                        }
-                        Some(fr) => {
-                            let none: Arc<[u32]> = Arc::from(Vec::new());
-                            let none_earlier: Arc<[Arc<[u32]>]> = Arc::from(Vec::new());
-                            let mut v: Vec<LocalEntry> = x.entries.iter().map(|e| local(e, SERVE_OWN)).collect();
-                            v.extend(fr.entries.iter().enumerate().filter(|(_, e)| !x.hidden.contains(&e.0) && !under(e.1, e.2.len())).map(|(k, e)| (e.1, 4 * e.2.len() as u64, e.2.clone(), none.clone(), none_earlier.clone(), SERVE_FROZEN + k as u8)));
-                            (v, Some(fr.clone()))
-                        }
-                    }
-                }
+            let g = ENTRIES.read();
+            l.1 = HELD.with(|h| match h.borrow().as_ref() {
+                None => g.iter().map(|e| (e.base, 4 * e.words.len() as u64, e.words.clone(), e.old.clone(), e.earlier.clone())).collect(),
+                Some(x) => x
+                    .entries
+                    .iter()
+                    .chain(g.iter().filter(|e| !x.hidden.contains(&e.id) && !x.entries.iter().any(|p| p.base < e.base + 4 * e.words.len() as u64 && e.base < p.base + 4 * p.words.len() as u64)))
+                    .map(|e| (e.base, 4 * e.words.len() as u64, e.words.clone(), e.old.clone(), e.earlier.clone()))
+                    .collect(),
             });
-            l.1 = v;
-            l.3 = fr;
             l.2 = l.1.iter().fold((u64::MAX, 0), |(lo, hi), e| (lo.min(e.0), hi.max(e.0 + e.1)));
             l.0 = generation;
         }
-        f(&l.1, l.2, l.3.as_deref())
+        f(&l.1, l.2)
     })
 }
 
@@ -686,7 +375,7 @@ pub fn word_or(addr: u64, mem: u32) -> u32 {
         }
         v.iter().find(|e| e.0 <= addr && addr < e.0 + e.1).map(|e| {
             let k = ((addr - e.0) / 4) as usize;
-            (e.0, e.2[k], e.5 != SERVE_CHECKED || before_copy(&e.3, &e.4, k, mem))
+            (e.0, e.2[k], before_copy(&e.3, &e.4, k, mem))
         })
     });
     match hit {
@@ -716,16 +405,15 @@ pub fn overlay(addr: u64, out: &mut [u32]) {
             return 0;
         }
         let mut n = 0u64;
-        for (base, bytes, words, old, earlier, serve) in v {
+        for (base, bytes, words, old, earlier) in v {
             let (lo, hi) = (addr.max(*base), end.min(base + bytes));
             if lo >= hi {
                 continue;
             }
-            let ok = *serve != SERVE_CHECKED
-                || (lo..hi).step_by(4).all(|a| {
-                    let (i, k) = (((a - addr) / 4) as usize, ((a - base) / 4) as usize);
-                    out[i] == words[k] || before_copy(old, earlier, k, out[i])
-                });
+            let ok = (lo..hi).step_by(4).all(|a| {
+                let (i, k) = (((a - addr) / 4) as usize, ((a - base) / 4) as usize);
+                out[i] == words[k] || before_copy(old, earlier, k, out[i])
+            });
             if !ok {
                 stale.push(*base);
                 continue;
@@ -756,8 +444,7 @@ pub fn uncovered(reads: &[(u64, u64)]) -> Option<Vec<(u64, u64)>> {
     // read while it changes can only miss a cover: the reads are then
     // waited for as without forwarding.)
     let (lo, hi) = (SPAN[0].load(Ordering::Acquire), SPAN[1].load(Ordering::Acquire));
-    // (A scout's view does not follow the published entries: its own span decides, below.)
-    let held = HELD.with(|h| h.borrow().as_ref().is_some_and(|x| x.frozen.is_some() || x.entries.iter().any(|e| reads.iter().any(|&(a, n)| e.base < a + n && a < e.base + 4 * e.words.len() as u64))));
+    let held = HELD.with(|h| h.borrow().as_ref().is_some_and(|x| x.entries.iter().any(|e| reads.iter().any(|&(a, n)| e.base < a + n && a < e.base + 4 * e.words.len() as u64))));
     if !held && !reads.iter().any(|&(a, n)| a < hi && lo < a + n) {
         return None;
     }
@@ -826,22 +513,9 @@ pub fn written(a: u64, n: u64) {
         let Some(x) = h.as_mut() else { return false };
         let hit = |b: u64, len: usize| b < a + n && a < b + 4 * len as u64;
         let before = x.entries.len();
-        if x.frozen.is_some() && scout_trace() && x.gone.len() < 512 {
-            let ended: Vec<(u64, usize, u64, u64)> = x.entries.iter().filter(|e| hit(e.base, e.words.len())).map(|e| (e.base, e.words.len(), a, n)).collect();
-            x.gone.extend(ended);
-        }
         x.entries.retain(|e| !hit(e.base, e.words.len()));
         let mut changed = x.entries.len() != before;
-        if let Some(fr) = x.frozen.clone() {
-            // (A scout: the entries its record found are hidden from it; the published ones
-            // its writes end are found at its commit, `hold_commit_scout`.)
-            for e in fr.entries.iter().filter(|e| hit(e.1, e.2.len())) {
-                if !x.hidden.contains(&e.0) {
-                    x.hidden.push(e.0);
-                    changed = true;
-                }
-            }
-        } else if COUNT.load(Ordering::Acquire) != 0 {
+        if COUNT.load(Ordering::Acquire) != 0 {
             for e in ENTRIES.read().iter().filter(|e| hit(e.base, e.words.len())) {
                 if !x.hidden.contains(&e.id) {
                     x.hidden.push(e.id);
@@ -938,39 +612,15 @@ fn roles(p: &Prepared) -> Option<Roles> {
     let key = p.code_hash;
     let known = PROGRAMS.lock().get_or_insert_with(HashMap::new).get(&key).copied();
     if let Some(r) = known {
-        if r.is_some() {
-            note_copy_addr(p.addr);
-        }
         return r;
     }
     let r = recognize(insts, &p.found.tr.plan);
     if r.is_some() {
-        note_copy_addr(p.addr);
         COPY_HASH.store(key, Ordering::Release);
         crate::info!("gpu: cs {:#x} (code hash {key:#018x}) is a guarded modulo copy: its results are forwarded to later reads (`tune forward_copies`)", p.addr);
     }
     PROGRAMS.lock().get_or_insert_with(HashMap::new).insert(key, r);
     r
-}
-
-/// Addresses of the programs recognized as the copy kernel (0: free): what a walk ahead of
-/// the recording looks for (`Cp::walk_copy`).
-static COPY_ADDRS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-
-fn note_copy_addr(addr: u64) {
-    for c in &COPY_ADDRS {
-        match c.compare_exchange(0, addr, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return,
-            Err(a) if a == addr => return,
-            Err(_) => {}
-        }
-    }
-}
-
-/// Whether the compute program at `addr` was recognized as the copy kernel.
-#[inline]
-pub fn is_copy_addr(addr: u64) -> bool {
-    addr != 0 && COPY_ADDRS.iter().any(|c| c.load(Ordering::Relaxed) == addr)
 }
 
 /// `if (i < cb[0]) dst[i] = src[i % cb[1]]`, as the title's compiler emits
@@ -1052,29 +702,13 @@ unsafe fn read_words(a: u64, out: &mut [u32]) {
 /// block and source can be read now (`busy`: GPU work or a deferred CP write
 /// still writes one of those ranges). (destination base, words).
 pub fn compute(p: &Prepared, groups: [u32; 3], local: [u32; 3], busy: impl Fn(&[(u64, u64)]) -> bool) -> Option<(u64, Vec<u32>, Inputs)> {
-    compute_in(p, groups, local, busy, false)
-}
-
-/// `compute`; with `view`, the control block and the source are read through this thread's
-/// forwarded words (`overlay`: a scout's held CP writes and copies precede the dispatch in
-/// program order, `add_cp_write`), and only their parts no entry covers must be free of
-/// unfinished writes.
-pub fn compute_in(p: &Prepared, groups: [u32; 3], local: [u32; 3], busy: impl Fn(&[(u64, u64)]) -> bool, view: bool) -> Option<(u64, Vec<u32>, Inputs)> {
     let r = roles(p)?;
     let buf = |i: usize| match p.found.resources.get(i) {
         Some(Resolved::Buffer(v)) => Some(*v),
         _ => None,
     };
-    // (With a view, the scouts' census counts why a copy is not forwarded: `VIEW_REFUSALS`.)
-    let why = |k: usize| {
-        if view {
-            VIEW_REFUSALS[k].fetch_add(1, Ordering::Relaxed);
-        }
-    };
-    why(0);
     let (src, dst, cb) = (buf(r.src)?, buf(r.dst)?, buf(r.cb)?);
     if DISTRUSTED.lock().as_ref().is_some_and(|d| d.contains(&(p.code_hash, dst.base))) {
-        why(1);
         return None;
     }
     let refuse = || {
@@ -1082,54 +716,30 @@ pub fn compute_in(p: &Prepared, groups: [u32; 3], local: [u32; 3], busy: impl Fn
         None
     };
     if local != [64, 1, 1] || groups[1] != 1 || groups[2] != 1 || !plain32(src.format) || !plain32(dst.format) || dst.stride != 4 || src.stride < 4 || src.add_tid || dst.add_tid {
-        why(2);
         return refuse();
     }
     if !super::cp::guest_readable(cb.base, 8) {
-        why(3);
         return refuse();
     }
-    let mut nm = [unsafe { std::ptr::read_volatile(cb.base as *const u32) }, unsafe { std::ptr::read_volatile((cb.base + 4) as *const u32) }];
-    if view {
-        overlay(cb.base, &mut nm);
-    }
-    let (n, m) = (nm[0] as u64, nm[1] as u64);
+    let n = unsafe { std::ptr::read_volatile(cb.base as *const u32) } as u64;
+    let m = unsafe { std::ptr::read_volatile((cb.base + 4) as *const u32) } as u64;
     let count = n.min(groups[0] as u64 * 64).min(dst.num_records as u64);
     let in_src = m.min(src.num_records as u64);
     if m == 0 || count == 0 || count > 1 << 16 || in_src > 1 << 16 {
-        why(4);
-        if view {
-            static N: AtomicU64 = AtomicU64::new(0);
-            if N.fetch_add(1, Ordering::Relaxed) < 12 {
-                crate::info!("forward: a scout's copy not computed for its counts: n {n:#x}, m {m:#x}, groups {groups:?}, destination {:#x} ({} records, stride {}), source {:#x} ({} records)", dst.base, dst.num_records, dst.stride, src.base, src.num_records);
-            }
-        }
         return refuse();
     }
     let src_bytes = (in_src - 1) * src.stride as u64 + 4;
     let inputs = [(cb.base, 8), (src.base, src_bytes)];
-    let left = if view { uncovered(&inputs) } else { None };
-    if busy(left.as_deref().unwrap_or(&inputs)) || super::homes::any_stale(&inputs) || !super::cp::guest_readable(src.base, src_bytes) {
-        why(if busy(&[inputs[0]]) { 5 } else { 6 });
+    if busy(&inputs) || super::homes::any_stale(&inputs) || !super::cp::guest_readable(src.base, src_bytes) {
         trace_refusal(dst.base, 4 * count, &inputs, &busy);
         return refuse();
     }
-    why(7);
     let src_words: Vec<u32> = if src.stride == 4 {
         let mut v = vec![0u32; in_src as usize];
         unsafe { read_words(src.base, &mut v) };
-        if view {
-            overlay(src.base, &mut v);
-        }
         v
     } else {
-        (0..in_src)
-            .map(|j| {
-                let a = src.base + j * src.stride as u64;
-                let w = unsafe { std::ptr::read_volatile(a as *const u32) };
-                if view { word_or(a, w) } else { w }
-            })
-            .collect()
+        (0..in_src).map(|j| unsafe { std::ptr::read_volatile((src.base + j * src.stride as u64) as *const u32) }).collect()
     };
     // dst[i] = src[i % m], zero past the source's records: the source's
     // words a period at a time (a division per word was most of this).
@@ -1202,10 +812,6 @@ pub fn add(base: u64, words: Vec<u32>, program: u64, hash: u64, from: Inputs, ho
     o[0].fetch_add(1, Ordering::Relaxed);
     o[1].fetch_add(words.len() as u64, Ordering::Relaxed);
     let n = words.len() as u64;
-    if n <= 4096 {
-        DEST_SPAN[0].fetch_min(base, Ordering::Relaxed);
-        DEST_SPAN[1].fetch_max(base + 4 * n, Ordering::Relaxed);
-    }
     let old: Arc<[u32]> = if super::cp::guest_readable(base, 4 * n) {
         let mut v = vec![0u32; n as usize];
         unsafe { read_words(base, &mut v) };
@@ -1255,152 +861,6 @@ pub fn add(base: u64, words: Vec<u32>, program: u64, hash: u64, from: Inputs, ho
     id
 }
 
-/// Copies computed through a view (`compute_in`: scouts): [copy kernel dispatches, destination
-/// distrusted, odd shapes, control block unreadable, counts zero or large, control block still
-/// written, source still written or stale, computed].
-pub static VIEW_REFUSALS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
-
-/// Entries a held view keeps at most (a scout's holds the CP writes and copies of its own
-/// submission and of the ones walked before it).
-const HELD_MAX: usize = 192;
-
-/// Room for one more entry in a held view: past `MAX_ENTRIES` the oldest CP write's words go
-/// first (labels mostly), at `HELD_MAX` the oldest entry.
-fn held_room(entries: &mut Vec<Entry>) {
-    if entries.len() < MAX_ENTRIES {
-        return;
-    }
-    if let Some(k) = entries.iter().position(|e| e.how == HOW_CP_WRITE) {
-        if entries.len() >= HELD_MAX || entries.iter().filter(|e| e.how == HOW_CP_WRITE).count() >= HELD_MAX - MAX_ENTRIES {
-            entries.remove(k);
-        }
-    } else if entries.len() >= HELD_MAX {
-        entries.remove(0);
-    }
-}
-
-/// `Entry::how` of a held CP write's words (`add_cp_write`).
-const HOW_CP_WRITE: &str = "a held CP write";
-
-/// A CP write a scout's executor recorded into a held batch (`Exec::gpu_cp_write`): the GPU
-/// performs it there, so memory holds the old words until the record is committed and run, but
-/// the words are known. They are served to this thread's later reads as a copy's are (the
-/// write precedes them in program order): stage preparations, and the copy kernel's control
-/// block and source (`compute_in`), which else count as written by unfinished work. The entry is
-/// the thread's own (`publish` leaves it out) and ends with the next write over it (`written`).
-pub fn add_cp_write(base: u64, words: &[u32]) {
-    if words.is_empty() || base % 4 != 0 || !held() || !HERE.with(|h| h.get()) {
-        return;
-    }
-    let n = words.len() as u64;
-    let end = base + 4 * n;
-    let old: Arc<[u32]> = if super::cp::guest_readable(base, 4 * n) {
-        let mut v = vec![0u32; n as usize];
-        unsafe { read_words(base, &mut v) };
-        v.into()
-    } else {
-        Arc::from(Vec::new())
-    };
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    HELD.with(|h| {
-        let mut h = h.borrow_mut();
-        let Some(x) = h.as_mut() else { return };
-        x.entries.retain(|e| !(e.base < end && base < e.base + 4 * e.words.len() as u64));
-        held_room(&mut x.entries);
-        x.entries.push(Entry {
-            id,
-            base,
-            words: words.to_vec().into(),
-            seq: 0,
-            program: 0,
-            hash: 0,
-            from: Inputs { src: 0, stride: 0, src_words: Vec::new(), cb: 0, count: 0, modulus: 0 },
-            old,
-            earlier: Arc::from(Vec::new()),
-            how: HOW_CP_WRITE,
-            queue: "".into(),
-            write_backs: 0,
-            flip: super::FRAMES.load(Ordering::Relaxed),
-        });
-        x.version += 1;
-    });
-    CP_WRITE_ENTRIES.fetch_add(1, Ordering::Relaxed);
-}
-
-/// Held CP writes forwarded (`add_cp_write`).
-pub static CP_WRITE_ENTRIES: AtomicU64 = AtomicU64::new(0);
-
-/// `Entry::how` of a copy an earlier queued submission will make, computed by a walk ahead of
-/// its recording (`add_walked`).
-const HOW_WALKED: &str = "walked ahead";
-
-/// A copy an earlier queued submission of the graphics queue will make, computed by a scout's
-/// walk of that submission (`Cp::walk_copy`; its control block and source are the title's CPU
-/// data or CP writes the walk forwarded): an entry of this thread's held view, so that the
-/// scout reads the per-view block as the submissions before its own leave it. Never published
-/// (`publish`); checked against what the real copy forwarded when the scout's turn comes
-/// (`walked`, `global_words`).
-pub fn add_walked(base: u64, words: Vec<u32>, program: u64, hash: u64, from: Inputs) -> u64 {
-    WALKED_ENTRIES.fetch_add(1, Ordering::Relaxed);
-    add(base, words, program, hash, from, HOW_WALKED, "walk")
-}
-
-/// Copies computed by walks ahead (`add_walked`).
-pub static WALKED_ENTRIES: AtomicU64 = AtomicU64::new(0);
-
-/// The walked copies this thread's held view holds now (`add_walked`): destination and words.
-pub fn walked() -> Vec<(u64, Arc<[u32]>)> {
-    HELD.with(|h| h.borrow().as_ref().map_or_else(Vec::new, |x| x.entries.iter().filter(|e| e.how == HOW_WALKED).map(|e| (e.base, e.words.clone())).collect()))
-}
-
-/// What a reader without a held view takes at [base, base + 4 n) now: guest memory with the
-/// published entries' words over it (as `overlay` gives them). None: unreadable.
-pub fn global_words(base: u64, n: usize) -> Option<Vec<u32>> {
-    if !super::cp::guest_readable(base, 4 * n as u64) {
-        return None;
-    }
-    let mut out = vec![0u32; n];
-    unsafe { read_words(base, &mut out) };
-    let end = base + 4 * n as u64;
-    if COUNT.load(Ordering::Acquire) != 0 {
-        for e in ENTRIES.read().iter() {
-            let (lo, hi) = (base.max(e.base), end.min(e.base + 4 * e.words.len() as u64));
-            if lo >= hi {
-                continue;
-            }
-            let ok = (lo..hi).step_by(4).all(|a| {
-                let (i, k) = (((a - base) / 4) as usize, ((a - e.base) / 4) as usize);
-                out[i] == e.words[k] || before_copy(&e.old, &e.earlier, k, out[i])
-            });
-            if ok {
-                for a in (lo..hi).step_by(4) {
-                    out[((a - base) / 4) as usize] = e.words[((a - e.base) / 4) as usize];
-                }
-            }
-        }
-    }
-    Some(out)
-}
-
-/// A held view's entries for another thread (`snapshot`, `adopt`).
-pub struct Snapshot {
-    entries: Vec<Entry>,
-    hidden: Vec<u64>,
-    frozen: Option<Arc<Frozen>>,
-    gone: Vec<(u64, usize, u64, u64)>,
-}
-
-/// This thread's held view as it is now (None: it has none): what a scout's held run hands
-/// its workers (`par::Run::held_fwd`), whose chunks read the per-view block as the scout does.
-pub fn snapshot() -> Option<Arc<Snapshot>> {
-    HELD.with(|h| h.borrow().as_ref().map(|x| Arc::new(Snapshot { entries: x.entries.clone(), hidden: x.hidden.clone(), frozen: x.frozen.clone(), gone: x.gone.clone() })))
-}
-
-/// This thread reads through a copy of `s` until `hold_drop` (a scout's worker for a chunk).
-pub fn adopt(s: &Snapshot) {
-    HELD.with(|h| *h.borrow_mut() = Some(Held { entries: s.entries.clone(), hidden: s.hidden.clone(), version: next_version(), frozen: s.frozen.clone(), gone: s.gone.clone() }));
-}
-
 /// `add` on a thread with a held view: the entry is its own; its earlier
 /// words come from the entry it replaces there, else from the global one
 /// over the destination (hidden from it or not), else from `RECENT`.
@@ -1433,7 +893,9 @@ fn add_held(id: u64, base: u64, words: Vec<u32>, program: u64, hash: u64, from: 
             }
         };
         x.entries.retain(|e| !(e.base < end && base < e.base + 4 * e.words.len() as u64));
-        held_room(&mut x.entries);
+        if x.entries.len() >= MAX_ENTRIES {
+            x.entries.remove(0);
+        }
         if trace_on(base, 4 * n) {
             trace_life(format_args!("entry {id} {base:#x}+{:#x} made by {queue} (held)", 4 * n));
         }

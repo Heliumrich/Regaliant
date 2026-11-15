@@ -331,39 +331,6 @@ pub fn tsharp_diff_line() -> String {
 }
 
 /// `Images::sampler` from this thread's memo.
-thread_local! {
-    /// This thread records ahead of the stream (a scout's executor, `NoCreate`): it makes no
-    /// image and no sampler. A scout reads descriptors earlier than the stream reaches them and
-    /// may read words GPU work has still to write (its commit refuses the record then), and
-    /// what it would make from them stays: an image of any size, a sampler of any state. A
-    /// scout crashed the driver (an integer division by zero in nvoglv64) in a census window,
-    /// 2026-11-15.
-    static NO_CREATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// `Images::image_for` and `Images::sampler`'s error on a thread that makes none (`NoCreate`).
-pub const NOT_MADE_HERE: &str = "an image or sampler a scout does not make";
-
-/// While alive (with `on`), this thread makes no image and no sampler (`NO_CREATE`).
-pub struct NoCreate(bool);
-
-impl NoCreate {
-    pub fn new(on: bool) -> NoCreate {
-        let before = NO_CREATE.with(|c| c.replace(on || c.get()));
-        NoCreate(before)
-    }
-}
-
-impl Drop for NoCreate {
-    fn drop(&mut self) {
-        NO_CREATE.with(|c| c.set(self.0));
-    }
-}
-
-fn no_create() -> bool {
-    NO_CREATE.with(|c| c.get())
-}
-
 pub fn sampler_hit(s: [u32; 4], compare: bool) -> Option<vk::Sampler> {
     let aniso = ANISO.load(std::sync::atomic::Ordering::Relaxed);
     tls(|m| m.samplers.get(&(s, compare, aniso)).copied())
@@ -4472,102 +4439,6 @@ impl Images {
         NOTE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
-    /// A scout's record committed a segment at a time (`Exec::apply_held_notes`): its own image
-    /// notes were `prev` when its last segment was committed (the cache has those) and are
-    /// `cur` now. What it noted since is noted here; a fast clear of its own that it took
-    /// since (`resolve_fast_clears`: in `prev`, not in `cur`) is taken here, and must still be
-    /// pending as the record left it. False (nothing changed): other work took or changed it
-    /// first, so the record's own clear of the image would come a second time.
-    /// `taken`: the pending fast clears of earlier work the record took at its images' first
-    /// uses in the segment (`Exec::held_taken`): each must still be pending as it took it (no
-    /// work recorded since took or changed it), and is taken here (before the record's own
-    /// notes, which come after it in program order). Nothing changes unless every check passes.
-    pub fn apply_held_delta(
-        &mut self,
-        taken: &[(ImageKey, (u64, Option<u32>))],
-        prev: (&std::collections::HashMap<ImageKey, (u64, Option<u32>)>, &std::collections::HashSet<ImageKey>),
-        cur: (&std::collections::HashMap<ImageKey, (u64, Option<u32>)>, &std::collections::HashSet<ImageKey>),
-    ) -> bool {
-        if taken.iter().any(|(k, v)| self.pending_clears.get(k) != Some(v)) {
-            return false;
-        }
-        if prev.0.iter().any(|(k, v)| cur.0.get(k) != Some(v) && self.pending_clears.get(k) != Some(v)) {
-            return false;
-        }
-        let mut changed = false;
-        for (k, _) in taken {
-            if self.pending_clears.remove(k).is_some() {
-                self.pending_change += 1;
-                changed = true;
-            }
-        }
-        for (k, v) in prev.0 {
-            if cur.0.get(k) != Some(v) {
-                self.pending_clears.remove(k);
-                self.pending_change += 1;
-                changed = true;
-            }
-        }
-        for (k, v) in cur.0 {
-            if prev.0.get(k) != Some(v) {
-                self.pending_clears.insert(*k, *v);
-                self.pending_change += 1;
-                changed = true;
-            }
-        }
-        // (An image a zero fill of the record cleared since: no longer to be reloaded.)
-        for k in prev.1.iter().filter(|k| !cur.1.contains(*k)) {
-            let Some(img) = self.map.get_mut(k) else { continue };
-            if img.overwritten {
-                img.overwritten = false;
-                self.overwritten_keys.remove(k);
-                self.pending_overwrites = self.pending_overwrites.saturating_sub(1);
-                self.pending_change += 1;
-                changed = true;
-            }
-        }
-        for k in cur.1.iter().filter(|k| !prev.1.contains(*k)) {
-            let Some(img) = self.map.get_mut(k) else { continue };
-            if !img.overwritten {
-                img.overwritten = true;
-                self.overwritten_keys.insert(*k);
-                self.pending_change += 1;
-                self.pending_overwrites += 1;
-                changed = true;
-            }
-        }
-        if changed {
-            self.note_gen += 1;
-            NOTE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
-        }
-        true
-    }
-
-    /// Whether one of `keys` has a fast clear or a reload pending that is not the asking
-    /// record's own (`own`: what the cache has of its notes, `apply_held_delta`).
-    /// `taken`: the pending clears of earlier work the record took (`Exec::held_taken`), which
-    /// its commit checks itself.
-    pub fn pending_not_own(&self, keys: &[ImageKey], own: (&std::collections::HashMap<ImageKey, (u64, Option<u32>)>, &std::collections::HashSet<ImageKey>), taken: &[(ImageKey, (u64, Option<u32>))]) -> bool {
-        (!self.pending_clears.is_empty() && keys.iter().any(|k| self.pending_clears.get(k).is_some_and(|v| own.0.get(k) != Some(v) && !taken.iter().any(|t| t.0 == *k && t.1 == *v))))
-            || (self.pending_overwrites > 0 && keys.iter().any(|k| !own.1.contains(k) && self.map.get(k).is_some_and(|i| i.overwritten)))
-    }
-
-    /// The fast clears pending for `keys` (once each): image, metadata and value when known.
-    pub fn pending_clears_of(&self, keys: &[ImageKey]) -> Vec<(ImageKey, (u64, Option<u32>))> {
-        let mut v: Vec<(ImageKey, (u64, Option<u32>))> = Vec::new();
-        if self.pending_clears.is_empty() {
-            return v;
-        }
-        for k in keys {
-            if let Some(&x) = self.pending_clears.get(k) {
-                if !v.iter().any(|y| y.0 == *k) {
-                    v.push((*k, x));
-                }
-            }
-        }
-        v
-    }
-
     /// The fast clear of image `k` with metadata at `meta` (`take_clears`'s
     /// entry for a clear a held executor noted itself).
     pub fn fast_clear_of(&self, k: ImageKey, meta: u64, known: Option<u32>) -> Option<FastClear> {
@@ -4688,9 +4559,6 @@ impl Images {
                 self.note_layout(k, t);
             }
             return Ok(k);
-        }
-        if no_create() {
-            return Err(NOT_MADE_HERE.into());
         }
         let ts = timed();
         let (image, mem, bytes) = self.create(key)?;
@@ -6161,49 +6029,6 @@ impl Images {
             }
         }
         let key = self.image_for(t, frame, storage)?;
-        self.view_of(t, key, storage, frame, true)
-    }
-
-    /// A storage view for a scout's held batch (`Exec::bind_stage`, docs/SCOUTS.md): only of
-    /// an image that exists for `t` and GPU work wrote already (a depth feed: known as one),
-    /// and without `view`'s notes of the write: the work before the held batch, recorded
-    /// later, must not see a write that comes after it (the image's write generation moves
-    /// its aliases' copies). The notes are made when the batch is committed
-    /// (`note_held_storage`). None: no such image yet (its first write, which changes what
-    /// lookups find: the held batch stops there).
-    pub fn held_storage_view(&mut self, t: &Tsharp, frame: u64) -> Option<(vk::ImageView, vk::Image, ImageKey)> {
-        let key = Self::key_of(t)?;
-        let (k, _) = self.lookup(&key, true)?;
-        if !self.map.get(&k).is_some_and(|i| i.gpu_written) || is_depth(k.format) || self.refreshing.contains_key(&k) {
-            return None;
-        }
-        if matches!(k.format, vk::Format::R32_SFLOAT | vk::Format::R16_UNORM) && !self.depth_feeds.contains(&k.base) {
-            return None;
-        }
-        self.view_of(t, k, true, frame, false).ok().map(|r| (r.0, r.1, k))
-    }
-
-    /// A committed held batch's storage bindings (`held_storage_view`: image, mip level,
-    /// binding shader), in their order: each a write of its image, as `view` notes one.
-    pub fn note_held_storage(&mut self, notes: &[(ImageKey, u32, u64)]) {
-        for &(key, mip, writer) in notes {
-            self.write_seq += 1;
-            let seq = self.write_seq;
-            if let Some(img) = self.map.get_mut(&key) {
-                img.write_gen = seq;
-                let m = mip as usize;
-                if img.mip_gens.len() <= m {
-                    img.mip_gens.resize(m + 1, 0);
-                }
-                img.mip_gens[m] = seq;
-                img.writer = writer;
-            }
-        }
-    }
-
-    /// The view of image `key` that `t` asks for (`view_full`); `note`: a storage view's
-    /// write is noted (false: `held_storage_view`).
-    fn view_of(&mut self, t: &Tsharp, key: ImageKey, storage: bool, frame: u64, note: bool) -> Result<(vk::ImageView, vk::Image, UseStamp), String> {
         let req = vk_format(t.format).unwrap();
         let depth = is_depth(key.format);
         let stencil = depth && req == vk::Format::R8_UINT;
@@ -6229,18 +6054,17 @@ impl Images {
         let sel = |s: u16| -> u8 { (s & 7) as u8 };
         let swz = if storage { [4, 5, 6, 7] } else { [sel(t.dst_sel), sel(t.dst_sel >> 3), sel(t.dst_sel >> 6), sel(t.dst_sel >> 9)] };
         let vkey = (fmt, vt, t.base_level, levels.saturating_sub(t.base_level).max(1), base_layer, layer_count, swz, storage as u8 | (stencil as u8) << 1);
-        let storage_note = storage && note;
-        if storage_note {
+        if storage {
             self.write_seq += 1;
         }
         let seq = self.write_seq;
-        if storage_note && matches!(key.format, vk::Format::R32_SFLOAT | vk::Format::R16_UNORM) && self.depth_feeds.insert(key.base) {
+        if storage && matches!(key.format, vk::Format::R32_SFLOAT | vk::Format::R16_UNORM) && self.depth_feeds.insert(key.base) {
             // A possible compute view of a depth plane: memos of
             // `depth_copies_possible` see it from now on.
             LOOKUP_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
         }
         let img = self.map.get_mut(&key).unwrap();
-        if storage_note {
+        if storage {
             img.write_gen = seq;
             let m = t.base_level as usize;
             if img.mip_gens.len() <= m {
@@ -6305,9 +6129,6 @@ impl Images {
                 m.samplers.insert(key, v);
             });
             return Ok(v);
-        }
-        if no_create() {
-            return Err(NOT_MADE_HERE.into());
         }
         let b = |v: u32, lo: u32, n: u32| (v >> lo) & ((1 << n) - 1);
         // (Mirror once without the device feature: mirrored repeat, `vk::mirror_clamp`.)

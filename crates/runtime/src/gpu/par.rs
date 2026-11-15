@@ -200,14 +200,8 @@ pub struct Run {
     pub part_base: u32,
     pub held_writes: Arc<super::ranges::Ranges>,
     pub held_keys: Arc<std::collections::HashMap<super::images::ImageKey, u8>>,
-    /// The storage images the held work before it bound for writing (`Exec::
-    /// held_storage_bases`): a chunk that uses an alias of one stops.
-    pub held_bases: Arc<Vec<(u64, super::images::ImageKey)>>,
     /// A held run's chunks recorded (posted in any order: `collect_held`).
     recorded: Vec<AtomicBool>,
-    /// A scout's held run (`Cp::scout_run`): the scout's forwarded words when the run was
-    /// planned (`forward::snapshot`); its workers read through them (`forward::adopt`).
-    pub held_fwd: Option<Arc<super::forward::Snapshot>>,
 }
 
 /// Run ids (`Run::id`; 0: none).
@@ -244,9 +238,7 @@ impl Run {
             part_base: 0,
             held_writes: Arc::new(super::ranges::Ranges::new()),
             held_keys: Arc::new(std::collections::HashMap::new()),
-            held_bases: Arc::new(Vec::new()),
             recorded: (0..n).map(|_| AtomicBool::new(false)).collect(),
-            held_fwd: None,
         }
     }
 
@@ -629,11 +621,7 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
         cp.fe2_set_run(run.id, if run.held { run.part_base as usize + i + 1 } else { i + 1 });
         cp.chunk_start();
         if run.held {
-            cp.held_chunk_begin(run.held_writes.clone(), run.held_keys.clone(), run.held_bases.clone());
-        }
-        if let Some(v) = run.held_fwd.as_deref() {
-            super::forward::adopt(v);
-            cp.scout_chunk(true);
+            cp.held_chunk_begin(run.held_writes.clone(), run.held_keys.clone());
         }
         cp.chunk_costs = run.timed.then(|| Vec::with_capacity(512));
         lap(1, &mut t);
@@ -643,10 +631,6 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
         lap(2, &mut t);
         cp.chunk_finish();
         cp.fe2_set_run(0, 0);
-        if run.held_fwd.is_some() {
-            super::forward::hold_drop();
-            cp.scout_chunk(false);
-        }
         if run.held {
             let held = cp.held_chunk_end();
             lap(3, &mut t);

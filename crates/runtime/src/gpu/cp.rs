@@ -376,14 +376,6 @@ pub struct Cp {
     /// stretch is settling (its wait is waited for normally then).
     past_wait: Option<Box<PastWait>>,
     settling: bool,
-    /// A scout's state while it records a queued title submission ahead (`scout_run`).
-    pub(super) scout: Option<Box<ScoutCp>>,
-    /// The read that refused this scout's last segment (`scout_commit`; diagnostics).
-    pub scout_refused: Option<(u64, u64)>,
-    /// The main command processor took a scout's record over up to a gate (`ScoutGate`): the
-    /// wait's packet, where it waits itself and then takes the record's next segment
-    /// (`gpu::scout::more`).
-    pub scout_gate: Option<u64>,
     /// The index of the submission's command buffer being run (set by the
     /// queue's worker), and where the worker is to run from next when what
     /// was recorded past a run is dropped in a later buffer than the run's
@@ -606,10 +598,6 @@ struct PastWait {
     runs: u32,
     /// The share is in use (from the stretch's first held run: `Cp::par_plan`).
     sharing: bool,
-    /// Not a label wait but a scout's turn (`Cp::scout_run`): held from its submission's first
-    /// packet until the main command processor reaches that submission; it never settles on a
-    /// promise, and its end is the end of the scout's record (`Cp::scout_end`).
-    scout: bool,
 }
 
 /// A segment of a stretch's held work, in program order (`Cp::held_commit`): the command
@@ -1084,10 +1072,6 @@ struct Fetched {
     words: Vec<u32>,
     /// Packets the CPU streams behind a REWIND (not scanned ahead).
     live: bool,
-    /// A scout's copy of a buffer larger than `FETCH_DWORDS` (`Cp::run`): its parallel runs
-    /// are planned as in a buffer read as it executes (its workers read the same words: the
-    /// commit's check finds a change).
-    scout: bool,
 }
 
 impl Fetched {
@@ -1096,7 +1080,7 @@ impl Fetched {
         let on = *ON.get_or_init(|| std::env::var("DS_CP_FETCH").ok().as_deref() != Some("0"));
         let n = size as usize;
         let words = if on && size > 0 && size <= FETCH_DWORDS && valid(base, 4 * n as u64) { unsafe { std::slice::from_raw_parts(base as *const u32, n) }.to_vec() } else { Vec::new() };
-        Fetched { base, words, live: false, scout: false }
+        Fetched { base, words, live: false }
     }
 
     /// The `len` dwords at `a` when they are all fetched, or all live (none
@@ -2142,189 +2126,6 @@ fn label_wrote(addr: u64, wide: bool, v: u64) -> bool {
 /// What the queue thread is doing (diagnostics).
 pub static STATE: parking_lot::Mutex<Vec<(String, String)>> = parking_lot::Mutex::new(Vec::new());
 
-/// A scout's record of a queued title submission in the making (`Cp::scout_run`; `gpu::scout`,
-/// docs/SCOUTS.md).
-pub struct ScoutCp {
-    /// Why and where its record ended: the reason, the packet's address, the submission's
-    /// buffer (None: still recording). "buffer end" in the last buffer: the whole submission.
-    pub ended: Option<(&'static str, u64, usize)>,
-    /// Draws and dispatches its command processor recorded itself (its held runs' chunks
-    /// apart).
-    pub commands: u64,
-    /// The label writes the submissions before its own will make, in order (the walk's:
-    /// address, value, bytes; 0 bytes: a timestamp): a wait the last one on its label satisfies
-    /// passes, one it does not is a gate.
-    pub future: Arc<Vec<(u64, u64, u8)>>,
-    /// Waits by how they passed: [memory, a promise, its own held write, an earlier queued
-    /// submission's write, gates (not passed: the record ends there)].
-    pub waits: [u64; 5],
-    /// The gate it ended at: the label and its last writer.
-    pub gate: Option<(u64, String)>,
-    /// Its held runs (`PastWait::segs`, `counts`, `runs`), kept for its commit or drop.
-    segs: Vec<HeldSeg>,
-    counts: Vec<usize>,
-    pub runs: u32,
-    /// The title's timestamps its packets met (`release_mem`): written at the hand-over.
-    stamps: Vec<u64>,
-    /// Its submission's command buffers, and the words it parsed of each (`Cp::run`: copied
-    /// when it began the buffer; None: not begun). The title patches submitted frame command
-    /// buffers until the hardware reaches the patched packets, and the GPU may write commands:
-    /// at each segment's commit the words it parsed there must still be what memory holds
-    /// (`scout_buffers_current`; parsed early, scouts met unpatched packets: "bad packet
-    /// header" at the same offset of every frame's buffer, run 20261115-012536). `cmp_from`:
-    /// where the next segment's words begin (buffer, address).
-    bufs: Vec<(u64, u32)>,
-    fetched: Vec<Option<(u64, Vec<u32>)>>,
-    cmp_from: (usize, u64),
-    /// Set by the main command processor when it reached the submission before the record
-    /// was done and went on without it (`gpu::scout::turn`): the record ends at its next
-    /// packet and is dropped.
-    cancel: Arc<std::sync::atomic::AtomicBool>,
-    /// The waits it went past without their passing (`scout_gate`), in program order: the
-    /// record is committed a segment at a time, each after its gate's wait has passed for
-    /// the main command processor. `gated`: those waits (label, wide, function, reference,
-    /// mask): the same wait met again passes with its gate.
-    gates: Vec<ScoutGate>,
-    gated: Vec<(u64, bool, u32, u64, u64)>,
-    /// The waits it passed on what memory held (label, wide, function, reference, mask), in
-    /// order: each must pass again when its segment is committed (`scout_commit`). A wait a
-    /// hardware queue would have passed at any time since the submission was queued stays
-    /// passed; a label that was reset since (a flag reused) shows as not passing, and the
-    /// record is refused. (Noted as CPU reads, as a stretch past a label wait notes them,
-    /// every later write of the label by its queue refused the record: most segments behind
-    /// gates, run 20261115-004129.)
-    polls: Vec<(u64, bool, u32, u64, u64)>,
-    polls_at: usize,
-    /// Its content reads (`Exec::note_content`) checked so far: those of the segments before.
-    content_at: usize,
-    /// Its pending clears of earlier work taken (`Exec::held_taken`) committed so far.
-    taken_at: usize,
-    /// Its commit so far (`scout_commit`): segments of `segs` submitted and its own closed
-    /// batches among them, gates passed, the CPU reads and timestamps of the segments
-    /// before, what the whole record writes (taken at its first segment), its last batch.
-    next_seg: usize,
-    own: usize,
-    next_gate: usize,
-    reads_at: usize,
-    stamps_at: usize,
-    all_writes: Option<Vec<(u64, u64)>>,
-    last: Option<u64>,
-}
-
-/// A gate of a scout's record: a label wait that did not pass when the scout met it. The
-/// record goes on behind it as if it had passed (what follows is recorded held all the same);
-/// its batch closes there, and at the hand-over the main command processor takes the record
-/// up to the gate, waits at the wait itself, and takes the next segment when it has passed
-/// (`gpu::scout::more`): the segment's CPU reads are checked against everything written up
-/// to then.
-#[derive(Clone)]
-struct ScoutGate {
-    /// The wait's packet and its buffer in the submission.
-    at: u64,
-    buf: usize,
-    /// The command processor's state there.
-    st: ChunkState,
-    stack: Vec<Vec<u32>>,
-    markers: Vec<String>,
-    pred: Option<Pred>,
-    fence_pending: bool,
-    fence_kind: u8,
-    /// Where the segment before it ends: in `segs`, in the record's CPU reads, its timestamps
-    /// and its storage-image notes.
-    seg: usize,
-    reads: usize,
-    stamps: usize,
-    storage: usize,
-    polls: usize,
-    /// The record's own image notes there (`Exec::held_notes`): what the image cache gets
-    /// when the segment before it is committed.
-    notes: super::exec::HeldNotes,
-    /// Where the segment's content reads end (`Exec::content_mark`), and its pending clears
-    /// of earlier work taken (`Exec::held_taken`).
-    content: usize,
-    taken: usize,
-}
-
-/// Gates a record may hold (`ScoutGate`); a wait that does not pass after them ends it.
-const SCOUT_GATES: usize = 8;
-
-/// The largest command buffer a scout copies to parse (`ScoutCp::fetched`), in dwords: a
-/// larger one ends its record.
-const SCOUT_FETCH_MAX: u32 = 1 << 16;
-
-/// Scouts that met words that are not a packet yet (`Cp::run`: the title patches the buffer
-/// later).
-pub static SCOUT_NOT_PACKETS: AtomicU64 = AtomicU64::new(0);
-/// Turns at which the main command processor held work (`Cp::scout_turn`): [held, past a run,
-/// past a label wait, a run in progress].
-pub static SCOUT_TURN_HELD: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-/// Scouts' segments whose command buffer words changed before their commit
-/// (`Cp::scout_buffers_current`).
-pub static SCOUT_BUFFERS_CHANGED: AtomicU64 = AtomicU64::new(0);
-
-/// The CPU reads that refused scouts' records at their hand-over, by kind (`scout_commit`;
-/// kinds with `DS_TRACE_PAST_DROPS`).
-pub static SCOUT_REFUSED_READS: parking_lot::Mutex<Vec<(String, u64)>> = parking_lot::Mutex::new(Vec::new());
-
-/// What the main command processor takes over from a scout's committed record
-/// (`Cp::scout_commit`, `Cp::scout_adopt`): the command processor state where the record
-/// ended, where that is when short of the submission's end (the buffer and the packet the main
-/// command processor goes on from), and the last batch it submitted.
-pub struct ScoutEnd {
-    st: ChunkState,
-    stack: Vec<Vec<u32>>,
-    markers: Vec<String>,
-    pred: Option<Pred>,
-    fence_pending: bool,
-    fence_kind: u8,
-    pub stop: Option<(usize, u64)>,
-    last: Option<u64>,
-    /// It ended at a gate: the main command processor waits at `stop` (the wait's packet)
-    /// and takes the record's next segment then.
-    pub gate: bool,
-}
-
-/// `DS_SCOUT_SEED=1` (off by default): a scout walks the submissions before its own with
-/// their memory effects before it records (`Cp::scout_run`). As built it costs ~1.6 ms a
-/// record (each scout walks its predecessors again, ~33 copies a submission) and its view
-/// overflows (`forward::HELD_MAX`): docs/SCOUTS.md has the form that replaces it.
-fn scout_seed() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("DS_SCOUT_SEED").ok().as_deref() == Some("1"))
-}
-
-/// What a scout's record holds when it ended (`Cp::scout_run`).
-pub struct ScoutOut {
-    /// The copies of the submissions before it that its view started from (`forward::walked`).
-    pub seeds: Vec<(u64, Arc<[u32]>)>,
-    pub ended: (&'static str, u64, usize),
-    pub commands: u64,
-    pub waits: [u64; 5],
-    pub gate: Option<(u64, String)>,
-    /// Waits it went past as gates.
-    pub gates: usize,
-    pub runs: u32,
-    /// Batches closed in its executor, held chunks' batches in its workers' executors.
-    pub batches: usize,
-    pub chunk_batches: usize,
-    /// CPU reads noted, images used, ranges placed.
-    pub reads: usize,
-    pub keys: usize,
-    pub placed: usize,
-}
-
-/// What the checks of a scout's record find at the main command processor's turn
-/// (`Cp::scout_check`): CPU reads written meanwhile (their count and the first ones: kind,
-/// range, writer), images with a fast clear or reload pending.
-pub struct ScoutCheck {
-    pub conflicts: usize,
-    /// Of them reads of textures' memory (`sync_textures` notes every texture a command
-    /// binds; one that is a render target of earlier work is read on the GPU, not here).
-    pub textures: usize,
-    pub first: Vec<(&'static str, u64, u64, String)>,
-    pub images: bool,
-}
-
 /// A command processor's state while it records past a run or a label
 /// wait into held batches (`Cp::held`, `Cp::past_start`).
 pub struct HeldCp {
@@ -2403,9 +2204,6 @@ impl Cp {
             past: None,
             past_wait: None,
             settling: false,
-            scout: None,
-            scout_refused: None,
-            scout_gate: None,
             cur_buf: 0,
             rewind: None,
         }
@@ -2436,10 +2234,7 @@ impl Cp {
     /// lost 2.8% in the old front end, FINDINGS.md 2026-10-23: longer
     /// stretches held work back from the GPU; removed on 2026-11-01.)
     fn past_goes_on(&self) -> bool {
-        // (Not into a submission a scout has a finished record of: held work would keep the
-        // record from being taken over at its turn, `gpu::scout::next_has_record`; 5,215 turns
-        // of run 20261115-015212.)
-        let more = || self.more_follows.as_ref().is_some_and(|f| f()) && !(self.main_gfx && super::scout::next_has_record());
+        let more = || self.more_follows.as_ref().is_some_and(|f| f());
         self.depth == 1 && (self.past.as_ref().is_some_and(|p| p.across && (self.next_in_submission || (super::tune::past_subs() && more()))) || (self.past_wait.is_some() && (self.next_in_submission || more())))
     }
 
@@ -2519,9 +2314,6 @@ impl Cp {
     /// Whether recording into held batches stops after the packet at `cur`:
     /// it stopped in it (at `cur`).
     fn held_halted(&mut self, cur: u64) -> bool {
-        if self.scout.as_ref().is_some_and(|sc| sc.cancel.load(Ordering::Relaxed)) {
-            self.held_stop("cancelled", cur);
-        }
         let stopped = self.exec.as_ref().filter(|e| e.stopped).map(|e| e.stop_why);
         let Some(h) = self.held.as_mut() else { return false };
         if h.stop.is_some() {
@@ -2579,51 +2371,15 @@ impl Cp {
                     e.order_after_open_writes();
                 }
                 label_event(&self.name, b'o', a, v, reference, at);
-                if let Some(sc) = self.scout.as_mut() {
-                    sc.waits[2] += 1;
-                }
                 return Flow::Next;
             }
             label_event(&self.name, b'x', a, v, reference, at);
             self.held_stop("label wait (its own value)", at);
             return Flow::Next;
         }
-        // A scout: the last write an earlier queued submission of this queue will make to the
-        // label decides (memory holds an older value until then): it passes, in program order
-        // after that write, or it is a gate.
-        if self.scout.is_some() {
-            // (A wait it went past as a gate, met again: it passes with that gate.)
-            if self.scout.as_ref().is_some_and(|sc| sc.gated.contains(&(a, wide, func, reference, mask))) {
-                return Flow::Next;
-            }
-            let fut = self.scout.as_ref().and_then(|sc| sc.future.iter().rev().find(|w| w.0 == a).copied());
-            if let Some((_, v, bytes)) = fut {
-                let v = if wide { v } else { v & 0xFFFF_FFFF };
-                if bytes != 0 && !(wide && bytes < 8) && pass(v) {
-                    // (Checked again at its turn with the polls: the write is then in memory or
-                    // promised, `scout_commit`; the walk that found it read the earlier
-                    // submissions early.)
-                    if let Some(sc) = self.scout.as_mut() {
-                        sc.waits[3] += 1;
-                        sc.polls.push((a, wide, func, reference, mask));
-                    }
-                    return Flow::Next;
-                }
-                return self.scout_gate(a, at, (wide, func, reference, mask));
-            }
-        }
         if pass(read()) {
-            match self.scout.as_mut() {
-                // (A scout: evaluated again at its turn, `ScoutCp::polls`.)
-                Some(sc) => {
-                    sc.waits[0] += 1;
-                    sc.polls.push((a, wide, func, reference, mask));
-                }
-                None => {
-                    if let Some(e) = self.exec.as_mut() {
-                        e.note_held_reads(&[(a, if wide { 8 } else { 4 })], 3);
-                    }
-                }
+            if let Some(e) = self.exec.as_mut() {
+                e.note_held_reads(&[(a, if wide { 8 } else { 4 })], 3);
             }
             label_event(&self.name, b'i', a, read(), reference, at);
             return Flow::Next;
@@ -2633,14 +2389,7 @@ impl Cp {
                 e.depend_on(seq, by_cpu);
             }
             label_event(&self.name, b'p', a, read(), reference, at);
-            if let Some(sc) = self.scout.as_mut() {
-                sc.waits[1] += 1;
-            }
             return Flow::Next;
-        }
-        if self.scout.is_some() {
-            // (No missed-write or counter rule: those are for a queue that fell behind.)
-            return self.scout_gate(a, at, (wide, func, reference, mask));
         }
         if self.submitted_at.is_some_and(|since| missed_write(a, wide, func, mask, reference, since)) || counter_passed(a, wide, func, mask, reference) {
             label_event(&self.name, b'm', a, read(), reference, at);
@@ -2649,639 +2398,6 @@ impl Cp {
         label_event(&self.name, b'x', a, read(), reference, at);
         self.held_stop("label wait", at);
         Flow::Next
-    }
-
-    /// A scout's wait that does not pass: a gate (`ScoutGate`). The record goes on behind it
-    /// (`tune scouts_gates`) while it holds fewer than `SCOUT_GATES`; else it ends there, as a
-    /// stretch stops at a wait it cannot pass.
-    fn scout_gate(&mut self, a: u64, at: u64, key: (bool, u32, u64, u64)) -> Flow {
-        let writer = last_write(a).map(|w| w.0).unwrap_or_else(|| "cpu".into());
-        label_event(&self.name, b'x', a, 0, 0, at);
-        if let Some(sc) = self.scout.as_mut() {
-            sc.waits[4] += 1;
-            if sc.gate.is_none() {
-                sc.gate = Some((a, writer));
-            }
-        }
-        let room = self.scout.as_ref().is_some_and(|sc| sc.gates.len() < SCOUT_GATES);
-        // (A label no GPU work wrote: the title's CPU releases it, after writing what follows it,
-        // packets of this buffer among them. Not gone past.)
-        if last_write(a).is_none() {
-            self.held_stop("gate (a label the CPU writes)", at);
-            return Flow::Next;
-        }
-        if !super::tune::scouts_gates() || !room || self.par.is_some() || self.depth != 1 || self.exec.is_none() {
-            self.held_stop("gate", at);
-            return Flow::Next;
-        }
-        // The batch closes here: the segment before the gate ends.
-        let (marker, reads, storage, notes, content, taken) = self.exec.as_mut().map_or((0, 0, 0, Default::default(), 0, 0), |e| (e.close_held(), e.held_reads().len(), e.held_storage_len(), e.held_notes(), e.content_mark(), e.held_taken_len()));
-        let seg = match self.past_wait.as_deref_mut() {
-            Some(w) => {
-                w.segs.push(HeldSeg::Cp(marker));
-                w.segs.len()
-            }
-            None => 0,
-        };
-        let g = ScoutGate {
-            at,
-            buf: self.cur_buf,
-            st: self.chunk_state(),
-            stack: self.ctx_stack.clone(),
-            markers: self.markers.clone(),
-            pred: self.pred,
-            fence_pending: self.fence_pending,
-            fence_kind: self.fence_kind,
-            seg,
-            reads,
-            stamps: self.scout.as_ref().map_or(0, |sc| sc.stamps.len()),
-            storage,
-            polls: self.scout.as_ref().map_or(0, |sc| sc.polls.len()),
-            notes,
-            content,
-            taken,
-        };
-        if let Some(sc) = self.scout.as_mut() {
-            sc.gates.push(g);
-            sc.gated.push((a, key.0, key.1, key.2, key.3));
-        }
-        Flow::Next
-    }
-
-    /// Records the queued title submission `index` (its command buffers `bufs`, queued at
-    /// `at`) ahead of the main command processor, held from its first packet (`gpu::scout`,
-    /// docs/SCOUTS.md): from the state `start` walked from the stream, as the graphics command
-    /// processor records a stretch past a label wait (its batches closed in its executor, its
-    /// parallel runs held on its workers, its label writes held promises, its CPU reads, images
-    /// and placed ranges noted), until the submission's end or a stop (a packet held work
-    /// refuses, a wait that does not pass, a read of its own held work). `future`: the label
-    /// writes the submissions before it will make. The record stays in this command processor
-    /// until `scout_drop`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn scout_run(&mut self, start: &WalkState, index: u64, at: Instant, bufs: &[(u64, u32)], future: Arc<Vec<(u64, u64, u8)>>, pre: &[(Arc<WalkState>, Vec<(u64, u32)>)], seeded: &dyn Fn(Vec<(u64, usize)>), cancel: Arc<std::sync::atomic::AtomicBool>) -> Option<ScoutOut> {
-        if !super::exec::enabled() || self.exec_failed || bufs.is_empty() {
-            return None;
-        }
-        if self.exec.is_none() {
-            match super::exec::Exec::new(&self.name) {
-                Ok(e) => self.exec = Some(Box::new(e)),
-                Err(e) => {
-                    crate::error!("gpu[{}]: no executor: {e}", self.name);
-                    self.exec_failed = true;
-                    return None;
-                }
-            }
-        }
-        self.set_chunk_state(&start.st);
-        self.ctx_stack = start.stack.clone();
-        self.markers.clear();
-        self.pred = None;
-        self.fence_pending = false;
-        self.fence_kind = 0;
-        self.par_skip = (0, 0);
-        self.par_skip_n = 0;
-        self.drop_ahead();
-        self.rewind = None;
-        self.rewind_sub = None;
-        self.depth = 0;
-        self.sub_index = index;
-        self.submitted_at = Some(at);
-        CUR_SUB.with(|c| c.set(index));
-        self.fe2_sync(None);
-        self.exec.as_mut().unwrap().scout_begin();
-        // The submissions before it (the one the main command processor runs and the queued
-        // ones between): their CP writes and copies into this thread's view, in stream order,
-        // so that its reads find the per-view block as they leave it (`pre`: each one's start
-        // state and buffers; `seeded`: the walked copies' ranges, for the check at the turn).
-        if scout_seed() {
-            for (st, b) in pre {
-                let mut w = (**st).clone();
-                let _ = Self::walk_submission(&mut w, b, true);
-            }
-        }
-        let seeds = super::forward::walked();
-        seeded(seeds.iter().map(|s| (s.0, s.1.len())).collect());
-        self.held = Some(Box::new(HeldCp { stop: None, commands: 0 }));
-        self.past_wait = Some(Box::new(PastWait {
-            control: 0,
-            a: 0,
-            wide: false,
-            reference: 0,
-            mask: 0,
-            at: bufs[0].0,
-            buf: 0,
-            sub: index,
-            state: self.chunk_state(),
-            stack: Vec::new(),
-            markers: Vec::new(),
-            pred: None,
-            fence_pending: false,
-            began: Instant::now(),
-            ticks: 0,
-            share: if super::tune::held_runs() { super::par::new_run_id() } else { 0 },
-            part: 0,
-            segs: Vec::new(),
-            counts: Vec::new(),
-            runs: 0,
-            sharing: false,
-            scout: true,
-        }));
-        self.scout = Some(Box::new(ScoutCp {
-            ended: None,
-            commands: 0,
-            future,
-            waits: [0; 5],
-            gate: None,
-            segs: Vec::new(),
-            counts: Vec::new(),
-            runs: 0,
-            stamps: Vec::new(),
-            bufs: bufs.to_vec(),
-            fetched: Vec::new(),
-            cmp_from: (0, bufs.first().map_or(0, |b| b.0)),
-            cancel,
-            gates: Vec::new(),
-            gated: Vec::new(),
-            polls: Vec::new(),
-            polls_at: 0,
-            content_at: 0,
-            taken_at: 0,
-            next_seg: 0,
-            own: 0,
-            next_gate: 0,
-            reads_at: 0,
-            stamps_at: 0,
-            all_writes: None,
-            last: None,
-        }));
-        for (i, &(addr, size)) in bufs.iter().enumerate() {
-            self.next_in_submission = i + 1 < bufs.len();
-            self.cur_buf = i;
-            self.run(addr, size);
-            if self.scout.as_ref().is_some_and(|sc| sc.ended.is_some()) {
-                break;
-            }
-        }
-        if self.scout.as_ref().is_some_and(|sc| sc.ended.is_none()) {
-            // (Left its last buffer without a stop: a shutdown.)
-            self.held_stop("left", 0);
-            self.scout_end();
-        }
-        let sc = self.scout.as_ref()?;
-        let e = self.exec.as_ref()?;
-        let (ranges, _, _) = e.scout_placed();
-        Some(ScoutOut {
-            seeds,
-            ended: sc.ended.unwrap_or(("left", 0, 0)),
-            commands: sc.commands,
-            waits: sc.waits,
-            gate: sc.gate.clone(),
-            gates: sc.gates.len(),
-            runs: sc.runs,
-            batches: e.closed_count(),
-            chunk_batches: sc.counts.iter().sum(),
-            reads: e.held_reads().len(),
-            keys: e.held_keys().len(),
-            placed: ranges.len(),
-        })
-    }
-
-    /// A scout's record ends (a stop, or its submission's end): its open batch is closed and
-    /// held with the others, a held run still being collected is cancelled. Returns None (its
-    /// command processor leaves the buffer).
-    fn scout_end(&mut self) -> Option<u64> {
-        let w = self.past_wait.take();
-        let held = self.held.take();
-        let (why, at) = held.as_ref().and_then(|h| h.stop).unwrap_or(("stopped", self.cur_packet));
-        if self.par.is_some() {
-            self.par_cancel();
-        }
-        if let Some(e) = self.exec.as_mut() {
-            e.close_held();
-        }
-        self.fe2_set_run(0, 0);
-        let buf = self.cur_buf;
-        if let Some(sc) = self.scout.as_mut() {
-            if sc.ended.is_none() {
-                sc.ended = Some((why, at, buf));
-                sc.commands = held.as_ref().map_or(0, |h| h.commands);
-                if let Some(w) = w {
-                    sc.segs = w.segs;
-                    sc.counts = w.counts;
-                    sc.runs = w.runs;
-                }
-            }
-        }
-        None
-    }
-
-    /// The checks of a scout's record at the main command processor's turn, as a stretch past a
-    /// label wait is checked when it settles: its CPU reads against `writes` (what was written
-    /// from its start to the turn: `exec::scout_journal_end`; `who`: the writers), its images
-    /// against pending clears and reloads.
-    pub fn scout_check(&self, writes: &super::ranges::Ranges, who: &[(u64, u64, String)]) -> ScoutCheck {
-        let Some(e) = self.exec.as_ref() else { return ScoutCheck { conflicts: 0, textures: 0, first: Vec::new(), images: false } };
-        let reads = e.held_reads();
-        let mut conflicts = 0usize;
-        let mut textures = 0usize;
-        let mut first = Vec::new();
-        if !writes.is_empty() {
-            for (i, r) in reads.iter().enumerate() {
-                if writes.overlaps(r.0, r.1) {
-                    conflicts += 1;
-                    let tex = e.held_read_kind(i) == "texture";
-                    textures += tex as usize;
-                    if first.len() < 4 && !(tex && first.len() >= 1) {
-                        let by = who.iter().find(|w| w.0 < r.0 + r.1 && r.0 < w.0 + w.1).map(|w| w.2.clone()).unwrap_or_default();
-                        first.push((e.held_read_kind(i), r.0, r.1, by));
-                    }
-                }
-            }
-        }
-        // (Its binding reads by content: without waiting, at the census's sweep.)
-        if let Some((a, n)) = e.content_changed(0, e.content_len(), writes, false) {
-            conflicts += 1;
-            if first.len() < 4 {
-                let by = who.iter().find(|w| w.0 < a + n && a < w.0 + w.1).map(|w| w.2.clone()).unwrap_or_default();
-                first.push(("binding words", a, n, by));
-            }
-        }
-        let images = e.held_pending_conflict();
-        ScoutCheck { conflicts, textures, first, images }
-    }
-
-    /// The main command processor's part of a hand-over, before the scout's (`gpu::scout::
-    /// turn`): its recorded work goes to the GPU (the scout's batches follow it, and the scout's
-    /// journal ends after it), and its view is taken as at any submission's start. None: it
-    /// holds work back itself (a stretch past a run or a label wait), so nothing can be handed
-    /// over now. Returns its view (the epoch the scout's checks must be current for) and what
-    /// the record has to follow (`Exec::order_state`).
-    pub fn scout_turn(&mut self) -> Option<(u32, u64, u64)> {
-        if self.held.is_some() || self.past.is_some() || self.past_wait.is_some() || self.par.is_some() || self.exec_failed {
-            // (Which: [held, past a run, past a label wait, a run in progress], `scout::status`.)
-            for (k, on) in [self.held.is_some(), self.past.is_some(), self.past_wait.is_some(), self.par.is_some()].into_iter().enumerate() {
-                if on {
-                    SCOUT_TURN_HELD[k].fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            return None;
-        }
-        self.submit_gpu("scout");
-        self.new_submission();
-        let view = self.fe2_view.as_ref().map_or_else(|| super::precache::epoch() as u32, |c| match c.load(Ordering::Acquire) {
-            super::fe2::NO_VIEW => super::precache::epoch() as u32,
-            v => v,
-        });
-        let (last, cpu) = self.exec.as_ref().map_or((0, 0), |e| e.order_state());
-        Some((view, last, cpu))
-    }
-
-    /// A scout's record at its turn, or its next segment once the gate before it has passed
-    /// (`gpu::scout::turn`, `more`: on the main command processor's thread, with the seat's
-    /// command processor): checked as a stretch past a label wait is when it settles (the
-    /// segment's CPU reads against `writes`, what was written since the scout began; its
-    /// images against pending clears and reloads; the published copies its reads went
-    /// through against what a reader takes now; its front end 2 checks against the epoch
-    /// `need`, pages written since uploaded first or the record refused), then the segment's
-    /// batches go to the GPU in program order (its executor's and its held runs' chunks from
-    /// its workers', `held_commit`'s order) and the timestamps it met are written. With its
-    /// last segment its forwarded copies become everyone's and its image notes are made. Err:
-    /// why it is refused (the caller has it dropped).
-    pub fn scout_commit(&mut self, need: u32, follow: (u64, u64), writes: &super::ranges::Ranges) -> Result<ScoutEnd, &'static str> {
-        let Some(mut sc) = self.scout.take() else { return Err("no record") };
-        match self.scout_commit_segment(&mut sc, need, follow, writes) {
-            Ok(Some(end)) => {
-                self.scout = Some(sc);
-                Ok(end)
-            }
-            Ok(None) => {
-                self.held = None;
-                self.past_wait = None;
-                self.par_skip = (0, 0);
-                let (why, at, buf) = sc.ended.unwrap_or(("left", 0, 0));
-                Ok(ScoutEnd {
-                    st: self.chunk_state(),
-                    stack: self.ctx_stack.clone(),
-                    markers: self.markers.clone(),
-                    pred: self.pred,
-                    fence_pending: self.fence_pending,
-                    fence_kind: self.fence_kind,
-                    stop: (why != "buffer end" || self.next_in_submission).then_some((buf, at)),
-                    last: sc.last,
-                    gate: false,
-                })
-            }
-            Err(e) => {
-                self.scout = Some(sc);
-                Err(e)
-            }
-        }
-    }
-
-    /// `scout_commit`'s segment: Some: it ended at a gate (more follows); None: the record's
-    /// last.
-    fn scout_commit_segment(&mut self, sc: &mut ScoutCp, need: u32, follow: (u64, u64), writes: &super::ranges::Ranges) -> Result<Option<ScoutEnd>, &'static str> {
-        let Some(e) = self.exec.as_mut() else { return Err("no executor") };
-        let gate: Option<ScoutGate> = sc.gates.get(sc.next_gate).cloned();
-        let n_reads = e.held_reads().len();
-        let (n_content, n_taken) = (e.content_len(), e.held_taken_len());
-        let (seg_end, reads_end, stamps_end, polls_end, content_end, taken_end) = match &gate {
-            Some(g) => (g.seg.min(sc.segs.len()), g.reads.min(n_reads), g.stamps.min(sc.stamps.len()), g.polls.min(sc.polls.len()), g.content.min(n_content), g.taken.min(n_taken)),
-            None => (sc.segs.len(), n_reads, sc.stamps.len(), sc.polls.len(), n_content, n_taken),
-        };
-        let r0 = sc.reads_at.min(reads_end);
-        if let Some(k) = e.held_reads()[r0..reads_end].iter().position(|r| writes.overlaps(r.0, r.1)) {
-            // (Which reads refuse records, by kind: the status line; kinds with
-            // `DS_TRACE_PAST_DROPS`.)
-            let (kind, r) = (e.held_read_kind(r0 + k), e.held_reads()[r0 + k]);
-            let what = format!("{kind}{}", if sc.next_gate == 0 { "" } else { " (behind a gate)" });
-            let mut g = SCOUT_REFUSED_READS.lock();
-            match g.iter_mut().find(|x| x.0 == what) {
-                Some(x) => x.1 += 1,
-                None => g.push((what, 1)),
-            }
-            static LOGGED: AtomicU64 = AtomicU64::new(0);
-            if LOGGED.fetch_add(1, Ordering::Relaxed) < 40 {
-                crate::info!("gpu[{}]: scout hand-over: submission {} refused{}: its {kind} read {:#x}+{:#x} was written since its record began (by {})", self.name, self.sub_index, if sc.next_gate == 0 { "" } else { " behind a gate" }, r.0, r.1, super::exec::journal_writers(r.0, r.1).join(", "));
-            }
-            return Err(if sc.next_gate == 0 { "read what was written before its turn" } else { "read what was written before its gate passed" });
-        }
-        // Its binding reads, by content (`Exec::content_changed`).
-        if let Some((a, n)) = e.content_changed(sc.content_at.min(content_end), content_end, writes, true) {
-            let what = if sc.next_gate == 0 { "binding words" } else { "binding words (behind a gate)" };
-            let mut g = SCOUT_REFUSED_READS.lock();
-            match g.iter_mut().find(|x| x.0 == what) {
-                Some(x) => x.1 += 1,
-                None => g.push((what.to_string(), 1)),
-            }
-            drop(g);
-            self.scout_refused = Some((a, n));
-            return Err(if sc.next_gate == 0 { "read words that changed before its turn" } else { "read words that changed before its gate passed" });
-        }
-        // The command buffers' words it parsed in the segment are what memory holds now.
-        let to = match &gate {
-            Some(g) => (g.buf, g.at),
-            None => {
-                let (_, at, buf) = sc.ended.unwrap_or(("left", 0, 0));
-                (buf, at)
-            }
-        };
-        if !Self::scout_buffers_current(sc, sc.cmp_from, to) {
-            return Err(if sc.next_gate == 0 { "its command buffer changed before its turn" } else { "its command buffer changed before its gate passed" });
-        }
-        // The waits it passed on memory pass now as well (`ScoutCp::polls`).
-        let since = self.submitted_at;
-        for &(a, wide, func, reference, mask) in &sc.polls[sc.polls_at.min(polls_end)..polls_end] {
-            let v = if wide { unsafe { rd64(a) } } else { (unsafe { rd32(a) }) as u64 };
-            let ok = compare(func, v & mask, reference & mask) || promised(a, wide, func, mask, reference).is_some() || since.is_some_and(|t| missed_write(a, wide, func, mask, reference, t)) || counter_passed(a, wide, func, mask, reference);
-            if !ok {
-                return Err("a wait it passed does not pass at its turn");
-            }
-        }
-        // (Not its own: the notes of its segments committed before are the cache's already.)
-        if e.held_pending_conflict() {
-            return Err("images with pending clears or reloads");
-        }
-        if super::fe2::on() && e.past_checks_want() < need && !e.past_current_for(need) && !(super::tune::past_repair() && e.past_repair()) {
-            return Err("checks older than its turn");
-        }
-        // Its own image notes up to here, the last check: made now, before its batches go
-        // (as `past_commit_begin` makes a stretch's).
-        if !e.apply_held_notes(gate.as_ref().map(|g| &g.notes), sc.taken_at.min(taken_end)..taken_end) {
-            return Err("a fast clear it took or made was taken first");
-        }
-        if sc.all_writes.is_none() {
-            sc.all_writes = Some(e.scout_writes());
-        }
-        let last_segment = gate.is_none();
-        if last_segment {
-            // Its copies become everyone's, the published ones its writes overwrite end.
-            super::forward::hold_commit_scout(sc.all_writes.as_deref().unwrap_or(&[]));
-        }
-        // (Its label writes are promised with the main command processor's view.)
-        self.fe2_set_view(need);
-        let mut last = sc.last;
-        let up = |s: Option<u64>, last: &mut Option<u64>| {
-            if let Some(s) = s {
-                *last = Some(last.map_or(s, |l| l.max(s)));
-            }
-        };
-        // (After the main command processor's work; its first batch on the queue after that
-        // work's deferred CPU effects, `Exec::first_closed_after_cpu`.)
-        let mut cpu = follow.1;
-        if let Some(e) = self.exec.as_mut() {
-            e.scout_follow(follow.0);
-            match &gate {
-                // (Its storage images' writes up to the gate are noted now; its other image
-                // notes: none before a gate, `scout_gate`.)
-                Some(g) => e.apply_held_storage(g.storage),
-                None => e.past_commit_begin(),
-            }
-            e.submit_repair_first();
-        }
-        let mut own = sc.own;
-        for s in &sc.segs[sc.next_seg.min(seg_end)..seg_end] {
-            match *s {
-                HeldSeg::Cp(marker) => {
-                    if marker > own {
-                        let seq = self.exec.as_mut().and_then(|e| {
-                            if cpu != 0 && e.first_closed_after_cpu(cpu) {
-                                cpu = 0;
-                            }
-                            e.submit_closed_first(marker - own)
-                        });
-                        up(seq, &mut last);
-                        own = marker;
-                    }
-                }
-                HeldSeg::Chunk(wi, k) => {
-                    let seq = self.par_pool.get(wi).and_then(|w| {
-                        w.with_cp(|c| {
-                            if cpu != 0 && k > 0 && c.first_closed_after_cpu(cpu) {
-                                cpu = 0;
-                            }
-                            c.submit_closed_first(k)
-                        })
-                    });
-                    up(seq, &mut last);
-                    if let (Some(s), Some(e)) = (seq, self.exec.as_mut()) {
-                        e.depend_on(s, false);
-                    }
-                }
-            }
-        }
-        sc.own = own;
-        if last_segment {
-            let seq = self.exec.as_mut().and_then(|e| {
-                if cpu != 0 && e.first_closed_after_cpu(cpu) {
-                    cpu = 0;
-                }
-                e.submit_closed()
-            });
-            up(seq, &mut last);
-            // (Nothing should be left in its workers' executors: `held_commit`.)
-            for (i, &c) in sc.counts.iter().enumerate() {
-                if c > 0 {
-                    if let Some(w) = self.par_pool.get(i) {
-                        w.with_cp(|cp| {
-                            if cp.closed_count() > 0 {
-                                cp.discard_closed_tail(0);
-                            }
-                        });
-                    }
-                }
-            }
-        }
-        let _ = cpu;
-        for &a in &sc.stamps[sc.stamps_at.min(stamps_end)..stamps_end] {
-            cpu_timestamp(a);
-        }
-        sc.last = last;
-        match gate {
-            Some(g) => {
-                sc.next_gate += 1;
-                sc.next_seg = seg_end;
-                sc.reads_at = reads_end;
-                sc.stamps_at = stamps_end;
-                sc.polls_at = polls_end;
-                sc.content_at = content_end;
-                sc.taken_at = taken_end;
-                sc.cmp_from = to;
-                Ok(Some(ScoutEnd { st: g.st, stack: g.stack, markers: g.markers, pred: g.pred, fence_pending: g.fence_pending, fence_kind: g.fence_kind, stop: Some((g.buf, g.at)), last, gate: true }))
-            }
-            None => Ok(None),
-        }
-    }
-
-    /// Whether the words a scout parsed of its submission's command buffers from `from` to `to`
-    /// (buffer, address; `ScoutCp::fetched`) are what memory holds now, after the GPU work
-    /// still writing them (`exec::wait_writers`), as the main command processor would read
-    /// them now.
-    fn scout_buffers_current(sc: &ScoutCp, from: (usize, u64), to: (usize, u64)) -> bool {
-        if sc.bufs.is_empty() {
-            return true;
-        }
-        let last = to.0.min(sc.bufs.len() - 1);
-        for b in from.0..=last {
-            let (addr, size) = sc.bufs[b];
-            let end = addr + 4 * size as u64;
-            let lo = if b == from.0 { from.1.clamp(addr, end) } else { addr };
-            let hi = if b == to.0 { to.1.clamp(addr, end) } else { end };
-            if lo >= hi {
-                continue;
-            }
-            let Some(Some((fa, words))) = sc.fetched.get(b) else { return false };
-            if *fa != addr {
-                return false;
-            }
-            let (i, j) = (((lo - addr) / 4) as usize, ((hi - addr) / 4) as usize);
-            let Some(want) = words.get(i..j) else { return false };
-            let r = [(lo, hi - lo)];
-            if !valid(lo, hi - lo) || super::homes::any_stale(&r) || (super::exec::writes_unfinished(&r) && !super::exec::wait_writers(&r)) {
-                return false;
-            }
-            // SAFETY: readable guest memory (`valid`), read as the command processor reads it.
-            let now = unsafe { std::slice::from_raw_parts(lo as *const u32, j - i) };
-            if now != want {
-                SCOUT_BUFFERS_CHANGED.fetch_add(1, Ordering::Relaxed);
-                return false;
-            }
-        }
-        true
-    }
-
-    /// What a scout's record writes, as taken at its first committed segment (`scout_commit`;
-    /// empty: none committed): a record refused at a later gate ends the published forward
-    /// entries under it (`forward::hold_end_scout`).
-    pub fn scout_all_writes(&self) -> Vec<(u64, u64)> {
-        self.scout.as_ref().and_then(|sc| sc.all_writes.clone()).unwrap_or_default()
-    }
-
-    /// The main command processor takes a scout's committed record over (`gpu::scout::turn`):
-    /// its state where the record ended, its later work after the record's batches.
-    pub fn scout_adopt(&mut self, end: ScoutEnd) {
-        self.set_chunk_state(&end.st);
-        self.ctx_stack = end.stack;
-        self.markers = end.markers;
-        self.pred = end.pred;
-        self.fence_pending = end.fence_pending;
-        self.fence_kind = end.fence_kind;
-        self.par_skip = (0, 0);
-        self.par_skip_n = 0;
-        self.drop_ahead();
-        if let (Some(s), Some(e)) = (end.last, self.exec.as_mut()) {
-            e.depend_on(s, false);
-        }
-        self.fe2_sync(None);
-    }
-
-    /// A scout's record is dropped: its batches (its executor's and its workers') never go to
-    /// the GPU, its forwarded copies are forgotten.
-    pub fn scout_drop(&mut self) {
-        if let Some(e) = self.exec.as_mut() {
-            e.past_drop();
-        }
-        self.held_truncate(&[]);
-        self.scout = None;
-        self.held = None;
-        self.past_wait = None;
-        self.par_skip = (0, 0);
-    }
-
-    /// A direct dispatch met by a walk with effects (`walk_inner`): when the copy kernel is
-    /// bound, its result from the walked registers and this thread's view (its control block
-    /// and source are the title's CPU data, or CP writes the walk forwarded) becomes a walked
-    /// entry of the view (`forward::add_walked`).
-    fn walk_copy(w: &WalkState, groups: [u32; 3], initiator: u32) {
-        let r = ScanRegs { sh: &w.st.regs.sh, ctx: &w.st.regs.ctx };
-        if !super::forward::is_copy_addr(super::shaders::cs_addr_of(&r)) {
-            return;
-        }
-        let Ok(p) = super::shaders::prepare_compute(&r, initiator & (1 << 15) == 0) else { return };
-        let local = super::shaders::cs_local_of(&r);
-        if let Some((base, words, from)) = super::forward::compute_in(&p, groups, local, |_| false, true) {
-            super::forward::add_walked(base, words, p.addr, p.code_hash, from);
-        }
-    }
-
-    /// Walks the state effects of a title submission's command buffers into `w` (`walk_state`
-    /// through its flips; with `fx`, its known memory effects into this thread's held forward
-    /// view, `walk_inner`): whether it holds a flip; Err at a packet the walk refuses.
-    pub fn walk_submission(w: &mut WalkState, bufs: &[(u64, u32)], fx: bool) -> Result<bool, &'static str> {
-        let mut flip = false;
-        for &(addr, size) in bufs {
-            let end = addr + 4 * size as u64;
-            let mut from = addr;
-            loop {
-                if !Self::walk_inner(w, from, ((end - from) / 4) as u32, fx)? {
-                    break;
-                }
-                // (Stopped before a FLIP: on behind it.)
-                let Some((at, bytes)) = w.flip.take() else { break };
-                flip = true;
-                from = at + bytes;
-                if from >= end {
-                    break;
-                }
-            }
-        }
-        Ok(flip)
-    }
-
-    /// Whether the states `a` (walked) and `b` (the command processor's own) agree where a
-    /// submission starts: the registers (the SH registers either lists as unknown left out),
-    /// the fields and the context stack's depth.
-    pub fn walk_states_agree(a: &WalkState, b: &WalkState) -> bool {
-        let mut skip = a.unknown.clone();
-        skip.extend(b.unknown.iter().copied());
-        chunk_states_equal(&a.st, &b.st, &skip) && a.stack.len() == b.stack.len()
-    }
-
-    /// A scout's worker begins or ends a chunk of its held run (`par::take_chunks`).
-    pub fn scout_chunk(&mut self, on: bool) {
-        if let Some(e) = self.exec.as_mut() {
-            e.set_scout(on);
-        }
     }
 
     pub fn chunk_start(&mut self) {
@@ -3830,9 +2946,9 @@ impl Cp {
     }
 
     /// A held run's chunk begins on this worker (`Exec::held_chunk_begin`).
-    pub fn held_chunk_begin(&mut self, writes: Arc<super::ranges::Ranges>, keys: Arc<HashMap<super::images::ImageKey, u8>>, bases: Arc<Vec<(u64, super::images::ImageKey)>>) {
+    pub fn held_chunk_begin(&mut self, writes: Arc<super::ranges::Ranges>, keys: Arc<HashMap<super::images::ImageKey, u8>>) {
         if let Some(e) = self.exec.as_mut() {
-            e.held_chunk_begin(writes, keys, bases);
+            e.held_chunk_begin(writes, keys);
         }
     }
 
@@ -3851,12 +2967,6 @@ impl Cp {
         if let Some(e) = self.exec.as_mut() {
             e.discard_closed_tail(keep);
         }
-    }
-
-    /// Its executor's first closed batch waits for batch `cpu`'s deferred CPU effects
-    /// (`Exec::first_closed_after_cpu`).
-    pub fn first_closed_after_cpu(&mut self, cpu: u64) -> bool {
-        self.exec.as_mut().is_some_and(|e| e.first_closed_after_cpu(cpu))
     }
 
     /// Submits its executor's first `n` closed batches (`Exec::submit_closed_first`).
@@ -4486,10 +3596,6 @@ impl Cp {
                 run.part_base = w.part;
                 run.held_writes = Arc::new(e.held_writes_now());
                 run.held_keys = Arc::new(e.held_note_keys());
-                run.held_bases = Arc::new(e.held_storage_bases());
-                if w.scout {
-                    run.held_fwd = super::forward::snapshot();
-                }
                 w.runs += 1;
             }
             let (share, part) = self.past_wait.as_deref().map_or((0, 0), |w| (w.share, w.part));
@@ -4851,10 +3957,6 @@ impl Cp {
             && !super::capture::capturing()
             && last_write(a).is_some_and(|(q, _, _)| q == "gpu-acb0x50")
             && past_backoff_pass(a)
-            // (Scouts' records are what is recorded behind its waits then: in a stretch of its
-            // own it holds work at the next submissions' turns and can take no record over,
-            // about half the turns of run 20261115-004129. `tune scouts_stretch` 1: both.)
-            && !(super::tune::scouts_commit() && super::scout::on() && !super::tune::scouts_stretch())
     }
 
     /// Goes past a label wait (`past_wait_ok`): this command processor's
@@ -4885,7 +3987,6 @@ impl Cp {
             counts: Vec::new(),
             runs: 0,
             sharing: false,
-            scout: false,
         }));
         self.held = Some(Box::new(HeldCp { stop: None, commands: 0 }));
         label_event(&self.name, b'G', a, 0, reference, at);
@@ -4900,9 +4001,6 @@ impl Cp {
     /// Whether the label gone past passes now (in memory or promised).
     fn past_wait_passes(&self) -> bool {
         let Some(w) = self.past_wait.as_deref() else { return false };
-        if w.scout {
-            return false;
-        }
         let func = w.control & 7;
         let v = if w.wide { unsafe { rd64(w.a) } } else { (unsafe { rd32(w.a) }) as u64 };
         compare(func, v & w.mask, w.reference & w.mask) || promised(w.a, w.wide, func, w.mask, w.reference).is_some()
@@ -5094,9 +4192,7 @@ impl Cp {
 
     /// Settles what was recorded past a parallel run or a label wait.
     fn settle_held(&mut self) -> Option<u64> {
-        if self.scout.is_some() {
-            self.scout_end()
-        } else if self.past_wait.is_some() {
+        if self.past_wait.is_some() {
             self.past_wait_settle()
         } else {
             self.past_settle()
@@ -5398,7 +4494,7 @@ impl Cp {
     pub fn prefetch_compiles(&self) {
         let Some((base, from, end)) = self.compile_ctx.take() else { return };
         // Read in place (the scan does not copy the buffer).
-        let f = Fetched { base, words: Vec::new(), live: false, scout: false };
+        let f = Fetched { base, words: Vec::new(), live: false };
         let (cmds, why, ns) = self.scan_commands(&f, from, end, true);
         super::compile::note_scan_end(why, cmds.len());
         let slots: Vec<Arc<super::ahead::Slot>> = cmds.into_iter().filter_map(|c| c.stages[0].clone()).collect();
@@ -5969,14 +5065,6 @@ impl Cp {
     /// The user SGPRs indirect draws set from their arguments (memory GPU
     /// work writes) are listed in `unknown`.
     pub fn walk_state(w: &mut WalkState, addr: u64, size: u32) -> Result<bool, &'static str> {
-        Self::walk_inner(w, addr, size, false)
-    }
-
-    /// `walk_state`; with `fx`, the packets' memory effects that are known before they execute
-    /// go into the calling thread's held forward view as it walks: the words of CP writes
-    /// (`forward::add_cp_write`) and the copy kernel's results (`walk_copy`). A scout walks the
-    /// submissions before its own this way (`scout_run`).
-    fn walk_inner(w: &mut WalkState, addr: u64, size: u32, fx: bool) -> Result<bool, &'static str> {
         let f = Fetched::new(addr, size);
         let end = addr + 4 * size as u64;
         let mut cur = addr;
@@ -6037,45 +5125,24 @@ impl Cp {
                     let a = addr64(p(1), p(2));
                     match dst {
                         0 => return Err("WRITE_DATA to registers"),
-                        1 | 2 | 5 if count > 0 => {
-                            match (count, no_incr) {
-                                (1, _) => w.labels.push((a, p(3) as u64, 4)),
-                                (2, false) => w.labels.push((a, p(3) as u64 | (p(4) as u64) << 32, 8)),
-                                (_, true) => w.labels.push((a, p(2 + count) as u64, 4)),
-                                _ => w.labels.extend((0..count).map(|i| (a + 4 * i, p(3 + i) as u64, 4u8))),
-                            }
-                            if fx && count <= 16384 {
-                                if no_incr {
-                                    super::forward::add_cp_write(a, &[p(2 + count)]);
-                                } else {
-                                    let data: Vec<u32> = (0..count).map(|i| p(3 + i)).collect();
-                                    super::forward::add_cp_write(a, &data);
-                                }
-                            }
-                        }
+                        1 | 2 | 5 if count > 0 => match (count, no_incr) {
+                            (1, _) => w.labels.push((a, p(3) as u64, 4)),
+                            (2, false) => w.labels.push((a, p(3) as u64 | (p(4) as u64) << 32, 8)),
+                            (_, true) => w.labels.push((a, p(2 + count) as u64, 4)),
+                            _ => w.labels.extend((0..count).map(|i| (a + 4 * i, p(3 + i) as u64, 4u8))),
+                        },
                         _ => {}
                     }
                 }
                 op::RELEASE_MEM => {
                     let a = addr64(p(2) & !3, p(3));
                     match (p(1) >> 29) & 7 {
-                        1 => {
-                            w.labels.push((a, p(4) as u64, 4));
-                            if fx {
-                                super::forward::add_cp_write(a, &[p(4)]);
-                            }
-                        }
-                        2 => {
-                            w.labels.push((a, addr64(p(4), p(5)), 8));
-                            if fx {
-                                super::forward::add_cp_write(a, &[p(4), p(5)]);
-                            }
-                        }
+                        1 => w.labels.push((a, p(4) as u64, 4)),
+                        2 => w.labels.push((a, addr64(p(4), p(5)), 8)),
                         3 | 4 => w.labels.push((a, 0, 0)),
                         _ => {}
                     }
                 }
-                op::DISPATCH_DIRECT if fx && n >= 4 => Self::walk_copy(w, [p(0), p(1), p(2)], p(3)),
                 op::COPY_DATA if (p(0) >> 8) & 0xF == 0 => return Err("COPY_DATA to a register"),
                 op::COND_EXEC => return Err("COND_EXEC"),
                 op::INDIRECT_BUFFER => return Err("indirect buffer"),
@@ -6620,26 +5687,6 @@ impl Cp {
         }
         self.before_fetch(addr, 4 * size as u64);
         let mut f = Fetched::new(addr, size);
-        // A scout parses a copy of the buffer and keeps it for its commit's check
-        // (`ScoutCp::fetched`).
-        if self.depth == 1 && self.scout.is_some() {
-            if f.words.is_empty() && size > 0 && size <= SCOUT_FETCH_MAX && valid(addr, 4 * size as u64) {
-                f.words = unsafe { std::slice::from_raw_parts(addr as *const u32, size as usize) }.to_vec();
-                f.scout = true;
-            }
-            let i = self.cur_buf;
-            let copy = (!f.words.is_empty()).then(|| (addr, f.words.clone()));
-            let missing = copy.is_none();
-            if let Some(sc) = self.scout.as_mut() {
-                if sc.fetched.len() <= i {
-                    sc.fetched.resize(i + 1, None);
-                }
-                sc.fetched[i] = copy;
-            }
-            if missing {
-                self.held_stop("command buffer not copied", addr);
-            }
-        }
         if cb_census_on() {
             self.cb_note(addr, size);
         }
@@ -6720,13 +5767,6 @@ impl Cp {
                     cur += 4;
                     continue;
                 }
-                // (A scout: the title has not written the packets here yet. Its record ends; the
-                // main command processor reads them when it gets here.)
-                0 | 1 if self.scout.is_some() => {
-                    SCOUT_NOT_PACKETS.fetch_add(1, Ordering::Relaxed);
-                    self.held_stop("not a packet yet (the title patches the buffer later)", cur);
-                    continue;
-                }
                 0 => {
                     // Type-0: base register + (count + 1) values.
                     let n = ((h >> 16) & 0x3FFF) as u64 + 1;
@@ -6763,7 +5803,7 @@ impl Cp {
                     None => break,
                 }
             }
-            if self.par.is_none() && !skip && is_command(opcode) && h & 1 == 0 && (f.words.is_empty() || f.scout) && !f.live && self.exec.is_some() && (self.held.is_none() || self.held_runs_ok()) && (if self.compute { compute_workers() > 0 } else { super::par::workers() > 0 }) && !super::capture::capturing() {
+            if self.par.is_none() && !skip && is_command(opcode) && h & 1 == 0 && f.words.is_empty() && !f.live && self.exec.is_some() && (self.held.is_none() || self.held_runs_ok()) && (if self.compute { compute_workers() > 0 } else { super::par::workers() > 0 }) && !super::capture::capturing() {
                 let t = class_start(classes);
                 self.par_plan(&f, cur, end);
                 class_end(7, t);
@@ -6966,20 +6006,6 @@ impl Cp {
             class_end(class, t);
             acb_op_end(opcode, ta);
             stretch_op_end(opcode, tw);
-            // The gate of a scout's record it took over up to here (`scout_gate`): its wait
-            // has passed now, the record's next segment is taken, and it goes on from where
-            // that one ends (`gpu::scout::more`; refused: with the packet after the wait).
-            if self.scout_gate == Some(cur) {
-                self.scout_gate = None;
-                if self.held.is_none() && !super::shutting_down() {
-                    if let Some(to) = super::scout::more(self) {
-                        self.rewind = Some(to);
-                        break;
-                    }
-                } else {
-                    super::scout::abandon();
-                }
-            }
             if self.held.is_some() {
                 // Stopped inside it: it and what follows are left to the
                 // main command processor; done: what follows.
@@ -7776,12 +6802,7 @@ impl Cp {
         // swamp x1.037, the vista x1.026 against bottom-of-pipe queries stored
         // by a kernel; the title does not react to the values, 2026-11-04).
         if matches!(data_sel, 3 | 4) && (int_sel == 0 || int_sel == 3) {
-            // (A scout writes nothing into guest memory ahead of its turn: the stamp is written
-            // at the hand-over, `scout_commit`.)
-            match self.scout.as_mut() {
-                Some(sc) => sc.stamps.push(a),
-                None => cpu_timestamp(a),
-            }
+            cpu_timestamp(a);
             self.fence_pending = false;
             return;
         }
@@ -7931,9 +6952,8 @@ impl Cp {
             self.note("`tune xwait_skip 2`: gpu-acb0x50's waits for other queues' labels skipped (measurement; pictures may be wrong)");
             return Flow::Next;
         }
-        // Recording goes on past it, held (`Cp::past_wait_ok`); not at the gate of a scout's
-        // record (what follows is recorded: `scout_gate`).
-        if self.past_wait_ok(a) && self.scout_gate != Some(at) {
+        // Recording goes on past it, held (`Cp::past_wait_ok`).
+        if self.past_wait_ok(a) {
             self.last_wait_kind = b'G';
             return self.past_wait_start(control, a, wide, reference, mask, at);
         }
@@ -8377,7 +7397,7 @@ mod tests {
     fn register_ranges_copy_like_single_writes() {
         // A SET_*_REG payload at 0x1000 (fetched): registers 3.. get 10, 11,
         // 12; a range past the file's end stops at it.
-        let f = Fetched { base: 0x1000, words: vec![10, 11, 12, 13, 14], live: false, scout: false };
+        let f = Fetched { base: 0x1000, words: vec![10, 11, 12, 13, 14], live: false };
         let mut a = vec![7u32; 2];
         put_regs(&mut a, Space::Ctx, 64, 3, &f, 0x1000, 3);
         let mut b = vec![7u32; 2];

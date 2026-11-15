@@ -226,7 +226,7 @@ fn load() {
                         add_recipe(&mut g, rank, r);
                         STATS[LOADED].fetch_add(1, Ordering::Relaxed);
                     }
-                } else if let Some((h, s)) = parse(line) {
+                } else if let Some((h, s)) = parse(line).filter(|(_, s)| local_ok(s.local)) {
                     let v = &mut m.entry(h).or_insert_with(|| (rank, Vec::new())).1;
                     if !v.contains(&s) {
                         v.push(s);
@@ -942,9 +942,22 @@ pub fn first_translation(addr: u64, insts: &[rdna::Inst], plan: &rdna::analysis:
     }
 }
 
+/// Whether a thread-group size can be a dispatch's (1 to 1,024 threads, the hardware's and
+/// Vulkan's common limit). The store never takes another: it is made again at every start
+/// (2026-11-15: specs with 512x8 and 0x1x1 threads, learned from the scouts' recording with
+/// stale registers, were precompiled at each start; the validation layer reported one, and the
+/// driver crashed with a division by zero once).
+fn local_ok(l: [u32; 3]) -> bool {
+    let n = l[0] as u64 * l[1] as u64 * l[2] as u64;
+    n > 0 && n <= 1024
+}
+
 /// Records the spec a dispatch of the program `code_hash` used (once per
 /// distinct spec; appended to the store).
 fn learn(code_hash: u64, spec: &Spec) {
+    if !local_ok(spec.cs_local_size) {
+        return;
+    }
     let s = Seen { rsrc2: spec.cs_rsrc2, local: spec.cs_local_size, wave64: spec.wave64, resources: spec.resources.clone(), batched: spec.batched };
     let new = learned(|m| {
         let rank = LINES.load(Ordering::Relaxed) as u32;

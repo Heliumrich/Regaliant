@@ -1342,7 +1342,8 @@ unsafe fn veh_body(info: *mut EXCEPTION_POINTERS) -> i32 {
             // Exceptions deeper inside system code are left to its handlers
             // (and reported by `unhandled` when none takes them).
             // (An integer division by zero in a driver's code is fatal there too: reported with
-            // our frames that called it; a driver crashed so with scouts, 2026-11-15.)
+            // our frames that called it; the NVIDIA driver crashed so on 2026-11-15, with the
+            // scouts of that day: FINDINGS.md.)
             if code != 0xC0000094 && (code != 0xC0000005 || !called_from_our_code(ctx, 3)) {
                 return EXCEPTION_CONTINUE_SEARCH;
             }
