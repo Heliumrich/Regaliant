@@ -38,7 +38,7 @@ pub fn report_and_reset() -> String {
     let iv = std::mem::take(&mut STATE.lock().intervals);
     let hitches = super::hitch::window_report_and_reset();
     let gpu = super::hitch::gpu_window_clause();
-    let host = crate::hostload::window_report_and_reset();
+    let host = crate::hostload::window_report_and_reset() + &crate::displayclock::window_clause();
     let cpu = super::threadcpu::frames_window_clause(iv.len() as u64) + &super::threadcpu::frames_detail_clause(iv.len() as u64) + &super::exec::title_barriers_clause(iv.len() as u64) + &super::cp::past_wait_window_clause(iv.len() as u64);
     if iv.is_empty() {
         return "no flips".into();

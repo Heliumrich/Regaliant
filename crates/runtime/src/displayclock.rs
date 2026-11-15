@@ -61,8 +61,9 @@ pub struct Snap {
 struct State {
     device: String,
     snap: Option<Snap>,
-    /// The last vblanks' times (up to 129) and how many came since the clock opened the display.
-    times: std::collections::VecDeque<Instant>,
+    /// The last vblanks seen (up to 129: when, and their number) and how many came since the
+    /// clock opened the display (a wait woken late counts the vblanks it missed).
+    times: std::collections::VecDeque<(Instant, u64)>,
     count: u64,
 }
 
@@ -122,6 +123,11 @@ fn monitor_hz(device: &str) -> u32 {
 
 fn run() {
     crate::log::set_thread_name("display-clock");
+    // (It only waits: woken at once, it sees each vblank on time under the title's load.)
+    unsafe {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL};
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    }
     let mut opened: Option<(String, u32, u32)> = None; // device, adapter, source
     let mut failures = 0u32;
     loop {
@@ -202,17 +208,23 @@ fn note(device: &str, now: Instant) {
     if s.device != device {
         return;
     }
-    // A refresh far longer than the mode's period while the measure runs: variable refresh (or a
-    // stall). Three within two seconds keep the lock off for ten.
-    if let (Some(&prev), true) = (s.times.back(), mode_hz > 0) {
+    // The vblanks since the last one seen: one, or more where the wait woke late (the gap in
+    // the mode's periods). A refresh far longer than the mode's period, many times a second, is
+    // variable refresh (the screen waits for frames; a late wake is rare at this thread's
+    // priority): eight within a second keep the lock off for ten.
+    let mut step = 1u64;
+    if let (Some(&(prev, _)), true) = (s.times.back(), mode_hz > 0) {
         let nominal = 1.0 / mode_hz as f64;
         let gap = now.duration_since(prev).as_secs_f64();
+        if gap < 0.25 {
+            step = ((gap / nominal).round() as u64).max(1);
+        }
         if gap > nominal * 1.6 && gap < 0.25 {
             static LONG: Mutex<Vec<Instant>> = Mutex::new(Vec::new());
             let mut l = LONG.lock();
-            l.retain(|t| now.duration_since(*t) < Duration::from_secs(2));
+            l.retain(|t| now.duration_since(*t) < Duration::from_secs(1));
             l.push(now);
-            if l.len() >= 3 {
+            if l.len() >= 8 {
                 *VRR_UNTIL.lock() = Some(now + Duration::from_secs(10));
                 if !VRR_LOGGED.swap(true, Relaxed) {
                     crate::info!("display clock: {device}'s refreshes vary ({:.1} ms against {:.1}): variable refresh or stalls; the vblank keeps its own timer while they do", gap * 1e3, nominal * 1e3);
@@ -220,14 +232,14 @@ fn note(device: &str, now: Instant) {
             }
         }
     }
-    s.times.push_back(now);
+    s.count += step;
+    s.times.push_back((now, s.count));
     while s.times.len() > 129 {
         s.times.pop_front();
     }
-    s.count += 1;
     // (The period once half a second of vblanks or more is in.)
-    let n = s.times.len();
-    s.snap = (n >= 61).then(|| Snap { last: now, count: s.count, period: now.duration_since(s.times[0]) / (n as u32 - 1), mode_hz });
+    let (t0, c0) = s.times[0];
+    s.snap = (s.count - c0 >= 60).then(|| Snap { last: now, count: s.count, period: now.duration_since(t0) / (s.count - c0) as u32, mode_hz });
 }
 
 /// The presents' cadence in the display's refreshes: per present (`note_present`, the vblank
@@ -251,6 +263,19 @@ pub fn note_present() {
         c.0[d] += 1;
     }
     c.1 = Some(count);
+}
+
+/// The frame-time windows' clause (`gpu::pacing::report_and_reset`): how many of the display's
+/// refreshes lay between the window's presents (even pacing: one count), counted afresh.
+pub fn window_clause() -> String {
+    let (c, _) = std::mem::replace(&mut *CADENCE.lock(), ([0; 9], None));
+    let total: u64 = c.iter().sum();
+    let Some(s) = snapshot().filter(|_| total > 0) else { return String::new() };
+    let parts: Vec<String> = c.iter().enumerate().filter(|(_, n)| **n > 0).map(|(i, n)| format!("{}{}:{n}", i, if i == 8 { "+" } else { "" })).collect();
+    format!("; display refreshes between presents ({:.0} Hz, {}): {}", 1.0 / s.period.as_secs_f64(), match lock() {
+        Some((n, _)) => format!("locked every {n}"),
+        None => "timer".into(),
+    }, parts.join(" "))
 }
 
 /// Status: the clock's display and rate, the lock's state, the presents' cadence.

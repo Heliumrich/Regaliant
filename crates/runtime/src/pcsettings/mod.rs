@@ -239,7 +239,7 @@ pub fn graphics_items() -> Vec<Item> {
         Item {
             id: s("RefreshRate"),
             label: s("Refresh Rate"),
-            tooltip: s("The screen's refresh rate in Fullscreen mode."),
+            tooltip: s("The screen's refresh rate in Fullscreen mode (Automatic keeps motion even)."),
             kind: ItemKind::Display(2),
         },
     ]

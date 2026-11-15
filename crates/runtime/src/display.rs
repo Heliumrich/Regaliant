@@ -287,3 +287,21 @@ pub fn set_refresh_index(i: u32) {
 pub fn hdr_now(device: &str) -> Option<f32> {
     targets().into_iter().find(|t| t.0.eq_ignore_ascii_case(device)).filter(|t| t.3).map(|t| t.4)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(rates: &[u32]) -> Vec<Mode> {
+        rates.iter().map(|&hz| Mode { w: 2560, h: 1440, hz }).collect()
+    }
+
+    #[test]
+    fn paced_rate_is_the_highest_multiple_of_60() {
+        // (The user's monitor: 165 Hz desktop, 120 the even one.)
+        assert_eq!(paced_rate(&at(&[59, 60, 75, 100, 120, 144, 165])), Some(120));
+        assert_eq!(paced_rate(&at(&[60, 75, 144])), Some(60));
+        assert_eq!(paced_rate(&at(&[59, 119, 239, 240])), Some(240));
+        assert_eq!(paced_rate(&at(&[75, 144, 165])), None);
+    }
+}
