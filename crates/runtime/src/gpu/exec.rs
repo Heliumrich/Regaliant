@@ -10869,6 +10869,8 @@ fn cull_census_on() -> bool {
 /// The frame being counted: (frame, dispatches, address -> (value, reads, one value)).
 #[allow(clippy::type_complexity)]
 static CULL_CENSUS: Mutex<Option<(u64, u64, HashMap<u64, (u32, u64, bool)>)>> = Mutex::new(None);
+/// The frame's dispatches by program (`CULL_CS`'s order).
+static CULL_BY_CS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 fn note_cull_census(p: &Prepared) {
     let frame = super::FRAMES.load(Ordering::Relaxed);
@@ -10889,9 +10891,10 @@ fn note_cull_census(p: &Prepared) {
             let first: Vec<String> = common.iter().take(12).map(|(_, w)| format!("{w:08x}")).collect();
             let varied = acc.2.values().filter(|e| !e.2 && e.1 >= n * 9 / 10).count();
             crate::info!(
-                "cull census: frame {} (queued flip {}): {n} dispatches, {} common words {span} hash {:016x}, {varied} read by all with differing values; first [{}]",
+                "cull census: frame {} (queued flip {}): {n} dispatches ({} by program), {} common words {span} hash {:016x}, {varied} read by all with differing values; first [{}]",
                 acc.0,
                 crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed),
+                CULL_BY_CS.iter().map(|c| c.swap(0, Ordering::Relaxed).to_string()).collect::<Vec<_>>().join("/"),
                 common.len(),
                 h.finish(),
                 first.join(" ")
@@ -10900,6 +10903,9 @@ fn note_cull_census(p: &Prepared) {
         *acc = (frame, 0, HashMap::new());
     }
     acc.1 += 1;
+    if let Some(i) = CULL_CS.iter().position(|&c| c == p.addr) {
+        CULL_BY_CS[i].fetch_add(1, Ordering::Relaxed);
+    }
     let mut k = 0usize;
     for &(a, len) in &p.found.reads {
         let m = (len / 4) as usize;
