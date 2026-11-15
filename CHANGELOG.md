@@ -18,7 +18,7 @@ player's own game files on Windows.
   while the camera moves, sound output and device, the save folder and the import of a decrypted
   PS5 save.
 - Keyboard and mouse with raw mouse look, key prompts in the game's style, a mouse pointer that
-  selects what it points at in menus, a text box in the game's window for the character's name
+  points and clicks in the menus (it selects what it points at at once and hides in cutscenes), a text box in the game's window for the character's name
   (with a keyboard of its own for controllers), and Xbox prompts for Xbox controllers.
 - 5.1 and 7.1 sound, headphone and Windows Sonic or Dolby Atmos output of the game's 3D sound.
   The controller speaker's sounds can play through the PC's speakers (Pad Speaker).

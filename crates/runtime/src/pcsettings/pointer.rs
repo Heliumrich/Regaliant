@@ -109,8 +109,6 @@ struct State {
     /// parts: the grid's own jump, `grid_hook`, takes any of its cells): the item, until when,
     /// and whether a click follows.
     jump: Option<(u64, Instant, bool)>,
-    /// When the other groups were last searched for the pointer (a search reads every node).
-    searched: Instant,
     /// Presses toward the target in a row that did not move the selection.
     stuck: u32,
 }
@@ -191,8 +189,12 @@ pub extern "sysv64" fn select_hook(regs: *const u64, _arg: u32) {
         if *((list + 0x2a0) as *const u64) != 0 {
             let sel = *((list + 0x2b0) as *const i32);
             let step = *DIRECT_STEP.lock();
+            // (Only the target's own list: a press meant for another list (the storage screen's
+            // panels) runs the focused list's move, which must not take the step.)
+            let n = (end - begin) / 0x18;
+            let here = (0..n).any(|i| *((begin + i * 0x18) as *const u64) == target);
             match step {
-                Some((t, d)) if t == target && sel >= 0 && sel as i64 + d >= 0 && d != 0 => {
+                Some((t, d)) if here && t == target && sel >= 0 && sel as i64 + d >= 0 && d != 0 => {
                     *g = None;
                     *regs.add(6) = (sel as i64 + d) as u64;
                     *regs.add(2) = 0;
@@ -439,7 +441,9 @@ fn value_side(t: &uistate::Tree, item: u64, (x, y): (f32, f32)) -> Option<&'stat
         let same: Vec<&(f32, f32, f32, f32)> = parts.iter().filter(|b| small(b) && (b.2 - a.2).abs() < 1.0 && (b.3 - a.3).abs() < 1.0 && (cy(b) - cy(a)).abs() < 6.0).collect();
         if same.len() == 2 {
             let (l, r) = if cx(same[0]) < cx(same[1]) { (same[0], same[1]) } else { (same[1], same[0]) };
-            if cx(r) - cx(l) >= 150.0 && x >= l.0 - 24.0 && x < r.0 + r.2 + 24.0 && (y - cy(l)).abs() < 48.0 {
+            // (A value between them: the choice's text or a count, as the deposit dialog's.)
+            let between = parts.iter().any(|v| !same.contains(&v) && cx(v) > cx(l) + l.2 / 2.0 && cx(v) < cx(r) - r.2 / 2.0 && (cy(v) - cy(l)).abs() < 24.0);
+            if cx(r) - cx(l) >= 40.0 && between && x >= l.0 - 24.0 && x < r.0 + r.2 + 24.0 && (y - cy(l)).abs() < 48.0 {
                 return Some(if x < (cx(l) + cx(r)) / 2.0 { "left" } else { "right" });
             }
         }
@@ -509,6 +513,9 @@ pub fn tick() {
 /// When the last screen with items to point at was seen (`tick`'s condition for the pointer).
 static POINTABLE: Mutex<Option<Instant>> = Mutex::new(None);
 const POINTABLE_HOLD: Duration = Duration::from_millis(400);
+/// Items larger than this (canvas units squared) are panels, not the pointer's targets.
+const PANEL_AREA: f32 = 150_000.0;
+
 /// Since when the screen has had items without a break, and how long before the pointer shows.
 static POINTABLE_SINCE: Mutex<Option<Instant>> = Mutex::new(None);
 const POINTABLE_SETTLE: Duration = Duration::from_millis(120);
@@ -641,7 +648,6 @@ fn tick_nodes(tree: &std::sync::Arc<uistate::Tree>, want: bool, kbm: bool) -> bo
         chase: Vec::new(),
         hold_until: Instant::now(),
         jump: None,
-        searched: Instant::now(),
         stuck: 0,
     });
     let found = focused(tree);
@@ -744,6 +750,9 @@ fn tick_nodes(tree: &std::sync::Arc<uistate::Tree>, want: bool, kbm: bool) -> bo
             .filter(|&(_, n)| uistate::flags(n) & uistate::NOT_SHOWN == 0)
             .filter_map(|(group, n)| uistate::bounds(tree, n).map(|r| (group, n, r)))
             .filter(|(_, _, r)| x >= r.0 && x < r.2 && y >= r.1 && y < r.3)
+            // (Not whole panels: the storage screen's Inventory and Storage Box are the two items
+            // of a list that a screen's own button switches, not a pointer's target.)
+            .filter(|(_, _, r)| (r.2 - r.0) * (r.3 - r.1) < PANEL_AREA)
             .min_by(|a, b| dist(a.2).total_cmp(&dist(b.2)))
             .map(|(group, n, _)| (group, n))
     });
@@ -769,15 +778,12 @@ fn tick_nodes(tree: &std::sync::Arc<uistate::Tree>, want: bool, kbm: bool) -> bo
             s.jump = None;
         }
     }
+    // Another part of the focused input grid (the equipment screen's groups): its own jump.
+    // (Other lists' items take no press on a hover: a press runs the focused list's move.)
     if moved && hovered.is_none() && s.jump.is_none() {
         if let Some(c) = pos.and_then(|p| grid_cell_at(tree, &found, p)) {
             if !found.contains(&c) {
                 jump_to(s, tree, &found, c, false);
-            }
-        } else if s.searched.elapsed() > Duration::from_millis(100) {
-            s.searched = Instant::now();
-            if let Some((_, item, true)) = pos.and_then(|p| other_item_at(tree, &found, p)) {
-                jump_to(s, tree, &found, item, false);
             }
         }
     }
@@ -847,13 +853,18 @@ fn tick_nodes(tree: &std::sync::Arc<uistate::Tree>, want: bool, kbm: bool) -> bo
                         continue;
                     }
                     match pos.and_then(|p| other_item_at(tree, &found, p).map(|o| (o, p))) {
-                        // Another group of the focused scene: the jump there, then the click.
-                        Some(((_, item, true), _)) => jump_to(s, tree, &found, item, true),
-                        // A page of its own on the right of the lists in focus: into it with
+                        // A page on the right of the lists in focus: into it with
                         // Cross as a pad does, then the click there. (Nothing to the left: Circle
                         // would close a top-level menu.)
-                        Some(((_, _, false), (px, _))) => {
-                            let fx = found.iter().filter_map(|&f| uistate::bounds(tree, uistate::parent(f))).map(|r| r.2).fold(f32::NAN, f32::max);
+                        // Only from a single column of items (the SETTINGS categories, whose
+                        // Cross opens the page): from a grid Cross acts on the item (the storage
+                        // screen's Deposit).
+                        Some((_, (px, _))) => {
+                            let column = |g: u64| {
+                                let xs: Vec<f32> = tree.children.get(&g).map(|v| v.as_slice()).unwrap_or(&[]).iter().filter(|&&k| uistate::flags(k) & uistate::NOT_SHOWN == 0).filter_map(|&k| uistate::absolute(tree, k).map(|p| p.0)).collect();
+                                xs.len() >= 2 && xs.iter().all(|x| (x - xs[0]).abs() < 4.0)
+                            };
+                            let fx = found.iter().map(|&f| uistate::parent(f)).filter(|&g| column(g)).filter_map(|g| uistate::bounds(tree, g)).map(|r| r.2).fold(f32::NAN, f32::max);
                             if !fx.is_nan() && px >= fx {
                                 s.queue.push_back("cross");
                                 s.across = Some((found.iter().map(|&f| uistate::parent(f)).collect(), Instant::now() + Duration::from_millis(900)));
