@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 184] = [
+    static ALL: [Tunable; 185] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -216,6 +216,7 @@ pub mod tune {
         Tunable { name: "scout_seats", env: "DS_SCOUT_SEATS", default: 3, value: AtomicU64::new(UNSET) },
         Tunable { name: "scouts_gates", env: "DS_SCOUTS_GATES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "scouts_stretch", env: "DS_SCOUTS_STRETCH", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "scouts_clears", env: "DS_SCOUTS_CLEARS", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1439,9 +1440,10 @@ pub mod tune {
     }
 
     /// Scouts (`gpu::scout`, docs/SCOUTS.md): command processors that record the graphics
-    /// queue's queued title submissions ahead of its own (read once, when the graphics queue
-    /// starts: set it with `DS_SCOUTS`; at most 4). Census stage: their records are checked at
-    /// the command processor's turn and dropped. 0: none.
+    /// queue's queued title submissions ahead of its own (how many: read once, when the graphics
+    /// queue starts, from `DS_SCOUTS`, at most 8; set to 0 later, they idle until set again).
+    /// Their records are handed over with `tune scouts_commit`, else checked at the command
+    /// processor's turn and dropped (the census). 0: none.
     pub fn scouts() -> u64 {
         get(176)
     }
@@ -1502,6 +1504,13 @@ pub mod tune {
     #[inline]
     pub fn scouts_stretch() -> bool {
         get(183) != 0
+    }
+
+    /// A scout's own executor takes pending fast clears of earlier work at its images' first
+    /// uses (`Exec::resolve_fast_clears`, checked at its commit). 0: its record ends there.
+    #[inline]
+    pub fn scouts_clears() -> bool {
+        get(184) != 0
     }
 
     /// Whether translations get `rdna::translate::Spec::hw_bounds` (scalar
@@ -2782,9 +2791,10 @@ fn worker(q: &'static Queue, name: &str) {
             scout::Handed::From(buf, addr) => run_kept(&mut cp, &Kept { index: batch.index, bufs: batch.bufs.clone(), at: batch.at }, Some((buf, addr)), name),
         }
         timeline::end(&format!("{name} subs"), tl_sub, || format!("sub {} run{}", batch.index, match handed {
-            scout::Handed::No => "",
-            scout::Handed::Whole => " (its scout's record)",
-            scout::Handed::From(..) => " (from its scout's record on)",
+            scout::Handed::No if scout::on() => format!(" ({})", scout::last_outcome()),
+            scout::Handed::No => String::new(),
+            scout::Handed::Whole => " (its scout's record)".to_string(),
+            scout::Handed::From(..) => " (from its scout's record on)".to_string(),
         }));
         while let Some((s, buf, addr)) = cp.take_rewind_sub() {
             let Some(k) = kept.iter().position(|x| x.index == s) else {

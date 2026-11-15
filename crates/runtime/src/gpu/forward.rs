@@ -69,10 +69,16 @@ pub struct Inputs {
 }
 
 impl Inputs {
-    /// The guest ranges they were read from: the control block's two words and the source's
-    /// records (a scout notes what its view did not cover of them as CPU reads).
-    pub fn ranges(&self) -> [(u64, u64); 2] {
-        [(self.cb, 8), (self.src, (self.src_words.len() as u64).saturating_sub(1) * self.stride + 4)]
+    /// The words they were read as, by where: the control block's two, the source's records
+    /// (a scout keeps them for its content check, `Exec::note_content`).
+    pub fn words(&self) -> Vec<(u64, Vec<u32>)> {
+        let mut v = vec![(self.cb, vec![self.count as u32, self.modulus as u32])];
+        if self.stride == 4 {
+            v.push((self.src, self.src_words.clone()));
+        } else {
+            v.extend(self.src_words.iter().enumerate().map(|(j, &w)| (self.src + j as u64 * self.stride, vec![w])));
+        }
+        v
     }
 }
 
@@ -270,24 +276,13 @@ pub fn trace_uncovered(reads: &[(u64, u64)], who: &str, stages: [u64; 2]) {
 /// The published entries as a scout's record found them when it began (id, destination,
 /// words). A scout records a later submission than the main command processor, which goes on
 /// publishing copies of the submissions between: the scout reads through this snapshot for
-/// its whole record (so every read of it sees one state), `used` says which entries served
-/// its reads (bit k: entry k), and at its turn each of those must still be what a reader
-/// takes there (`frozen_current`), else the record is refused. Its own entries (its copies
-/// and CP writes) come first. Both are served as they are: memory under them moves with the
-/// earlier submissions' copies meanwhile, so `before_copy` says nothing here.
+/// its whole record (so every read of it sees one state); the words it takes from it are kept
+/// with its other binding reads and checked by content at its turn (`Exec::note_content`,
+/// `content_changed`). Its own entries (its copies and CP writes) come first. Both are served
+/// as they are: memory under them moves with the earlier submissions' copies meanwhile, so
+/// `before_copy` says nothing here.
 struct Frozen {
     entries: Vec<(u64, u64, Arc<[u32]>)>,
-    used: AtomicU64,
-}
-
-impl Frozen {
-    #[inline]
-    fn mark(&self, k: u8) {
-        let bit = 1u64 << k;
-        if self.used.load(Ordering::Relaxed) & bit == 0 {
-            self.used.fetch_or(bit, Ordering::Relaxed);
-        }
-    }
 }
 
 /// How a thread's copy of an entry is served (`LocalEntry`'s last field): checked against
@@ -322,7 +317,7 @@ pub fn hold_begin() {
 /// published entries as they are now (`Frozen`).
 pub fn hold_begin_scout() {
     let entries: Vec<(u64, u64, Arc<[u32]>)> = ENTRIES.read().iter().map(|e| (e.id, e.base, e.words.clone())).collect();
-    HELD.with(|h| *h.borrow_mut() = Some(Held { version: next_version(), frozen: Some(Arc::new(Frozen { entries, used: AtomicU64::new(0) })), ..Default::default() }));
+    HELD.with(|h| *h.borrow_mut() = Some(Held { version: next_version(), frozen: Some(Arc::new(Frozen { entries })), ..Default::default() }));
 }
 
 /// The scout's record on this thread is committed (`Cp::scout_commit`, in place of
@@ -400,49 +395,86 @@ pub fn hold_end_scout(writes: &[(u64, u64)]) {
     }
 }
 
-/// [records whose reads went through published entries, those entries, records refused
-/// because one of them was no longer what a reader takes at the turn].
-pub static FROZEN_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+thread_local! {
+    /// The span of this thread's held view's own entries, by the view's version
+    /// (`uncovered_by_own`): (version, lowest destination, highest end).
+    static OWN_SPAN: Cell<(u64, u64, u64)> = const { Cell::new((u64::MAX, 0, 0)) };
+}
 
-/// A scout's record at its turn (on its thread, before its commit): whether every published
-/// entry its reads went through (`Frozen::used`) is still what a reader takes at its
-/// destination now, the main command processor having recorded everything before the
-/// record's submission (`reader_words`; `busy`: unfinished GPU work or a deferred CP write
-/// still writes one of the ranges).
-pub fn frozen_current(busy: impl Fn(&[(u64, u64)]) -> bool) -> bool {
-    let Some(fr) = HELD.with(|h| h.borrow().as_ref().and_then(|x| x.frozen.clone())) else { return true };
-    let used = fr.used.load(Ordering::Acquire);
-    if used == 0 {
-        return true;
-    }
-    FROZEN_STATS[0].fetch_add(1, Ordering::Relaxed);
-    for (k, e) in fr.entries.iter().enumerate() {
-        if used & (1 << k) == 0 {
-            continue;
+/// Appends to `out` the parts of [a, a + n) that this thread's held view's own entries do not
+/// cover (a scout's: its copies and CP writes, before the reader in program order); without a
+/// held view the whole range.
+pub fn uncovered_by_own(a: u64, n: u64, out: &mut Vec<(u64, u64)>) {
+    let end = a + n;
+    HELD.with(|h| {
+        let h = h.borrow();
+        let Some(x) = h.as_ref() else {
+            out.push((a, n));
+            return;
+        };
+        let (v, lo, hi) = OWN_SPAN.with(|s| s.get());
+        let (lo, hi) = if v == x.version {
+            (lo, hi)
+        } else {
+            let (lo, hi) = x.entries.iter().fold((u64::MAX, 0u64), |(lo, hi), e| (lo.min(e.base), hi.max(e.base + 4 * e.words.len() as u64)));
+            OWN_SPAN.with(|s| s.set((x.version, lo, hi)));
+            (lo, hi)
+        };
+        if end <= lo || hi <= a {
+            out.push((a, n));
+            return;
         }
-        FROZEN_STATS[1].fetch_add(1, Ordering::Relaxed);
-        let now = reader_words(e.1, e.2.len(), &busy);
-        if now.as_deref() != Some(&e.2[..]) {
-            FROZEN_STATS[2].fetch_add(1, Ordering::Relaxed);
-            static LOGGED: AtomicU64 = AtomicU64::new(0);
-            if LOGGED.fetch_add(1, Ordering::Relaxed) < 40 {
-                let d = now.as_ref().and_then(|n| n.iter().zip(e.2.iter()).position(|(a, b)| a != b));
-                crate::info!("forward: a scout's record read the published copy at {:#x}+{:#x} (entry {} of {} when it began), which is not what a reader takes at its turn: {}", e.1, 4 * e.2.len(), k, fr.entries.len(), match (&now, d) {
-                    (None, _) => "not known there now (still written, or the entry over it went stale)".to_string(),
-                    (Some(n), Some(d)) => format!("word {d} was {:#x}, is {:#x} ({} of {} words differ)", e.2[d], n[d], n.iter().zip(e.2.iter()).filter(|(a, b)| a != b).count(), n.len()),
-                    _ => "?".to_string(),
-                });
+        let mut over: Vec<(u64, u64)> = x.entries.iter().filter(|e| e.base < end && a < e.base + 4 * e.words.len() as u64).map(|e| (a.max(e.base), end.min(e.base + 4 * e.words.len() as u64))).collect();
+        if over.is_empty() {
+            out.push((a, n));
+            return;
+        }
+        over.sort_unstable();
+        let mut at = a;
+        for (s, e) in over {
+            if s > at {
+                out.push((at, s - at));
             }
-            return false;
+            at = at.max(e);
+        }
+        if at < end {
+            out.push((at, end - at));
+        }
+    });
+}
+
+/// The parts of `ranges` no published entry covers: what a reader in program order takes
+/// from guest memory there (a scout's content check waits for their unfinished writers
+/// first, `exec::words_now`).
+pub fn uncovered_published(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    if COUNT.load(Ordering::Acquire) == 0 {
+        out.extend_from_slice(ranges);
+        return out;
+    }
+    let g = ENTRIES.read();
+    for &(a, n) in ranges {
+        let end = a + n;
+        let mut over: Vec<(u64, u64)> = g.iter().filter(|e| e.base < end && a < e.base + 4 * e.words.len() as u64).map(|e| (a.max(e.base), end.min(e.base + 4 * e.words.len() as u64))).collect();
+        over.sort_unstable();
+        let mut at = a;
+        for (s, e) in over {
+            if s > at {
+                out.push((at, s - at));
+            }
+            at = at.max(e);
+        }
+        if at < end {
+            out.push((at, end - at));
         }
     }
-    true
+    out
 }
 
 /// What a reader in program order takes at [base, base + 4 n) now: the published entries'
 /// words over guest memory (as `overlay` serves them); None where that is not known: the
 /// range unreadable, or a part no entry covers still written by unfinished work (`busy`).
-fn reader_words(base: u64, n: usize, busy: &impl Fn(&[(u64, u64)]) -> bool) -> Option<Vec<u32>> {
+pub(super) fn reader_words(base: u64, n: usize, busy: &impl Fn(&[(u64, u64)]) -> bool) -> Option<Vec<u32>> {
     if !super::cp::guest_readable(base, 4 * n as u64) {
         return None;
     }
@@ -569,7 +601,7 @@ fn with_local_span<R>(f: impl FnOnce(&[LocalEntry], (u64, u64)) -> R) -> R {
 }
 
 /// `with_local_span`, with a scout's snapshot (its entries are in the copy, served as they
-/// are: `SERVE_FROZEN`; the caller marks the ones it serves, `Frozen::mark`).
+/// are: `SERVE_FROZEN`).
 fn with_local_view<R>(f: impl FnOnce(&[LocalEntry], (u64, u64), Option<&Frozen>) -> R) -> R {
     // A held view's own version is mixed in (its entries and hidden ones); a scout's view
     // does not follow the published entries at all.
@@ -648,15 +680,12 @@ pub fn word_or(addr: u64, mem: u32) -> u32 {
     if !active() {
         return mem;
     }
-    let hit = with_local_view(|v, (lo, hi), fr| {
+    let hit = with_local_span(|v, (lo, hi)| {
         if addr < lo || hi <= addr {
             return None;
         }
         v.iter().find(|e| e.0 <= addr && addr < e.0 + e.1).map(|e| {
             let k = ((addr - e.0) / 4) as usize;
-            if let (true, Some(fr)) = (e.5 >= SERVE_FROZEN, fr) {
-                fr.mark(e.5 - SERVE_FROZEN);
-            }
             (e.0, e.2[k], e.5 != SERVE_CHECKED || before_copy(&e.3, &e.4, k, mem))
         })
     });
@@ -682,7 +711,7 @@ pub fn overlay(addr: u64, out: &mut [u32]) {
     }
     let end = addr + 4 * out.len() as u64;
     let mut stale = Vec::new();
-    let n = with_local_view(|v, (lo, hi), fr| {
+    let n = with_local_span(|v, (lo, hi)| {
         if end <= lo || hi <= addr {
             return 0;
         }
@@ -700,9 +729,6 @@ pub fn overlay(addr: u64, out: &mut [u32]) {
             if !ok {
                 stale.push(*base);
                 continue;
-            }
-            if let (true, Some(fr)) = (*serve >= SERVE_FROZEN, fr) {
-                fr.mark(*serve - SERVE_FROZEN);
             }
             for a in (lo..hi).step_by(4) {
                 out[((a - addr) / 4) as usize] = words[((a - base) / 4) as usize];
@@ -735,7 +761,7 @@ pub fn uncovered(reads: &[(u64, u64)]) -> Option<Vec<(u64, u64)>> {
     if !held && !reads.iter().any(|&(a, n)| a < hi && lo < a + n) {
         return None;
     }
-    with_local_view(|v, (lo, hi), fr| {
+    with_local_span(|v, (lo, hi)| {
         if !reads.iter().any(|&(a, n)| a < hi && lo < a + n && v.iter().any(|e| e.0 < a + n && a < e.0 + e.1)) {
             return None;
         }
@@ -748,13 +774,7 @@ pub fn uncovered(reads: &[(u64, u64)]) -> Option<Vec<(u64, u64)>> {
         for &(a, n) in reads {
             let end = a + n;
             over.clear();
-            over.extend(v.iter().filter(|e| e.0 < end && a < e.0 + e.1).map(|e| {
-                // (A scout: the published entries that cover its reads are checked at its turn.)
-                if let (true, Some(fr)) = (e.5 >= SERVE_FROZEN, fr) {
-                    fr.mark(e.5 - SERVE_FROZEN);
-                }
-                (e.0.max(a), (e.0 + e.1).min(end))
-            }));
+            over.extend(v.iter().filter(|e| e.0 < end && a < e.0 + e.1).map(|e| (e.0.max(a), (e.0 + e.1).min(end))));
             if over.is_empty() {
                 out.push((a, n));
                 continue;

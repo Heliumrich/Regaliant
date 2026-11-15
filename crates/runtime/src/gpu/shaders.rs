@@ -2874,7 +2874,7 @@ pub fn load_range(code_base: u64, plan: &Plan, k: usize, user: &[u32]) -> Option
 /// that. Err(0): a chain is unreadable; Err(1): a formatted buffer's V# has
 /// another format or swizzle than the translation's (its loads decode with
 /// that one).
-pub fn gpu_chain_ranges(code_base: u64, plan: &Plan, spec: &Spec, user: &[u32], loads: &mut Vec<(u64, u64)>, bufs: &mut Vec<(u64, u64)>, reads: &mut Vec<(u64, u64)>) -> Result<(), u8> {
+pub fn gpu_chain_ranges(code_base: u64, plan: &Plan, spec: &Spec, user: &[u32], loads: &mut Vec<(u64, u64)>, bufs: &mut Vec<(u64, u64)>, reads: &mut Vec<(u64, u64)>, words: &mut Vec<u32>) -> Result<(), u8> {
     let mut rd = Reader::new(code_base);
     for (k, l) in plan.loads.iter().enumerate().take(64) {
         if spec.gpu_loads & (1u64 << k) == 0 {
@@ -2908,6 +2908,7 @@ pub fn gpu_chain_ranges(code_base: u64, plan: &Plan, spec: &Spec, user: &[u32], 
         }
     }
     reads.extend_from_slice(&rd.reads);
+    words.extend_from_slice(&rd.words);
     Ok(())
 }
 

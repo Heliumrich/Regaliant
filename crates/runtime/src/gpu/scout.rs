@@ -196,6 +196,36 @@ static REFUSED: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
 /// Records not finished when the main command processor reached their submission with a
 /// hand-over wanted (it went on without them: `tune scouts_wait`).
 static LATE: AtomicU64 = AtomicU64::new(0);
+/// The turns of the graphics queue's submissions by outcome (`turn`; `OUTCOMES` names them):
+/// what took a submission from the main command processor or left it there.
+static TURNS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+const OUTCOMES: [&str; 8] = ["no record", "the census", "its record not finished", "the command processor held work", "nothing recorded", "refused", "taken whole", "taken as a prefix"];
+
+thread_local! {
+    /// The last turn's outcome on this thread (an index into `OUTCOMES`; timelines name the
+    /// submissions' runs by it, `last_outcome`).
+    static OUTCOME: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn outcome(k: usize) {
+    TURNS[k].fetch_add(1, Ordering::Relaxed);
+    OUTCOME.with(|o| o.set(k));
+}
+
+/// Whether the graphics queue's next submission has a finished record to hand over (`Cp::
+/// past_goes_on`: work the main command processor holds stops at the end of the submission
+/// before it, so that the record can be taken at its turn).
+pub fn next_has_record() -> bool {
+    if !on() || !super::tune::scouts_commit() {
+        return false;
+    }
+    LANES.lock().as_ref().and_then(|l| l.queued.front()).and_then(|e| e.slot.as_ref()).is_some_and(|s| s.done.load(Ordering::Acquire))
+}
+
+/// What the last turn on this thread did with its submission (`OUTCOMES`).
+pub fn last_outcome() -> &'static str {
+    OUTCOMES[OUTCOME.with(|o| o.get())]
+}
 /// Gates (`Cp::scout_gate`): [records taken over up to a gate, segments behind gates taken
 /// over, segments refused at their gate (the rest of the record dropped)].
 static GATED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
@@ -224,7 +254,7 @@ pub fn reset_stats() {
     for c in [&CLAIMED, &RECORDED, &WHOLE, &IN_TIME, &LATE_NS, &EARLY_NS, &REC_NS, &COMMANDS, &RUNS, &BATCHES, &CHUNK_BATCHES, &READS, &AHEAD, &DWORDS, &DWORDS_DONE, &UNWALKED, &MISSED, &LATE] {
         c.store(0, Ordering::Relaxed);
     }
-    for c in WAITS.iter().chain(CHECKS.iter()).chain(HAND.iter()).chain(GATED.iter()) {
+    for c in WAITS.iter().chain(CHECKS.iter()).chain(HAND.iter()).chain(GATED.iter()).chain(TURNS.iter()).chain(super::cp::SCOUT_TURN_HELD.iter()) {
         c.store(0, Ordering::Relaxed);
     }
     REFUSED.lock().clear();
@@ -239,7 +269,7 @@ pub fn reset_stats() {
     }
     super::forward::CP_WRITE_ENTRIES.store(0, Ordering::Relaxed);
     super::forward::WALKED_ENTRIES.store(0, Ordering::Relaxed);
-    for c in super::forward::FROZEN_STATS.iter() {
+    for c in super::exec::SCOUT_CONTENT.iter().chain(super::exec::SCOUT_CLEARS.iter()).chain([&super::cp::SCOUT_NOT_PACKETS, &super::cp::SCOUT_BUFFERS_CHANGED]) {
         c.store(0, Ordering::Relaxed);
     }
 }
@@ -320,10 +350,12 @@ pub fn turn(index: u64, bufs: &[(u64, u32)], cp: &mut Cp) -> Handed {
     };
     let Some(slot) = slot else {
         CV.notify_all();
+        outcome(0);
         return Handed::No;
     };
     if !super::tune::scouts_commit() {
         leave(&slot, &state, true, false);
+        outcome(1);
         return Handed::No;
     }
     // A record its scout has not finished is not waited for (`tune scouts_wait`: or only so
@@ -341,6 +373,7 @@ pub fn turn(index: u64, bufs: &[(u64, u32)], cp: &mut Cp) -> Handed {
             LATE.fetch_add(1, Ordering::Relaxed);
             slot.cancel.store(true, Ordering::Relaxed);
             leave(&slot, &state, false, false);
+            outcome(2);
             return Handed::No;
         }
     }
@@ -348,15 +381,18 @@ pub fn turn(index: u64, bufs: &[(u64, u32)], cp: &mut Cp) -> Handed {
     // it holds work back itself, a stretch past a run or a label wait: nothing to hand over.)
     let Some((need, last, cpu)) = cp.scout_turn() else {
         leave(&slot, &state, true, false);
+        outcome(3);
         return Handed::No;
     };
     let Some(mut made) = slot.made.lock().take() else {
         leave(&slot, &state, false, false);
+        outcome(4);
         return Handed::No;
     };
     let Some(out) = made.out.as_ref() else {
         *slot.made.lock() = Some(made);
         leave(&slot, &state, false, false);
+        outcome(4);
         return Handed::No;
     };
     HAND[0].fetch_add(1, Ordering::Relaxed);
@@ -378,7 +414,9 @@ pub fn turn(index: u64, bufs: &[(u64, u32)], cp: &mut Cp) -> Handed {
         if let Some(v) = made.view.take() {
             super::forward::unpark(v);
         }
+        scp.scout_refused = None;
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scp.scout_commit(need, (last, cpu), &writes))).unwrap_or(Err("failed"));
+        log_refusal(&slot, &scp, &r, false);
         // (Refused, or more of it waits behind a gate: its view stays with it.)
         if !matches!(&r, Ok(end) if !end.gate) {
             made.view = super::forward::park();
@@ -408,10 +446,12 @@ pub fn turn(index: u64, bufs: &[(u64, u32)], cp: &mut Cp) -> Handed {
                 None => {
                     HAND[1].fetch_add(1, Ordering::Relaxed);
                     HAND[4].fetch_add(bufs.iter().map(|b| b.1 as u64).sum(), Ordering::Relaxed);
+                    outcome(6);
                     Handed::Whole
                 }
                 Some((buf, at)) => {
                     HAND[2].fetch_add(1, Ordering::Relaxed);
+                    outcome(7);
                     let before: u64 = bufs.iter().take(buf).map(|b| b.1 as u64).sum::<u64>() + bufs.get(buf).map_or(0, |b| if at >= b.0 { ((at - b.0) / 4).min(b.1 as u64) } else { 0 });
                     HAND[4].fetch_add(before, Ordering::Relaxed);
                     Handed::From(buf, at)
@@ -423,6 +463,7 @@ pub fn turn(index: u64, bufs: &[(u64, u32)], cp: &mut Cp) -> Handed {
             bump(&REFUSED, &why);
             *slot.made.lock() = Some(made);
             leave(&slot, &state, false, true);
+            outcome(5);
             Handed::No
         }
     }
@@ -446,7 +487,9 @@ pub fn more(cp: &mut Cp) -> Option<(usize, u64)> {
             if let Some(v) = made.view.take() {
                 super::forward::unpark(v);
             }
+            scp.scout_refused = None;
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scp.scout_commit(need, (last, cpu), &writes))).unwrap_or(Err("failed"));
+            log_refusal(&slot, &scp, &r, true);
             match &r {
                 // (More of it waits behind the next gate: its view stays with it.)
                 Ok(end) if end.gate => made.view = super::forward::park(),
@@ -490,6 +533,17 @@ pub fn more(cp: &mut Cp) -> Option<(usize, u64)> {
             leave(&slot, &state, false, true);
             None
         }
+    }
+}
+
+/// Logs the first refusals by a read whose words changed, with the writers the record's journal
+/// noted there.
+fn log_refusal(slot: &Slot, scp: &Cp, r: &Result<super::cp::ScoutEnd, &'static str>, gate: bool) {
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    let (Err(why), Some((a, n))) = (r, scp.scout_refused) else { return };
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 60 {
+        let who = super::exec::scout_journal_who(slot.journal.load(Ordering::Acquire), a, n);
+        crate::info!("gpu[{}]: scout hand-over: submission {} refused{}: {why}: {a:#x}+{n:#x} (written since by {})", scp.name, slot.index, if gate { " behind a gate" } else { "" }, if who.is_empty() { "?".to_string() } else { who.join(", ") });
     }
 }
 
@@ -650,6 +704,12 @@ fn run(name: &str) {
             return;
         }
         sweep(&mut mine);
+        // (`tune scouts 0` after start: the scouts idle, in-run A/Bs against none.)
+        if super::tune::scouts() == 0 {
+            let mut g = LANES.lock();
+            CV.wait_for(&mut g, std::time::Duration::from_millis(20));
+            continue;
+        }
         let Some(seat) = seats.iter().find(|x| !x.busy.load(Ordering::Acquire)) else {
             // (Every seat holds a record that waits for its turn.)
             let mut g = LANES.lock();
@@ -871,11 +931,13 @@ pub fn status() -> String {
     let hand = if v(&HAND[0]) == 0 {
         String::new()
     } else {
+        let turns: Vec<String> = OUTCOMES.iter().zip(TURNS.iter()).filter(|(_, c)| v(c) > 0).map(|(k, c)| format!("{k} {}", v(c))).collect();
         let mut r = REFUSED.lock().clone();
         r.sort_by(|a, b| b.1.cmp(&a.1));
         let r: Vec<String> = r.iter().map(|(w, n)| format!("{w} {n}")).collect();
-        format!(
-            "    scouts' hand-overs (`tune scouts_commit`): {} asked: {} records taken over whole, {} as a prefix, {} refused ({}); {} K of the asked submissions' {} K dwords taken over ({:.0}%); the command processor waited {:.0} us for its scout on average ({} ms in all), a scout's commit {:.0} us; records that read published copies {} ({} of them checked at the turn, {} records refused for one); {} records not finished at their turn (not waited for: `tune scouts_wait`); {} records taken over up to a gate, {} segments behind gates taken over, {} refused there; the reads that refused records: {}\n",
+        let held: Vec<u64> = super::cp::SCOUT_TURN_HELD.iter().map(v).collect();
+        format!("    scouts' turns by outcome: {} (the command processor held: work {}, past a run {}, past a label wait {}, a run {})\n", turns.join(", "), held[0], held[1], held[2], held[3]) + &format!(
+            "    scouts' hand-overs (`tune scouts_commit`): {} asked: {} records taken over whole, {} as a prefix, {} refused ({}); {} K of the asked submissions' {} K dwords taken over ({:.0}%); the command processor waited {:.0} us for its scout on average ({} ms in all), a scout's commit {:.0} us; content reads checked at turns and gates {} ({} equal, {} changed; their writers waited for {} ms), kept {} ({} K words); pending fast clears of earlier work taken {} ({} segments refused for a clear taken first); records that met words not yet packets {}, segments whose command buffer words changed {}; {} records not finished at their turn (not waited for: `tune scouts_wait`); {} records taken over up to a gate, {} segments behind gates taken over, {} refused there; the reads that refused records: {}\n",
             v(&HAND[0]),
             v(&HAND[1]),
             v(&HAND[2]),
@@ -887,9 +949,16 @@ pub fn status() -> String {
             v(&HAND[6]) as f64 / 1e3 / v(&HAND[0]).max(1) as f64,
             v(&HAND[6]) / 1_000_000,
             v(&HAND[7]) as f64 / 1e3 / v(&HAND[0]).max(1) as f64,
-            v(&super::forward::FROZEN_STATS[0]),
-            v(&super::forward::FROZEN_STATS[1]),
-            v(&super::forward::FROZEN_STATS[2]),
+            v(&super::exec::SCOUT_CONTENT[0]),
+            v(&super::exec::SCOUT_CONTENT[1]),
+            v(&super::exec::SCOUT_CONTENT[2]),
+            v(&super::exec::SCOUT_CONTENT[3]) / 1_000_000,
+            v(&super::exec::SCOUT_CONTENT[4]),
+            v(&super::exec::SCOUT_CONTENT[5]) / 1000,
+            v(&super::exec::SCOUT_CLEARS[0]),
+            v(&super::exec::SCOUT_CLEARS[1]),
+            v(&super::cp::SCOUT_NOT_PACKETS),
+            v(&super::cp::SCOUT_BUFFERS_CHANGED),
             v(&LATE),
             v(&GATED[0]),
             v(&GATED[1]),

@@ -194,6 +194,14 @@ pub fn name_object<H: vk::Handle>(handle: H, name: &str) {
     }
 }
 
+/// The device takes the mirror-once sampler address mode (`samplerMirrorClampToEdge`, enabled).
+static MIRROR_CLAMP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether samplers may use `MIRROR_CLAMP_TO_EDGE` (`Images::sampler`).
+pub fn mirror_clamp() -> bool {
+    MIRROR_CLAMP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn ctx() -> &'static Ctx {
     CTX.get().expect("Vulkan not initialized")
 }
@@ -652,7 +660,13 @@ fn init_inner() -> Result<(), String> {
         let device_addresses = f12_supported.buffer_device_address != 0;
         let draw_indirect_count = f12_supported.draw_indirect_count != 0;
         let host_query_reset = f12_supported.host_query_reset != 0;
+        // (The title's samplers use the mirror-once address mode; without the feature they take
+        // mirrored repeat, `mirror_clamp`. Not enabled before 2026-11-15: the validation layer
+        // reported the samplers.)
+        let mirror_clamp = f12_supported.sampler_mirror_clamp_to_edge != 0;
+        MIRROR_CLAMP.store(mirror_clamp, std::sync::atomic::Ordering::Relaxed);
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
+            .sampler_mirror_clamp_to_edge(mirror_clamp)
             .buffer_device_address(device_addresses)
             .host_query_reset(host_query_reset)
             .draw_indirect_count(draw_indirect_count)

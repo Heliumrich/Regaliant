@@ -331,6 +331,39 @@ pub fn tsharp_diff_line() -> String {
 }
 
 /// `Images::sampler` from this thread's memo.
+thread_local! {
+    /// This thread records ahead of the stream (a scout's executor, `NoCreate`): it makes no
+    /// image and no sampler. A scout reads descriptors earlier than the stream reaches them and
+    /// may read words GPU work has still to write (its commit refuses the record then), and
+    /// what it would make from them stays: an image of any size, a sampler of any state. A
+    /// scout crashed the driver (an integer division by zero in nvoglv64) in a census window,
+    /// 2026-11-15.
+    static NO_CREATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `Images::image_for` and `Images::sampler`'s error on a thread that makes none (`NoCreate`).
+pub const NOT_MADE_HERE: &str = "an image or sampler a scout does not make";
+
+/// While alive (with `on`), this thread makes no image and no sampler (`NO_CREATE`).
+pub struct NoCreate(bool);
+
+impl NoCreate {
+    pub fn new(on: bool) -> NoCreate {
+        let before = NO_CREATE.with(|c| c.replace(on || c.get()));
+        NoCreate(before)
+    }
+}
+
+impl Drop for NoCreate {
+    fn drop(&mut self) {
+        NO_CREATE.with(|c| c.set(self.0));
+    }
+}
+
+fn no_create() -> bool {
+    NO_CREATE.with(|c| c.get())
+}
+
 pub fn sampler_hit(s: [u32; 4], compare: bool) -> Option<vk::Sampler> {
     let aniso = ANISO.load(std::sync::atomic::Ordering::Relaxed);
     tls(|m| m.samplers.get(&(s, compare, aniso)).copied())
@@ -4445,15 +4478,29 @@ impl Images {
     /// since (`resolve_fast_clears`: in `prev`, not in `cur`) is taken here, and must still be
     /// pending as the record left it. False (nothing changed): other work took or changed it
     /// first, so the record's own clear of the image would come a second time.
+    /// `taken`: the pending fast clears of earlier work the record took at its images' first
+    /// uses in the segment (`Exec::held_taken`): each must still be pending as it took it (no
+    /// work recorded since took or changed it), and is taken here (before the record's own
+    /// notes, which come after it in program order). Nothing changes unless every check passes.
     pub fn apply_held_delta(
         &mut self,
+        taken: &[(ImageKey, (u64, Option<u32>))],
         prev: (&std::collections::HashMap<ImageKey, (u64, Option<u32>)>, &std::collections::HashSet<ImageKey>),
         cur: (&std::collections::HashMap<ImageKey, (u64, Option<u32>)>, &std::collections::HashSet<ImageKey>),
     ) -> bool {
+        if taken.iter().any(|(k, v)| self.pending_clears.get(k) != Some(v)) {
+            return false;
+        }
         if prev.0.iter().any(|(k, v)| cur.0.get(k) != Some(v) && self.pending_clears.get(k) != Some(v)) {
             return false;
         }
         let mut changed = false;
+        for (k, _) in taken {
+            if self.pending_clears.remove(k).is_some() {
+                self.pending_change += 1;
+                changed = true;
+            }
+        }
         for (k, v) in prev.0 {
             if cur.0.get(k) != Some(v) {
                 self.pending_clears.remove(k);
@@ -4498,9 +4545,27 @@ impl Images {
 
     /// Whether one of `keys` has a fast clear or a reload pending that is not the asking
     /// record's own (`own`: what the cache has of its notes, `apply_held_delta`).
-    pub fn pending_not_own(&self, keys: &[ImageKey], own: (&std::collections::HashMap<ImageKey, (u64, Option<u32>)>, &std::collections::HashSet<ImageKey>)) -> bool {
-        (!self.pending_clears.is_empty() && keys.iter().any(|k| self.pending_clears.get(k).is_some_and(|v| own.0.get(k) != Some(v))))
+    /// `taken`: the pending clears of earlier work the record took (`Exec::held_taken`), which
+    /// its commit checks itself.
+    pub fn pending_not_own(&self, keys: &[ImageKey], own: (&std::collections::HashMap<ImageKey, (u64, Option<u32>)>, &std::collections::HashSet<ImageKey>), taken: &[(ImageKey, (u64, Option<u32>))]) -> bool {
+        (!self.pending_clears.is_empty() && keys.iter().any(|k| self.pending_clears.get(k).is_some_and(|v| own.0.get(k) != Some(v) && !taken.iter().any(|t| t.0 == *k && t.1 == *v))))
             || (self.pending_overwrites > 0 && keys.iter().any(|k| !own.1.contains(k) && self.map.get(k).is_some_and(|i| i.overwritten)))
+    }
+
+    /// The fast clears pending for `keys` (once each): image, metadata and value when known.
+    pub fn pending_clears_of(&self, keys: &[ImageKey]) -> Vec<(ImageKey, (u64, Option<u32>))> {
+        let mut v: Vec<(ImageKey, (u64, Option<u32>))> = Vec::new();
+        if self.pending_clears.is_empty() {
+            return v;
+        }
+        for k in keys {
+            if let Some(&x) = self.pending_clears.get(k) {
+                if !v.iter().any(|y| y.0 == *k) {
+                    v.push((*k, x));
+                }
+            }
+        }
+        v
     }
 
     /// The fast clear of image `k` with metadata at `meta` (`take_clears`'s
@@ -4623,6 +4688,9 @@ impl Images {
                 self.note_layout(k, t);
             }
             return Ok(k);
+        }
+        if no_create() {
+            return Err(NOT_MADE_HERE.into());
         }
         let ts = timed();
         let (image, mem, bytes) = self.create(key)?;
@@ -6238,14 +6306,19 @@ impl Images {
             });
             return Ok(v);
         }
+        if no_create() {
+            return Err(NOT_MADE_HERE.into());
+        }
         let b = |v: u32, lo: u32, n: u32| (v >> lo) & ((1 << n) - 1);
+        // (Mirror once without the device feature: mirrored repeat, `vk::mirror_clamp`.)
+        let mirror_once = if super::vk::mirror_clamp() { vk::SamplerAddressMode::MIRROR_CLAMP_TO_EDGE } else { vk::SamplerAddressMode::MIRRORED_REPEAT };
         let addr = |m: u32| match m {
             0 => vk::SamplerAddressMode::REPEAT,
             1 => vk::SamplerAddressMode::MIRRORED_REPEAT,
             2 => vk::SamplerAddressMode::CLAMP_TO_EDGE,
-            3 => vk::SamplerAddressMode::MIRROR_CLAMP_TO_EDGE,
+            3 => mirror_once,
             4 | 6 => vk::SamplerAddressMode::CLAMP_TO_BORDER,
-            _ => vk::SamplerAddressMode::MIRROR_CLAMP_TO_EDGE,
+            _ => mirror_once,
         };
         let filt = |m: u32| if m & 1 != 0 { vk::Filter::LINEAR } else { vk::Filter::NEAREST };
         let aniso = b(s[0], 9, 3);
