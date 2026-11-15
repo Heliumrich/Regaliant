@@ -3111,6 +3111,7 @@ pub fn start_profiler() {
         1 << 20,
         Box::new(|| {
             crate::log::set_thread_name("gpu-profiler");
+            crate::thread::sampler_priority();
             let period = PROFILE_MS.load(Ordering::Relaxed);
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(period));

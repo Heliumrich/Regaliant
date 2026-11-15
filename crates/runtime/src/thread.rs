@@ -310,6 +310,15 @@ pub fn run_key_destructors(t: &'static GuestThread) {
     }
 }
 
+/// Raises the calling thread (a sampler) above every thread it samples: at a lower priority
+/// than the front end's threads (above normal, `gpu::prio`) it ran only when one of them
+/// blocked, so its samples found them idle far more often than they were (2026-11-15: the
+/// graphics workers sampled 22% busy while their thread cycles were 98% in their runs).
+pub fn sampler_priority() {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL};
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) };
+}
+
 /// Creates a host thread whose whole stack is committed up front. PS4 code does
 /// not probe the stack, so lazily grown (guard-page) Windows stacks would fault
 /// when a large frame is touched below the guard page.

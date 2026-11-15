@@ -400,6 +400,13 @@ pub static TURN_NS: AtomicU64 = AtomicU64::new(0);
 static PHASE_NS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 static STARTS: AtomicU64 = AtomicU64::new(0);
 pub static CANCELLED: AtomicU64 = AtomicU64::new(0);
+/// The workers' idle census ([graphics, compute] x [wake-ups from their idle
+/// sleep, of them finding no run (the pool's word wakes every idle worker),
+/// their own cycles in runs, of them waiting for chunks' turns]; the cycles
+/// with `DS_IDLE_CENSUS=1`), and the kinds' thread cycles and the flip count at
+/// the window's start (`reset_stats`).
+static IDLE: [[AtomicU64; 4]; 2] = [const { [const { AtomicU64::new(0) }; 4] }; 2];
+static IDLE_BASE: Mutex<([u64; 2], u64)> = Mutex::new(([0; 2], 0));
 static STOP_WHY: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
 
 /// Recording past runs (`tune past_runs`): [runs gone past, committed,
@@ -527,7 +534,7 @@ impl Pool {
                     } else if let Some(id) = qname.strip_prefix("gpu-acb").and_then(|h| u32::from_str_radix(h.trim_start_matches("0x"), 16).ok()) {
                         super::prio::set_compute_worker(id);
                     }
-                    run_worker(&w2, &tname);
+                    run_worker(&w2, &tname, compute);
                 }),
             );
             if let Err(e) = r {
@@ -558,9 +565,12 @@ impl Pool {
     }
 }
 
-fn run_worker(w: &Worker, name: &str) {
+fn run_worker(w: &Worker, name: &str, compute: bool) {
+    let k = compute as usize;
+    let census = super::threadcpu::idle_census();
     loop {
         super::prio::apply();
+        let mut woke = false;
         let run = loop {
             // The word before looking: a run given after this wakes the
             // sleep below (or it does not start).
@@ -572,6 +582,9 @@ fn run_worker(w: &Worker, name: &str) {
                     break r;
                 }
             }
+            if woke {
+                IDLE[k][1].fetch_add(1, Ordering::Relaxed);
+            }
             unsafe {
                 windows_sys::Win32::System::Threading::WaitOnAddress(
                     Arc::as_ptr(&w.wake) as *const core::ffi::c_void,
@@ -580,19 +593,25 @@ fn run_worker(w: &Worker, name: &str) {
                     windows_sys::Win32::System::Threading::INFINITE,
                 )
             };
+            IDLE[k][0].fetch_add(1, Ordering::Relaxed);
+            woke = true;
         };
+        let c0 = if census { super::threadcpu::own_cycles() } else { 0 };
         // (Counted on the run from here: a cancel waits for the workers
         // recording or committing its chunks, not for those given it that
         // are still busy with earlier runs.)
         run.active.fetch_add(1, Ordering::SeqCst);
-        take_chunks(w, &run, name);
+        take_chunks(w, &run, name, k, census);
         run.leave();
+        if census {
+            IDLE[k][2].fetch_add(super::threadcpu::own_cycles().wrapping_sub(c0), Ordering::Relaxed);
+        }
     }
 }
 
 /// Records, submits and posts chunks of `run` until none is left or the run
 /// is cancelled.
-fn take_chunks(w: &Worker, run: &Run, name: &str) {
+fn take_chunks(w: &Worker, run: &Run, name: &str, k: usize, census: bool) {
     let mut first = true;
     let lap = |k: usize, t: &mut std::time::Instant| {
         let now = std::time::Instant::now();
@@ -641,7 +660,11 @@ fn take_chunks(w: &Worker, run: &Run, name: &str) {
         let ready = || run.turn.load(Ordering::Acquire) > i || run.cancelled.load(Ordering::Acquire);
         if !ready() {
             let tl = super::timeline::mark();
+            let c0 = if census { super::threadcpu::own_cycles() } else { 0 };
             TURN_NS.fetch_add(run.wait_until(ready), Ordering::Relaxed);
+            if census {
+                IDLE[k][3].fetch_add(super::threadcpu::own_cycles().wrapping_sub(c0), Ordering::Relaxed);
+            }
             super::timeline::end(name, tl, || "wait: chunk turn".into());
         }
         commit(run, i, cp, stopped, failed, state);
@@ -747,11 +770,45 @@ pub fn reset_stats() {
     }
     PAST_STOPS.lock().clear();
     PAST_DROPS.lock().clear();
+    for c in IDLE.iter().flatten() {
+        c.store(0, Ordering::Relaxed);
+    }
+    *IDLE_BASE.lock() = ([super::threadcpu::kind_cycles("par"), super::threadcpu::kind_cycles("cpar")], super::FRAMES.load(Ordering::Relaxed));
     *LENGTHS.lock() = [[0; 2]; 6];
     ENDS.lock().clear();
     *LENGTHS_C.lock() = [[0; 2]; 6];
     ENDS_C.lock().clear();
     ENDS_SHORT.lock().clear();
+}
+
+/// The workers' idle census line (`DS_IDLE_CENSUS=1`), per flip since the
+/// window's start.
+fn idle_line() -> String {
+    if !super::threadcpu::idle_census() {
+        return String::new();
+    }
+    let (base, f0) = *IDLE_BASE.lock();
+    let flips = super::FRAMES.load(Ordering::Relaxed).saturating_sub(f0).max(1) as f64;
+    let now = [super::threadcpu::kind_cycles("par"), super::threadcpu::kind_cycles("cpar")];
+    let ms = |c: u64| super::threadcpu::ms(c) / flips;
+    let v = |k: usize, i: usize| IDLE[k][i].load(Ordering::Relaxed);
+    let thread = [ms(now[0].saturating_sub(base[0])), ms(now[1].saturating_sub(base[1]))];
+    let runs = [ms(v(0, 2)), ms(v(1, 2))];
+    format!(
+        "    chunk workers' CPU (graphics, compute queues' workers; ms a flip over {flips:.0} flips): threads {:.1}, {:.1}; in runs {:.1}, {:.1} (of it waiting for chunks' turns {:.1}, {:.1}); outside runs {:.1}, {:.1}; wake-ups {:.0}, {:.0} a flip ({:.0}, {:.0} finding no run)\n",
+        thread[0],
+        thread[1],
+        runs[0],
+        runs[1],
+        ms(v(0, 3)),
+        ms(v(1, 3)),
+        thread[0] - runs[0],
+        thread[1] - runs[1],
+        v(0, 0) as f64 / flips,
+        v(1, 0) as f64 / flips,
+        v(0, 1) as f64 / flips,
+        v(1, 1) as f64 / flips
+    )
 }
 
 /// One status line ("" before any parallel run).
@@ -832,6 +889,7 @@ pub fn status() -> String {
         ends_c.join(", "),
         super::cp::run_passed_line()
     ) + &super::hscensus::line()
+        + &idle_line()
         + &{
             let (lo, hi) = (MIN_LOW.load(Ordering::Relaxed), MIN_HIGH.load(Ordering::Relaxed));
             if lo + hi == 0 {

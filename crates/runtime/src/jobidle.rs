@@ -29,8 +29,9 @@ static READY: AtomicBool = AtomicBool::new(false);
 /// A worker is the watcher.
 static WATCHED: AtomicBool = AtomicBool::new(false);
 /// [sleeps, ns asleep, watcher changes, failed takes, jobs run after a
-/// sleep, jobs run].
-static STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// sleep, jobs run, the workers' own cycles in streaks that ended in a job
+/// (`DS_IDLE_CENSUS=1`: polling, watching and the sleeps' overhead)].
+static STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 /// A worker's streak without work.
 #[derive(Clone, Copy, Default)]
@@ -41,10 +42,12 @@ struct Streak {
     watching: u64,
     /// It slept in this streak.
     slept: bool,
+    /// Its own cycles at the streak's start (`DS_IDLE_CENSUS=1`).
+    cycles: u64,
 }
 
 thread_local! {
-    static STREAK: Cell<Streak> = const { Cell::new(Streak { since: 0, watching: 0, slept: false }) };
+    static STREAK: Cell<Streak> = const { Cell::new(Streak { since: 0, watching: 0, slept: false, cycles: 0 }) };
 }
 
 /// Called once the hooks are installed.
@@ -74,6 +77,9 @@ fn nothing_found() {
     let mut st = STREAK.with(Cell::get);
     if st.since == 0 {
         st.since = now;
+        if crate::gpu::threadcpu::idle_census() {
+            st.cycles = crate::gpu::threadcpu::own_cycles();
+        }
         STREAK.with(|c| c.set(st));
         return;
     }
@@ -141,6 +147,9 @@ pub extern "sysv64" fn run_hook(_: *const u64, _: u32) {
     if st.slept {
         STATS[4].fetch_add(1, Ordering::Relaxed);
     }
+    if st.since != 0 && crate::gpu::threadcpu::idle_census() {
+        STATS[6].fetch_add(crate::gpu::threadcpu::own_cycles().wrapping_sub(st.cycles), Ordering::Relaxed);
+    }
     STREAK.with(|c| c.set(Streak::default()));
 }
 
@@ -150,8 +159,9 @@ pub fn status() -> String {
         return String::new();
     }
     let v: Vec<u64> = STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let census = if crate::gpu::threadcpu::idle_census() { format!(", {:.1} s of their CPU in streaks without work", crate::gpu::threadcpu::ms(v[6]) / 1000.0) } else { String::new() };
     format!(
-        "    idle job workers (`tune job_idle` {} us, `job_sleep` {} us, `job_watch` {} us): {} failed takes, {} sleeps ({:.1} s asleep), {} jobs run ({} after a sleep), {} watches\n",
+        "    idle job workers (`tune job_idle` {} us, `job_sleep` {} us, `job_watch` {} us): {} failed takes, {} sleeps ({:.1} s asleep), {} jobs run ({} after a sleep), {} watches{census}\n",
         crate::gpu::tune::job_idle(),
         crate::gpu::tune::job_sleep(),
         crate::gpu::tune::job_watch(),

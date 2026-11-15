@@ -39,6 +39,7 @@ fn sampler() {
     use windows_sys::Win32::System::Threading::{OpenThread, THREAD_QUERY_LIMITED_INFORMATION};
     use windows_sys::Win32::System::WindowsProgramming::QueryThreadCycleTime;
     crate::log::set_thread_name("guest-profiler");
+    crate::thread::sampler_priority();
     let (ours_lo, ours_hi) = crate::exception::host_image();
     // host tid -> (handle, last cycle count)
     let mut handles: HashMap<u32, (windows_sys::Win32::Foundation::HANDLE, u64)> = HashMap::new();
@@ -189,6 +190,7 @@ fn tracer() {
     use windows_sys::Win32::System::Threading::{OpenThread, THREAD_QUERY_LIMITED_INFORMATION};
     use windows_sys::Win32::System::WindowsProgramming::QueryThreadCycleTime;
     crate::log::set_thread_name("hitch-trace");
+    crate::thread::sampler_priority();
     let (ours_lo, ours_hi) = crate::exception::host_image();
     let mut handles: HashMap<u32, (windows_sys::Win32::Foundation::HANDLE, u64)> = HashMap::new();
     let mut guest_labels: HashMap<u64, String> = HashMap::new();

@@ -50,6 +50,22 @@ pub fn own_cycles() -> u64 {
     c
 }
 
+/// Cycles so far of the threads of one sampler kind ("par", "cpar", ...): the
+/// graphics queue's chunk workers apart from the compute queues' ones, which
+/// `snapshot` counts together.
+pub fn kind_cycles(kind: &str) -> u64 {
+    super::cpu_threads().into_iter().filter(|(k, _)| *k == kind).filter_map(|(_, tid)| thread_cycles(tid)).sum()
+}
+
+/// Whether idle CPU is measured (`DS_IDLE_CENSUS=1`): the chunk workers' own
+/// cycles in their runs and turn waits (`par`), the title's job workers' in
+/// their streaks without work (`jobidle`). Two thread-cycle reads a run or a
+/// streak.
+pub fn idle_census() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_IDLE_CENSUS").ok().as_deref() == Some("1"))
+}
+
 /// Time-stamp counter cycles per second (measured over 20 ms at first use).
 pub fn tsc_hz() -> f64 {
     static HZ: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
