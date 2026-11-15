@@ -418,6 +418,9 @@ pub const SELECTED: u32 = 0x1;
 /// On the input focus's path: the screen's containers down to the list the player moves in, and
 /// that list's item when the focus arrived with the screen or the list.
 pub const FOCUS_PATH: u32 = 0x40;
+/// Not shown: 0x2 on items the title hides (the main menu's last row), 0x4 on a scrolling list's
+/// rows outside its window (a SETTINGS page's rows below the box: placed, but clipped).
+pub const NOT_SHOWN: u32 = 0x6;
 
 /// A node's definition (its UIElement) and the definition's design width and height. Under
 /// `guarded` (its page asked of the operating system: the table's lock is not taken there).

@@ -94,6 +94,13 @@ struct State {
     logged: u32,
     /// The target a direct jump was asked for (once per target).
     direct_tried: Option<u64>,
+    /// A click on an item of another list of the screen (a page beside the focused list): the
+    /// item, its list and until when the focus may take to arrive there (after Cross into a
+    /// page on the right, Circle back to a list on the left).
+    across: Option<(u64, u64, Instant)>,
+    /// The items the selection passed while stepping toward the target: back on one of them, the
+    /// target cannot be selected (a greyed row the list steps over) and the chase ends.
+    chase: Vec<u64>,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -263,9 +270,10 @@ fn focused(t: &uistate::Tree) -> Vec<u64> {
         .filter(|&n| uistate::flags(n) & uistate::SELECTED != 0)
         .filter(|&n| {
             // The path runs through the list (its parent), or, in the lists a data provider fills
-            // (equipment, inventory), through the selected row's own child.
+            // (equipment, inventory), through the selected row's own child, or ends at the item
+            // itself (the main menu: its rows sit in a layout container off the path).
             let p = uistate::parent(n);
-            (p != 0 && t.holds(p) && uistate::flags(p) & uistate::FOCUS_PATH != 0) || t.children.get(&n).is_some_and(|k| k.iter().any(|&c| uistate::flags(c) & uistate::FOCUS_PATH != 0))
+            uistate::flags(n) & uistate::FOCUS_PATH != 0 || (p != 0 && t.holds(p) && uistate::flags(p) & uistate::FOCUS_PATH != 0) || t.children.get(&n).is_some_and(|k| k.iter().any(|&c| uistate::flags(c) & uistate::FOCUS_PATH != 0))
         })
         .filter(|&n| uistate::absolute(t, n).is_some())
         .collect()
@@ -309,9 +317,13 @@ pub fn tick() {
     // (Not while the system text box is open over a menu: the character's name. The box takes
     // the keys; the pointer has nothing to point at there.)
     let menu = uistate::menu_depth().unwrap_or(0) > 0 && !crate::hle::libs::ime_dialog::active();
-    let want = menu && input::last_device() == input::DEVICE_KBM;
+    // Only where there is something to point at: a menu with a list the index finds (not a
+    // cutscene's skip prompt, a loading screen or a title card; `POINTABLE`, kept a moment over a
+    // screen's change so the pointer does not blink between menus).
+    let pointable = POINTABLE.lock().is_some_and(|t| t.elapsed() < POINTABLE_HOLD);
+    let want = menu && pointable && input::last_device() == input::DEVICE_KBM;
     if ACTIVE.swap(want, Relaxed) != want {
-        crate::info!("pointer: {}", if want { "on (a menu is open, keyboard and mouse in use)" } else { "off" });
+        crate::info!("pointer: {}", if want { "on (a menu with items is open, keyboard and mouse in use)" } else { "off" });
         crate::gpu::vk::window::pointer_mode_changed();
         EVENTS.lock().clear();
         if !want {
@@ -337,14 +349,66 @@ pub fn tick() {
     let Some(tree) = uistate::tree() else { return };
     // The nodes are read with their pools held mapped (`uistate::guarded`; a skipped vblank
     // when the title's mappings change meanwhile); a new scan is asked for after it.
-    if uistate::guarded(&tree, || tick_nodes(&tree, want)) == Some(true) {
+    let kbm = input::last_device() == input::DEVICE_KBM;
+    if uistate::guarded(&tree, || tick_nodes(&tree, want, kbm)) == Some(true) {
         uistate::rescan();
     }
 }
 
+/// When the last screen with items to point at was seen (`tick`'s condition for the pointer).
+static POINTABLE: Mutex<Option<Instant>> = Mutex::new(None);
+const POINTABLE_HOLD: Duration = Duration::from_millis(400);
+
+/// A row of items across the top of the screen (the start menu's tab bar): the pointer does not
+/// switch its tabs as it passes over them; a click does.
+fn tab_like(t: &uistate::Tree, group: u64) -> bool {
+    let Some(kids) = t.children.get(&group) else { return false };
+    let centers: Vec<(f32, f32)> = kids.iter().filter(|&&k| uistate::flags(k) & uistate::NOT_SHOWN == 0).filter_map(|&k| uistate::bounds(t, k)).map(center).collect();
+    centers.len() >= 2 && centers.iter().all(|c| (c.1 - centers[0].1).abs() < 4.0 && c.1 < 200.0)
+}
+
+/// The screen's other lists (a container with one selected item: every list keeps one) and their
+/// shown items under the pointer, in the scene of the focused items: (list, item).
+fn other_item_at(t: &uistate::Tree, found: &[u64], (x, y): (f32, f32)) -> Option<(u64, u64)> {
+    let &f0 = found.first()?;
+    let mut root = f0;
+    for _ in 0..64 {
+        let p = uistate::parent(root);
+        if p == 0 || !t.holds(p) {
+            break;
+        }
+        root = p;
+    }
+    let groups: Vec<u64> = found.iter().map(|&n| uistate::parent(n)).collect();
+    let mut best: Option<(f32, u64, u64)> = None;
+    let mut stack = vec![(root, 0u32)];
+    let mut visited = 0u32;
+    while let Some((n, depth)) = stack.pop() {
+        visited += 1;
+        if visited > 30000 {
+            break;
+        }
+        let Some(kids) = t.children.get(&n) else { continue };
+        if !groups.contains(&n) && kids.iter().filter(|&&k| uistate::flags(k) & uistate::SELECTED != 0).count() == 1 {
+            for &k in kids.iter().filter(|&&k| uistate::flags(k) & uistate::NOT_SHOWN == 0) {
+                if let Some(r) = uistate::bounds(t, k) {
+                    let area = (r.2 - r.0) * (r.3 - r.1);
+                    if x >= r.0 && x < r.2 && y >= r.1 && y < r.3 && area > 16.0 && best.is_none_or(|b| area < b.0) {
+                        best = Some((area, n, k));
+                    }
+                }
+            }
+        }
+        if depth < 24 {
+            stack.extend(kids.iter().filter(|&&k| uistate::flags(k) & uistate::NOT_SHOWN == 0).map(|&k| (k, depth + 1)));
+        }
+    }
+    best.map(|(_, list, item)| (list, item))
+}
+
 /// `tick`'s part that reads the UI nodes (under `uistate::guarded`): true when the index
 /// misses the focused item (a new scan wanted).
-fn tick_nodes(tree: &std::sync::Arc<uistate::Tree>, want: bool) -> bool {
+fn tick_nodes(tree: &std::sync::Arc<uistate::Tree>, want: bool, kbm: bool) -> bool {
     let mut g = STATE.lock();
     let s = g.get_or_insert_with(|| State {
         target: None,
@@ -358,8 +422,15 @@ fn tick_nodes(tree: &std::sync::Arc<uistate::Tree>, want: bool) -> bool {
         moves_seen: MOVES.load(Relaxed),
         logged: 0,
         direct_tried: None,
+        across: None,
+        chase: Vec::new(),
     });
     let found = focused(tree);
+    if !found.is_empty() {
+        *POINTABLE.lock() = Some(Instant::now());
+    }
+    // (The pointer turns on at the next vblank once the screen has items: `tick`.)
+    let _ = kbm;
     if found != s.focused {
         for &n in found.iter().filter(|n| !s.focused.contains(n)) {
             if s.logged < 60 {
@@ -442,6 +513,7 @@ fn tick_nodes(tree: &std::sync::Arc<uistate::Tree>, want: bool) -> bool {
                 };
                 siblings.chain(cousins)
             })
+            .filter(|&(_, n)| uistate::flags(n) & uistate::NOT_SHOWN == 0)
             .filter_map(|(group, n)| uistate::bounds(tree, n).map(|r| (group, n, r)))
             .filter(|(_, _, r)| x >= r.0 && x < r.2 && y >= r.1 && y < r.3)
             .min_by(|a, b| dist(a.2).total_cmp(&dist(b.2)))
@@ -450,20 +522,57 @@ fn tick_nodes(tree: &std::sync::Arc<uistate::Tree>, want: bool) -> bool {
     let focused_in = |group: u64| found.iter().copied().find(|&n| uistate::parent(n) == group);
     if moved {
         if let Some((group, h)) = hovered {
-            s.target = Some(h);
-            s.target_group = group;
+            if !tab_like(tree, group) && s.target != Some(h) {
+                s.target = Some(h);
+                s.target_group = group;
+                s.chase.clear();
+            }
+        }
+    }
+    // A click on another list's item: once the focus arrived in that list, its item is the
+    // target and the click goes on there.
+    if let Some((item, list, until)) = s.across {
+        if focused_in(list).is_some() {
+            s.across = None;
+            s.chase.clear();
+            s.target = Some(item);
+            s.target_group = list;
+            s.click = true;
+        } else if Instant::now() > until {
+            s.across = None;
         }
     }
     for e in events {
         match e {
             Event::Left => match hovered {
-                Some((group, h)) if focused_in(group) == Some(h) => s.queue.push_back(pos.and_then(|p| value_side(tree, h, p)).unwrap_or("cross")),
+                Some((group, h)) if focused_in(group) == Some(h) => {
+                    let press = pos.and_then(|p| value_side(tree, h, p)).unwrap_or("cross");
+                    if s.logged < 60 {
+                        s.logged += 1;
+                        crate::info!("pointer: click on the selected item {h:#x}: {press}");
+                    }
+                    s.queue.push_back(press);
+                }
                 Some((group, h)) => {
+                    if s.target != Some(h) {
+                        s.chase.clear();
+                    }
                     s.target = Some(h);
                     s.target_group = group;
                     s.click = true;
                 }
-                None => {}
+                // Another list's item (a page's button beside the list in focus): into that list
+                // as a pad does (Cross into a page on the right, Circle back to the left), then
+                // the click goes on there.
+                None => {
+                    if let Some(((list, item), (px, _))) = pos.and_then(|p| other_item_at(tree, &found, p).map(|o| (o, p))) {
+                        let fx = found.iter().filter_map(|&f| uistate::bounds(tree, uistate::parent(f))).map(|r| center(r).0).fold(f32::NAN, f32::min);
+                        let into = if fx.is_nan() || px >= fx { "cross" } else { "circle" };
+                        s.queue.push_back(into);
+                        s.across = Some((item, list, Instant::now() + Duration::from_millis(900)));
+                        s.target = None;
+                    }
+                }
             },
             Event::Right => {
                 s.target = None;
@@ -493,7 +602,21 @@ fn tick_nodes(tree: &std::sync::Arc<uistate::Tree>, want: bool) -> bool {
                     pump(s);
                 }
             }
+            // Back on an item passed while stepping toward this target: the list steps over it
+            // (a greyed row): the chase (and its click) ends here.
+            Some(f) if s.chase.last() != Some(&f) && s.chase.contains(&f) => {
+                if s.logged < 60 {
+                    s.logged += 1;
+                    crate::info!("pointer: the item under the pointer cannot be selected (the list steps over it)");
+                }
+                s.target = None;
+                s.click = false;
+                s.chase.clear();
+            }
             Some(f) if Instant::now() >= s.next_press && s.tried.is_none() => {
+                if s.chase.last() != Some(&f) {
+                    s.chase.push(f);
+                }
                 // A jump the title's list takes in one move (`select_hook`): asked once per
                 // target; a request it did not take within DIRECT_WAIT steps as before.
                 let direct = crate::titlefix::applied("menu pointer selects directly") && s.direct_tried != Some(t);
