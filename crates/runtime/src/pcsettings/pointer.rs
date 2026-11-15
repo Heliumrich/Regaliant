@@ -105,6 +105,12 @@ struct State {
     chase: Vec<u64>,
     /// No press before then (a page coming in after a press that moved the focus into it).
     hold_until: Instant,
+    /// A jump to an item of another group in the focused scene (the equipment grid's other
+    /// parts: the grid's own jump, `grid_hook`, takes any of its cells): the item, until when,
+    /// and whether a click follows.
+    jump: Option<(u64, Instant, bool)>,
+    /// When the other groups were last searched for the pointer (a search reads every node).
+    searched: Instant,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -113,8 +119,43 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 /// when (a request the title did not take within `DIRECT_WAIT` falls back to stepping).
 static DIRECT: Mutex<Option<(u64, Instant)>> = Mutex::new(None);
 const DIRECT_WAIT: Duration = Duration::from_millis(250);
-/// Direct jumps made, and lists the hook did not find the item in.
-static DIRECT_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// Direct jumps made, lists the hook did not find the item in, and jumps in lists a data
+/// provider fills.
+static DIRECT_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// For a list a data provider fills: the rows from the selected row to the target in reading
+/// order (top to bottom, left to right), with the target they were counted for.
+static DIRECT_STEP: Mutex<Option<(u64, i64)>> = Mutex::new(None);
+
+/// The rows from `from` to `to` among `group`'s shown items in reading order (lines by their
+/// centres' heights, left to right within a line).
+fn reading_step(t: &uistate::Tree, group: u64, from: u64, to: u64) -> Option<i64> {
+    let mut rows: Vec<(u64, (f32, f32), f32)> = t
+        .children
+        .get(&group)?
+        .iter()
+        .copied()
+        .filter(|&k| uistate::flags(k) & uistate::NOT_SHOWN == 0)
+        .filter_map(|k| uistate::bounds(t, k).map(|r| (k, center(r), r.3 - r.1)))
+        .filter(|&(_, _, h)| h > 1.0)
+        .collect();
+    rows.sort_by(|a, b| a.1 .1.total_cmp(&b.1 .1));
+    // Lines: a row more than half a row's height below the line's first starts the next.
+    let mut keyed: Vec<(usize, f32, u64)> = Vec::new();
+    let (mut line, mut top) = (0usize, f32::NAN);
+    for &(k, (cx, cy), h) in &rows {
+        if top.is_nan() || cy - top > h / 2.0 {
+            if !top.is_nan() {
+                line += 1;
+            }
+            top = cy;
+        }
+        keyed.push((line, cx, k));
+    }
+    keyed.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    let a = keyed.iter().position(|e| e.2 == from)?;
+    let b = keyed.iter().position(|e| e.2 == to)?;
+    Some(b as i64 - a as i64)
+}
 
 /// The title's menu list selection change (eboot+0xe2a8d0, `titlefix`), at its entry with the
 /// call's registers (`patch::Patcher::hook`: rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8 .. r15,
@@ -142,9 +183,29 @@ pub extern "sysv64" fn select_hook(regs: *const u64, _arg: u32) {
             return;
         }
         // A list a data provider fills (its pointer at +0x2a0): its rows are recycled, a row's
-        // place is not its item's index: the move steps as before.
+        // place is not its item's index. The item's index is the selected one's (+0x2b0, where
+        // this function stores it) moved by the rows from the selected row to the item in reading
+        // order, counted by the pointer on screen (`DIRECT_STEP`).
         if *((list + 0x2a0) as *const u64) != 0 {
-            DIRECT_STATS[1].fetch_add(1, Relaxed);
+            let sel = *((list + 0x2b0) as *const i32);
+            let step = *DIRECT_STEP.lock();
+            match step {
+                Some((t, d)) if t == target && sel >= 0 && sel as i64 + d >= 0 && d != 0 => {
+                    *g = None;
+                    *regs.add(6) = (sel as i64 + d) as u64;
+                    *regs.add(2) = 0;
+                    *regs.add(1) = 0;
+                    *regs.add(8) = 0;
+                    let fx = ((regs as u64 - 8) & !15) - 512;
+                    std::ptr::write_bytes((fx + 160) as *mut u8, 0, 16);
+                    if DIRECT_STATS[2].fetch_add(1, Relaxed) < 4 {
+                        crate::info!("pointer: the title's data list jumps {d:+} rows to the item under the pointer (index {sel} -> {})", sel as i64 + d);
+                    }
+                }
+                _ => {
+                    DIRECT_STATS[1].fetch_add(1, Relaxed);
+                }
+            }
             return;
         }
         let n = (end - begin) / 0x18;
@@ -177,12 +238,14 @@ pub extern "sysv64" fn grid_hook(regs: *const u64, _arg: u32) {
     // vblank thread takes it under the guest-reader lock.)
     let target = {
         let mut g = DIRECT.lock();
-        let Some((target, since)) = *g else { return };
-        if since.elapsed() > DIRECT_WAIT {
-            *g = None;
-            return;
+        match *g {
+            Some((_, since)) if since.elapsed() > DIRECT_WAIT => {
+                *g = None;
+                0
+            }
+            Some((target, _)) => target,
+            None => 0,
         }
-        target
     };
     let Some(base) = crate::loader::main_module().map(|m| m.base) else { return };
     let regs = regs as *mut u64;
@@ -201,6 +264,26 @@ pub extern "sysv64" fn grid_hook(regs: *const u64, _arg: u32) {
         }
         let rows: extern "sysv64" fn(u64, u32) -> u64 = std::mem::transmute(base + 0xf640c0);
         let cell: extern "sysv64" fn(u64, u32, u32) -> u64 = std::mem::transmute(base + 0xf63db0);
+        // Every cell of the grid, for the pointer to find (`GRID_CELLS`).
+        let mut all = Vec::new();
+        for c in 0..((ce - cb) / 40) as u32 {
+            let nr = rows(grid, c) as u32;
+            if nr == u32::MAX || nr > 512 {
+                continue;
+            }
+            all.extend((0..nr).map(|r| cell(grid, c, r)).filter(|&n| n > 0x10000));
+        }
+        {
+            static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            static COUNT: AtomicU32 = AtomicU32::new(0);
+            if LOGGED.swap(grid, Relaxed) != grid && COUNT.fetch_add(1, Relaxed) < 20 {
+                crate::info!("pointer: input grid {grid:#x}: {} columns, {} cells", (ce - cb) / 40, all.len());
+            }
+        }
+        *GRID_CELLS.lock() = Some((Instant::now(), all));
+        if target == 0 {
+            return;
+        }
         for c in 0..((ce - cb) / 40) as u32 {
             let nr = rows(grid, c) as u32;
             if nr == u32::MAX || nr > 512 {
@@ -227,13 +310,35 @@ pub extern "sysv64" fn grid_hook(regs: *const u64, _arg: u32) {
     }
 }
 
+/// The cells of the input grid the title moved in last (`grid_hook`, on its thread): the pointer
+/// finds the grid's other parts there (the equipment screen's hands, armour, rings, items).
+static GRID_CELLS: Mutex<Option<(Instant, Vec<u64>)>> = Mutex::new(None);
+
+/// The cell of the last grid under the pointer (not one of the focused lists' items).
+fn grid_cell_at(t: &uistate::Tree, found: &[u64], (x, y): (f32, f32)) -> Option<u64> {
+    let g = GRID_CELLS.lock();
+    let (when, cells) = g.as_ref()?;
+    // (Only the grid of the focused cell: one of the focused items is its.)
+    if when.elapsed() > Duration::from_secs(600) || !found.iter().any(|f| cells.contains(f)) {
+        return None;
+    }
+    cells
+        .iter()
+        .copied()
+        .filter(|&c| t.holds(c) && uistate::flags(c) & uistate::NOT_SHOWN == 0)
+        .filter_map(|c| uistate::bounds(t, c).map(|r| (c, r)))
+        .filter(|(_, r)| x >= r.0 && x < r.2 && y >= r.1 && y < r.3)
+        .min_by(|a, b| ((a.1 .2 - a.1 .0) * (a.1 .3 - a.1 .1)).total_cmp(&((b.1 .2 - b.1 .0) * (b.1 .3 - b.1 .1))))
+        .map(|(c, _)| c)
+}
+
 /// Status: direct jumps made and moves in lists the hook did not serve.
 pub fn direct_line() -> String {
-    let (a, b) = (DIRECT_STATS[0].load(Relaxed), DIRECT_STATS[1].load(Relaxed));
-    if a == 0 && b == 0 {
+    let (a, b, c) = (DIRECT_STATS[0].load(Relaxed), DIRECT_STATS[1].load(Relaxed), DIRECT_STATS[2].load(Relaxed));
+    if a == 0 && b == 0 && c == 0 {
         return String::new();
     }
-    format!("    menu pointer: {a} direct jumps to the item under the pointer, {b} list moves without the item\n")
+    format!("    menu pointer: {a} direct jumps to the item under the pointer, {c} in lists a data provider fills, {b} list moves without the item\n")
 }
 
 /// The pointer on the canvas (None: outside the frame, or unknown).
@@ -274,13 +379,19 @@ fn focused(t: &uistate::Tree) -> Vec<u64> {
         .filter(|&n| uistate::flags(n) & uistate::SELECTED != 0)
         .filter(|&n| {
             // The path runs through the list (its parent), or, in the lists a data provider fills
-            // (equipment, inventory), through the selected row's own child, or ends at the item
-            // itself (the main menu: its rows sit in a layout container off the path).
+            // (equipment, inventory), through a node inside the selected row (its child; on the
+            // equipment screen's Items row two levels down), or ends at the item itself (the main
+            // menu: its rows sit in a layout container off the path).
             let p = uistate::parent(n);
-            uistate::flags(n) & uistate::FOCUS_PATH != 0 || (p != 0 && t.holds(p) && uistate::flags(p) & uistate::FOCUS_PATH != 0) || t.children.get(&n).is_some_and(|k| k.iter().any(|&c| uistate::flags(c) & uistate::FOCUS_PATH != 0))
+            uistate::flags(n) & uistate::FOCUS_PATH != 0 || (p != 0 && t.holds(p) && uistate::flags(p) & uistate::FOCUS_PATH != 0) || path_below(t, n, 3)
         })
         .filter(|&n| uistate::absolute(t, n).is_some())
         .collect()
+}
+
+/// Whether a node within `depth` levels below `n` is on the input focus's path.
+fn path_below(t: &uistate::Tree, n: u64, depth: u32) -> bool {
+    depth > 0 && t.children.get(&n).is_some_and(|k| k.iter().any(|&c| uistate::flags(c) & uistate::FOCUS_PATH != 0 || path_below(t, c, depth - 1)))
 }
 
 fn center(r: (f32, f32, f32, f32)) -> (f32, f32) {
@@ -388,7 +499,7 @@ fn root_shown(t: &uistate::Tree, n: u64) -> (u64, bool) {
 
 /// The screen's other lists (a container with a selected item: every list keeps one, in the
 /// scenes of the focused items, shown) and the item of theirs under the pointer: (list, item).
-fn other_item_at(t: &uistate::Tree, found: &[u64], (x, y): (f32, f32)) -> Option<(u64, u64)> {
+fn other_item_at(t: &uistate::Tree, found: &[u64], (x, y): (f32, f32)) -> Option<(u64, u64, bool)> {
     let roots: Vec<u64> = found.iter().map(|&f| root_shown(t, f).0).collect();
     let groups: Vec<u64> = found.iter().map(|&n| uistate::parent(n)).collect();
     let mut lists: Vec<u64> = Vec::new();
@@ -438,7 +549,22 @@ fn other_item_at(t: &uistate::Tree, found: &[u64], (x, y): (f32, f32)) -> Option
             .collect();
         crate::info!("pointer: a click off the focused lists at ({x:.0}, {y:.0}): {} other lists in the scene, item {:?}; the focused items' roots {:x?}; selected items there: {}", lists.len(), best.map(|b| b.2), roots, under.join(", "));
     }
-    best.map(|(_, list, item)| (list, item))
+    best.map(|(_, list, item)| (list, item, roots.contains(&root_shown(t, item).0)))
+}
+
+/// A jump to `item` of another group in the focused scene: the title's next list or grid move
+/// is asked to land there (`DIRECT`), with one press from the nearest focused item toward it.
+fn jump_to(s: &mut State, t: &uistate::Tree, found: &[u64], item: u64, click: bool) {
+    let Some(tb) = uistate::bounds(t, item) else { return };
+    let (tx, ty) = center(tb);
+    let near = found.iter().filter_map(|&f| uistate::bounds(t, f).map(|r| center(r))).min_by(|a, b| ((a.0 - tx).powi(2) + (a.1 - ty).powi(2)).total_cmp(&((b.0 - tx).powi(2) + (b.1 - ty).powi(2))));
+    let Some((fx, fy)) = near else { return };
+    let dir = if (ty - fy).abs() >= (tx - fx).abs() { if ty > fy { "down" } else { "up" } } else if tx > fx { "right" } else { "left" };
+    s.target = None;
+    s.click = false;
+    *DIRECT.lock() = Some((item, Instant::now()));
+    s.queue.push_back(dir);
+    s.jump = Some((item, Instant::now() + Duration::from_millis(500), click));
 }
 
 /// `tick`'s part that reads the UI nodes (under `uistate::guarded`): true when the index
@@ -460,6 +586,8 @@ fn tick_nodes(tree: &std::sync::Arc<uistate::Tree>, want: bool, kbm: bool) -> bo
         across: None,
         chase: Vec::new(),
         hold_until: Instant::now(),
+        jump: None,
+        searched: Instant::now(),
     });
     let found = focused(tree);
     if !found.is_empty() {
@@ -565,6 +693,30 @@ fn tick_nodes(tree: &std::sync::Arc<uistate::Tree>, want: bool, kbm: bool) -> bo
             }
         }
     }
+    // A jump into another group of the focused scene: done once the item is focused (then the
+    // click, if any), given up after its time.
+    if let Some((item, until, click)) = s.jump {
+        if found.contains(&item) {
+            s.jump = None;
+            if click {
+                s.queue.push_back(pos.and_then(|p| value_side(tree, item, p)).unwrap_or("cross"));
+            }
+        } else if Instant::now() > until {
+            s.jump = None;
+        }
+    }
+    if moved && hovered.is_none() && s.jump.is_none() {
+        if let Some(c) = pos.and_then(|p| grid_cell_at(tree, &found, p)) {
+            if !found.contains(&c) {
+                jump_to(s, tree, &found, c, false);
+            }
+        } else if s.searched.elapsed() > Duration::from_millis(100) {
+            s.searched = Instant::now();
+            if let Some((_, item, true)) = pos.and_then(|p| other_item_at(tree, &found, p)) {
+                jump_to(s, tree, &found, item, false);
+            }
+        }
+    }
     // A click on another list's item: once the focus arrived in that list, its item is the
     // target and the click goes on there.
     if let Some((before, until)) = s.across.clone() {
@@ -605,12 +757,29 @@ fn tick_nodes(tree: &std::sync::Arc<uistate::Tree>, want: bool, kbm: bool) -> bo
                 // as a pad does (Cross into a page on the right, Circle back to the left), then
                 // the click goes on there.
                 None => {
-                    if let Some((_, (px, _))) = pos.and_then(|p| other_item_at(tree, &found, p).map(|o| (o, p))) {
-                        let fx = found.iter().filter_map(|&f| uistate::bounds(tree, uistate::parent(f))).map(|r| center(r).0).fold(f32::NAN, f32::min);
-                        let into = if fx.is_nan() || px >= fx { "cross" } else { "circle" };
-                        s.queue.push_back(into);
-                        s.across = Some((found.iter().map(|&f| uistate::parent(f)).collect(), Instant::now() + Duration::from_millis(900)));
-                        s.target = None;
+                    if let Some(c) = pos.and_then(|p| grid_cell_at(tree, &found, p)) {
+                        if found.contains(&c) {
+                            s.queue.push_back("cross");
+                        } else {
+                            jump_to(s, tree, &found, c, true);
+                        }
+                        continue;
+                    }
+                    match pos.and_then(|p| other_item_at(tree, &found, p).map(|o| (o, p))) {
+                        // Another group of the focused scene: the jump there, then the click.
+                        Some(((_, item, true), _)) => jump_to(s, tree, &found, item, true),
+                        // A page of its own on the right of the lists in focus: into it with
+                        // Cross as a pad does, then the click there. (Nothing to the left: Circle
+                        // would close a top-level menu.)
+                        Some(((_, _, false), (px, _))) => {
+                            let fx = found.iter().filter_map(|&f| uistate::bounds(tree, uistate::parent(f))).map(|r| r.2).fold(f32::NAN, f32::max);
+                            if !fx.is_nan() && px >= fx {
+                                s.queue.push_back("cross");
+                                s.across = Some((found.iter().map(|&f| uistate::parent(f)).collect(), Instant::now() + Duration::from_millis(900)));
+                                s.target = None;
+                            }
+                        }
+                        None => {}
                     }
                 }
             },
@@ -662,6 +831,7 @@ fn tick_nodes(tree: &std::sync::Arc<uistate::Tree>, want: bool, kbm: bool) -> bo
                 let direct = crate::titlefix::applied("menu pointer selects directly") && s.direct_tried != Some(t);
                 if direct {
                     s.direct_tried = Some(t);
+                    *DIRECT_STEP.lock() = reading_step(tree, group, f, t).map(|d| (t, d));
                     *DIRECT.lock() = Some((t, Instant::now()));
                 }
                 if let (Some(a), Some(b)) = (uistate::bounds(tree, f), uistate::bounds(tree, t)) {
