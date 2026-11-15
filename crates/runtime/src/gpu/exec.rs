@@ -10853,6 +10853,69 @@ const TAA_CS: u64 = 0x100893aa00;
 /// weeds drawn as tall thorned grass sticking out of its walls; FINDINGS.md 2026-11-14). The
 /// buffer is zeroed before the placement (`DS_VG_CLEAR=0`: not).
 const VG_PLACEMENT_CS: u64 = 0x10089ad900;
+/// The title's index culls (01.007.000, `xprindexculling`): they add the counts the title's CPU
+/// reads (`cullread`).
+const CULL_CS: [u64; 4] = [0x1008993700, 0x1008994d00, 0x1008997600, 0x1008998c00];
+
+/// Diagnosis (`DS_CULL_CENSUS=1`): per frame (the graphics CP's flips), the words every index
+/// cull dispatch of the frame read at the same address with one value (the frame's shared
+/// constants) are logged as a hash with their range and first values (`cull census: ...`), to
+/// compare frames whose culls computed 0 for visible objects (FINDINGS.md 2026-11-15).
+fn cull_census_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_CULL_CENSUS").ok().as_deref() == Some("1"))
+}
+
+/// The frame being counted: (frame, dispatches, address -> (value, reads, one value)).
+#[allow(clippy::type_complexity)]
+static CULL_CENSUS: Mutex<Option<(u64, u64, HashMap<u64, (u32, u64, bool)>)>> = Mutex::new(None);
+
+fn note_cull_census(p: &Prepared) {
+    let frame = super::FRAMES.load(Ordering::Relaxed);
+    let mut g = CULL_CENSUS.lock();
+    let acc = g.get_or_insert_with(|| (frame, 0, HashMap::new()));
+    if acc.0 != frame {
+        if acc.1 > 0 {
+            let n = acc.1;
+            let mut common: Vec<(u64, u32)> = acc.2.iter().filter(|(_, e)| e.2 && e.1 >= n * 9 / 10).map(|(&a, e)| (a, e.0)).collect();
+            common.sort_unstable();
+            use std::hash::{Hash, Hasher};
+            let mut h = super::fx::FxHasher::default();
+            for (a, w) in &common {
+                a.hash(&mut h);
+                w.hash(&mut h);
+            }
+            let span = common.first().map_or(String::new(), |f| format!("{:#x}..{:#x}", f.0, common.last().unwrap().0 + 4));
+            let first: Vec<String> = common.iter().take(12).map(|(_, w)| format!("{w:08x}")).collect();
+            let varied = acc.2.values().filter(|e| !e.2 && e.1 >= n * 9 / 10).count();
+            crate::info!(
+                "cull census: frame {} (queued flip {}): {n} dispatches, {} common words {span} hash {:016x}, {varied} read by all with differing values; first [{}]",
+                acc.0,
+                crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed),
+                common.len(),
+                h.finish(),
+                first.join(" ")
+            );
+        }
+        *acc = (frame, 0, HashMap::new());
+    }
+    acc.1 += 1;
+    let mut k = 0usize;
+    for &(a, len) in &p.found.reads {
+        let m = (len / 4) as usize;
+        for j in 0..m {
+            if let Some(&w) = p.found.words.get(k + j) {
+                let e = acc.2.entry(a + 4 * j as u64).or_insert((w, 0, true));
+                if e.0 != w {
+                    e.2 = false;
+                }
+                e.1 += 1;
+            }
+        }
+        k += m;
+    }
+}
+
 /// Its first instruction words (the bundle's code), checked before the clear applies.
 const VG_PLACEMENT_CODE: [u32; 8] = [0xbfa00002, 0xd7460008, 0x04010c0e, 0xf4201a80, 0xfa000000, 0xbf8cc07f, 0x7da8106a, 0xbf880021];
 /// Placement clears recorded, and not (a range the in-place fill does not cover).
@@ -17616,6 +17679,9 @@ impl Exec {
         // (`VG_PLACEMENT_CS`).
         if p.addr == VG_PLACEMENT_CS && vg_clear_on() {
             self.vg_placement_clear(&p)?;
+        }
+        if cull_census_on() && CULL_CS.contains(&p.addr) {
+            note_cull_census(&p);
         }
         // The fill kernel over a whole range (`verify::full_fill`): one buffer
         // fill of guest memory in place, without the kernel's VRAM shadow
