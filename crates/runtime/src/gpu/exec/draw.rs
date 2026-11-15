@@ -1284,6 +1284,14 @@ impl Exec {
             DRAW_SKIPPED.fetch_add(1, Ordering::Relaxed);
             return "skipped (`tune skip_cmds`)".into();
         }
+        // Diagnosis (`DS_SKIP_DEPTH=<hex depth base>`): draws into that depth target left out
+        // (Forlorn Outpost's odd-flip culls: the occluders' 1024x512 depth, 0x10f6470000).
+        if let Some(d) = skip_depth() {
+            if depth_surface(cp).is_some_and(|s| s.base == d) {
+                DRAW_SKIPPED.fetch_add(1, Ordering::Relaxed);
+                return "skipped (`DS_SKIP_DEPTH`)".into();
+            }
+        }
         let t_prog = super::laps().then(std::time::Instant::now);
         // Menu & HUD Size: the interface layer scaled before the title composites it.
         if super::super::uiscale::scale() < 1.0 {
@@ -3387,6 +3395,11 @@ fn note_draw_diff(last: &mut [u64; 5], sig: [u64; 5], consecutive: bool) -> usiz
     }
     *last = sig;
     k
+}
+
+fn skip_depth() -> Option<u64> {
+    static D: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *D.get_or_init(|| std::env::var("DS_SKIP_DEPTH").ok().and_then(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()))
 }
 
 /// Diagnosis (`DS_VIEW_CENSUS=<hex lo>-<hex hi>`): the words a draw's stages read inside that

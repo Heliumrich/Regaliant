@@ -231,6 +231,13 @@ static FLIP: AtomicU64 = AtomicU64::new(0);
 static SAMPLED: AtomicU64 = AtomicU64::new(0);
 static REFILL: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 static REFILL_US: AtomicU64 = AtomicU64::new(0);
+/// Mode 9: per record (its index), the first-instance field last read, and per flip [reads whose
+/// record now holds another first instance, of those reading 0, zero reads whose record kept it].
+fn last_first() -> &'static [std::sync::atomic::AtomicU32] {
+    static T: std::sync::OnceLock<Box<[std::sync::atomic::AtomicU32]>> = std::sync::OnceLock::new();
+    T.get_or_init(|| (0..(HOLD_LEN as usize) / 5 + 1).map(|_| std::sync::atomic::AtomicU32::new(0)).collect())
+}
+static MOVED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// Mode 8: the lowest and highest first-dword index of the flip's set zero reads seen lately.
 static SET_SEEN_IDX: [AtomicU64; 2] = [AtomicU64::new(u64::MAX), AtomicU64::new(0)];
 /// Zero reads by (record blank, read non-zero within `HOLD_FLIPS`): index blank << 1 | seen.
@@ -308,6 +315,11 @@ pub extern "sysv64" fn read_hook(regs: *const u64, _arg: u32) {
             e != 0 && e & 0xFFFF_FFFF == r10 & 0xFFFF_FFFF && (flip as u32).wrapping_sub((e >> 32) as u32) <= HOLD_FLIPS
         };
         ZERO_KIND[(blank as usize) << 1 | seen as usize].fetch_add(1, Ordering::Relaxed);
+        if mode() == 9 && !blank && rbx < HOLD_LEN as u64 && rbx % 5 == 0 {
+            let first = w(4);
+            let prev = last_first()[(rbx / 5) as usize].load(Ordering::Relaxed);
+            MOVED[if prev != 0 && prev != first { 1 } else { 2 }].fetch_add(1, Ordering::Relaxed);
+        }
         // Mode 8: a set record read 0 though non-zero lately: one in 4 is read again for up
         // to 3 ms (a count that lands later, or one the culls computed as 0?), and the record
         // indices of these reads are kept for the flip's line.
@@ -329,6 +341,16 @@ pub extern "sysv64" fn read_hook(regs: *const u64, _arg: u32) {
         }
         if rbx == 0 && mode() == 3 {
             crate::info!("cull read: flip {flip}: record 0 reads 0: [{} {} {} {}] after it", w(1), w(2), w(3), w(4));
+        }
+    }
+    // Mode 9: the record's first instance against the one it held at its last read.
+    if mode() == 9 && rbx < HOLD_LEN as u64 && rbx % 5 == 0 {
+        let first = w(4);
+        if first != 0 || v != 0 {
+            let prev = last_first()[(rbx / 5) as usize].swap(first, Ordering::Relaxed);
+            if prev != 0 && prev != first {
+                MOVED[0].fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
     if mode() != 0 && mode() != 5 && rbx < HOLD_LEN as u64 {
@@ -378,6 +400,10 @@ pub extern "sysv64" fn read_hook(regs: *const u64, _arg: u32) {
         let mut waits = if mode() >= 4 { format!("; waits for the GPU's writes: {} ({} us, {} timed out)", w[0], w[1], w[2]) } else { String::new() };
         if mode() == 7 {
             waits += &format!("; waits for the graphics CP to take up earlier submissions: {} ({} us, {} given up)", sw[0], sw[1], sw[2]);
+        }
+        if mode() == 9 {
+            let m: Vec<u64> = MOVED.iter().map(|c| c.swap(0, Ordering::Relaxed)).collect();
+            waits += &format!("; records holding another first instance than at their last read: {} (set zero reads: {} moved, {} kept)", m[0], m[1], m[2]);
         }
         crate::info!(
             "cull read: flip {last}: {}{refill}; zero records: blank {} ({} seen lately), set {} ({} seen lately){waits}",
