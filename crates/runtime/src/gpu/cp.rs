@@ -2996,6 +2996,33 @@ impl Cp {
     }
 
     /// Applies a state packet of a run to `st` as `packet` would.
+    /// Whether `apply_state` changes anything for packets of `opcode` (its match's arms; the
+    /// planner's walk calls it for these only).
+    #[inline]
+    fn acts_on_state(opcode: u32) -> bool {
+        matches!(
+            opcode,
+            op::SET_CONTEXT_REG
+                | op::SET_CONTEXT_REG_INDEX
+                | op::SET_SH_REG
+                | op::SET_SH_REG_INDEX
+                | op::SET_UCONFIG_REG
+                | op::SET_UCONFIG_REG_INDEX
+                | op::LOAD_CONTEXT_REG_INDEX
+                | op::LOAD_SH_REG_INDEX
+                | op::LOAD_UCONFIG_REG
+                | op::INDEX_TYPE
+                | op::INDEX_BASE
+                | op::INDEX_BUFFER_SIZE
+                | op::NUM_INSTANCES
+                | op::SET_BASE
+                | op::DRAW_INDIRECT
+                | op::DRAW_INDEX_INDIRECT
+                | op::DRAW_INDEX_INDIRECT_MULTI
+                | op::DRAW_INDIRECT_MULTI
+        )
+    }
+
     fn apply_state(st: &mut ChunkState, opcode: u32, n: u64, p: &dyn Fn(u64) -> u32) {
         let set = |v: &mut Vec<u32>, space: Space, cap: usize, first: u32| {
             for i in 1..n {
@@ -3221,6 +3248,11 @@ impl Cp {
             let next = c + 4 * (n + 1);
             if next > end || !valid(c, 4 * (n + 1)) {
                 break c;
+            }
+            // (Register writes, most of a run's packets, are state that no check below takes.)
+            if matches!(opc, op::SET_CONTEXT_REG | op::SET_CONTEXT_REG_INDEX | op::SET_SH_REG | op::SET_SH_REG_INDEX | op::SET_UCONFIG_REG | op::SET_UCONFIG_REG_INDEX) {
+                c = next;
+                continue;
             }
             let at = c;
             let p = |i: u64| f.rd(at + 4 * (1 + i));
@@ -3485,7 +3517,9 @@ impl Cp {
                         PLAN_WALK[1].fetch_add(1, Ordering::Relaxed);
                         PLAN_WALK[2].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     }
-                    _ => Self::apply_state(&mut st, opc, n, &|i: u64| f.rd(at + 4 * (1 + i))),
+                    // (Draws, dispatches, NOPs and events change no chunk state.)
+                    _ if Self::acts_on_state(opc) => Self::apply_state(&mut st, opc, n, &|i: u64| f.rd(at + 4 * (1 + i))),
+                    _ => {}
                 }
                 if lap.0.is_some() {
                     PLAN_WALK[0].fetch_add(1, Ordering::Relaxed);
