@@ -9182,6 +9182,29 @@ fn miss_parts(before: u64, check: u64, how: u8, after: u64) {
     });
 }
 
+/// Stages' shader-read syncs timed (`DS_STEP_LAPS`): [cycles, calls], added per thread every
+/// 4,096.
+pub static SYNC_CYCLES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+thread_local! {
+    static SYNC_CYC: std::cell::Cell<[u64; 2]> = const { std::cell::Cell::new([0; 2]) };
+}
+
+fn sync_time(cycles: u64) {
+    SYNC_CYC.with(|c| {
+        let mut v = c.get();
+        v[0] += cycles;
+        v[1] += 1;
+        if v[1] >= 4096 {
+            for (a, b) in SYNC_CYCLES.iter().zip(v.iter()) {
+                a.fetch_add(*b, Ordering::Relaxed);
+            }
+            v = [0; 2];
+        }
+        c.set(v);
+    });
+}
+
 /// `PLACE_MEMO_CYCLES` as a status line ("" before any).
 fn place_memo_cycles_line() -> String {
     let v: Vec<u64> = PLACE_MEMO_CYCLES.iter().map(|c| c.load(Ordering::Relaxed)).collect();
@@ -9192,6 +9215,9 @@ fn place_memo_cycles_line() -> String {
     let ns = |c: u64, n: u64| if n == 0 { 0.0 } else { c as f64 * 1e9 / hz / n as f64 };
     let m: Vec<u64> = MISS_PARTS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let n = m[2] + m[4];
+    let sc: Vec<u64> = SYNC_CYCLES.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let sync = format!("    stages' shader-read syncs timed (`DS_STEP_LAPS`): {} at {:.0} ns
+", sc[1], ns(sc[0], sc[1]));
     format!(
         "    front end 2's placements timed (`DS_STEP_LAPS`, since the last profile reset): memo hits {} at {:.0} ns, misses {} at {:.0} ns; a miss's parts ({n} timed): before the check {:.0} ns, the check {:.0} ns when the range cache answered ({}), {:.0} ns otherwise ({}; with nothing to do {:.0} ns ({})), after it {:.0} ns
 ",
@@ -9207,7 +9233,7 @@ fn place_memo_cycles_line() -> String {
         ns(m[6], m[7]),
         m[7],
         ns(m[5], n)
-    )
+    ) + &sync
 }
 
 fn place_memo_time(hit: bool, cycles: u64) {
@@ -10952,7 +10978,7 @@ static BATCH_MISS_SITES: Mutex<Option<HashMap<u32, u64>>> = Mutex::new(None);
 
 /// A new window for the batched dispatches' statistics (`profile reset`).
 pub(super) fn reset_batch_misses() {
-    for c in BATCHED.iter().chain(BATCH_MISS.iter()).chain(SHADOWS_PRE.iter()).chain(PLACE_MEMO_CYCLES.iter()).chain(MISS_PARTS.iter()) {
+    for c in BATCHED.iter().chain(BATCH_MISS.iter()).chain(SHADOWS_PRE.iter()).chain(PLACE_MEMO_CYCLES.iter()).chain(MISS_PARTS.iter()).chain(SYNC_CYCLES.iter()) {
         c.store(0, Ordering::Relaxed);
     }
     *BATCH_MISS_PROGRAMS.lock() = None;
@@ -14817,7 +14843,13 @@ impl Exec {
         if super::tune::skip_read_waits() {
             return false;
         }
-        self.sync_for(reads, why)
+        if !laps() {
+            return self.sync_for(reads, why);
+        }
+        let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+        let r = self.sync_for(reads, why);
+        sync_time(unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0));
+        r
     }
 
     pub fn sync_for(&mut self, reads: &[(u64, u64)], why: usize) -> bool {
