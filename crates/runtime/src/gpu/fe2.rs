@@ -281,12 +281,30 @@ struct Fine {
     marked: bool,
 }
 
+/// This thread's ranges found fine (`RANGES`): a ring, newest at `head`, the ranges' bounds
+/// packed apart from their records so a lookup reads 512 bytes, not the records' 3 KiB, and an
+/// insert writes one entry instead of moving the list (2026-11-16: the list's insert at its front
+/// and its retain were most of a full check's bookkeeping). A dropped entry has `hi` 0.
+struct Ring {
+    keys: [(u64, u64); RANGE_CACHE],
+    fines: [Fine; RANGE_CACHE],
+    head: usize,
+}
+
+/// This thread's exact ranges found fine (`EXACT_SLOTS`, by `exact_slot`): the bounds packed
+/// apart (64 KiB a thread, the records' 384 KiB read only on a match); an empty slot has `hi` 0.
+struct Exact {
+    keys: Vec<(u64, u64)>,
+    fines: Vec<Fine>,
+}
+
+const FINE_NONE: Fine = Fine { lo: 0, hi: 0, gens: [0; FINE_CHUNKS], host: [0; FINE_LEAVES], ep: 0, marked: false };
+
 thread_local! {
     /// This thread's ranges found fine, most recent first.
-    static RANGES: std::cell::RefCell<Vec<Fine>> = const { std::cell::RefCell::new(Vec::new()) };
-    /// This thread's exact ranges found fine (`EXACT_SLOTS`, by `exact_slot`;
-    /// an empty slot has `hi` 0).
-    static EXACT: std::cell::RefCell<Vec<Fine>> = const { std::cell::RefCell::new(Vec::new()) };
+    static RANGES: std::cell::RefCell<Ring> = const { std::cell::RefCell::new(Ring { keys: [(0, 0); RANGE_CACHE], fines: [FINE_NONE; RANGE_CACHE], head: 0 }) };
+    /// This thread's exact ranges found fine.
+    static EXACT: std::cell::RefCell<Exact> = const { std::cell::RefCell::new(Exact { keys: Vec::new(), fines: Vec::new() }) };
 }
 
 /// Slots of each thread's table of exact ranges found fine, beside the
@@ -348,13 +366,16 @@ fn range_fine(lo: u64, hi: u64, want: u32, marked: bool) -> bool {
         let hit = EXACT.with(|t| {
             let mut t = t.borrow_mut();
             let k = exact_slot(lo, hi);
-            let f = t.get(k)?;
-            if f.lo != lo || f.hi != hi || (marked && !f.marked) {
+            if *t.keys.get(k)? != (lo, hi) {
+                return None;
+            }
+            let f = &t.fines[k];
+            if marked && !f.marked {
                 return None;
             }
             match changed(f) {
                 Some(c) => {
-                    t[k].hi = 0;
+                    t.keys[k].1 = 0;
                     Some(Err(c))
                 }
                 None if f.ep >= want => Some(Ok(())),
@@ -371,29 +392,35 @@ fn range_fine(lo: u64, hi: u64, want: u32, marked: bool) -> bool {
         let mut r = r.borrow_mut();
         // (Why not, for `DS_FE2_CALLERS`: the last covering range's reason.)
         let mut why = exact_why.unwrap_or(C_NO_RANGE);
-        let mut i = 0;
-        while i < r.len() {
-            let f = &r[i];
-            if f.lo <= lo && hi <= f.hi && (f.marked || !marked) {
-                let ep_ok = f.ep >= want;
-                match changed(f) {
-                    // Generations and events only grow: it never holds again.
-                    Some(c) => {
-                        why = c;
-                        r.remove(i);
-                        continue;
-                    }
-                    None if ep_ok => {
-                        // (One step forward a hit: no move of the whole list.)
-                        if i > 0 {
-                            r.swap(i, i - 1);
-                        }
-                        return true;
-                    }
-                    None => why = C_EPOCH,
-                }
+        let head = r.head;
+        for j in 0..RANGE_CACHE {
+            let i = (head + j) % RANGE_CACHE;
+            let (flo, fhi) = r.keys[i];
+            if !(flo <= lo && hi <= fhi) {
+                continue;
             }
-            i += 1;
+            let f = &r.fines[i];
+            if !(f.marked || !marked) {
+                continue;
+            }
+            let ep_ok = f.ep >= want;
+            match changed(f) {
+                // Generations and events only grow: it never holds again.
+                Some(c) => {
+                    why = c;
+                    r.keys[i].1 = 0;
+                }
+                None if ep_ok => {
+                    // (One step toward the newest a hit.)
+                    if j > 0 {
+                        let n = (head + j - 1) % RANGE_CACHE;
+                        r.keys.swap(i, n);
+                        r.fines.swap(i, n);
+                    }
+                    return true;
+                }
+                None => why = C_EPOCH,
+            }
         }
         if callers_on() {
             caller_count(why, 1);
@@ -942,20 +969,32 @@ fn caller_count(what: usize, n: u64) {
 }
 
 fn note_range_fine(lo: u64, hi: u64, gens: [u32; FINE_CHUNKS], host: [u64; FINE_LEAVES], ep: u32, marked: bool) {
+    let f = Fine { lo, hi, gens, host, ep, marked };
     if exact_on() {
         EXACT.with(|t| {
             let mut t = t.borrow_mut();
-            if t.is_empty() {
-                t.resize(EXACT_SLOTS, Fine { lo: 0, hi: 0, gens: [0; FINE_CHUNKS], host: [0; FINE_LEAVES], ep: 0, marked: false });
+            if t.keys.is_empty() {
+                t.keys.resize(EXACT_SLOTS, (0, 0));
+                t.fines.resize(EXACT_SLOTS, FINE_NONE);
             }
-            t[exact_slot(lo, hi)] = Fine { lo, hi, gens, host, ep, marked };
+            let k = exact_slot(lo, hi);
+            t.keys[k] = (lo, hi);
+            t.fines[k] = f;
         });
     }
     RANGES.with(|r| {
         let mut r = r.borrow_mut();
-        r.retain(|f| !(lo <= f.lo && f.hi <= hi && (marked || !f.marked)));
-        r.insert(0, Fine { lo, hi, gens, host, ep, marked });
-        r.truncate(RANGE_CACHE);
+        // (Ranges the new one covers dropped, as the list's retain did.)
+        for i in 0..RANGE_CACHE {
+            let (flo, fhi) = r.keys[i];
+            if fhi != 0 && lo <= flo && fhi <= hi && (marked || !r.fines[i].marked) {
+                r.keys[i].1 = 0;
+            }
+        }
+        let head = (r.head + RANGE_CACHE - 1) % RANGE_CACHE;
+        r.head = head;
+        r.keys[head] = (lo, hi);
+        r.fines[head] = f;
     });
 }
 

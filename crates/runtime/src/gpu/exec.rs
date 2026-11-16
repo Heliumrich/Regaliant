@@ -9045,10 +9045,13 @@ pub(super) fn prog_note(class: u8, a: u64, b: u64, ns: u64) {
     });
 }
 
-/// Slots of an executor's placement memo (`Exec::fe2_place`).
-/// (2,048 slots measured x0.947 at Castlewall turning against 128: the larger arrays' cache
-/// footprint cost more than the extra answers saved, FINDINGS.md 2026-11-15 small hours.)
-const PLACE_MEMO_SLOTS: usize = 128;
+/// Entries of an executor's placement memo (`Exec::fe2_place`), in sets of `PLACE_MEMO_WAYS`
+/// by the range's hash. (2,048 direct-mapped slots measured x0.947 at Castlewall turning against
+/// 128: the larger array's cache footprint cost more than the extra answers saved, FINDINGS.md
+/// 2026-11-15 small hours. 128 direct-mapped slots missed ~10% of placements repeating one of
+/// their batch at the same epoch, FINDINGS.md 2026-11-16 afternoon: 256 in 4-way sets, 18 KiB.)
+const PLACE_MEMO_SLOTS: usize = 256;
+const PLACE_MEMO_WAYS: usize = 4;
 
 /// A placement of the executor's batch (`Exec::fe2_place`).
 #[derive(Clone, Copy)]
@@ -9070,10 +9073,11 @@ impl Default for PlaceMemo {
     }
 }
 
+/// The first entry of the placement memo's set for a range.
 #[inline]
-fn place_memo_slot(base: u64, size: u64, written: bool) -> usize {
+fn place_memo_set(base: u64, size: u64, written: bool) -> usize {
     let h = (base >> 2).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ size.wrapping_mul(0xC2B2_AE3D_27D4_EB4F) ^ written as u64;
-    (h >> (64 - PLACE_MEMO_SLOTS.trailing_zeros())) as usize
+    ((h >> (64 - (PLACE_MEMO_SLOTS / PLACE_MEMO_WAYS).trailing_zeros())) as usize) * PLACE_MEMO_WAYS
 }
 
 /// The placement memo's [hits, misses] (`Exec::fe2_place`), added per
@@ -10022,6 +10026,8 @@ pub struct Exec {
     /// batch, epoch, want and mapping generation they were made under
     /// (`PlaceMemo`, `fe2_place`).
     place_memo: Box<[PlaceMemo; PLACE_MEMO_SLOTS]>,
+    /// The placement memo's next replaced entry in a full set (`fe2_place_memo`).
+    place_memo_next: u8,
     fe2_gens: Vec<u32>,
     /// This queue's view (`fe2::view_cell`): what its checks need.
     fe2_view: std::sync::Arc<std::sync::atomic::AtomicU32>,
@@ -11287,6 +11293,7 @@ impl Exec {
                 wb_unheld: 0,
                 fe2_memo: Default::default(),
                 place_memo: Box::new([PlaceMemo::default(); PLACE_MEMO_SLOTS]),
+                place_memo_next: 0,
                 fe2_gens: Vec::new(),
                 fe2_view: super::fe2::view_cell(name),
                 f3_ranges: Vec::new(),
@@ -12687,12 +12694,22 @@ impl Exec {
         self.fe2_place_memo(base, size, written)
     }
 
+    /// The entry of the placement memo's set `set` holding the range (any batch's).
+    #[inline]
+    fn place_memo_way(&self, set: usize, base: u64, size: u64, written: bool) -> Option<usize> {
+        (set..set + PLACE_MEMO_WAYS).find(|&i| {
+            let m = &self.place_memo[i];
+            m.batch != 0 && m.base == base && m.size == size && m.written == written
+        })
+    }
+
     /// `fe2_place_memo` with the batch starts' census (`PLACE_CENSUS`).
     fn fe2_place_census(&mut self, base: u64, size: u64, written: bool) -> Option<(vk::Buffer, u64, u64)> {
         let ep = super::precache::epoch() as u32;
         let want = self.fe2_want(ep);
         let map_gen = crate::mem::MAP_GEN.load(Ordering::Acquire);
-        let m = self.place_memo[place_memo_slot(base, size, written)];
+        let set = place_memo_set(base, size, written);
+        let m = self.place_memo_way(set, base, size, written).map_or_else(PlaceMemo::default, |k| self.place_memo[k]);
         let first = !self.recording || self.batch_shaders.is_empty();
         let hit = self.recording && m.batch == self.batch_count && m.base == base && m.size == size && m.written == written && m.ep == ep && m.want == want && m.map_gen == map_gen;
         let class = if m.batch != 0 && m.base == base && m.size == size && m.written == written {
@@ -12729,9 +12746,10 @@ impl Exec {
             let ep = super::precache::epoch() as u32;
             let want = self.fe2_want(ep);
             let map_gen = crate::mem::MAP_GEN.load(Ordering::Acquire);
-            let k = place_memo_slot(base, size, written);
-            let m = self.place_memo[k];
-            if m.batch == self.batch_count && m.base == base && m.size == size && m.written == written && m.ep == ep && m.want == want && m.map_gen == map_gen {
+            let set = place_memo_set(base, size, written);
+            let found = self.place_memo_way(set, base, size, written);
+            let m = found.map_or_else(PlaceMemo::default, |k| self.place_memo[k]);
+            if found.is_some() && m.batch == self.batch_count && m.ep == ep && m.want == want && m.map_gen == map_gen {
                 if let Some(s) = CP_WRITES.latest(&[(base, size)]) {
                     self.submit_after = self.submit_after.max(s);
                 }
@@ -12762,6 +12780,17 @@ impl Exec {
                 // (Under the batch it was made in: a placement begins one when
                 // none is being recorded.)
                 if self.recording && !self.stopped && !self.past_grow && crate::mem::MAP_GEN.load(Ordering::Acquire) == map_gen && super::precache::epoch() as u32 == ep {
+                    // The range's own entry, else one of an earlier batch, else the set's next in turn.
+                    let k = match found {
+                        Some(k) => k,
+                        None => match (set..set + PLACE_MEMO_WAYS).find(|&i| self.place_memo[i].batch != self.batch_count) {
+                            Some(k) => k,
+                            None => {
+                                self.place_memo_next = self.place_memo_next.wrapping_add(1);
+                                set + (self.place_memo_next as usize & (PLACE_MEMO_WAYS - 1))
+                            }
+                        },
+                    };
                     self.place_memo[k] = PlaceMemo { base, size, batch: self.batch_count, ep, want, written, map_gen, result };
                 }
             }
