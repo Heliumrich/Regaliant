@@ -182,7 +182,7 @@ pub mod tune {
         Tunable { name: "fe2_back_granule", env: "DS_FE2_BACK_GRANULE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "ballast_ns", env: "DS_BALLAST_NS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "ballast_at", env: "DS_BALLAST_AT", default: 0, value: AtomicU64::new(UNSET) },
-        Tunable { name: "async_compute", env: "DS_ASYNC_COMPUTE", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "async_compute", env: "DS_ASYNC_COMPUTE", default: 2, value: AtomicU64::new(UNSET) },
         Tunable { name: "vram_others", env: "DS_VRAM_OTHERS", default: 512, value: AtomicU64::new(UNSET) },
         Tunable { name: "mirror_cold", env: "DS_MIRROR_COLD", default: 3600, value: AtomicU64::new(UNSET) },
         Tunable { name: "buffer_delta", env: "DS_BUFFER_DELTA", default: 1, value: AtomicU64::new(UNSET) },
@@ -209,7 +209,7 @@ pub mod tune {
         Tunable { name: "held_min", env: "DS_HELD_MIN", default: 192, value: AtomicU64::new(UNSET) },
         Tunable { name: "async_gfx_inline", env: "DS_ASYNC_GFX_INLINE", default: 12, value: AtomicU64::new(UNSET) },
         Tunable { name: "zk", env: "DS_ZK", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "xq_pre_c", env: "DS_XQ_PRE_C", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "xq_pre_c", env: "DS_XQ_PRE_C", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1444,6 +1444,8 @@ pub mod tune {
     /// live at batch boundaries): no main-queue wait for an earlier compute batch whose writes
     /// its uploads would undo; its uploads count for other batches once it completed, and the
     /// main queue's later batches that write into its pages wait for it (`exec::XC_UPLOADS`).
+    /// The default since 2026-11-16: Doran x1.034 at 240 Hz, TowerL Top x1.010 at 59.94 Hz, the
+    /// swamp x1.005, every cycle (FINDINGS.md 2026-11-16).
     pub fn xq_pre_c() -> bool {
         get(177) != 0
     }
@@ -1704,12 +1706,12 @@ pub mod tune {
     }
 
     /// Ordered async compute (RENDERER.md "Ordered async compute"; the
-    /// default from 2026-11-01 to 2026-11-14): 2, the compute queues' batches on a queue
-    /// of a compute-only family (set up when the value is 2 or more at boot:
-    /// `vk::async_compute_boot`; live at batch boundaries); 0, every batch on
-    /// the main queue (the default since 2026-11-14: the 1-1 walk had 886 one-frame
-    /// flashes of 8+ cells of 144 with 2 against 136 with 0, 586 against 26 of 20+, and ran
-    /// x1.089 with 0; FINDINGS.md 2026-11-14); 1, one queue with a census of the waits
+    /// default from 2026-11-01 to 2026-11-14 and again since 2026-11-16): 2, the compute
+    /// queues' batches on a queue of a compute-only family (set up when the value is 2 or more
+    /// at boot: `vk::async_compute_boot`; live at batch boundaries; x1.013-1.046 in-run,
+    /// FINDINGS.md 2026-11-16, its one-frame faults of 2026-11-14 gone with the culling-read
+    /// fixes); 0, every batch on the main queue (the default 2026-11-14 to 11-16); 1, one
+    /// queue with a census of the waits
     /// the main queue's batches would need, by reason, counted and marked in
     /// the timeline (`after #seq (xq ...)`, `tools/schedmodel.py`).
     #[inline]
