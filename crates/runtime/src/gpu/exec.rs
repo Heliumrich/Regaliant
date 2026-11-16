@@ -7039,45 +7039,6 @@ fn journal_note_one(w: (u64, u64), who: &str) {
 /// Kinds of the CPU reads of held recording (`Exec::note_held_reads`).
 pub const HELD_READ_KINDS: [&str; 6] = ["shared copy", "texture", "binding", "CP label poll", "CP read", "register pairs"];
 
-/// Pages where a dispatcher segment's upload met a write another one committed since
-/// (`Cp::dispatch_commit`; page number + 1, direct-mapped): a dispatcher task's placement over
-/// one leaves front end 2's check to its commit (`Exec::deferred_places`), where it is made in
-/// program order.
-static CONTESTED: [AtomicU64; 1024] = [const { AtomicU64::new(0) }; 1024];
-static CONTESTED_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Dispatcher placements deferred to their commit, and those checks' uploads failed.
-pub static DEFERRED_PLACES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
-
-/// Page `p` (an address in it) is contested (`CONTESTED`).
-pub fn contest_page(p: u64) {
-    let n = p / super::resident::PAGE;
-    CONTESTED[(n as usize) & 1023].store(n + 1, Ordering::Relaxed);
-    CONTESTED_ANY.store(true, Ordering::Relaxed);
-}
-
-/// Whether [lo, hi) holds a contested page (ranges of 64 pages at most are looked at).
-fn contested(lo: u64, hi: u64) -> bool {
-    if !CONTESTED_ANY.load(Ordering::Relaxed) || hi <= lo || hi - lo > 64 * super::resident::PAGE {
-        return false;
-    }
-    let mut n = lo / super::resident::PAGE;
-    let end = hi.div_ceil(super::resident::PAGE);
-    while n < end {
-        if CONTESTED[(n as usize) & 1023].load(Ordering::Relaxed) == n + 1 {
-            return true;
-        }
-        n += 1;
-    }
-    false
-}
-
-/// `bind_stage`'s error for a storage image a dispatcher task may not bind (`Images::
-/// held_storage_view` found none GPU work wrote already).
-const HELD_STORAGE_FIRST: &str = "held storage image";
-/// Dispatcher tasks' storage images: [bound held, first writes that stopped one, uses of an
-/// alias of its own that stopped one].
-pub static HELD_STORAGE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
-
 /// `DS_TRACE_PAST_DROPS=<n>`: the first n (1: 60) stretches past a label
 /// wait dropped because other queues wrote what they read on the CPU are
 /// logged with that read's kind and range and who wrote it
@@ -8101,13 +8062,6 @@ pub struct HeldChunk {
     pub ranges: Vec<(u64, u64)>,
     pub up: HashSet<u64>,
     pub want_min: u32,
-    /// A dispatcher task's storage images bound held (`Exec::held_storage`), noted at its commit.
-    pub storage: Vec<(super::images::ImageKey, u32, u64)>,
-    /// A dispatcher task's kinds of `reads` (`HELD_READ_KINDS`), in their order.
-    pub kinds: Vec<u8>,
-    /// A dispatcher task's placements over contested pages, checked at its commit
-    /// (`Exec::commit_places`).
-    pub deferred: Vec<(u64, u64, u32, bool)>,
 }
 
 /// Held runs' chunks stopped by a CPU read of held work before them (`Exec::held_run_writes`)
@@ -10652,14 +10606,6 @@ pub struct Exec {
     /// fast clears or overwrites of (a use stops the chunk); its closed batches before the chunk.
     held_run_writes: Option<std::sync::Arc<super::ranges::Ranges>>,
     held_run_keys: Option<std::sync::Arc<HashMap<super::images::ImageKey, u8>>>,
-    /// A dispatcher task (`Cp::dispatch_step`): its storage images bound held
-    /// (`Images::held_storage_view`: image, mip level, binding shader), in program order, noted
-    /// at its commit.
-    pub(super) held_dispatch: bool,
-    held_storage: Vec<(super::images::ImageKey, u32, u64)>,
-    /// A dispatcher task's placements over contested pages (`contested`): range, the epoch its
-    /// check wanted, written; checked at its commit (`commit_places`).
-    deferred_places: Vec<(u64, u64, u32, bool)>,
     held_base: usize,
     pub(crate) stopped: bool,
     /// Why (statistics), and the reason a caller gives a flush that follows.
@@ -11796,9 +11742,6 @@ impl Exec {
                 held_extra: super::ranges::Ranges::new(),
                 held_run_writes: None,
                 held_run_keys: None,
-                held_dispatch: false,
-                held_storage: Vec::new(),
-                deferred_places: Vec::new(),
                 held_base: 0,
                 stopped: false,
                 stop_why: "",
@@ -13530,21 +13473,12 @@ impl Exec {
         let run = Some(self.fe2_share()).filter(|r| r.0 != 0 && super::fe2::run_any(r.0)).unwrap_or((0, 0));
         let mine_any = !mine.is_empty() || run.0 != 0;
         let m1 = rd();
-        // (A dispatcher task over a contested page: the check is made at its commit, in program
-        // order, `commit_places`; bound as the mirror holds it until then.)
-        let defer = self.held_dispatch && contested(lo, hi);
-        let r = if defer {
-            self.deferred_places.push((lo, hi, want, written));
-            DEFERRED_PLACES[0].fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        } else {
-            super::fe2::ensure(lo, hi, want, ep, written, &|p| (!mine.is_empty() && mine.contains(&p)) || (run.0 != 0 && super::fe2::run_shared(p, run.0, run.1)), mine_any, &mut |a, b| self.fe2_upload(mbuf, a, b, &mut up), &fe2_armable)
-        };
+        let r = super::fe2::ensure(lo, hi, want, ep, written, &|p| (!mine.is_empty() && mine.contains(&p)) || (run.0 != 0 && super::fe2::run_shared(p, run.0, run.1)), mine_any, &mut |a, b| self.fe2_upload(mbuf, a, b, &mut up), &fe2_armable);
         // Past a label wait the CPU may write the pages it rewrites every
         // frame again before the label (FINDINGS.md 2026-10-29): a small
         // binding's such pages are uploaded as they are when the stretch
         // runs, whatever the check found.
-        if self.past_grow && !self.held_dispatch && r.is_ok() && (hi - lo) / PAGE <= STRETCH_HOT_PAGES && super::tune::past_hot() {
+        if self.past_grow && r.is_ok() && (hi - lo) / PAGE <= STRETCH_HOT_PAGES && super::tune::past_hot() {
             let mut hot = Vec::new();
             super::fe2::hot_pages(lo, hi, &mut hot);
             let own = |p: u64, up: &[(u64, u64)]| mine.contains(&p) || up[first..].iter().any(|&(s, e)| s <= p && p < e);
@@ -15359,17 +15293,9 @@ impl Exec {
     /// bindings: ~2 needless waits of 5-7 ms per frame in the courtyard).
     pub fn sync_textures(&mut self, textures: &[((u64, u64), super::desc::Tsharp)], why: usize) -> bool {
         if self.held {
-            // Textures are taken from guest memory as it is now. (A dispatcher task's: only those
-            // the GPU does not own; the GPU's images are read on the GPU, in queue order.)
-            if self.held_dispatch {
-                let cpu: Vec<(u64, u64)> = super::images::with(|im| textures.iter().filter(|x| !im.gpu_owned(&x.1)).map(|x| x.0).collect());
-                let n = cpu.len();
-                self.held_reads.extend(cpu);
-                self.note_kinds(1, n);
-            } else {
-                self.held_reads.extend(textures.iter().map(|x| x.0));
-                self.note_kinds(1, textures.len());
-            }
+            // Textures are taken from guest memory as it is now.
+            self.held_reads.extend(textures.iter().map(|x| x.0));
+            self.note_kinds(1, textures.len());
         }
         if textures.is_empty() || super::tune::skip_steps() & 1 != 0 {
             return false;
@@ -16785,11 +16711,6 @@ impl Exec {
     }
 
 
-    /// Whether a batch is being recorded.
-    pub fn is_recording(&self) -> bool {
-        self.recording
-    }
-
     /// Makes this a deferred executor (`gpu::par` workers).
     pub fn set_deferred(&mut self) {
         self.deferred = true;
@@ -17037,31 +16958,6 @@ impl Exec {
         ok
     }
 
-    /// A dispatcher segment's deferred placements (`deferred_places`) checked now, at its
-    /// commit, in program order: their uploads in a batch of their own, submitted before the
-    /// segment's. False: an upload failed.
-    pub fn commit_places(&mut self, list: &[(u64, u64, u32, bool)]) -> bool {
-        let Some((mbuf, _)) = super::resident::mirror_buffer() else { return false };
-        self.submit_for("dispatch");
-        self.begin();
-        if !self.recording || self.stopped {
-            return false;
-        }
-        let ep = super::precache::epoch() as u32;
-        let mut up = std::mem::take(&mut self.fe2_up);
-        let mut ok = true;
-        for &(lo, hi, want, written) in list {
-            let r = super::fe2::ensure(lo, hi, want.min(ep), ep, written, &|_| false, false, &mut |a, b| self.fe2_upload(mbuf, a, b, &mut up), &fe2_armable);
-            ok &= r.is_ok();
-        }
-        self.fe2_up = up;
-        self.submit_for("dispatch places");
-        if !ok {
-            DEFERRED_PLACES[1].fetch_add(1, Ordering::Relaxed);
-        }
-        ok
-    }
-
     /// The repair batch (`past_repair`) goes to the GPU first.
     pub fn submit_repair_first(&mut self) {
         if std::mem::take(&mut self.repair) {
@@ -17139,43 +17035,9 @@ impl Exec {
         self.past_stale.clear();
     }
 
-    /// A dispatcher task's held recording (`Cp::dispatch_step`): storage images GPU work wrote
-    /// already are bound held (`held_storage`).
-    pub fn set_held_dispatch(&mut self, on: bool) {
-        self.held_dispatch = on;
-    }
-
-    /// Drops the first `n` batches this deferred executor closed (a dispatcher segment's that
-    /// failed its commit's checks; the later ones stay for their commits).
-    pub fn discard_closed_head(&mut self, n: usize) {
-        let n = n.min(self.closed.len());
-        if n == 0 {
-            return;
-        }
-        let rest = self.closed.split_off(n);
-        let head = std::mem::replace(&mut self.closed, rest);
-        let c = ctx();
-        for b in head {
-            super::forward::drop_checks(&b.forward_ids);
-            super::forward::drop_entries(&b.forward_ids);
-            super::resident::dropped(&b.res_pages);
-            let s = &mut self.slots[b.slot];
-            unsafe {
-                c.device.reset_command_buffer(s.cmd, vk::CommandBufferResetFlags::empty()).ok();
-                c.device.reset_command_buffer(s.pre, vk::CommandBufferResetFlags::empty()).ok();
-                c.device.reset_descriptor_pool(s.desc_pool, vk::DescriptorPoolResetFlags::empty()).ok();
-            }
-            s.homes.clear();
-            s.keep.clear();
-            s.seq = 0;
-        }
-    }
-
     /// A stretch into held batches begins: not stopped, nothing read or
     /// noted.
     pub fn held_reset(&mut self) {
-        self.held_storage.clear();
-        self.deferred_places.clear();
         self.stopped = false;
         self.stop_why = "";
         self.held_reads.clear();
@@ -17224,12 +17086,8 @@ impl Exec {
             ranges: std::mem::take(&mut self.past_ranges),
             up: std::mem::take(&mut self.past_up),
             want_min: std::mem::replace(&mut self.past_want_min, u32::MAX),
-            storage: std::mem::take(&mut self.held_storage),
-            kinds: if self.held_dispatch { std::mem::take(&mut self.held_kinds) } else { Vec::new() },
-            deferred: std::mem::take(&mut self.deferred_places),
         };
         self.held = false;
-        self.held_dispatch = false;
         self.past_grow = false;
         self.held_run_writes = None;
         self.held_run_keys = None;
@@ -17367,13 +17225,6 @@ impl Exec {
             self.stop(if kind == 0 { "an image the held work before its run clears" } else { "an image the held work before its run overwrote" });
             return true;
         }
-        // (An image at the base of one this task bound for writing, under another key: an alias
-        // whose copy from it follows the write's note, made at the commit.)
-        if !self.held_storage.is_empty() && keys.iter().any(|k| self.held_storage.iter().any(|s| s.0.base == k.base && s.0 != *k)) {
-            HELD_STORAGE[2].fetch_add(1, Ordering::Relaxed);
-            self.stop("an alias of its held storage image");
-            return true;
-        }
         self.held_keys.extend(keys.iter().copied());
         keys.iter().any(|k| self.held_clears.contains_key(k) || self.held_over.contains(k))
     }
@@ -17399,7 +17250,7 @@ impl Exec {
 
     /// The kinds of the last `n` held reads (`DS_TRACE_PAST_DROPS`).
     fn note_kinds(&mut self, kind: u8, n: usize) {
-        if trace_past_drops() || self.held_dispatch {
+        if trace_past_drops() {
             self.held_kinds.resize(self.held_reads.len() - n, u8::MAX);
             self.held_kinds.resize(self.held_reads.len(), kind);
         }
@@ -18164,17 +18015,11 @@ impl Exec {
             return Ok(bound);
         }
         // Held batches: a storage image's binding marks it written in the
-        // image cache, which the work before them would see. A dispatcher
-        // task binds the ones GPU work wrote already without that note
-        // (`Images::held_storage_view`; noted at its commit); a first write
-        // stops it.
-        let held_storage = self.held && found.tr.out.bindings.iter().any(|b| matches!(b.kind, BindingKind::StorageImage(_) | BindingKind::StorageImageMips(_)));
-        if held_storage && !self.held_dispatch {
+        // image cache, which the work before them would see.
+        if self.held && found.tr.out.bindings.iter().any(|b| matches!(b.kind, BindingKind::StorageImage(_) | BindingKind::StorageImageMips(_))) {
             self.stop("storage image");
             return Err(STOPPED.into());
         }
-        let mut storage_notes: Vec<(super::images::ImageKey, u32, u64)> = Vec::new();
-        let binding_shader = p.addr;
         bound.imgs.clear();
         bound.images.clear();
         bound.stored.clear();
@@ -18198,13 +18043,7 @@ impl Exec {
                             Some(rdna::translate::ResSpec::Image { dim: rdna::translate::ImageDim::D2, .. }) if t.ty == 13 => Some(vk::ImageViewType::TYPE_2D),
                             _ => None,
                         };
-                        let (view, image) = if storage && held_storage {
-                            let Some((v, i, k)) = im.held_storage_view(t, frame, want) else { return Err(HELD_STORAGE_FIRST.into()) };
-                            storage_notes.push((k, t.base_level, binding_shader));
-                            (v, i)
-                        } else {
-                            im.view_as(t, storage, frame, want)?
-                        };
+                        let (view, image) = im.view_as(t, storage, frame, want)?;
                         let ty = if storage { vk::DescriptorType::STORAGE_IMAGE } else { vk::DescriptorType::SAMPLED_IMAGE };
                         bound.imgs.push((b.binding, ty, vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL }));
                         bound.images.push(image);
@@ -18254,13 +18093,7 @@ impl Exec {
                             let mut tk = *t;
                             tk.base_level = t.base_level + k;
                             tk.raw[3] = (tk.raw[3] & !(0xf << 12)) | (tk.base_level << 12);
-                            let (view, img) = if held_storage {
-                                let Some((v, i, key)) = im.held_storage_view(&tk, frame, None) else { return Err(HELD_STORAGE_FIRST.into()) };
-                                storage_notes.push((key, tk.base_level, binding_shader));
-                                (v, i)
-                            } else {
-                                im.view(&tk, true, frame)?
-                            };
+                            let (view, img) = im.view(&tk, true, frame)?;
                             image = img;
                             infos.push(vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL });
                         }
@@ -18289,19 +18122,8 @@ impl Exec {
         for f in failed {
             self.report(f);
         }
-        if r.as_ref().is_err_and(|e| e == HELD_STORAGE_FIRST) {
-            // (An image no GPU work wrote yet, or not there: not a task's to make.)
-            let _ = refreshed;
-            HELD_STORAGE[1].fetch_add(1, Ordering::Relaxed);
-            self.stop("storage image (its first write)");
-            return Err(STOPPED.into());
-        }
         r?;
         refreshed?;
-        if !storage_notes.is_empty() {
-            HELD_STORAGE[0].fetch_add(storage_notes.len() as u64, Ordering::Relaxed);
-            self.held_storage.extend(storage_notes);
-        }
         Ok(bound)
     }
 

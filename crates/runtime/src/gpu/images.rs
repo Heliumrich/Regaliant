@@ -5834,12 +5834,6 @@ impl Images {
         n
     }
 
-    /// Whether an image GPU work wrote lies at `base` (a dispatcher task's texture read there
-    /// is the GPU's, in queue order, not a read of guest memory).
-    pub fn gpu_base(&self, base: u64) -> bool {
-        self.gpu_bases.contains(&base) || self.by_base.get(&base).is_some_and(|ks| ks.iter().any(|k| self.map.get(k).is_some_and(|i| i.gpu_written)))
-    }
-
     /// Whether a T# resolves to an image the GPU owns (written by GPU work;
     /// never re-uploaded from guest memory).
     pub fn gpu_owned(&self, t: &Tsharp) -> bool {
@@ -6064,49 +6058,6 @@ impl Images {
             }
         }
         let key = self.image_for(t, frame, storage)?;
-        self.view_of(t, key, storage, frame, want, true)
-    }
-
-    /// A storage view for a dispatcher task's held work (`Exec::bind_stage`; the 2026-11-16
-    /// held-storage form): only of an image that exists for `t` and GPU work wrote already
-    /// (a depth feed: known as one), and without `view`'s note of the write: work before the
-    /// task, recorded later or on other threads, must not see a write that comes after it (the
-    /// write generation decides its aliases' copies). The note is made at the task's commit
-    /// (`note_held_storage`). None: no such image yet (its first write changes what lookups
-    /// find: the task stops there).
-    pub fn held_storage_view(&mut self, t: &Tsharp, frame: u64, want: Option<vk::ImageViewType>) -> Option<(vk::ImageView, vk::Image, ImageKey)> {
-        let key = Self::key_of(t)?;
-        let (k, _) = self.lookup(&key, true)?;
-        if !self.map.get(&k).is_some_and(|i| i.gpu_written) || is_depth(k.format) || self.refreshing.contains_key(&k) {
-            return None;
-        }
-        if matches!(k.format, vk::Format::R32_SFLOAT | vk::Format::R16_UNORM) && !self.depth_feeds.contains(&k.base) {
-            return None;
-        }
-        self.view_of(t, k, true, frame, want, false).ok().map(|r| (r.0, r.1, k))
-    }
-
-    /// A committed task's storage bindings (`held_storage_view`: image, mip level, binding
-    /// shader), in their order: each a write of its image, as `view` notes one.
-    pub fn note_held_storage(&mut self, notes: &[(ImageKey, u32, u64)]) {
-        for &(key, mip, writer) in notes {
-            self.write_seq += 1;
-            let seq = self.write_seq;
-            if let Some(img) = self.map.get_mut(&key) {
-                img.write_gen = seq;
-                let m = mip as usize;
-                if img.mip_gens.len() <= m {
-                    img.mip_gens.resize(m + 1, 0);
-                }
-                img.mip_gens[m] = seq;
-                img.writer = writer;
-            }
-        }
-    }
-
-    /// The view of image `key` that `t` asks for (`view_full`); `note`: a storage view's write
-    /// is noted (false: `held_storage_view`).
-    fn view_of(&mut self, t: &Tsharp, key: ImageKey, storage: bool, frame: u64, want: Option<vk::ImageViewType>, note: bool) -> Result<(vk::ImageView, vk::Image, UseStamp), String> {
         let req = vk_format(t.format).unwrap();
         let depth = is_depth(key.format);
         let stencil = depth && req == vk::Format::R8_UINT;
@@ -6136,18 +6087,17 @@ impl Images {
         let sel = |s: u16| -> u8 { (s & 7) as u8 };
         let swz = if storage { [4, 5, 6, 7] } else { [sel(t.dst_sel), sel(t.dst_sel >> 3), sel(t.dst_sel >> 6), sel(t.dst_sel >> 9)] };
         let vkey = (fmt, vt, t.base_level, levels.saturating_sub(t.base_level).max(1), base_layer, layer_count, swz, storage as u8 | (stencil as u8) << 1);
-        let storage_note = storage && note;
-        if storage_note {
+        if storage {
             self.write_seq += 1;
         }
         let seq = self.write_seq;
-        if storage_note && matches!(key.format, vk::Format::R32_SFLOAT | vk::Format::R16_UNORM) && self.depth_feeds.insert(key.base) {
+        if storage && matches!(key.format, vk::Format::R32_SFLOAT | vk::Format::R16_UNORM) && self.depth_feeds.insert(key.base) {
             // A possible compute view of a depth plane: memos of
             // `depth_copies_possible` see it from now on.
             LOOKUP_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
         }
         let img = self.map.get_mut(&key).unwrap();
-        if storage_note {
+        if storage {
             img.write_gen = seq;
             let m = t.base_level as usize;
             if img.mip_gens.len() <= m {

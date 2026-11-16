@@ -149,17 +149,6 @@ pub struct Done {
     /// the worker whose executor keeps its batches (`Pool::get`).
     pub held: Option<Box<super::exec::HeldChunk>>,
     pub worker: usize,
-    /// Which of the worker's recorders keeps them (`Worker::with_cp_at`; 0 but for the
-    /// dispatcher's chunks).
-    pub recorder: usize,
-    /// A dispatcher stretch's context stack where it stopped or ended.
-    pub stack: Option<Vec<Vec<u32>>>,
-    /// Its worker's front end 2 view at its end (`fe2::NO_VIEW`: none; the dispatcher's
-    /// commit re-checks later segments planned at an older one).
-    pub view: u32,
-    /// The dispatcher's commits when it began recording (`cp::dispatch_commits`): what those
-    /// wrote was in the in-flight log for its checks.
-    pub began_at: u64,
 }
 
 /// The chunks of a parallel run that the workers record (all but the main
@@ -213,20 +202,6 @@ pub struct Run {
     pub held_keys: Arc<std::collections::HashMap<super::images::ImageKey, u8>>,
     /// A held run's chunks recorded (posted in any order: `collect_held`).
     recorded: Vec<AtomicBool>,
-    /// A dispatcher task (`tune dispatch`, `Cp::dispatch_step`): its chunks are recorded held
-    /// on the workers' second recorders when free and committed by the command processor in
-    /// program order. `stretch`: its one chunk is a serial stretch, recorded through the
-    /// general packet loop (`Cp::run_stretch`) from the context stack `stack`.
-    pub dispatch: bool,
-    pub stretch: bool,
-    pub stack: Arc<Vec<Vec<u32>>>,
-    /// The graphics queue's label writes before the task that were not committed when it was
-    /// planned (the walk's: address, value, bytes; 0 bytes: a timestamp): its label waits pass
-    /// on them (`Cp::held_wait`).
-    pub labels: Arc<[(u64, u64, u8)]>,
-    /// A stretch of a buffer the command processor fetched (copied: `Cp::run`'s small buffers):
-    /// the copy's base and words, which its worker reads instead of guest memory.
-    pub words: Option<(u64, Arc<Vec<u32>>)>,
 }
 
 /// Run ids (`Run::id`; 0: none).
@@ -264,32 +239,7 @@ impl Run {
             held_writes: Arc::new(super::ranges::Ranges::new()),
             held_keys: Arc::new(std::collections::HashMap::new()),
             recorded: (0..n).map(|_| AtomicBool::new(false)).collect(),
-            dispatch: false,
-            stretch: false,
-            stack: Arc::new(Vec::new()),
-            labels: Arc::from(Vec::new()),
-            words: None,
         }
-    }
-
-    /// Whether chunk `i` of a held run was recorded (posted), without waiting.
-    pub fn is_recorded(&self, i: usize) -> bool {
-        self.recorded.get(i).is_some_and(|r| r.load(Ordering::Acquire))
-    }
-
-    /// Chunk `i`'s range (first packet, the packet after it).
-    pub fn chunk_range(&self, i: usize) -> Option<(u64, u64)> {
-        self.chunks.get(i).map(|c| (c.1, c.2))
-    }
-
-    /// The number of chunks.
-    pub fn len(&self) -> usize {
-        self.chunks.len()
-    }
-
-    /// Whether the run was cancelled.
-    pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
     }
 
     /// Waits for chunk `i` of a held run to be recorded (`Run::held`): it and how long the
@@ -426,16 +376,6 @@ pub struct Worker {
     idx: usize,
     /// The command processor it records chunks with (its own executor).
     cp: Mutex<Cp>,
-    /// Its second recorder (`tune dispatch`; made on first need, None if it could not be):
-    /// a dispatcher chunk goes to the recorder holding fewer batches for the commit, so the
-    /// command processor committing one recorder's batches does not wait for the worker
-    /// recording into the other.
-    cp1: std::sync::OnceLock<Option<Mutex<Cp>>>,
-    /// Batches each recorder holds for the dispatcher's commit (`held_count`).
-    held: [AtomicUsize; 2],
-    /// Its name and kind (the second recorder's).
-    name: String,
-    compute: bool,
     /// Runs given it, taken in order, and whether there is one (what a
     /// spinning worker looks at).
     job: Mutex<std::collections::VecDeque<Arc<Run>>>,
@@ -576,17 +516,7 @@ impl Pool {
                 crate::warn!("gpu[{wname}]: no executor for a parallel worker ({e})");
                 return None;
             }
-            let w = Arc::new(Worker {
-                idx: n,
-                cp: Mutex::new(cp),
-                cp1: std::sync::OnceLock::new(),
-                held: [AtomicUsize::new(0), AtomicUsize::new(0)],
-                name: wname.clone(),
-                compute,
-                job: Mutex::new(Default::default()),
-                has_job: AtomicBool::new(false),
-                wake: self.wake.clone(),
-            });
+            let w = Arc::new(Worker { idx: n, cp: Mutex::new(cp), job: Mutex::new(Default::default()), has_job: AtomicBool::new(false), wake: self.wake.clone() });
             let w2 = w.clone();
             let tname = wname.clone();
             let qname = name.to_string();
@@ -701,13 +631,7 @@ fn take_chunks(w: &Worker, run: &Run, name: &str, k: usize, census: bool) {
             PHASE_NS[0].fetch_add((t - run.born).as_nanos() as u64, Ordering::Relaxed);
             STARTS.fetch_add(1, Ordering::Relaxed);
         }
-        let rec = if run.dispatch { w.pick_recorder() } else { 0 };
-        // (Read before it records: commits up to here are in the in-flight log it checks.)
-        let began_at = if run.dispatch { super::cp::dispatch_commits() } else { 0 };
-        let mut cp = match rec {
-            1 => w.cp1.get().and_then(|o| o.as_ref()).expect("second recorder").lock(),
-            _ => w.cp.lock(),
-        };
+        let mut cp = w.cp.lock();
         cp.set_chunk_state(&state);
         cp.set_hs_seg(run.hs_seg);
         cp.chunk_waits = run.passed_waits.clone();
@@ -717,27 +641,10 @@ fn take_chunks(w: &Worker, run: &Run, name: &str, k: usize, census: bool) {
         cp.chunk_start();
         if run.held {
             cp.held_chunk_begin(run.held_writes.clone(), run.held_keys.clone());
-            if run.dispatch {
-                cp.set_held_dispatch(true);
-            }
         }
         cp.chunk_costs = run.timed.then(|| Vec::with_capacity(512));
-        if run.dispatch {
-            cp.chunk_labels = run.labels.clone();
-        }
         lap(1, &mut t);
-        let r = if run.stretch {
-            let stack = run.stack.clone();
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cp.run_stretch(from, to, &stack, run.words.as_ref())))
-        } else if run.dispatch {
-            // (Held as a stretch is: its CPU reads noted for the commit's checks.)
-            cp.set_held_mode(true);
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cp.run_chunk(from, to)));
-            cp.set_held_mode(false);
-            r
-        } else {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cp.run_chunk(from, to)))
-        };
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cp.run_chunk(from, to)));
         let failed = r.is_err();
         let stopped = r.unwrap_or(Some(from));
         lap(2, &mut t);
@@ -745,11 +652,8 @@ fn take_chunks(w: &Worker, run: &Run, name: &str, k: usize, census: bool) {
         cp.fe2_set_run(0, 0);
         if run.held {
             let held = cp.held_chunk_end();
-            if run.dispatch {
-                cp.chunk_labels = Arc::from(Vec::new());
-            }
             lap(3, &mut t);
-            post_held(run, i, cp, stopped, failed, state, held, w, rec, began_at);
+            post_held(run, i, cp, stopped, failed, state, held, w.idx);
             continue;
         }
         lap(3, &mut t);
@@ -783,13 +687,13 @@ fn commit(run: &Run, i: usize, mut cp: parking_lot::MutexGuard<'_, Cp>, stopped:
         return;
     }
     let done = if failed {
-        Done { stopped, state: *state, last: None, why: "failed", costs: Vec::new(), writes: Default::default(), held: None, worker: 0, recorder: 0, stack: None, view: super::fe2::NO_VIEW, began_at: 0 }
+        Done { stopped, state: *state, last: None, why: "failed", costs: Vec::new(), writes: Default::default(), held: None, worker: 0 }
     } else {
         let writes = if super::runprobe::on() || super::tune::past_runs() { cp.worker_writes() } else { Default::default() };
         let last = cp.worker_submit();
         let why = if stopped.is_some() { cp.worker_stop_why() } else { "" };
         let state = cp.chunk_state();
-        Done { stopped, state, last, why, costs: cp.chunk_costs.take().unwrap_or_default(), writes, held: None, worker: 0, recorder: 0, stack: None, view: super::fe2::NO_VIEW, began_at: 0 }
+        Done { stopped, state, last, why, costs: cp.chunk_costs.take().unwrap_or_default(), writes, held: None, worker: 0 }
     };
     drop(cp);
     run.results.lock()[i] = Some(done);
@@ -807,10 +711,8 @@ fn commit(run: &Run, i: usize, mut cp: parking_lot::MutexGuard<'_, Cp>, stopped:
 /// (`Cp::held_commit`); cancelled, its batches are dropped and it is not posted; failed, they
 /// are dropped and it is posted for the main command processor to record from its start.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
-fn post_held(run: &Run, i: usize, mut cp: parking_lot::MutexGuard<'_, Cp>, stopped: Option<u64>, failed: bool, state: Box<ChunkState>, held: super::exec::HeldChunk, w: &Worker, recorder: usize, began_at: u64) {
+fn post_held(run: &Run, i: usize, mut cp: parking_lot::MutexGuard<'_, Cp>, stopped: Option<u64>, failed: bool, state: Box<ChunkState>, held: super::exec::HeldChunk, worker: usize) {
     let mut t = std::time::Instant::now();
-    let worker = w.idx;
     let cancelled = run.cancelled.load(Ordering::SeqCst);
     if failed || cancelled {
         let keep = cp.closed_count().saturating_sub(held.batches);
@@ -820,16 +722,11 @@ fn post_held(run: &Run, i: usize, mut cp: parking_lot::MutexGuard<'_, Cp>, stopp
         }
     }
     let done = if failed {
-        Done { stopped, state: *state, last: None, why: "failed", costs: Vec::new(), writes: Default::default(), held: None, worker, recorder, stack: None, view: super::fe2::NO_VIEW, began_at: 0 }
+        Done { stopped, state: *state, last: None, why: "failed", costs: Vec::new(), writes: Default::default(), held: None, worker }
     } else {
         let why = if stopped.is_some() { cp.worker_stop_why() } else { "" };
         let state = cp.chunk_state();
-        if run.dispatch {
-            w.held[recorder].fetch_add(held.batches, Ordering::AcqRel);
-        }
-        let stack = run.stretch.then(|| cp.ctx_stack_now());
-        let view = if run.dispatch { cp.fe2_view_now() } else { super::fe2::NO_VIEW };
-        Done { stopped, state, last: None, why, costs: cp.chunk_costs.take().unwrap_or_default(), writes: Default::default(), held: Some(Box::new(held)), worker, recorder, stack, view, began_at }
+        Done { stopped, state, last: None, why, costs: cp.chunk_costs.take().unwrap_or_default(), writes: Default::default(), held: Some(Box::new(held)), worker }
     };
     drop(cp);
     run.results.lock()[i] = Some(done);
@@ -847,53 +744,6 @@ impl Worker {
     /// drop of a held run's batches its executor keeps (`Cp::held_commit`).
     pub fn with_cp<R>(&self, f: impl FnOnce(&mut Cp) -> R) -> R {
         f(&mut self.cp.lock())
-    }
-
-    /// Runs `f` on recorder `r`'s command processor (the dispatcher's commit, `Done::recorder`).
-    pub fn with_cp_at<R>(&self, r: usize, f: impl FnOnce(&mut Cp) -> R) -> R {
-        match r {
-            1 => f(&mut self.cp1.get().and_then(|o| o.as_ref()).expect("second recorder").lock()),
-            _ => f(&mut self.cp.lock()),
-        }
-    }
-
-    /// `k` of recorder `r`'s held batches were committed or dropped (`held`).
-    pub fn held_done(&self, r: usize, k: usize) {
-        let h = &self.held[r.min(1)];
-        let _ = h.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some(v.saturating_sub(k)));
-    }
-
-    /// Batches recorder `r` holds for the dispatcher's commit.
-    pub fn held_count(&self, r: usize) -> usize {
-        self.held[r.min(1)].load(Ordering::Acquire)
-    }
-
-    /// The recorder a dispatcher chunk records into: the one holding fewer batches for the
-    /// commit (the second made on first need; 0 when it cannot be).
-    fn pick_recorder(&self) -> usize {
-        let second = self.cp1.get_or_init(|| {
-            let mut cp = Cp::new(&self.name, self.compute);
-            match cp.make_worker_exec() {
-                Ok(()) => Some(Mutex::new(cp)),
-                Err(e) => {
-                    crate::warn!("gpu[{}]: no second recorder for the dispatcher ({e})", self.name);
-                    None
-                }
-            }
-        });
-        if second.is_none() {
-            return 0;
-        }
-        if self.held[1].load(Ordering::Acquire) < self.held[0].load(Ordering::Acquire) {
-            1
-        } else {
-            0
-        }
-    }
-
-    /// Whether its second recorder was made.
-    pub fn has_second(&self) -> bool {
-        self.cp1.get().is_some_and(|o| o.is_some())
     }
 
     /// Gives it `run` to take chunks of; it starts once its pool wakes
@@ -915,7 +765,6 @@ pub fn reset_stats() {
         c.store(0, Ordering::Relaxed);
     }
     STOP_WHY.lock().clear();
-    super::cp::reset_dispatch();
     for c in &PAST {
         c.store(0, Ordering::Relaxed);
     }
@@ -1014,7 +863,7 @@ pub fn status() -> String {
     } else {
         String::new()
     };
-    super::cp::dispatch_line() + &past + &format!(
+    past + &format!(
         "    parallel runs: {runs} runs ({} split at equal recording cost), {} chunks to workers ({} commands; {} per recorder), {} stopped early ({}), {} cancelled; main waited {} ms for workers (its chunk {:.2}x a worker's), workers {} ms for their turns ({} batch slots added), per chunk: start latency {:.0} us (first chunks), setup {:.1} us, recording {:.0} us ({:.0} commands), closing {:.0} us, submitting and posting {:.1} us; runs seen by length (runs/commands) {}; by end {}; runs under 32 commands by end {}; compute queues' runs by length {}; by end {}{}\n",
         super::cp::PAR_COSTED.load(Ordering::Relaxed),
         CHUNKS.load(Ordering::Relaxed),
