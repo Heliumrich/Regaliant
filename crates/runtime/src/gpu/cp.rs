@@ -626,6 +626,9 @@ pub static HELD_RUNS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
 pub static PAST_WAITS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 static PAST_WAIT_STOPS: parking_lot::Mutex<Vec<(&'static str, u64)>> = parking_lot::Mutex::new(Vec::new());
 static PAST_WAIT_DROPS: parking_lot::Mutex<Vec<(&'static str, u64)>> = parking_lot::Mutex::new(Vec::new());
+/// The graphics CP's waits on labels queue 0x50 wrote last that did not pass at once and were
+/// not gone past, by the first condition of `past_wait_ok` that failed (`past_wait_not`).
+static PAST_WAIT_NOT: parking_lot::Mutex<Vec<(&'static str, u64)>> = parking_lot::Mutex::new(Vec::new());
 /// Held runs' chunks collected after their stretch settled and dropped, by reason (`Cp::unheld_collect`).
 static HELD_DROPS: parking_lot::Mutex<Vec<(&'static str, u64)>> = parking_lot::Mutex::new(Vec::new());
 
@@ -645,6 +648,7 @@ pub fn past_wait_reset() {
     PAST_SKIPPED.store(0, Ordering::Relaxed);
     PAST_WAIT_STOPS.lock().clear();
     PAST_WAIT_DROPS.lock().clear();
+    PAST_WAIT_NOT.lock().clear();
     HELD_DROPS.lock().clear();
     for c in HELD_RUNS.iter().chain(super::exec::HELD_RUN_STOPS.iter()).chain(super::exec::PAST_REPAIRS.iter()) {
         c.store(0, Ordering::Relaxed);
@@ -823,6 +827,14 @@ pub fn past_wait_status() -> String {
         super::exec::PAST_HOT[0].load(Ordering::Relaxed),
         super::exec::PAST_HOT[1].load(Ordering::Relaxed)
     ) + &{
+        let l = list(&PAST_WAIT_NOT);
+        if l.is_empty() {
+            String::new()
+        } else {
+            format!("    the graphics CP's waits on queue 0x50's labels not gone past, by why: {l}
+")
+        }
+    } + &{
         let r = |i: usize| super::exec::PAST_REPAIRS[i].load(Ordering::Relaxed);
         if r(0) == 0 {
             String::new()
@@ -3962,6 +3974,31 @@ impl Cp {
             && past_backoff_pass(a)
     }
 
+    /// Why a wait on a label queue 0x50 wrote last is not gone past (`past_wait_ok`'s first
+    /// condition that fails; None: not the graphics CP's, or not 0x50's label).
+    fn past_wait_not(&self, a: u64) -> Option<&'static str> {
+        if !self.main_gfx || !last_write(a).is_some_and(|(q, _, _)| q == "gpu-acb0x50") {
+            return None;
+        }
+        Some(if self.settling {
+            "settling a stretch"
+        } else if self.past.is_some() {
+            "recording past a run"
+        } else if self.past_wait.is_some() {
+            "in a stretch already"
+        } else if self.held.is_some() {
+            "held otherwise"
+        } else if self.par.is_some() {
+            "in a parallel run"
+        } else if self.depth != 1 {
+            "nested command buffer"
+        } else if self.exec.is_none() || super::capture::capturing() {
+            "no executor or capturing"
+        } else {
+            "backoff after drops"
+        })
+    }
+
     /// Goes past a label wait (`past_wait_ok`): this command processor's
     /// work so far to the GPU, its state noted, then on from the packet after
     /// the wait with its executor held (`Exec::past_begin`) until the label
@@ -6970,6 +7007,9 @@ impl Cp {
         if self.past_wait_ok(a) {
             self.last_wait_kind = b'G';
             return self.past_wait_start(control, a, wide, reference, mask, at);
+        }
+        if let Some(why) = self.past_wait_not(a) {
+            note_why(&PAST_WAIT_NOT, why);
         }
         label_event(&self.name, b'S', a, v0, reference, at);
         // Let recorded work and deferred effects progress while polling; a
