@@ -6466,6 +6466,9 @@ impl RangeLog {
         if w.1 == 0 {
             return;
         }
+        // (Counted before the write shows and again after: odd while a note is in progress,
+        // so a memo keyed on `notes` never takes in a check made in between, `notes_settled`.)
+        self.notes.fetch_add(1, Ordering::AcqRel);
         self.mark_pages(seq, w.0, w.1);
         self.latest_seq.fetch_max(seq, Ordering::SeqCst);
         let done = done_seq();
@@ -6481,6 +6484,7 @@ impl RangeLog {
         if writes.is_empty() {
             return;
         }
+        self.notes.fetch_add(1, Ordering::AcqRel);
         for (a, n) in writes.iter() {
             self.mark_pages(seq, a, n);
         }
@@ -6491,6 +6495,14 @@ impl RangeLog {
         g.insert_all(seq, writes);
         drop(g);
         self.notes.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Whether a check made while `notes` read `t` may be kept by a memo keyed on it: no note
+    /// was in progress then (`t` even) and none began since (2026-11-16: a noting thread
+    /// descheduled between making its write visible and counting it left pages answered clean
+    /// for ~10 ms while its write was in flight, `DS_CLEAN_CHECK`).
+    fn notes_settled(&self, t: u64) -> bool {
+        t & 1 == 0 && self.notes.load(Ordering::Acquire) == t
     }
 
     /// The latest unfinished batch that writes into `reads`.
@@ -14925,7 +14937,7 @@ impl Exec {
             }
             if written(self, *r) {
                 hit.push(t);
-            } else if self.tex_clean.len() < 4096 {
+            } else if self.tex_clean.len() < 4096 && INFLIGHT.notes_settled(tag[1]) {
                 self.tex_clean.insert(*r);
             }
         }
@@ -15226,7 +15238,9 @@ impl Exec {
                         clean = false;
                         break;
                     }
-                    self.clean_pages[slot] = page;
+                    if INFLIGHT.notes_settled(tag[1]) {
+                        self.clean_pages[slot] = page;
+                    }
                 }
                 if !clean {
                     dirty.push((a, n));
