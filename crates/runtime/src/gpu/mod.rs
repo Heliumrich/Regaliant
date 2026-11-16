@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 178] = [
+    static ALL: [Tunable; 180] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -210,6 +210,8 @@ pub mod tune {
         Tunable { name: "async_gfx_inline", env: "DS_ASYNC_GFX_INLINE", default: 12, value: AtomicU64::new(UNSET) },
         Tunable { name: "zk", env: "DS_ZK", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "xq_pre_c", env: "DS_XQ_PRE_C", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "steal", env: "DS_STEAL", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "steal_min", env: "DS_STEAL_MIN", default: 24, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1448,6 +1450,20 @@ pub mod tune {
     /// swamp x1.005, every cycle (FINDINGS.md 2026-11-16).
     pub fn xq_pre_c() -> bool {
         get(177) != 0
+    }
+
+    /// Work stealing inside parallel runs (`par::Steal`; read when a run is planned, so live at
+    /// the next run): a worker out of chunks takes the rest of the chunk with the most commands
+    /// left. Runs' last chunks ended 2.5-6 ms a frame after their mean in the walk's turning
+    /// timelines, two thirds of it more CPU in that chunk (FINDINGS.md 2026-11-16).
+    pub fn steal() -> bool {
+        get(178) != 0
+    }
+
+    /// The fewest whole commands a chunk must have left after the one its worker records for a
+    /// thief to cut it (`par::steal`; at least 8).
+    pub fn steal_min() -> u64 {
+        get(179)
     }
 
     /// Whether translations get `rdna::translate::Spec::hw_bounds` (scalar
