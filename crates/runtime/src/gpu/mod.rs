@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 180] = [
+    static ALL: [Tunable; 183] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -212,6 +212,9 @@ pub mod tune {
         Tunable { name: "xq_pre_c", env: "DS_XQ_PRE_C", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lean", env: "DS_LEAN", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lane", env: "DS_LANE", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "dispatch", env: "DS_DISPATCH", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "dispatch_window", env: "DS_DISPATCH_WINDOW", default: 24, value: AtomicU64::new(UNSET) },
+        Tunable { name: "dispatch_cmds", env: "DS_DISPATCH_CMDS", default: 48, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1470,6 +1473,23 @@ pub mod tune {
     /// and lean-check answer again in full and compares.
     pub fn lane() -> bool {
         get(179) != 0
+    }
+
+    /// The dispatcher (ROUTE60.md "2026-11-16 night"): the graphics command processor walks
+    /// and plans, its serial stretches and its runs' chunks recorded held on the workers and
+    /// committed in program order (`Cp::dispatch_step`).
+    pub fn dispatch() -> bool {
+        get(180) != 0
+    }
+
+    /// The dispatcher's segments in flight at most.
+    pub fn dispatch_window() -> u64 {
+        get(181)
+    }
+
+    /// The commands of a dispatcher's serial stretch at most.
+    pub fn dispatch_cmds() -> u64 {
+        get(182)
     }
 
     /// Whether translations get `rdna::translate::Spec::hw_bounds` (scalar

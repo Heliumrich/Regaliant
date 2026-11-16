@@ -358,6 +358,9 @@ pub struct Cp {
     /// A parallel worker: the label waits its run holds (`par::Run::
     /// passed_waits`).
     pub chunk_waits: std::sync::Arc<[u64]>,
+    /// A worker's dispatcher task: this queue's label writes before it that were not
+    /// committed when it was planned (`par::Run::labels`; `held_wait` passes on them).
+    pub chunk_labels: std::sync::Arc<[(u64, u64, u8)]>,
     /// The stretch `handshake_census` scanned last: its buffer's end and
     /// its end.
     hs_until: (u64, u64),
@@ -384,6 +387,11 @@ pub struct Cp {
     /// (`take_rewind`: buffer, address).
     pub cur_buf: usize,
     rewind: Option<(usize, u64)>,
+    /// The dispatcher's segments in flight (`tune dispatch`, `dispatch_step`), and the planner
+    /// called by it (`par_plan` posts the run's chunks as its segments, `disp_planned` its end).
+    disp: Option<Box<Disp>>,
+    disp_planning: bool,
+    disp_planned: Option<u64>,
 }
 
 /// The recording cost of a parallel run's commands as its workers measured
@@ -1841,6 +1849,25 @@ fn op_census_on() -> bool {
     *W.get_or_init(|| std::env::var("DS_OP_CENSUS").ok().as_deref() == Some("1"))
 }
 static OP_CENSUS: [[AtomicU64; 256]; 2] = [const { [const { AtomicU64::new(0) }; 256] }; 2];
+
+/// The dispatcher's tasks' label waits on this queue's earlier tasks' writes (`held_wait`):
+/// [passed, stopped].
+static DISPATCH_LABELS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The buffer a dispatcher segment lies in as its command processor fetched it: the copy of a
+/// small buffer (`words`: base and words), else guest memory from `from`.
+fn fetched_of(from: u64, words: Option<&(u64, Arc<Vec<u32>>)>) -> Fetched {
+    match words {
+        Some((base, w)) => Fetched { base: *base, words: (**w).clone(), live: false },
+        None => Fetched::new(from, 0),
+    }
+}
+
+/// Packets a dispatcher task does not take (the command processor executes them itself, all
+/// work before them committed): nested and chained buffers, rewinds and predication state.
+fn dispatch_refuses(opcode: u32) -> bool {
+    matches!(opcode, op::INDIRECT_BUFFER | op::REWIND | op::SET_PREDICATION | op::COND_EXEC | op::DMA_DATA | op::COPY_DATA)
+}
 static OP_REFUSED: parking_lot::Mutex<Vec<(&'static str, u64)>> = parking_lot::Mutex::new(Vec::new());
 
 fn op_census(opcode: u32, depth: u32, refused: Option<&'static str>) {
@@ -2257,6 +2284,10 @@ impl Cp {
             par_pool: super::par::Pool::new(),
             chunk_costs: None,
             chunk_waits: std::sync::Arc::from(Vec::new()),
+            chunk_labels: std::sync::Arc::from(Vec::new()),
+            disp: None,
+            disp_planning: false,
+            disp_planned: None,
             hs_until: (0, 0),
             run_costs: HashMap::new(),
             run_costs_pruned: u64::MAX,
@@ -2443,6 +2474,22 @@ impl Cp {
             self.held_stop("label wait (its own value)", at);
             return Flow::Next;
         }
+        // A dispatcher task: this queue's last write to the label before it, in an earlier
+        // task not committed when it was planned, comes before memory (its batches go to the
+        // GPU first; this batch's leading barrier orders its work after them). A timestamp
+        // (value unknown) stops it.
+        if let Some(&(_, v, bytes)) = self.chunk_labels.iter().rev().find(|l| l.0 == a) {
+            let v = if wide { v } else { v & 0xFFFF_FFFF };
+            if bytes != 0 && !(wide && bytes < 8) && pass(v) {
+                DISPATCH_LABELS[0].fetch_add(1, Ordering::Relaxed);
+                label_event(&self.name, b'q', a, v, reference, at);
+                return Flow::Next;
+            }
+            DISPATCH_LABELS[1].fetch_add(1, Ordering::Relaxed);
+            label_event(&self.name, b'x', a, v, reference, at);
+            self.held_stop("label wait (an earlier task's value)", at);
+            return Flow::Next;
+        }
         if pass(read()) {
             if let Some(e) = self.exec.as_mut() {
                 e.note_held_reads(&[(a, if wide { 8 } else { 4 })], 3);
@@ -2581,6 +2628,90 @@ impl Cp {
         super::par::COMMANDS.fetch_add(commands, Ordering::Relaxed);
         self.drop_ahead();
         None
+    }
+
+    /// A dispatcher task's serial stretch [from, to) on a worker (`par::Run::stretch`, `tune
+    /// dispatch`): its packets executed as the graphics command processor would, recording held
+    /// (the worker began its executor's held chunk), from the context stack `stack`; a packet a
+    /// held recorder refuses, a predicated one, or a stop inside one ends it there (it and the
+    /// rest are left to the command processor's commit). Returns where it stopped, or None.
+    pub fn run_stretch(&mut self, from: u64, to: u64, stack: &[Vec<u32>], words: Option<&(u64, Arc<Vec<u32>>)>) -> Option<u64> {
+        let f = fetched_of(from, words);
+        self.ctx_stack.clear();
+        self.ctx_stack.extend(stack.iter().cloned());
+        self.held = Some(Box::new(HeldCp { stop: None, commands: 0 }));
+        // (Its CP writes follow the GPU work before them, as after a flush: whether one was
+        // asked for before the task is not known here.)
+        self.fence_pending = true;
+        self.pred = None;
+        let mut cur = from;
+        let mut commands = 0u64;
+        let stop = loop {
+            if cur >= to {
+                break None;
+            }
+            if super::shutting_down() || !valid(cur, 4) {
+                break Some(cur);
+            }
+            if self.held_halted(cur) {
+                break Some(cur);
+            }
+            let h = f.rd(cur);
+            match h >> 30 {
+                3 => {}
+                2 => {
+                    cur += 4;
+                    continue;
+                }
+                _ => break Some(cur),
+            }
+            let count = (h >> 16) & 0x3FFF;
+            let opcode = (h >> 8) & 0xFF;
+            if count == 0x3FFF {
+                cur += 4;
+                continue;
+            }
+            let n = count as u64 + 1;
+            let next = cur + 4 * (n + 1);
+            if next > to || !valid(cur, 4 * (n + 1)) || h & 1 != 0 {
+                break Some(cur);
+            }
+            let at = cur;
+            let p = |i: u64| f.rd(at + 4 * (1 + i));
+            if dispatch_refuses(opcode) || self.held_refuses(opcode, n, &p).is_some() {
+                break Some(cur);
+            }
+            PACKETS.fetch_add(1, Ordering::Relaxed);
+            self.cur_packet = cur;
+            if super::exec::replay_census_on() {
+                super::exec::CUR_PACKET.with(|c| c.set(cur));
+            }
+            self.cur_opcode = opcode;
+            let command = is_command(opcode) || matches!(opcode, op::DRAW_INDEX_INDIRECT_MULTI | op::DRAW_INDIRECT_MULTI | op::DRAW_INDEX_MULTI_AUTO);
+            if command && matches!(opcode, op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT) && super::compile::at_first_uses() {
+                self.compile_ctx.set(Some((f.base, next, to)));
+            }
+            let flow = self.packet(opcode, h, cur, n, &p);
+            self.compile_ctx.set(None);
+            if command {
+                for s in self.take_ahead().iter().flatten() {
+                    s.cancel();
+                }
+            }
+            if self.exec.as_ref().is_some_and(|e| e.stopped) || self.held.as_ref().is_some_and(|h| h.stop.is_some()) {
+                break Some(cur);
+            }
+            if !matches!(flow, Flow::Next) {
+                break Some(cur);
+            }
+            commands += command as u64;
+            cur = next;
+        };
+        self.held = None;
+        self.pred = None;
+        super::par::COMMANDS.fetch_add(commands, Ordering::Relaxed);
+        self.drop_ahead();
+        stop
     }
 
     /// A packet the graphics queue's runs hold although it is neither state
@@ -3011,6 +3142,28 @@ impl Cp {
         }
     }
 
+    /// A dispatcher task's held recording binds storage images held (`Exec::set_held_dispatch`).
+    pub fn set_held_dispatch(&mut self, on: bool) {
+        if let Some(e) = self.exec.as_mut() {
+            e.set_held_dispatch(on);
+        }
+    }
+
+    /// A worker records a dispatcher run's chunk in held mode (its CPU reads noted).
+    pub fn set_held_mode(&mut self, on: bool) {
+        self.held = on.then(|| Box::new(HeldCp { stop: None, commands: 0 }));
+    }
+
+    /// Its front end 2 view now (`fe2::NO_VIEW`: none).
+    pub fn fe2_view_now(&self) -> u32 {
+        self.fe2_view.as_ref().map_or(super::fe2::NO_VIEW, |c| c.load(Ordering::Acquire))
+    }
+
+    /// Its context stack now (a dispatcher stretch's end, `par::Done::stack`).
+    pub fn ctx_stack_now(&self) -> Vec<Vec<u32>> {
+        self.ctx_stack.clone()
+    }
+
     /// A held run's chunk begins on this worker (`Exec::held_chunk_begin`).
     pub fn held_chunk_begin(&mut self, writes: Arc<super::ranges::Ranges>, keys: Arc<HashMap<super::images::ImageKey, u8>>) {
         if let Some(e) = self.exec.as_mut() {
@@ -3032,6 +3185,13 @@ impl Cp {
     pub fn discard_closed_tail(&mut self, keep: usize) {
         if let Some(e) = self.exec.as_mut() {
             e.discard_closed_tail(keep);
+        }
+    }
+
+    /// Drops its executor's first `n` closed batches (`Exec::discard_closed_head`).
+    pub fn discard_closed_head(&mut self, n: usize) {
+        if let Some(e) = self.exec.as_mut() {
+            e.discard_closed_head(n);
         }
     }
 
@@ -3123,9 +3283,11 @@ impl Cp {
                 };
                 if vtx_loc != 0 {
                     put_reg(&mut st.regs.sh, Space::Sh, SH_DWORDS, vtx_loc as usize, bv);
+                    note_arg_sgpr(vtx_loc);
                 }
                 if inst_loc != 0 {
                     put_reg(&mut st.regs.sh, Space::Sh, SH_DWORDS, inst_loc as usize, si);
+                    note_arg_sgpr(inst_loc);
                 }
             }
             op::DRAW_INDEX_INDIRECT_MULTI | op::DRAW_INDIRECT_MULTI => {
@@ -3164,12 +3326,15 @@ impl Cp {
                 };
                 if vtx_loc != 0 {
                     put_reg(&mut st.regs.sh, Space::Sh, SH_DWORDS, vtx_loc as usize, bv);
+                    note_arg_sgpr(vtx_loc);
                 }
                 if inst_loc != 0 {
                     put_reg(&mut st.regs.sh, Space::Sh, SH_DWORDS, inst_loc as usize, si);
+                    note_arg_sgpr(inst_loc);
                 }
                 if id_enable && id_loc != 0 {
                     put_reg(&mut st.regs.sh, Space::Sh, SH_DWORDS, id_loc as usize, i);
+                    note_arg_sgpr(id_loc);
                 }
             }
             _ => {}
@@ -3238,6 +3403,9 @@ impl Cp {
         }
         // (Profile: `tune cp_classes`, `PLAN_PHASES`.)
         let mut lap = PlanLaps(super::tune::cp_classes().then(Instant::now));
+        // The dispatcher's (`dispatch_step`): every chunk goes to the workers, recorded held and
+        // committed in program order; this command processor goes on from the walked end.
+        let disp = self.disp_planning;
         let k = if self.compute { compute_workers() } else { super::par::workers() };
         // Inside a stretch past a label wait (`held_runs_ok`): a held run (`par::Run::held`).
         let held_run = self.held.is_some();
@@ -3494,7 +3662,7 @@ impl Cp {
         // The main command processor's chunk first (`par::main_weight`
         // times a worker's), then equal ones for the workers' queue.
         let m = chunks - 1;
-        let w = super::par::main_weight();
+        let w = if disp { 1.0 } else { super::par::main_weight() };
         let main_n = ((n as f64 * w / (w + m as f64)).round() as usize).clamp(chunk_min, n - m * chunk_min);
         let per = (n - main_n) / m;
         // At equal recording cost when the run was measured before, else at
@@ -3521,6 +3689,7 @@ impl Cp {
         let starts: Vec<u64> = firsts.iter().map(|&i| if i == 0 { from } else { ends[i - 1] }).collect();
         // The state at each chunk's start.
         let mut st = self.chunk_state();
+        let st0 = disp.then(|| st.clone());
         let mut states: Vec<Box<ChunkState>> = Vec::new();
         let mut c = from;
         // (`tune plan_check`: the same a register at a time.)
@@ -3589,7 +3758,7 @@ impl Cp {
         // processor goes on from there before collecting the chunks).
         let mut end_unknown: Vec<u32> = Vec::new();
         let timing = lap.0.is_some();
-        let end_state = (super::tune::past_runs() && self.main_gfx && !held_run).then(|| {
+        let end_state = (disp || (super::tune::past_runs() && self.main_gfx && !held_run)).then(|| {
             let tc = timing.then(Instant::now);
             let mut st = st.clone();
             if let Some(tc) = tc {
@@ -3662,7 +3831,7 @@ impl Cp {
         // run handed over first measured level: 2026-10-17, 2026-11-03).
         // (Held: nothing is submitted before the stretch settles; the workers stop on reading
         // what its held work writes, `par::Run::held_writes`.)
-        let main_writes = if held_run { Default::default() } else { self.exec.as_ref().map(|e| e.unsubmitted_writes()).unwrap_or_default() };
+        let main_writes = if held_run || disp { Default::default() } else { self.exec.as_ref().map(|e| e.unsubmitted_writes()).unwrap_or_default() };
         if lap.0.is_some() && !main_writes.is_empty() {
             // (Profile: how much of them the forwarded copies cover.)
             let ranges: Vec<(u64, u64)> = main_writes.iter().collect();
@@ -3685,7 +3854,12 @@ impl Cp {
             }
         }
         lap.mark(8);
-        let queue = states.into_iter().enumerate().map(|(i, st)| (st, starts[i], if i + 1 < starts.len() { starts[i + 1] } else { run_end })).collect();
+        let mut queue: Vec<(Box<ChunkState>, u64, u64)> = states.into_iter().enumerate().map(|(i, st)| (st, starts[i], if i + 1 < starts.len() { starts[i + 1] } else { run_end })).collect();
+        // (The dispatcher's: this command processor's chunk is the workers' first.)
+        if let Some(s0) = st0 {
+            queue.insert(0, (Box::new(s0), from, starts[0]));
+        }
+        let disp_segs: Vec<(Box<ChunkState>, u64, u64)> = if disp { queue.iter().map(|(s, a, b)| (s.clone(), *a, *b)).collect() } else { Vec::new() };
         let mut run = super::par::Run::new(queue);
         run.timed = true;
         let mut approved: Vec<u64> = passed.iter().map(|w| w.0).chain(own_waits.iter().copied()).collect();
@@ -3713,7 +3887,11 @@ impl Cp {
             HELD_RUNS[1].fetch_add(starts.len() as u64, Ordering::Relaxed);
             HELD_RUNS[8].fetch_add((n - main_n) as u64, Ordering::Relaxed);
         }
-        if self.main_gfx && !self.compute && super::hscensus::on() && !held_run {
+        if disp {
+            run.held = true;
+            run.dispatch = true;
+        }
+        if self.main_gfx && !self.compute && super::hscensus::on() && !held_run && !disp {
             run.hs_seg = super::hscensus::next_segment();
             if let Some(e) = self.exec.as_mut() {
                 e.hs_seg = run.hs_seg;
@@ -3724,10 +3902,16 @@ impl Cp {
         let run = Arc::new(run);
         // Its own part, queued before the workers' chunks: part 0 of the run
         // (not past a run or held: then it has none before them).
-        if self.past.is_none() && self.held.is_none() {
+        if self.past.is_none() && self.held.is_none() && !disp {
             self.fe2_set_run(run.id, 0);
         }
         lap.mark(9);
+        if disp {
+            // (One more chunk than workers' share: every worker may take it.)
+            if let Some(w) = self.par_pool.worker(workers.len(), &self.name, self.compute).filter(|_| workers.len() < k) {
+                workers.push(w);
+            }
+        }
         for w in &workers {
             w.give(run.clone());
         }
@@ -3735,6 +3919,19 @@ impl Cp {
         lap.mark(10);
         super::par::RUNS.fetch_add(1, Ordering::Relaxed);
         super::par::CHUNKS.fetch_add(starts.len() as u64, Ordering::Relaxed);
+        if disp {
+            let n_chunks = disp_segs.len();
+            self.dispatch_push_run(run, disp_segs);
+            if let Some(es) = end_state.as_ref() {
+                self.set_chunk_state(es);
+            }
+            self.disp_planned = Some(run_end);
+            disp_count(D_RUNS, 1);
+            disp_count(D_RUN_CHUNKS, n_chunks as u64);
+            lap.mark(5);
+            PLAN_PHASES[6].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let buf = self.cur_buf;
         self.par = Some(ParRun { starts, end: run_end, next: 0, run, waited_ns: 0, sync, sig, n, firsts, writes: Default::default(), end_state, end_unknown, buf, sub: self.sub_index, held: held_run, unheld: None });
         lap.mark(5);
@@ -5832,6 +6029,11 @@ impl Cp {
         let acb_ops = self.compute && super::tune::cp_classes() && self.name.strip_prefix("gpu-acb").and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()) == Some(super::tune::cp_classes_acb());
         loop {
             if cur >= end {
+                // The dispatcher's segments are committed at a buffer's end unless the
+                // submission's next buffer goes on with them.
+                if self.depth == 1 && self.disp.as_ref().is_some_and(|d| !d.segs.is_empty()) && !(self.next_in_submission || self.more_follows.as_ref().is_some_and(|f| f())) {
+                    self.dispatch_drain("buffer end");
+                }
                 // Past a run, the buffer's end is a stop (what was recorded
                 // past it may be recorded again, from the run's end), unless
                 // the submission's next buffer goes on with it.
@@ -5926,6 +6128,17 @@ impl Cp {
                 break;
             }
             let skip = self.par_skip.0 == end && cur < self.par_skip.1;
+            // The dispatcher (`tune dispatch`): from here a run or a serial stretch goes to the
+            // workers, or (None) this command processor executes the packet, all before it
+            // committed.
+            if self.disp_ok(&f) {
+                if let Some(c) = self.dispatch_step(&f, cur, end, opcode, h, n) {
+                    cur = c;
+                    continue;
+                }
+            } else if self.disp.as_ref().is_some_and(|d| !d.segs.is_empty()) {
+                self.dispatch_drain("left the dispatcher");
+            }
             if self.past.is_some() && self.par.is_none() && !skip && is_command(opcode) && h & 1 == 0 && f.words.is_empty() && !f.live && super::par::workers() > 0 && self.par_would_split(&f, cur, end) {
                 // The next parallel run: planned once this one is collected.
                 self.held_stop("next run", cur);
@@ -6142,6 +6355,11 @@ impl Cp {
             let flow = self.packet(opcode, h, cur, n, &p);
             self.wait_ctx = None;
             self.compile_ctx.set(None);
+            // (The dispatcher's: a packet executed here goes to the GPU before the tasks after
+            // it are recorded, which see its writes as submitted work.)
+            if self.disp.is_some() && self.disp_ok(&f) {
+                self.submit_gpu("dispatch own");
+            }
             class_end(class, t);
             acb_op_end(opcode, ta);
             stretch_op_end(opcode, tw);
@@ -7490,6 +7708,865 @@ enum Flow {
     Skip(u32),
     Chain(u64, u32),
     Stop,
+}
+
+// ---- The dispatcher (`tune dispatch`; ROUTE60.md "2026-11-16 night") ----
+//
+// The graphics command processor walks its stream and plans; it records nothing of what
+// tasks can take. Each serial stretch (to a run long enough to split, a packet tasks do not
+// take, the buffer's end or `tune dispatch_cmds` commands) and each chunk of a run goes to
+// the workers as a held chunk (`par::Run::dispatch`), recorded into their recorders' batches
+// and posted without a turn. The command processor commits the segments in program order
+// (`dispatch_commit`): each is checked against what the segments committed since it was
+// planned wrote and noted (its CPU reads, its uploads, its images) and against the actual end
+// state of the segment before it; then its image notes apply and its batches go to the GPU.
+// A segment that fails a check is executed here with every segment after it (`dispatch_replay`);
+// one whose worker stopped has the rest executed here (`dispatch_rest`). Packets tasks do
+// not take are executed here once everything before them is committed (`dispatch_drain`).
+
+/// A segment of the dispatcher's work in flight (`Disp::segs`): chunk `i` of the held run
+/// `run`, packets [from, to), in program order.
+struct DSeg {
+    run: Arc<super::par::Run>,
+    i: usize,
+    from: u64,
+    to: u64,
+    /// Its start state as walked (compared at its commit with the actual end of the segment
+    /// before it) and the context stack then.
+    start: Box<ChunkState>,
+    stack: Vec<Vec<u32>>,
+    /// The segments committed when it was planned: it is checked against the writes and image
+    /// notes of those committed since.
+    planned_at: u64,
+    /// The walk's label writes through its end (`Disp::labels_base` + index).
+    labels_to: usize,
+    /// Its buffer's copy (a small buffer the command processor fetched), else None.
+    words: Option<(u64, Arc<Vec<u32>>)>,
+}
+
+/// The dispatcher's state on the graphics command processor.
+#[derive(Default)]
+struct Disp {
+    segs: std::collections::VecDeque<DSeg>,
+    commits: u64,
+    /// Segments committed while others planned before were in flight: commit number, what it
+    /// writes, the images it noted (clears and overwrites).
+    recent: std::collections::VecDeque<(u64, super::ranges::Ranges, Vec<super::images::ImageKey>)>,
+    /// The walk's label writes not committed yet (address, value, bytes), and how many were
+    /// committed before them.
+    labels: Vec<(u64, u64, u8)>,
+    labels_base: usize,
+    /// The actual state at the end of the last committed segment (None: this command
+    /// processor's own state is the actual one).
+    actual: Option<Box<ChunkState>>,
+    /// The newest front end 2 view a committed segment's worker ended with (a label wait it
+    /// passed on what the CPU released): segments planned before whose checks needed an older
+    /// epoch are checked again as of it at their commit (`Exec::chunk_stale_for`).
+    view: u32,
+}
+
+/// SH registers the walk set from indirect draws' arguments (`apply_state`; a bit per register
+/// below 1024): a draw that hands its start instance to Vulkan (`tune cpu_args_base`) leaves
+/// them as they were, so the dispatcher's start-state check leaves them out (as past runs do).
+static ARG_SGPRS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+
+fn note_arg_sgpr(i: u32) {
+    if i < 1024 {
+        let (w, b) = ((i / 64) as usize, i % 64);
+        if ARG_SGPRS[w].load(Ordering::Relaxed) & (1 << b) == 0 {
+            ARG_SGPRS[w].fetch_or(1 << b, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The registers `note_arg_sgpr` noted.
+fn arg_sgprs() -> Vec<u32> {
+    let mut v = Vec::new();
+    for (w, c) in ARG_SGPRS.iter().enumerate() {
+        let mut m = c.load(Ordering::Relaxed);
+        while m != 0 {
+            let b = m.trailing_zeros();
+            v.push(w as u32 * 64 + b);
+            m &= m - 1;
+        }
+    }
+    v
+}
+
+/// The first registers where two states differ (diagnosis): (space, index, a's, b's).
+fn state_diff(a: &ChunkState, b: &ChunkState, skip: &[u32]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (k, (x, y)) in [(&a.regs.ctx, &b.regs.ctx), (&a.regs.sh, &b.regs.sh), (&a.regs.uc, &b.regs.uc)].iter().enumerate() {
+        let n = x.len().max(y.len());
+        for i in 0..n {
+            let (p, q) = (x.get(i).copied().unwrap_or(0), y.get(i).copied().unwrap_or(0));
+            if p != q && !(k == 1 && skip.contains(&(i as u32))) {
+                out.push(format!("{}[{i:#x}] {p:#x}/{q:#x}", ["ctx", "sh", "uc"][k]));
+                if out.len() >= 6 {
+                    return out;
+                }
+            }
+        }
+    }
+    if a.index_base != b.index_base || a.index_count != b.index_count || a.num_instances != b.num_instances || a.draw_indirect_base != b.draw_indirect_base || a.dispatch_indirect_base != b.dispatch_indirect_base {
+        out.push(format!("fields ({:#x} {} {} {:#x} {:#x} / {:#x} {} {} {:#x} {:#x})", a.index_base, a.index_count, a.num_instances, a.draw_indirect_base, a.dispatch_indirect_base, b.index_base, b.index_count, b.num_instances, b.draw_indirect_base, b.dispatch_indirect_base));
+    }
+    out
+}
+
+/// Segments the dispatcher committed (program order; bumped once a segment's batches went to
+/// the GPU, their writes in the in-flight log): a chunk reads it when it begins recording
+/// (`par::Done::began_at`), and is checked only against what was committed from then on.
+static DISPATCH_COMMITS: AtomicU64 = AtomicU64::new(0);
+
+pub fn dispatch_commits() -> u64 {
+    DISPATCH_COMMITS.load(Ordering::Acquire)
+}
+
+/// The dispatcher's counts (`dispatch_line`).
+static DISP: [AtomicU64; 30] = [const { AtomicU64::new(0) }; 30];
+const D_STRETCHES: usize = 0;
+const D_STRETCH_CMDS: usize = 1;
+const D_RUNS: usize = 2;
+const D_RUN_CHUNKS: usize = 3;
+const D_COMMITS: usize = 4;
+const D_COMMIT_NS: usize = 5;
+const D_WAIT_NS: usize = 6;
+const D_WAITS: usize = 7;
+const D_DRAINS: usize = 8;
+const D_REFUSED: usize = 9;
+const D_STOPS: usize = 10;
+const D_REPLAYS: usize = 11;
+const D_REPLAYED: usize = 12;
+const D_FAIL_STATE: usize = 13;
+const D_FAIL_READS: usize = 14;
+const D_FAIL_UP: usize = 15;
+const D_FAIL_IMAGES: usize = 16;
+const D_FAIL_FAILED: usize = 17;
+const D_PLAN_NS: usize = 18;
+const D_DRAIN_NS: usize = 19;
+const D_INFLIGHT: usize = 20;
+const D_EMPTY: usize = 21;
+const D_REST_NS: usize = 22;
+const D_REPLAY_NS: usize = 23;
+const D_RECHECKS: usize = 24;
+const D_REPAIRS: usize = 25;
+const D_FAIL_STALE: usize = 26;
+const D_FAIL_ALIAS: usize = 27;
+
+/// The dispatcher's CPU-read conflicts by the read's kind (`exec::HELD_READ_KINDS`).
+static READ_KINDS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// Of them, reads the walk's CP writes of earlier tasks cover (diagnosis).
+static READ_COVERED: AtomicU64 = AtomicU64::new(0);
+
+/// The first conflicts the dispatcher's checks found, logged (diagnosis: what they read and
+/// what the segments committed since wrote there).
+fn note_conflict(kind: &str, seg: &DSeg, a: u64, n: u64, w: &super::ranges::Ranges) {
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) >= 40 {
+        return;
+    }
+    let hit: Vec<String> = w.intersect(a, n).iter().take(3).map(|&(x, m)| format!("{x:#x}+{m:#x}")).collect();
+    let owner = crate::engine::names().get(&crate::engine::owner(a)).cloned().unwrap_or_default();
+    crate::info!("gpu: dispatcher conflict: a {} segment {:#x}..{:#x} ({kind} {a:#x}+{n:#x}, {owner}) meets writes committed since ({}; {} ranges written)", if seg.run.stretch { "stretch" } else { "run chunk" }, seg.from, seg.to, hit.join(", "), w.iter().count());
+}
+static DISP_STOPS: parking_lot::Mutex<Vec<(&'static str, u64)>> = parking_lot::Mutex::new(Vec::new());
+static DISP_DRAINS: parking_lot::Mutex<Vec<(&'static str, u64)>> = parking_lot::Mutex::new(Vec::new());
+
+fn disp_count(k: usize, v: u64) {
+    DISP[k].fetch_add(v, Ordering::Relaxed);
+}
+
+fn disp_note(l: &parking_lot::Mutex<Vec<(&'static str, u64)>>, why: &'static str) {
+    let mut g = l.lock();
+    match g.iter_mut().find(|e| e.0 == why) {
+        Some(e) => e.1 += 1,
+        None => g.push((why, 1)),
+    }
+}
+
+/// Clears the dispatcher's counts (`profile reset`).
+pub fn reset_dispatch() {
+    for c in &DISP {
+        c.store(0, Ordering::Relaxed);
+    }
+    DISP_STOPS.lock().clear();
+    DISP_DRAINS.lock().clear();
+    DISPATCH_LABELS[0].store(0, Ordering::Relaxed);
+    DISPATCH_LABELS[1].store(0, Ordering::Relaxed);
+    for c in super::exec::HELD_STORAGE.iter().chain(READ_KINDS.iter()).chain(super::exec::DEFERRED_PLACES.iter()) {
+        c.store(0, Ordering::Relaxed);
+    }
+    READ_COVERED.store(0, Ordering::Relaxed);
+}
+
+/// The dispatcher's status line ("" before it posted anything).
+pub fn dispatch_line() -> String {
+    let v: Vec<u64> = DISP.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    if v[D_STRETCHES] + v[D_RUNS] == 0 {
+        return String::new();
+    }
+    let list = |l: &parking_lot::Mutex<Vec<(&'static str, u64)>>| {
+        let mut g = l.lock().clone();
+        g.sort_by_key(|e| std::cmp::Reverse(e.1));
+        g.iter().map(|(w, n)| format!("{w} {n}")).collect::<Vec<_>>().join(", ")
+    };
+    let segs = v[D_STRETCHES] + v[D_RUN_CHUNKS];
+    format!(
+        "    dispatcher (`tune dispatch`): {} stretches ({:.1} commands each), {} runs ({} chunks); {} commits ({:.1} us each), {:.1} segments in flight at a plan on average, planning {:.1} us a segment; the command processor waited {} times for the first segment ({:.0} us each); {} packets it executed itself, {} drains ({:.0} us each: {}), {} stretches that could not begin; {} segments stopped on their worker (the rest here, {:.0} us each: {}); {} replays of {} segments ({:.0} us each; start state {}, CPU reads {} (by kind {:?}; covered by earlier tasks' CP writes {}), uploads {}, storage image aliases {}, failed {}, stale pages {}); image clears or reloads resolved at a commit {}; storage images bound held {} (first writes stopped {}, own aliases stopped {}); placements over contested pages deferred to their commit {} ({} failed); segments checked again at a newer view {} ({} repaired); label waits on earlier tasks' writes passed {}, stopped {}\n",
+        v[D_STRETCHES],
+        v[D_STRETCH_CMDS] as f64 / v[D_STRETCHES].max(1) as f64,
+        v[D_RUNS],
+        v[D_RUN_CHUNKS],
+        v[D_COMMITS],
+        v[D_COMMIT_NS] as f64 / 1e3 / v[D_COMMITS].max(1) as f64,
+        v[D_INFLIGHT] as f64 / (v[D_STRETCHES] + v[D_RUNS]).max(1) as f64,
+        v[D_PLAN_NS] as f64 / 1e3 / segs.max(1) as f64,
+        v[D_WAITS],
+        v[D_WAIT_NS] as f64 / 1e3 / v[D_WAITS].max(1) as f64,
+        v[D_REFUSED],
+        v[D_DRAINS],
+        v[D_DRAIN_NS] as f64 / 1e3 / v[D_DRAINS].max(1) as f64,
+        list(&DISP_DRAINS),
+        v[D_EMPTY],
+        v[D_STOPS],
+        v[D_REST_NS] as f64 / 1e3 / v[D_STOPS].max(1) as f64,
+        list(&DISP_STOPS),
+        v[D_REPLAYS],
+        v[D_REPLAYED],
+        v[D_REPLAY_NS] as f64 / 1e3 / v[D_REPLAYS].max(1) as f64,
+        v[D_FAIL_STATE],
+        v[D_FAIL_READS],
+        READ_KINDS.iter().map(|c| c.load(Ordering::Relaxed)).collect::<Vec<_>>(),
+        READ_COVERED.load(Ordering::Relaxed),
+        v[D_FAIL_UP],
+        v[D_FAIL_ALIAS],
+        v[D_FAIL_FAILED],
+        v[D_FAIL_STALE],
+        v[D_FAIL_IMAGES],
+        super::exec::HELD_STORAGE[0].load(Ordering::Relaxed),
+        super::exec::HELD_STORAGE[1].load(Ordering::Relaxed),
+        super::exec::HELD_STORAGE[2].load(Ordering::Relaxed),
+        super::exec::DEFERRED_PLACES[0].load(Ordering::Relaxed),
+        super::exec::DEFERRED_PLACES[1].load(Ordering::Relaxed),
+        v[D_RECHECKS],
+        v[D_REPAIRS],
+        DISPATCH_LABELS[0].load(Ordering::Relaxed),
+        DISPATCH_LABELS[1].load(Ordering::Relaxed)
+    )
+}
+
+/// Why a dispatcher segment fails its commit's checks (`D_FAIL_*`), or None.
+fn dispatch_check(d: &Disp, seg: &DSeg, done: &super::par::Done) -> Option<usize> {
+    let Some(h) = done.held.as_deref() else { return Some(D_FAIL_FAILED) };
+    if let Some(a) = d.actual.as_deref() {
+        let skip = arg_sgprs();
+        if !chunk_states_equal(&seg.start, a, &skip) {
+            static LOGGED: AtomicU64 = AtomicU64::new(0);
+            if LOGGED.fetch_add(1, Ordering::Relaxed) < 24 {
+                crate::info!("gpu: dispatcher start state: a {} segment {:#x}..{:#x} (walked/actual): {}", if seg.run.stretch { "stretch" } else { "run chunk" }, seg.from, seg.to, state_diff(&seg.start, a, &skip).join(", "));
+            }
+            return Some(D_FAIL_STATE);
+        }
+    }
+    let from = seg.planned_at.max(done.began_at);
+    for (_, w, stored) in d.recent.iter().filter(|r| r.0 >= from) {
+        if !w.is_empty() {
+            if let Some(i) = h.reads.iter().position(|&(a, n)| w.overlaps(a, n)) {
+                let (a, n) = h.reads[i];
+                let kind = h.kinds.get(i).copied().unwrap_or(u8::MAX);
+                if let Some(c) = READ_KINDS.get(kind as usize) {
+                    c.fetch_add(1, Ordering::Relaxed);
+                }
+                let name = super::exec::HELD_READ_KINDS.get(kind as usize).copied().unwrap_or("?");
+                // (Diagnosis: whether the walk's CP writes of earlier tasks cover the read.)
+                let covered = (a..a + n).step_by(4).all(|x| seg.run.labels.iter().any(|l| l.2 != 0 && l.0 <= x && x < l.0 + l.2 as u64));
+                if covered {
+                    READ_COVERED.fetch_add(1, Ordering::Relaxed);
+                }
+                note_conflict(if covered { "CP-written read" } else { name }, seg, a, n, w);
+                return Some(D_FAIL_READS);
+            }
+            if let Some(&pg) = h.up.iter().find(|&&pg| w.overlaps(pg, super::resident::PAGE)) {
+                note_conflict("upload", seg, pg, super::resident::PAGE, w);
+                super::exec::contest_page(pg);
+                return Some(D_FAIL_UP);
+            }
+        }
+        // (An alias of a storage image written since: its copy from that image follows the
+        // write's note, which the task's recording did not see.)
+        if !stored.is_empty() && h.keys.iter().any(|k| stored.iter().any(|s| s.base == k.base && s != k)) {
+            return Some(D_FAIL_ALIAS);
+        }
+    }
+    // (Images it used with a fast clear or a reload made pending since it was recorded are
+    // resolved at its commit, before its batches: `dispatch_commit_seg`.)
+    None
+}
+
+impl Cp {
+    /// Whether the dispatcher takes the packets of buffer `f` here: the graphics command
+    /// processor at depth 1, nothing held, no run of its own, no capture, workers.
+    fn disp_ok(&self, f: &Fetched) -> bool {
+        self.main_gfx
+            && !self.compute
+            && self.depth == 1
+            && !f.live
+            && self.exec.is_some()
+            && self.held.is_none()
+            && self.past.is_none()
+            && self.past_wait.is_none()
+            && self.par.is_none()
+            && self.rewind.is_none()
+            && self.rewind_sub.is_none()
+            && !self.settling
+            && super::tune::dispatch()
+            && super::par::workers() > 0
+            && !super::capture::capturing()
+            && !super::shutting_down()
+    }
+
+    /// The dispatcher at packet `cur`: commits what is ready, then plans from here a run long
+    /// enough to split or a serial stretch, posted to the workers; returns where to go on.
+    /// None: this command processor executes the packet itself, everything before it committed.
+    fn dispatch_step(&mut self, f: &Fetched, cur: u64, end: u64, opcode: u32, h: u32, n: u64) -> Option<u64> {
+        if self.disp.is_none() {
+            self.disp = Some(Box::new(Disp { commits: dispatch_commits(), ..Default::default() }));
+        }
+        // (Its own work so far goes to the GPU first.)
+        if self.exec.as_ref().is_some_and(|e| e.is_recording()) {
+            self.submit_gpu("dispatch own");
+        }
+        self.drop_ahead();
+        self.dispatch_commit(false);
+        if self.disp.is_none() {
+            // (Shut down meanwhile: its segments were dropped.)
+            return None;
+        }
+        let at = cur;
+        let p = |i: u64| f.rd(at + 4 * (1 + i));
+        if h & 1 != 0 || self.pred.is_some() || dispatch_refuses(opcode) || self.held_refuses(opcode, n, &p).is_some() {
+            disp_count(D_REFUSED, 1);
+            self.dispatch_drain("a packet tasks do not take");
+            return None;
+        }
+        // Watched homes are this command processor's to evict, everything before them committed
+        // (as at a run's start). (Fast clears pending stay so: a task stops at its image's first
+        // use, the rest here; the commit resolves them for segments recorded before.)
+        if super::homes::any_watched() {
+            self.dispatch_drain("watched homes");
+            if let Some(e) = self.exec.as_mut() {
+                e.evict_watched_homes();
+            }
+            self.submit_gpu("dispatch own");
+        }
+        let window = super::tune::dispatch_window().max(2) as usize;
+        while self.disp.as_ref().is_some_and(|d| d.segs.len() >= window) {
+            self.dispatch_commit(true);
+        }
+        let t = Instant::now();
+        disp_count(D_INFLIGHT, self.disp.as_ref().map_or(0, |d| d.segs.len() as u64));
+        let skip = self.par_skip.0 == end && cur < self.par_skip.1;
+        if is_command(opcode) && !skip && f.words.is_empty() {
+            self.disp_planning = true;
+            self.disp_planned = None;
+            self.par_plan(f, cur, end);
+            self.disp_planning = false;
+            if let Some(e) = self.disp_planned.take() {
+                disp_count(D_PLAN_NS, t.elapsed().as_nanos() as u64);
+                return Some(e);
+            }
+        }
+        let r = self.dispatch_plan_stretch(f, cur, end);
+        disp_count(D_PLAN_NS, t.elapsed().as_nanos() as u64);
+        if r.is_none() {
+            disp_count(D_EMPTY, 1);
+            self.dispatch_drain("a packet a stretch cannot begin with");
+        }
+        r
+    }
+
+    /// A serial stretch from `cur` posted to the workers (`par::Run::stretch`): up to a run long
+    /// enough to split, a packet tasks do not take, the buffer's end or `tune dispatch_cmds`
+    /// commands, this command processor's state walked to its end (as `walk_state`, with the
+    /// label writes it sees). Returns its end; None when its first packet cannot be taken.
+    fn dispatch_plan_stretch(&mut self, f: &Fetched, cur: u64, end: u64) -> Option<u64> {
+        let start = self.chunk_state();
+        let mut st = start.clone();
+        let stack0 = self.ctx_stack.clone();
+        let mut stack = stack0.clone();
+        let mut labels: Vec<(u64, u64, u8)> = Vec::new();
+        let max = super::tune::dispatch_cmds().max(1);
+        let mut cmds = 0u64;
+        let mut c = cur;
+        while c < end {
+            if !valid(c, 4) {
+                break;
+            }
+            let h = f.rd(c);
+            match h >> 30 {
+                3 => {}
+                2 => {
+                    c += 4;
+                    continue;
+                }
+                _ => break,
+            }
+            let count = (h >> 16) & 0x3FFF;
+            if count == 0x3FFF {
+                c += 4;
+                continue;
+            }
+            let opc = (h >> 8) & 0xFF;
+            let n = count as u64 + 1;
+            let next = c + 4 * (n + 1);
+            if next > end || !valid(c, 4 * (n + 1)) || h & 1 != 0 {
+                break;
+            }
+            let at = c;
+            let p = |i: u64| f.rd(at + 4 * (1 + i));
+            if dispatch_refuses(opc) || self.held_refuses(opc, n, &p).is_some() {
+                break;
+            }
+            let command = is_command(opc) || matches!(opc, op::DRAW_INDEX_INDIRECT_MULTI | op::DRAW_INDIRECT_MULTI | op::DRAW_INDEX_MULTI_AUTO);
+            if command && c != cur {
+                if cmds >= max {
+                    break;
+                }
+                // A run long enough to split begins here: planned on its own.
+                let skip = self.par_skip.0 == end && c < self.par_skip.1;
+                if !skip && f.words.is_empty() && is_command(opc) && self.par_would_split(f, c, end) {
+                    break;
+                }
+            }
+            // The walk (as `walk_state`).
+            match opc {
+                op::NOP if n >= 3 && p(0) == DS_MAGIC && p(1) == pop::CONTEXT_STATE => match p(2) {
+                    0 => walk_clear(&mut st),
+                    1 => stack.push(st.regs.ctx.clone()),
+                    2 => match stack.pop() {
+                        Some(x) => st.regs.ctx = x,
+                        None => break,
+                    },
+                    3 => {
+                        stack.push(st.regs.ctx.clone());
+                        walk_clear(&mut st);
+                    }
+                    _ => break,
+                },
+                op::CLEAR_STATE => walk_clear(&mut st),
+                op::WRITE_DATA => {
+                    let c0 = p(0);
+                    let (dst, no_incr, count) = ((c0 >> 8) & 0xF, (c0 >> 16) & 1 != 0, n.saturating_sub(3));
+                    let a = addr64(p(1), p(2));
+                    match dst {
+                        // (To registers: this command processor's.)
+                        0 => break,
+                        1 | 2 | 5 if count > 0 => match (count, no_incr) {
+                            (1, _) => labels.push((a, p(3) as u64, 4)),
+                            (2, false) => labels.push((a, p(3) as u64 | (p(4) as u64) << 32, 8)),
+                            (_, true) => labels.push((a, p(2 + count) as u64, 4)),
+                            _ => labels.extend((0..count).map(|i| (a + 4 * i, p(3 + i) as u64, 4u8))),
+                        },
+                        _ => {}
+                    }
+                }
+                op::RELEASE_MEM => {
+                    let a = addr64(p(2) & !3, p(3));
+                    match (p(1) >> 29) & 7 {
+                        1 => labels.push((a, p(4) as u64, 4)),
+                        2 => labels.push((a, addr64(p(4), p(5)), 8)),
+                        3 | 4 => labels.push((a, 0, 0)),
+                        _ => {}
+                    }
+                }
+                _ if Self::acts_on_state(opc) => Self::apply_state(&mut st, opc, n, &p),
+                _ => {}
+            }
+            cmds += command as u64;
+            c = next;
+        }
+        if c == cur || self.disp.is_none() {
+            return None;
+        }
+        let d = self.disp.as_mut().unwrap();
+        let mut run = super::par::Run::new(vec![(Box::new(start.clone()), cur, c)]);
+        run.held = true;
+        run.dispatch = true;
+        run.stretch = true;
+        run.stack = Arc::new(stack0.clone());
+        run.labels = Arc::from(d.labels.clone());
+        run.fe2_view = self.fe2_view.as_ref().map_or(super::fe2::NO_VIEW, |v| v.load(Ordering::Acquire));
+        let words = (!f.words.is_empty()).then(|| (f.base, Arc::new(f.words.clone())));
+        run.words = words.clone();
+        let run = Arc::new(run);
+        let labels_to = d.labels_base + d.labels.len() + labels.len();
+        d.segs.push_back(DSeg { run: run.clone(), i: 0, from: cur, to: c, start: Box::new(start), stack: stack0, planned_at: d.commits, labels_to, words });
+        d.labels.extend(labels);
+        self.dispatch_give(&run);
+        self.set_chunk_state(&st);
+        self.ctx_stack = stack;
+        disp_count(D_STRETCHES, 1);
+        disp_count(D_STRETCH_CMDS, cmds);
+        Some(c)
+    }
+
+    /// A run of the dispatcher's planned (`par_plan`): its chunks become segments.
+    fn dispatch_push_run(&mut self, run: Arc<super::par::Run>, chunks: Vec<(Box<ChunkState>, u64, u64)>) {
+        let stack = self.ctx_stack.clone();
+        let d = self.disp.get_or_insert_with(|| Box::new(Disp { commits: dispatch_commits(), ..Default::default() }));
+        let labels_to = d.labels_base + d.labels.len();
+        for (i, (st, a, b)) in chunks.into_iter().enumerate() {
+            d.segs.push_back(DSeg { run: run.clone(), i, from: a, to: b, start: st, stack: stack.clone(), planned_at: d.commits, labels_to, words: None });
+        }
+    }
+
+    /// Gives a dispatcher stretch to every worker (the first free one takes it).
+    fn dispatch_give(&mut self, run: &Arc<super::par::Run>) {
+        let k = super::par::workers();
+        for i in 0..k {
+            if let Some(w) = self.par_pool.worker(i, &self.name, self.compute) {
+                w.give(run.clone());
+            }
+        }
+        self.par_pool.wake();
+    }
+
+    /// Commits the dispatcher's segments in program order while the first one is recorded
+    /// (`block`: the first one is waited for).
+    fn dispatch_commit(&mut self, block: bool) {
+        let mut wait = block;
+        loop {
+            if super::shutting_down() {
+                self.dispatch_abandon();
+                return;
+            }
+            let Some(seg) = self.disp.as_ref().and_then(|d| d.segs.front()) else { return };
+            if !seg.run.is_recorded(seg.i) && !wait {
+                return;
+            }
+            wait = false;
+            let seg = self.disp.as_mut().unwrap().segs.pop_front().unwrap();
+            let tw = super::timeline::wait_start();
+            let (done, waited) = seg.run.collect_held(seg.i);
+            if waited > 0 {
+                tw.end(&self.name, || "wait: dispatched segment".into());
+                disp_count(D_WAIT_NS, waited);
+                disp_count(D_WAITS, 1);
+            }
+            self.dispatch_commit_seg(seg, done);
+        }
+    }
+
+    /// One segment at its commit: checked, then its notes and batches go on (and the rest of
+    /// it here if its worker stopped); a failed check replays it and everything after it.
+    fn dispatch_commit_seg(&mut self, seg: DSeg, mut done: super::par::Done) {
+        let t = Instant::now();
+        if let Some(why) = dispatch_check(self.disp.as_ref().unwrap(), &seg, &done) {
+            disp_count(why, 1);
+            self.dispatch_redo(seg, &done);
+            return;
+        }
+        let h = *done.held.take().unwrap();
+        // Checks made at an older view than a committed segment passed: as of that one, the
+        // pages written since uploaded first (`tune past_repair`), else replayed.
+        let need = self.disp.as_ref().map_or(super::fe2::NO_VIEW, |d| d.view);
+        if need != super::fe2::NO_VIEW && h.want_min < need && !h.ranges.is_empty() {
+            disp_count(D_RECHECKS, 1);
+            let empty = HashSet::new();
+            let ok = match self.exec.as_mut().and_then(|e| e.chunk_stale_for(&h.ranges, &h.up, &empty, need)) {
+                None => false,
+                Some(stale) if stale.is_empty() => true,
+                Some(stale) => {
+                    let r = super::tune::past_repair() && self.exec.as_mut().is_some_and(|e| e.repair_now(&stale));
+                    if r {
+                        disp_count(D_REPAIRS, 1);
+                    }
+                    r
+                }
+            };
+            if !ok {
+                disp_count(D_FAIL_STALE, 1);
+                done.held = Some(Box::new(h));
+                self.dispatch_redo(seg, &done);
+                return;
+            }
+        }
+        // Fast clears and reloads made pending (by segments committed since it was recorded)
+        // on images it used: resolved here, before its batches (as its first use would).
+        if !h.keys.is_empty() && super::images::any_pending() {
+            let keys: Vec<super::images::ImageKey> = h.keys.iter().copied().collect();
+            if super::images::with(|im| im.clears_pending(&keys) || im.overwrites_pending(&keys)) {
+                if let Some(e) = self.exec.as_mut() {
+                    e.resolve_fast_clears(&keys);
+                    e.resolve_overwrites(&keys);
+                }
+                self.submit_gpu("dispatch images");
+                disp_count(D_FAIL_IMAGES, 1);
+            }
+        }
+        if !h.clears.is_empty() || !h.over.is_empty() {
+            super::images::with(|im| im.apply_held(&h.clears, &h.over));
+        }
+        if !h.storage.is_empty() {
+            super::images::with(|im| im.note_held_storage(&h.storage));
+        }
+        // Its placements over contested pages: checked now, in program order, before its batches.
+        if !h.deferred.is_empty() {
+            if let Some(e) = self.exec.as_mut() {
+                e.commit_places(&h.deferred);
+            }
+        }
+        let seq = if h.batches > 0 {
+            self.par_pool.get(done.worker).and_then(|w| {
+                let s = w.with_cp_at(done.recorder, |c| c.submit_closed_first(h.batches));
+                w.held_done(done.recorder, h.batches);
+                s
+            })
+        } else {
+            None
+        };
+        if let (Some(s), Some(e)) = (seq, self.exec.as_mut()) {
+            e.depend_on(s, false);
+        }
+        {
+            let d = self.disp.as_mut().unwrap();
+            let stored: Vec<super::images::ImageKey> = h.storage.iter().map(|s| s.0).collect();
+            if !d.segs.is_empty() {
+                d.recent.push_back((d.commits, h.writes, stored));
+            }
+            d.commits += 1;
+            DISPATCH_COMMITS.store(d.commits, Ordering::Release);
+            let oldest = d.segs.front().map_or(u64::MAX, |s| s.planned_at);
+            while d.recent.front().is_some_and(|r| r.0 < oldest) {
+                d.recent.pop_front();
+            }
+            d.actual = Some(Box::new(done.state.clone()));
+            if done.view != super::fe2::NO_VIEW && (d.view == super::fe2::NO_VIEW || done.view > d.view) {
+                d.view = done.view;
+            }
+            let k = seg.labels_to.saturating_sub(d.labels_base).min(d.labels.len());
+            d.labels.drain(..k);
+            d.labels_base += k;
+        }
+        if done.view != super::fe2::NO_VIEW {
+            self.fe2_adopt_epoch(done.view);
+        }
+        disp_count(D_COMMITS, 1);
+        disp_count(D_COMMIT_NS, t.elapsed().as_nanos() as u64);
+        if let Some(s) = done.stopped {
+            disp_note(&DISP_STOPS, if done.why.is_empty() { "stopped" } else { done.why });
+            self.dispatch_rest(&seg, s, &done);
+        }
+    }
+
+    /// The worker stopped segment `seg` at `s`: the rest of it is executed here from the state
+    /// it stopped with (what it writes joins the checks of the segments in flight); the walk
+    /// then goes on from where it was.
+    fn dispatch_rest(&mut self, seg: &DSeg, s: u64, done: &super::par::Done) {
+        let t = Instant::now();
+        disp_count(D_STOPS, 1);
+        let walked = self.chunk_state();
+        let walked_stack = std::mem::take(&mut self.ctx_stack);
+        self.set_chunk_state(&done.state);
+        self.ctx_stack = done.stack.clone().unwrap_or_else(|| seg.stack.clone());
+        if let Some(stop) = self.run_serial_range(s, seg.to, seg.words.as_ref()) {
+            if !super::shutting_down() {
+                crate::error!("gpu[{}]: the dispatcher's rest of a segment stopped at {stop:#x} (from {s:#x} to {:#x})", self.name, seg.to);
+            }
+        }
+        let writes = self.exec.as_ref().map(|e| e.unsubmitted_writes()).unwrap_or_default();
+        self.submit_gpu("dispatch rest");
+        let actual = self.chunk_state();
+        self.set_chunk_state(&walked);
+        self.ctx_stack = walked_stack;
+        let d = self.disp.as_mut().unwrap();
+        if !d.segs.is_empty() {
+            d.recent.push_back((d.commits, writes, Vec::new()));
+            d.commits += 1;
+            DISPATCH_COMMITS.store(d.commits, Ordering::Release);
+        }
+        d.actual = Some(Box::new(actual));
+        disp_count(D_REST_NS, t.elapsed().as_nanos() as u64);
+    }
+
+    /// Segment `seg` failed its checks: its batches are dropped from its recorder and it is
+    /// executed here, from the actual state before it; what it writes joins the checks of the
+    /// segments still in flight, which stay (each is checked at its own commit against it).
+    fn dispatch_redo(&mut self, seg: DSeg, done: &super::par::Done) {
+        let t = Instant::now();
+        if let Some(h) = done.held.as_deref().filter(|h| h.batches > 0) {
+            if let Some(w) = self.par_pool.get(done.worker) {
+                w.with_cp_at(done.recorder, |c| c.discard_closed_head(h.batches));
+                w.held_done(done.recorder, h.batches);
+            }
+        }
+        let walked = self.chunk_state();
+        let walked_stack = std::mem::take(&mut self.ctx_stack);
+        let st = self.disp.as_mut().unwrap().actual.take().map(|b| *b).unwrap_or_else(|| (*seg.start).clone());
+        self.set_chunk_state(&st);
+        self.ctx_stack = seg.stack.clone();
+        if let Some(stop) = self.run_serial_range(seg.from, seg.to, seg.words.as_ref()) {
+            if !super::shutting_down() {
+                crate::error!("gpu[{}]: the dispatcher's redo of {:#x}..{:#x} stopped at {stop:#x}", self.name, seg.from, seg.to);
+            }
+        }
+        let writes = self.exec.as_ref().map(|e| e.unsubmitted_writes()).unwrap_or_default();
+        self.submit_gpu("dispatch redo");
+        let actual = self.chunk_state();
+        self.set_chunk_state(&walked);
+        self.ctx_stack = walked_stack;
+        let d = self.disp.as_mut().unwrap();
+        if !d.segs.is_empty() {
+            d.recent.push_back((d.commits, writes, Vec::new()));
+        }
+        d.commits += 1;
+            DISPATCH_COMMITS.store(d.commits, Ordering::Release);
+        d.actual = Some(Box::new(actual));
+        let k = seg.labels_to.saturating_sub(d.labels_base).min(d.labels.len());
+        d.labels.drain(..k);
+        d.labels_base += k;
+        disp_count(D_REPLAYS, 1);
+        disp_count(D_REPLAYED, 1);
+        disp_count(D_REPLAY_NS, t.elapsed().as_nanos() as u64);
+    }
+
+    /// Segment `seg` failed its checks (or its recording): it and every segment after it are
+    /// dropped (their runs cancelled, the batches their workers hold discarded) and executed
+    /// here in order from the actual state; this command processor's state is then the actual
+    /// one at the walk's position.
+    fn dispatch_replay(&mut self, seg: DSeg) {
+        let t = Instant::now();
+        let mut d = self.disp.take().unwrap();
+        let mut all = vec![seg];
+        all.extend(d.segs.drain(..));
+        self.dispatch_cancel(&all);
+        let st = d.actual.take().map(|b| *b).unwrap_or_else(|| (*all[0].start).clone());
+        self.set_chunk_state(&st);
+        self.ctx_stack = all[0].stack.clone();
+        for s in &all {
+            if let Some(stop) = self.run_serial_range(s.from, s.to, s.words.as_ref()) {
+                if !super::shutting_down() {
+                    crate::error!("gpu[{}]: the dispatcher's replay stopped at {stop:#x} (segment {:#x}..{:#x})", self.name, s.from, s.to);
+                }
+            }
+        }
+        self.submit_gpu("dispatch replay");
+        d.labels_base += d.labels.len();
+        d.labels.clear();
+        d.recent.clear();
+        self.disp = Some(d);
+        disp_count(D_REPLAYS, 1);
+        disp_count(D_REPLAYED, all.len() as u64);
+        disp_count(D_REPLAY_NS, t.elapsed().as_nanos() as u64);
+    }
+
+    /// Cancels the runs of `segs` (their workers leave them) and drops every batch the workers'
+    /// recorders hold for the commit (all of them these segments').
+    fn dispatch_cancel(&mut self, segs: &[DSeg]) {
+        let mut seen: Vec<*const super::par::Run> = Vec::new();
+        for s in segs {
+            let p = Arc::as_ptr(&s.run);
+            if !seen.contains(&p) {
+                seen.push(p);
+                s.run.cancel();
+            }
+        }
+        for i in 0..self.par_pool.count() {
+            if let Some(w) = self.par_pool.get(i) {
+                for r in 0..2 {
+                    if r == 1 && !w.has_second() {
+                        continue;
+                    }
+                    if w.held_count(r) > 0 {
+                        w.with_cp_at(r, |c| c.discard_closed_tail(0));
+                        w.held_done(r, usize::MAX);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every segment in flight committed (`why`: the reason, counted); this command
+    /// processor's state is then the actual one.
+    fn dispatch_drain(&mut self, why: &'static str) {
+        if !self.disp.as_ref().is_some_and(|d| !d.segs.is_empty()) {
+            return;
+        }
+        let t = Instant::now();
+        while self.disp.as_ref().is_some_and(|d| !d.segs.is_empty()) {
+            self.dispatch_commit(true);
+        }
+        if let Some(a) = self.disp.as_mut().and_then(|d| d.actual.take()) {
+            self.set_chunk_state(&a);
+        }
+        disp_count(D_DRAINS, 1);
+        disp_count(D_DRAIN_NS, t.elapsed().as_nanos() as u64);
+        disp_note(&DISP_DRAINS, why);
+    }
+
+    /// Shutdown: the segments in flight are dropped.
+    fn dispatch_abandon(&mut self) {
+        if let Some(mut d) = self.disp.take() {
+            let all: Vec<DSeg> = d.segs.drain(..).collect();
+            self.dispatch_cancel(&all);
+        }
+    }
+
+    /// Executes the packets in [from, to) here as `run` would, recording into this command
+    /// processor's own executor (the rest of a dispatcher segment its worker stopped, or a
+    /// replay). Returns where it stopped on a packet it does not execute here, or None.
+    fn run_serial_range(&mut self, from: u64, to: u64, words: Option<&(u64, Arc<Vec<u32>>)>) -> Option<u64> {
+        let f = fetched_of(from, words);
+        let was = std::mem::replace(&mut self.settling, true);
+        let mut cur = from;
+        let r = loop {
+            if cur >= to {
+                break None;
+            }
+            if super::shutting_down() || !valid(cur, 4) {
+                break Some(cur);
+            }
+            let h = f.rd(cur);
+            match h >> 30 {
+                3 => {}
+                2 => {
+                    cur += 4;
+                    continue;
+                }
+                _ => break Some(cur),
+            }
+            let count = (h >> 16) & 0x3FFF;
+            let opcode = (h >> 8) & 0xFF;
+            if count == 0x3FFF {
+                cur += 4;
+                continue;
+            }
+            let n = count as u64 + 1;
+            let next = cur + 4 * (n + 1);
+            if next > to || !valid(cur, 4 * (n + 1)) || dispatch_refuses(opcode) {
+                break Some(cur);
+            }
+            PACKETS.fetch_add(1, Ordering::Relaxed);
+            self.cur_packet = cur;
+            self.cur_opcode = opcode;
+            let at = cur;
+            let p = |i: u64| f.rd(at + 4 * (1 + i));
+            let flow = self.packet(opcode, h, cur, n, &p);
+            for s in self.take_ahead().iter().flatten() {
+                s.cancel();
+            }
+            if self.exec.as_ref().is_some_and(|e| e.submit_requested()) {
+                self.submit_gpu("label");
+            }
+            match flow {
+                Flow::Next => cur = next,
+                _ => break Some(next),
+            }
+        };
+        self.settling = was;
+        r
+    }
 }
 
 #[cfg(test)]

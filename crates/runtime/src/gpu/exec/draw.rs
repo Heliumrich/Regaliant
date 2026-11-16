@@ -1829,9 +1829,17 @@ impl Exec {
                 self.delta.counts[1] = self.delta.counts[1].wrapping_sub(1);
                 self.delta.count(6);
             } else {
-                let n = self.delta.textures.len();
-                self.held_reads.extend_from_slice(&self.delta.textures);
-                self.note_kinds(1, n);
+                if self.held_dispatch {
+                    // (A dispatcher task: the textures the GPU owns are read on the GPU.)
+                    let cpu: Vec<(u64, u64)> = super::super::images::with(|im| self.delta.textures.iter().filter(|x| !im.gpu_base(x.0)).copied().collect());
+                    let n = cpu.len();
+                    self.held_reads.extend(cpu);
+                    self.note_kinds(1, n);
+                } else {
+                    let n = self.delta.textures.len();
+                    self.held_reads.extend_from_slice(&self.delta.textures);
+                    self.note_kinds(1, n);
+                }
             }
         }
         let expect = if delta_mode == 2 { delta.take() } else { None };
