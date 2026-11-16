@@ -289,14 +289,98 @@ pub(super) fn prepare(addr: u64, insts: &Arc<Local<Vec<rdna::Inst>>>, code_hash:
         STATS[4].fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    RES_SPECS.with(|r| {
+    let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+    let r = RES_SPECS.with(|r| {
         let mut specs = r.borrow_mut();
         prepare_with(addr, insts, code_hash, user, stage, user_sgprs, user_base, tkey, &mut specs)
-    })
+    });
+    if r.is_some() {
+        time(0, unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0));
+        if twice_on() {
+            // The same preparation again on warm caches: what it costs without its misses.
+            PHASE_FIRST.with(|c| c.set(false));
+            let t1 = unsafe { core::arch::x86_64::_rdtsc() };
+            let r2 = RES_SPECS.with(|r| {
+                let mut specs = r.borrow_mut();
+                prepare_with(addr, insts, code_hash, user, stage, user_sgprs, user_base, tkey, &mut specs)
+            });
+            PHASE_FIRST.with(|c| c.set(true));
+            if r2.is_some() {
+                time(3, unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t1));
+            }
+        }
+    }
+    r
+}
+
+/// With `DS_LEAN_TWICE`: cycles of a lean preparation's phases [plan and reader, resources,
+/// depth views and translation, scalar loads and SGPR data, result], and preparations timed.
+static PHASES: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+thread_local! {
+    static PHASE_LOCAL: Cell<[u64; 6]> = const { Cell::new([0; 6]) };
+    /// The preparation in progress is the first of the two (`DS_LEAN_TWICE`): its phases are timed.
+    static PHASE_FIRST: Cell<bool> = const { Cell::new(true) };
+}
+
+/// `DS_LEAN_TWICE=1` (a diagnosis): each lean preparation made twice, the second on warm caches
+/// timed apart (`time` kind 3).
+fn twice_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_LEAN_TWICE").ok().as_deref() == Some("1"))
+}
+
+/// Cycles and preparations: [lean, full path with the lane off, full path for what the lane
+/// left] (`time`).
+static CYCLES: [[AtomicU64; 2]; 4] = [const { [const { AtomicU64::new(0) }; 2] }; 4];
+
+thread_local! {
+    static CYC_LOCAL: Cell<[(u64, u64); 4]> = const { Cell::new([(0, 0); 4]) };
+}
+
+/// Adds one preparation's cycles to kind `k` (0 lean, 1 the full path with the lane off, 2 the
+/// full path for what the lane left).
+pub(super) fn time(k: usize, cycles: u64) {
+    CYC_LOCAL.with(|c| {
+        let mut v = c.get();
+        v[k].0 += cycles;
+        v[k].1 += 1;
+        if v[k].1 >= 4096 {
+            CYCLES[k][0].fetch_add(v[k].0, Ordering::Relaxed);
+            CYCLES[k][1].fetch_add(v[k].1, Ordering::Relaxed);
+            v[k] = (0, 0);
+        }
+        c.set(v);
+    });
+}
+
+/// `profile reset`: the cycle sums emptied.
+pub fn reset_cycles() {
+    for k in &CYCLES {
+        for c in k {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+    for c in &PHASES {
+        c.store(0, Ordering::Relaxed);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_with(addr: u64, insts: &Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: &[u32], stage: Stage, user_sgprs: u16, user_base: u16, tkey: u64, specs: &mut Vec<ResSpec>) -> Option<Result<Prepared, String>> {
+    let phases = twice_on() && PHASE_FIRST.with(|c| c.get());
+    let mut tp = if phases { unsafe { core::arch::x86_64::_rdtsc() } } else { 0 };
+    let mut mark = |k: usize| {
+        if phases {
+            let t = unsafe { core::arch::x86_64::_rdtsc() };
+            PHASE_LOCAL.with(|c| {
+                let mut v = c.get();
+                v[k] += t.wrapping_sub(tp);
+                c.set(v);
+            });
+            tp = t;
+        }
+    };
     let plan_key = code_hash ^ (user_sgprs as u64) << 48 ^ (user_base as u64) << 56;
     let lp = plan_for(plan_key, insts, stage)?;
     if !lp.ok {
@@ -317,6 +401,7 @@ fn prepare_with(addr: u64, insts: &Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, 
     specs.clear();
     let compute = stage == Stage::Compute;
     let mut specialized = 0u64;
+    mark(0);
     let fail = |resources: Vec<Resolved>, res_addrs: Vec<Option<u64>>| {
         pool::put_resolved(resources);
         pool::put_addrs(res_addrs);
@@ -416,6 +501,7 @@ fn prepare_with(addr: u64, insts: &Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, 
             }
         }
     }
+    mark(1);
     // Depth views for the images comparison instructions sample.
     let mut cmp_images = 0u64;
     let mut cmp_depth = 0u64;
@@ -453,6 +539,7 @@ fn prepare_with(addr: u64, insts: &Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, 
         return None;
     };
     let _ = specialized;
+    mark(2);
     let trs = lp.trs.borrow();
     let te = &trs[ti];
     let tr = te.tr.clone();
@@ -495,17 +582,33 @@ fn prepare_with(addr: u64, insts: &Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, 
         }
     }
     drop(trs);
-    let used = [rd.reads.len() as u32, rd.words.len() as u32, nodes.len() as u32];
+    mark(3);
+    let used = [rd.reads.len() as u32, rd.words.len() as u32, 0];
     lp.hints.set(used);
     rd.save_spans();
     drop(nodes_ref);
     let Reader { reads, words, unread, chain_vals, .. } = rd;
     pool::put_addrs(chain_vals);
     STATS[0].fetch_add(1, Ordering::Relaxed);
+    let found = Arc::new(Found { insts: insts.clone(), tr, resources, res_addrs, reads, words, unread, data_loads });
+    mark(4);
+    if phases {
+        PHASE_LOCAL.with(|c| {
+            let mut v = c.get();
+            v[5] += 1;
+            if v[5] >= 4096 {
+                for (a, b) in PHASES.iter().zip(v.iter()) {
+                    a.fetch_add(*b, Ordering::Relaxed);
+                }
+                v = [0; 6];
+            }
+            c.set(v);
+        });
+    }
     Some(Ok(Prepared {
         stage,
         addr,
-        found: Arc::new(Found { insts: insts.clone(), tr, resources, res_addrs, reads, words, unread, data_loads }),
+        found,
         sgpr_data,
         user: UserData::new(user),
         map_gen,
@@ -599,11 +702,29 @@ pub(super) fn compare(a: &Prepared, b: &Prepared, second: bool) -> bool {
 /// Status line ("" before any lean preparation).
 pub fn status() -> String {
     let s: Vec<u64> = STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let hz = super::super::threadcpu::tsc_hz();
+    let per = |k: usize| {
+        let (c, n) = (CYCLES[k][0].load(Ordering::Relaxed), CYCLES[k][1].load(Ordering::Relaxed));
+        if n == 0 { "-".to_string() } else { format!("{:.0} ns ({n})", c as f64 * 1e9 / hz / n as f64) }
+    };
+    let ph: Vec<u64> = PHASES.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let phase_line = if ph[5] == 0 {
+        String::new()
+    } else {
+        let ns = |c: u64| c as f64 * 1e9 / hz / ph[5] as f64;
+        format!(
+            "    lean preparation by phase (`DS_LEAN_TWICE`, {} timed): plan and reader {:.0} ns, resources {:.0}, depth views and translation {:.0}, scalar loads and SGPR data {:.0}, result {:.0}
+",
+            ph[5], ns(ph[0]), ns(ph[1]), ns(ph[2]), ns(ph[3]), ns(ph[4])
+        )
+    };
+    let timing = phase_line + &format!("    stage preparation cycles (since the last profile reset): lean {}, full path with the lane off {}, full path for what the lane left {}, lean again on warm caches {}
+", per(0), per(1), per(2), per(3));
     if s.iter().all(|&x| x == 0) {
-        return String::new();
+        return timing;
     }
     format!(
         "    lean stage preparations (`tune lean`): {} made here, left to the full path: {} unsupported plans, {} translations not in the table, {} unreadable or unevaluable, {} diagnoses; checked {}, differing {} (equal at a second lean read {}, still differing {})\n",
         s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8]
-    )
+    ) + &timing
 }

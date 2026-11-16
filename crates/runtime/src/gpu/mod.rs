@@ -3206,6 +3206,45 @@ static PROFILE_CALLS: Mutex<Option<std::collections::HashMap<(&'static str, Stri
 /// function.
 static PROFILE_LINES: Mutex<Option<std::collections::HashMap<(&'static str, String), u64>>> = Mutex::new(None);
 static PROFILE_LEAF: Mutex<Option<std::collections::HashMap<(&'static str, String), u64>>> = Mutex::new(None);
+/// Busy samples by the instruction at the sampled address: [busy, at a locked read-modify-write
+/// or an exchange with memory, right after one (the sample taken once it retired), at a
+/// spin-wait pause]. What the cross-core traffic of shared counters, reference counts and lock
+/// words costs the recording threads (2026-11-16).
+static PROFILE_ATOMIC: Mutex<Option<std::collections::HashMap<&'static str, [u64; 4]>>> = Mutex::new(None);
+/// Busy samples at or right after a locked instruction, by its function and source line.
+static PROFILE_ATOMIC_SITES: Mutex<Option<std::collections::HashMap<(&'static str, String), u64>>> = Mutex::new(None);
+
+/// The instruction at a sampled address: 1 a locked read-modify-write or an exchange with
+/// memory, 2 right after one (with its address), 3 a spin-wait pause, 0 anything else.
+fn sampled_instruction(rip: u64) -> (u8, u64) {
+    use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind};
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut buf = [0u8; 32];
+    let mut n = 0usize;
+    let ok = rip > 16 && unsafe { ReadProcessMemory(GetCurrentProcess(), (rip - 16) as *const core::ffi::c_void, buf.as_mut_ptr() as *mut core::ffi::c_void, 32, &mut n) } != 0 && n == 32;
+    if !ok {
+        return (0, 0);
+    }
+    let locked = |i: &iced_x86::Instruction| i.has_lock_prefix() || (i.mnemonic() == Mnemonic::Xchg && (i.op0_kind() == OpKind::Memory || i.op1_kind() == OpKind::Memory));
+    let at = Decoder::with_ip(64, &buf[16..], rip, DecoderOptions::NONE).decode();
+    if !at.is_invalid() {
+        if locked(&at) {
+            return (1, rip);
+        }
+        if at.mnemonic() == Mnemonic::Pause {
+            return (3, rip);
+        }
+    }
+    for k in 1..=15usize {
+        let start = rip - k as u64;
+        let i = Decoder::with_ip(64, &buf[16 - k..16], start, DecoderOptions::NONE).decode();
+        if !i.is_invalid() && i.len() == k && locked(&i) {
+            return (2, start);
+        }
+    }
+    (0, 0)
+}
 
 /// Threads sampled besides the queues' command processors: (kind, host tid)
 /// ("par": parallel recording workers, "prep": stage preparation workers).
@@ -3240,6 +3279,8 @@ pub fn start_profiler() {
     *PROFILE_CALLS.lock() = Some(Default::default());
     *PROFILE_LINES.lock() = Some(Default::default());
     *PROFILE_LEAF.lock() = Some(Default::default());
+    *PROFILE_ATOMIC.lock() = Some(Default::default());
+    *PROFILE_ATOMIC_SITES.lock() = Some(Default::default());
     let _ = crate::thread::spawn_host(
         "gpu-profiler",
         1 << 20,
@@ -3304,6 +3345,23 @@ pub fn start_profiler() {
                         if let Some(m) = PROFILE_LEAF.lock().as_mut() {
                             *m.entry((kind, fns.first().copied().unwrap_or("(none)").to_string())).or_default() += 1;
                         }
+                        if let Some(&rip) = frames.first() {
+                            let (class, site) = sampled_instruction(rip);
+                            if let Some(m) = PROFILE_ATOMIC.lock().as_mut() {
+                                let e = m.entry(kind).or_default();
+                                e[0] += 1;
+                                if class > 0 {
+                                    e[class as usize] += 1;
+                                }
+                            }
+                            if matches!(class, 1 | 2) {
+                                let line = crate::exception::host_line(site).unwrap_or_default();
+                                let key = format!("{} @ {line} (in {ours})", crate::exception::frame_label(site));
+                                if let Some(m) = PROFILE_ATOMIC_SITES.lock().as_mut() {
+                                    *m.entry((kind, key)).or_default() += 1;
+                                }
+                            }
+                        }
                     } else if fns.iter().any(|f| f.contains("lock_slow") || f.contains("AcquireSRWLock")) {
                         if let Some(m) = PROFILE_LOCKS.lock().as_mut() {
                             *m.entry((kind, ours.to_string())).or_default() += 1;
@@ -3348,10 +3406,13 @@ pub fn reset_profile() {
     if let Some(m) = PROFILE_LOCKS.lock().as_mut() {
         m.clear();
     }
-    for p in [&PROFILE_CALLS, &PROFILE_LEAF, &PROFILE_LINES] {
+    for p in [&PROFILE_CALLS, &PROFILE_LEAF, &PROFILE_LINES, &PROFILE_ATOMIC_SITES] {
         if let Some(m) = p.lock().as_mut() {
             m.clear();
         }
+    }
+    if let Some(m) = PROFILE_ATOMIC.lock().as_mut() {
+        m.clear();
     }
     exec::reset_shader_profile();
     exec::reset_batch_misses();
@@ -3514,6 +3575,26 @@ fn profile_summary() -> String {
                 s.push_str(&format!("    gpu profile {kind} busy (not waiting): {busy} samples, {what}:\n"));
                 for (f, c) in v.iter().take(n) {
                     s.push_str(&format!("      {:5.1}%  {f}\n", **c as f64 * 100.0 / busy as f64));
+                }
+            }
+        }
+    }
+    if let Some(m) = PROFILE_ATOMIC.lock().as_ref() {
+        let sites = PROFILE_ATOMIC_SITES.lock();
+        for kind in PROFILE_KINDS {
+            let Some(e) = m.get(kind) else { continue };
+            let pct = |x: u64| x as f64 * 100.0 / e[0].max(1) as f64;
+            s.push_str(&format!(
+                "    gpu profile {kind} busy samples by instruction: {} busy, at a locked instruction {} ({:.1}%), right after one {} ({:.1}%), at a spin-wait pause {} ({:.1}%)
+",
+                e[0], e[1], pct(e[1]), e[2], pct(e[2]), e[3], pct(e[3])
+            ));
+            if let Some(sm) = sites.as_ref() {
+                let mut v: Vec<(&String, &u64)> = sm.iter().filter(|((k, _), _)| *k == kind).map(|((_, f), n)| (f, n)).collect();
+                v.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+                for (f, n) in v.iter().take(30) {
+                    s.push_str(&format!("      {:5.2}%  {f}
+", pct(**n)));
                 }
             }
         }

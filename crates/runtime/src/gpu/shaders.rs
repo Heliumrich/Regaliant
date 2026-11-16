@@ -1280,6 +1280,7 @@ pub fn reset_prep_parts() {
     for c in PREP_PARTS.iter().flatten() {
         c.store(0, std::sync::atomic::Ordering::Relaxed);
     }
+    lean::reset_cycles();
 }
 
 /// The profile lines of `PREP_PARTS` ("" before any).
@@ -1311,7 +1312,10 @@ fn repeat_stats_on() -> bool {
 #[allow(clippy::too_many_arguments)]
 fn prepare_stage(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: &[u32], spec: &mut Spec, tmpl: u64, tkey: u64) -> Result<Prepared, String> {
     if tkey == 0 || !super::tune::lean() || repeat_stats_on() {
-        return prepare(addr, insts, code_hash, user, spec, tmpl);
+        let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+        let r = prepare(addr, insts, code_hash, user, spec, tmpl);
+        lean::time(1, unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0));
+        return r;
     }
     if lean::check_on() {
         let a = lean::prepare(addr, &insts, code_hash, user, spec.stage, spec.user_sgprs, spec.user_base, tkey);
@@ -1330,7 +1334,9 @@ fn prepare_stage(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, 
         }
         return b;
     }
+    let t0 = unsafe { core::arch::x86_64::_rdtsc() };
     let r = prepare(addr, insts, code_hash, user, spec, tmpl);
+    lean::time(2, unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0));
     if let Ok(p) = &r {
         lean::learn(p, spec, tkey);
     }
