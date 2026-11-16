@@ -155,20 +155,24 @@ pub struct Done {
 }
 
 /// Work stealing inside a run (`tune steal`): a worker that runs out of chunks takes the rest
-/// of the chunk with the most commands left. It sets the chunk's boundary at a command's end
-/// about halfway through what is left; the chunk's worker stops at the first packet at or past
-/// it (`Cp::run_chunk`) and says where (`cut`); the thief walks the chunk's start state to
-/// there (`Cp::walk_chunk_to`) and records the rest into its own executor. The head submits at the
-/// chunk's turn without passing it on (`commit_head`), the rest after the head (`head_done`),
-/// then passes the turn to the next chunk and posts the chunk (`commit_tail`); the command
-/// processor collects them as one (`Run::collect`). Front end 2's parts order them: chunk i is
-/// part 2(i + 1), its rest 2(i + 1) + 1 (a page an earlier part claimed is left to it).
+/// of the chunk with the most commands left. It sets the chunk's boundary at a command start
+/// about halfway through what is left and reads where the chunk's worker is; the worker
+/// publishes each command's start and then reads the boundary (both sequentially consistent),
+/// so when the thief sees it before the boundary it stops exactly there (`Cp::run_chunk`), and
+/// the thief records the rest at once, in parallel, from the chunk's start state walked to the
+/// cut (`Cp::walk_chunk_to`), into its own executor. (When it was past the boundary already,
+/// the thief waits for where it stops.) The head submits at the chunk's turn without passing
+/// it on (`commit_head`), the rest after the head (`head_done`), then passes the turn to the
+/// next chunk and posts the chunk (`commit_tail`); the command processor collects them as one
+/// (`Run::collect`). A head that stopped or failed before the cut keeps the chunk: the rest is
+/// dropped. Front end 2's parts order them: chunk i is part 2(i + 1), its rest 2(i + 1) + 1 (a
+/// page an earlier part claimed is left to it).
 pub struct Steal {
     /// The chunk's start state (what a thief walks to its cut).
     start: Arc<ChunkState>,
     /// The command its worker records now (0: not started; u64::MAX: it finished or stopped).
     at: AtomicU64,
-    /// Where its worker stops: the first packet at or past it (the chunk's end until cut).
+    /// Where its worker stops: the first command at or past it (the chunk's end until cut).
     boundary: AtomicU64,
     /// Where its worker stopped for the boundary (0: not yet).
     cut: AtomicU64,
@@ -179,27 +183,25 @@ pub struct Steal {
 }
 
 impl Steal {
-    /// The worker recording the chunk reached packet `cur`: true when it stops there (cut).
+    /// The worker recording the chunk begins the command at `cur`: true when it stops there
+    /// (cut). (Published before the boundary is read, both sequentially consistent: a thief that
+    /// stored the boundary and then saw the worker before it knows it stops exactly there.)
     #[inline]
-    pub fn reached(&self, cur: u64) -> bool {
-        if cur >= self.boundary.load(Ordering::Acquire) {
+    pub fn command(&self, cur: u64) -> bool {
+        self.at.store(cur, Ordering::SeqCst);
+        if cur >= self.boundary.load(Ordering::SeqCst) {
             self.cut.store(cur, Ordering::Release);
             return true;
         }
         false
     }
-
-    /// It begins the command at `cur` (what a thief measures what is left from).
-    #[inline]
-    pub fn command(&self, cur: u64) {
-        self.at.store(cur, Ordering::Relaxed);
-    }
 }
 
 /// Work stealing (`steal`): [cuts asked, rests recorded, cuts that came too late (the chunk ended
-/// or stopped first), commands in the rests, ns walking states, ns waiting for the cut, rests
-/// that stopped, rests dropped (cancelled)].
-static STEALS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// or stopped first), commands in the rests, ns walking states, ns waiting for the cut (when the
+/// worker was past it), rests that stopped, rests dropped (cancelled, or the head stopped
+/// before the cut), rests begun at once].
+static STEALS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 
 /// Commands a thief keeps between the chunk's worker and its cut (the worker must see the
 /// boundary before it passes it).
@@ -211,10 +213,10 @@ pub struct Run {
     /// Chunk i: its start state (taken by the worker that records it), its
     /// first packet and the packet after it.
     chunks: Vec<(Mutex<Option<Arc<ChunkState>>>, u64, u64)>,
-    /// Work stealing (`Steal`; `steal_on`: allowed in this run): per chunk its slot, the run's
-    /// command ends (where a thief may cut), the thieves' records of the rests (chunk i's at i).
+    /// Work stealing (`Steal`; `steal_on`: allowed in this run): per chunk its slot, where the
+    /// run's commands start (where a thief may cut), the thieves' records of the rests (chunk i's at i).
     steal: Vec<Steal>,
-    pub cmd_ends: Arc<[u64]>,
+    pub cmd_starts: Arc<[u64]>,
     pub steal_on: bool,
     tails: Mutex<Vec<Option<Done>>>,
     /// The next chunk not taken.
@@ -286,7 +288,7 @@ impl Run {
         Run {
             chunks: chunks.into_iter().map(|(s, a, b)| (Mutex::new(Some(s)), a, b)).collect(),
             steal,
-            cmd_ends: Arc::from(Vec::new()),
+            cmd_starts: Arc::from(Vec::new()),
             steal_on: false,
             tails: Mutex::new((0..n).map(|_| None).collect()),
             next: AtomicUsize::new(0),
@@ -740,6 +742,10 @@ fn take_chunks(w: &Worker, run: &Run, name: &str, k: usize, census: bool) {
         let cut = cp.chunk_cut.take().filter(|_| !failed);
         if let Some(s) = slot {
             s.at.store(u64::MAX, Ordering::Release);
+            // (A thief waiting to know whether its rest stands.)
+            if s.taken.load(Ordering::Acquire) {
+                run.notify();
+            }
         }
         lap(2, &mut t);
         cp.chunk_finish();
@@ -768,16 +774,17 @@ fn take_chunks(w: &Worker, run: &Run, name: &str, k: usize, census: bool) {
     }
 }
 
-/// A thief (`Steal`): the chunk being recorded with the most whole commands left after the one
-/// its worker records now (at least `tune steal_min`) is cut about halfway through them; once its
-/// worker stopped at the cut, the rest is recorded here and committed after the head. Returns
-/// whether to look for another (false: none left to take, or the run cancelled).
+/// A thief (`Steal`): the chunk being recorded with the most commands left after the one its
+/// worker records now (at least `tune steal_min`) is cut about halfway through them; the rest is
+/// recorded here at once when its worker was still before the cut, else from where it stopped,
+/// and committed after the head. Returns whether to look for another (false: none left to
+/// take, or the run cancelled).
 fn steal(w: &Worker, run: &Run, name: &str) -> bool {
-    if run.cancelled.load(Ordering::SeqCst) || run.cmd_ends.is_empty() {
+    if run.cancelled.load(Ordering::SeqCst) || run.cmd_starts.is_empty() {
         return false;
     }
     let min = super::tune::steal_min().max(2 * STEAL_AHEAD as u64) as usize;
-    let ends = &run.cmd_ends;
+    let starts = &run.cmd_starts;
     let mut best: Option<(usize, usize, usize)> = None;
     for (j, s) in run.steal.iter().enumerate() {
         if s.taken.load(Ordering::Relaxed) {
@@ -788,9 +795,9 @@ fn steal(w: &Worker, run: &Run, name: &str) -> bool {
             continue;
         }
         let b = s.boundary.load(Ordering::Acquire);
-        // The command it records now ends at ends[ia]; whole commands after it to the end.
-        let ia = ends.partition_point(|&e| e <= at);
-        let ib = ends.partition_point(|&e| e <= b);
+        // The command it records now is starts[ia]; the commands after it before the end.
+        let Some(ia) = starts.partition_point(|&x| x <= at).checked_sub(1) else { continue };
+        let ib = starts.partition_point(|&x| x < b);
         let left = ib.saturating_sub(ia + 1);
         if left >= min && best.map_or(true, |x| left > x.2) {
             best = Some((j, ia, left));
@@ -802,39 +809,46 @@ fn steal(w: &Worker, run: &Run, name: &str) -> bool {
         return true;
     }
     STEALS[0].fetch_add(1, Ordering::Relaxed);
-    let cut_at = ends[ia + (left / 2).max(STEAL_AHEAD)];
-    s.boundary.store(cut_at, Ordering::Release);
-    // Its worker stops at the first packet at or past the boundary (past it when it was
-    // there already), or ends the chunk first (then there is nothing to take).
-    let t0 = std::time::Instant::now();
-    let tl = super::timeline::mark();
-    let mut spins = 0u32;
-    let p = loop {
-        let c = s.cut.load(Ordering::Acquire);
-        if c != 0 {
-            break c;
-        }
-        if s.at.load(Ordering::Acquire) == u64::MAX {
-            // (The cut is stored before `at`: read it again.)
+    let cut_at = starts[ia + (left / 2).max(STEAL_AHEAD)];
+    s.boundary.store(cut_at, Ordering::SeqCst);
+    let seen = s.at.load(Ordering::SeqCst);
+    let p = if seen < cut_at {
+        // It stops exactly there (`Steal::command`): the rest is ours from now.
+        STEALS[8].fetch_add(1, Ordering::Relaxed);
+        cut_at
+    } else {
+        // It was past the cut already: where it stops (or nothing, when it ends first).
+        let t0 = std::time::Instant::now();
+        let tl = super::timeline::mark();
+        let mut spins = 0u32;
+        let c = loop {
             let c = s.cut.load(Ordering::Acquire);
             if c != 0 {
                 break c;
             }
-            STEALS[2].fetch_add(1, Ordering::Relaxed);
-            return true;
-        }
-        if run.cancelled.load(Ordering::SeqCst) {
-            return false;
-        }
-        spins += 1;
-        if spins < 256 {
-            std::hint::spin_loop();
-        } else {
-            std::thread::yield_now();
-        }
+            if s.at.load(Ordering::Acquire) == u64::MAX {
+                // (The cut is stored before `at`: read it again.)
+                let c = s.cut.load(Ordering::Acquire);
+                if c != 0 {
+                    break c;
+                }
+                STEALS[2].fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+            if run.cancelled.load(Ordering::SeqCst) {
+                return false;
+            }
+            spins += 1;
+            if spins < 256 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        };
+        super::timeline::end(name, tl, || "wait: a cut".into());
+        STEALS[5].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        c
     };
-    super::timeline::end(name, tl, || "wait: a cut".into());
-    STEALS[5].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let (_, from, to) = &run.chunks[j];
     let to = *to;
     let tw = std::time::Instant::now();
@@ -854,12 +868,19 @@ fn steal(w: &Worker, run: &Run, name: &str) -> bool {
     let stopped = r.unwrap_or(Some(p));
     cp.chunk_finish();
     cp.fe2_set_run(0, 0);
-    // Its turn: after the head's batches.
-    let ready = || s.head_done.load(Ordering::Acquire) || run.cancelled.load(Ordering::Acquire);
+    // Its turn: after the head's batches; a head that ended before the cut (it stopped or
+    // failed) keeps the chunk, and the rest is dropped.
+    let head_ended = || s.at.load(Ordering::Acquire) == u64::MAX && s.cut.load(Ordering::Acquire) == 0;
+    let ready = || s.head_done.load(Ordering::Acquire) || run.cancelled.load(Ordering::Acquire) || head_ended();
     if !ready() {
         let tl = super::timeline::mark();
         TURN_NS.fetch_add(run.wait_until(ready), Ordering::Relaxed);
         super::timeline::end(name, tl, || "wait: chunk turn (rest)".into());
+    }
+    if !s.head_done.load(Ordering::Acquire) {
+        cp.worker_discard();
+        STEALS[7].fetch_add(1, Ordering::Relaxed);
+        return !run.cancelled.load(Ordering::Acquire);
     }
     commit_tail(run, j, cp, p, stopped, failed, state);
     true
@@ -1046,17 +1067,21 @@ fn steal_line() -> String {
     if v(0) == 0 {
         return String::new();
     }
+    let late = v(0) - v(8);
     format!(
-        "    work stealing in runs (`tune steal`): {} cuts asked, {} rests recorded ({} commands, {:.1} each; {} stopped, {} dropped), {} too late (the chunk ended first); {:.0} us waited for a cut and {:.1} us walking its state on average\n",
+        "    work stealing in runs (`tune steal`): {} cuts asked ({} begun at once, {} after waiting {:.0} us on average for the worker to stop past them), {} rests recorded ({} commands, {:.1} each; {} stopped, {} dropped), {} too late (the chunk ended first); {:.1} us walking a state
+",
         v(0),
+        v(8),
+        late,
+        v(5) as f64 / 1e3 / late.max(1) as f64,
         v(1),
         v(3),
         v(3) as f64 / v(1).max(1) as f64,
         v(6),
         v(7),
         v(2),
-        v(5) as f64 / 1e3 / v(0).max(1) as f64,
-        v(4) as f64 / 1e3 / v(1).max(1) as f64
+        v(4) as f64 / 1e3 / (v(1) + v(7)).max(1) as f64
     )
 }
 

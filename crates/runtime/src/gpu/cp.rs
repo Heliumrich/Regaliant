@@ -2433,13 +2433,6 @@ impl Cp {
             if super::shutting_down() || !valid(cur, 4) {
                 return Some(cur);
             }
-            // A thief's cut (`par::Steal`): the rest from this packet is its.
-            if steal.is_some_and(|s| s.reached(cur)) {
-                self.chunk_cut = Some(cur);
-                super::par::COMMANDS.fetch_add(commands, Ordering::Relaxed);
-                self.drop_ahead();
-                return Some(cur);
-            }
             let h = f.rd(cur);
             match h >> 30 {
                 3 => {}
@@ -2482,8 +2475,15 @@ impl Cp {
                 cur = next;
                 continue;
             }
-            // Stages prepared ahead within the chunk, as in `run`.
             let command = is_command(opcode) || multi;
+            // A thief's cut (`par::Steal`): the rest from this command is its.
+            if command && steal.is_some_and(|s| s.command(cur)) {
+                self.chunk_cut = Some(cur);
+                super::par::COMMANDS.fetch_add(commands, Ordering::Relaxed);
+                self.drop_ahead();
+                return Some(cur);
+            }
+            // Stages prepared ahead within the chunk, as in `run`.
             if is_command(opcode) && !self.ahead.is_empty() {
                 if self.ahead.front().is_some_and(|c| c.at == cur) {
                     let c = self.ahead.pop_front().unwrap();
@@ -2499,11 +2499,6 @@ impl Cp {
             // one of queue 0x50's workers, 2026-11-01 night).
             if command && matches!(opcode, op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT) && super::compile::at_first_uses() {
                 self.compile_ctx.set(Some((f.base, next, to)));
-            }
-            if command {
-                if let Some(s) = steal {
-                    s.command(cur);
-                }
             }
             let flow = self.packet(opcode, h, cur, n, &p);
             self.compile_ctx.set(None);
@@ -3212,6 +3207,9 @@ impl Cp {
         let held_run = self.held.is_some();
         // The run's commands, its end and the indirect arguments read in it.
         let mut ends: Vec<u64> = Vec::new();
+        // (Work stealing, `tune steal`: where each command starts, a thief's cuts.)
+        let steal_run = super::tune::steal() && !held_run;
+        let mut cmd_starts: Vec<u64> = Vec::new();
         let mut args: Vec<(u64, u64)> = Vec::new();
         let (mut draw_base, mut disp_base) = (self.draw_indirect_base, self.dispatch_indirect_base);
         let mut c = from;
@@ -3267,6 +3265,9 @@ impl Cp {
             let p = |i: u64| f.rd(at + 4 * (1 + i));
             if is_command(opc) || self.run_multi(opc) {
                 ends.push(next);
+                if steal_run {
+                    cmd_starts.push(at);
+                }
                 match opc {
                     op::DRAW_INDIRECT => args.push((draw_base + p(0) as u64, 16)),
                     op::DRAW_INDEX_INDIRECT => args.push((draw_base + p(0) as u64, 20)),
@@ -3641,10 +3642,10 @@ impl Cp {
         let queue = states.into_iter().enumerate().map(|(i, st)| (st, starts[i], if i + 1 < starts.len() { starts[i + 1] } else { run_end })).collect();
         let mut run = super::par::Run::new(queue);
         run.timed = true;
-        // Work stealing (`tune steal`, not in held runs): the command ends a thief may cut at.
-        if super::tune::steal() && !held_run {
+        // Work stealing (`tune steal`, not in held runs): the command starts a thief may cut at.
+        if steal_run {
             run.steal_on = true;
-            run.cmd_ends = std::sync::Arc::from(&ends[..]);
+            run.cmd_starts = std::sync::Arc::from(std::mem::take(&mut cmd_starts));
         }
         let mut approved: Vec<u64> = passed.iter().map(|w| w.0).chain(own_waits.iter().copied()).collect();
         approved.sort_unstable();
