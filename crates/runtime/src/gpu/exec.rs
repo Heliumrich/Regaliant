@@ -3984,7 +3984,7 @@ fn note_copy_waits(own: bool, wait: u64) {
 /// there after all the main queue's work so far. Called in sequence order
 /// (`push_batch`): the timelines' signals increase.
 #[allow(clippy::too_many_arguments)]
-fn submit_batch(seq: u64, xpre: Option<vk::CommandBuffer>, pre: Option<vk::CommandBuffer>, cmd: vk::CommandBuffer, wait: u64, on_c: bool, xwait: u64, cpu_wait: u64) -> Result<(), String> {
+fn submit_batch(seq: u64, xpre: Option<vk::CommandBuffer>, pre: Option<vk::CommandBuffer>, cmd: vk::CommandBuffer, wait: u64, on_c: bool, pre_on_c: bool, xwait: u64, cpu_wait: u64) -> Result<(), String> {
     let c = ctx();
     // Guest page table updates queued before this batch, ahead of it (after
     // the compute family's queue's batches, which read the old entries),
@@ -4010,6 +4010,15 @@ fn submit_batch(seq: u64, xpre: Option<vk::CommandBuffer>, pre: Option<vk::Comma
     }
     if on_c {
         let cq = c.compute.as_ref().ok_or("no compute queue")?;
+        // (Its prologue on the compute queue too, `pre_on_c`: after every earlier batch there,
+        // whose writes its uploads would otherwise wait for on the main queue.)
+        if pre_on_c {
+            waits.push((c.g_progress, c.g_progress_value(), all));
+            let cmds: Vec<vk::CommandBuffer> = pre.into_iter().chain([cmd]).collect();
+            c.submit_timeline_on(false, true, &cmds, &waits, &[(cq.batches, seq)], vk::Fence::null())?;
+            XQ_SUBMITTED.store(seq, Ordering::Release);
+            return Ok(());
+        }
         if let Some(p) = pre {
             let mut pw = waits.clone();
             if xwait > c.batch_value_c() {
@@ -4058,6 +4067,9 @@ pub(super) struct SubmitSpec {
     lists: Option<super::vk::defer::Lists>,
     wait: u64,
     on_c: bool,
+    /// Its prologue (`pre`, a compute-family buffer) runs on the compute
+    /// family's queue right before it (`Slot::pre_on_c`).
+    pre_on_c: bool,
     xwait: u64,
     /// The batch whose deferred effects must have run first (0: none;
     /// `Exec::order_after_cpu`).
@@ -4310,7 +4322,7 @@ fn submit_specs(mut specs: Vec<(u64, SubmitSpec)>) {
                 }
             }
             let (seq, s) = &specs[i];
-            if let Err(e) = submit_batch(*seq, s.xpre, s.pre, s.cmd, s.wait, s.on_c, s.xwait, s.cpu_wait) {
+            if let Err(e) = submit_batch(*seq, s.xpre, s.pre, s.cmd, s.wait, s.on_c, s.pre_on_c, s.xwait, s.cpu_wait) {
                 fail(e, &s.name);
             }
             if !s.on_c {
@@ -4326,7 +4338,7 @@ fn submit_specs(mut specs: Vec<(u64, SubmitSpec)>) {
                 replay_main(l, specs[i].1.pre.is_some());
             }
             let (seq, s) = &specs[i];
-            if let Err(e) = submit_batch(*seq, s.xpre, s.pre, s.cmd, s.wait, s.on_c, s.xwait, s.cpu_wait) {
+            if let Err(e) = submit_batch(*seq, s.xpre, s.pre, s.cmd, s.wait, s.on_c, s.pre_on_c, s.xwait, s.cpu_wait) {
                 fail(e, &s.name);
             }
             LAST_MAIN_SUBMITTED.fetch_max(*seq, Ordering::Relaxed);
@@ -6627,9 +6639,19 @@ const XR_N: usize = 5;
 /// with image-cache work, main-queue batches, of them with a dependency,
 /// dependencies by reason (XR_*), compute prologues that waited for a
 /// compute batch, compute batches closed for image-cache work].
-static XQ_STATS: [AtomicU64; 7 + XR_N] = [const { AtomicU64::new(0) }; 7 + XR_N];
+static XQ_STATS: [AtomicU64; 9 + XR_N] = [const { AtomicU64::new(0) }; 9 + XR_N];
 const XS_PRE_WAITS: usize = 5 + XR_N;
 const XS_IMAGE_CLOSES: usize = 6 + XR_N;
+/// Compute prologues on the compute queue (`tune xq_pre_c`), and of them those
+/// that would have waited on the main queue for an unfinished compute batch.
+const XS_PRE_C: usize = 7 + XR_N;
+const XS_PRE_C_UNDO: usize = 8 + XR_N;
+/// The pages compute batches' prologues on the compute queue upload, noted
+/// when they are queued: a main-queue batch queued later that writes into one
+/// waits for that batch (its prologue's copy of guest memory would land over
+/// those writes in the mirror).
+static XC_UPLOADS: RangeLog = RangeLog::new(&XC_UPLOADS_SPAN);
+static XC_UPLOADS_SPAN: SpanMarks = SpanMarks::new();
 
 /// Ordered async compute's dependencies are tracked: its census, or the
 /// compute family's queue set up (its batches may still run after the
@@ -6667,6 +6689,8 @@ pub(super) struct XqBatch<'a> {
     dep: u64,
     why: u32,
     images: bool,
+    /// Its prologue runs on the compute family's queue (`Slot::pre_on_c`).
+    pre_on_c: bool,
 }
 
 /// `XqBatch` for batch `seq` (see there): the compute batch a main-queue
@@ -6691,6 +6715,21 @@ fn xq_queued(seq: u64, x: XqBatch, name: &str) -> u64 {
         if x.images {
             XQ_STATS[2].fetch_add(1, Ordering::Relaxed);
         }
+        if x.pre_on_c {
+            // (Its prologue runs on the compute queue after every earlier batch there: no
+            // wait on the main queue; the main queue's later writers into its pages wait.)
+            for &u in &ups {
+                XC_UPLOADS.note(seq, u);
+            }
+            XQ_STATS[XS_PRE_C].fetch_add(1, Ordering::Relaxed);
+            if undo.is_some() {
+                XQ_STATS[XS_PRE_C_UNDO].fetch_add(1, Ordering::Relaxed);
+            }
+            if let Some(t) = traced {
+                crate::info!("{t} [on the compute queue: no wait]");
+            }
+            return 0;
+        }
         if undo.is_some() {
             XQ_STATS[XS_PRE_WAITS].fetch_add(1, Ordering::Relaxed);
         }
@@ -6704,6 +6743,15 @@ fn xq_queued(seq: u64, x: XqBatch, name: &str) -> u64 {
     if let Some(s) = undo {
         dep = dep.max(s);
         why |= 1 << XR_UPLOAD;
+    }
+    // (Its writes into pages an unfinished compute batch's prologue on the compute queue
+    // uploads: after that batch, or the prologue's copy could land over them.)
+    if XC_UPLOADS.latest_seq.load(Ordering::SeqCst) > done && !x.writes.is_empty() {
+        let w: Vec<(u64, u64)> = x.writes.iter().collect();
+        if let Some(s) = XC_UPLOADS.latest(&w).filter(|&s| s > done) {
+            dep = dep.max(s);
+            why |= 1 << XR_UPLOAD;
+        }
     }
     if x.compute {
         let last = XQ_LAST[(x.acb & 0xFF) as usize].load(Ordering::Acquire);
@@ -6762,9 +6810,9 @@ pub fn xq_line() -> String {
         return String::new();
     }
     format!(
-        "    ordered async compute{}: {} compute batches ({} pages uploaded, {} with image-cache work, {} closed for it; {} prologues after an unfinished compute batch), {} main-queue batches, {} of them after an unfinished compute batch (label waits passed on its promise {}, labels read from memory it writes {}, uploads into pages it writes {}, indirect arguments it writes {}, its compute queue's batch before {})\n",
+        "    ordered async compute{}: {} compute batches ({} pages uploaded, {} with image-cache work, {} closed for it; {} prologues after an unfinished compute batch on the main queue, {} on the compute queue ({} of them after one)), {} main-queue batches, {} of them after an unfinished compute batch (label waits passed on its promise {}, labels read from memory it writes {}, uploads into pages it writes {}, indirect arguments it writes {}, its compute queue's batch before {})\n",
         if super::tune::async_compute() == 1 { "'s census" } else { "" },
-        v[0], v[1], v[2], v[XS_IMAGE_CLOSES], v[XS_PRE_WAITS], v[3], v[4], v[5], v[6], v[7], v[8], v[9]
+        v[0], v[1], v[2], v[XS_IMAGE_CLOSES], v[XS_PRE_WAITS], v[XS_PRE_C], v[XS_PRE_C_UNDO], v[3], v[4], v[5], v[6], v[7], v[8], v[9]
     )
 }
 
@@ -7617,8 +7665,13 @@ struct Slot {
     shadow_mem: vk::DeviceMemory,
     shadow_cap: u64,
     /// The batch's prologue: copies of read-only buffers into `pre_buf`
-    /// (PRE_SEG, allocated on first use), submitted before `cmd`.
+    /// (PRE_SEG, allocated on first use), submitted before `cmd`: `gpre`
+    /// (the main family's) or, for a compute batch with `tune xq_pre_c`,
+    /// `cpre` (the compute family's: it runs on the compute queue, `pre_on_c`).
     pre: vk::CommandBuffer,
+    gpre: vk::CommandBuffer,
+    cpre: vk::CommandBuffer,
+    pre_on_c: bool,
     pre_buf: Option<vk::Buffer>,
     pre_mem: vk::DeviceMemory,
     pre_cap: u64,
@@ -7736,10 +7789,11 @@ impl Slot {
             } else {
                 c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(xpool).command_buffer_count(1)).map_err(|e| e.to_string())?[0]
             };
-            let ccmd = if cpool == vk::CommandPool::null() {
-                vk::CommandBuffer::null()
+            let (ccmd, cpre) = if cpool == vk::CommandPool::null() {
+                (vk::CommandBuffer::null(), vk::CommandBuffer::null())
             } else {
-                c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cpool).command_buffer_count(1)).map_err(|e| e.to_string())?[0]
+                let v = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cpool).command_buffer_count(2)).map_err(|e| e.to_string())?;
+                (v[0], v[1])
             };
             // SGPR data in system memory: a copy in video memory, read by
             // every invocation, made no measurable difference (`tune ring_vram`).
@@ -7773,6 +7827,9 @@ impl Slot {
                 shadow_mem: vk::DeviceMemory::null(),
                 shadow_cap: 0,
                 pre,
+                gpre: pre,
+                cpre,
+                pre_on_c: false,
                 pre_buf: None,
                 pre_mem: vk::DeviceMemory::null(),
                 pre_cap: 0,
@@ -10889,6 +10946,9 @@ struct Closed {
     /// queue (`Exec::batch_c`).
     xq: (u64, u32, bool),
     on_c: bool,
+    /// Its prologue on the compute family's queue (`Slot::pre_on_c`): its
+    /// uploads are valid for other batches once it completed.
+    pre_on_c: bool,
 }
 
 /// Slot sequence of a batch closed but not yet submitted.
@@ -11569,6 +11629,9 @@ impl Exec {
             let s = &mut self.slots[self.cur];
             s.cmd = if self.batch_c { s.ccmd } else { s.gcmd };
             s.on_c = self.batch_c;
+            // (Its prologue on the compute queue too: `tune xq_pre_c`.)
+            s.pre_on_c = self.batch_c && s.cpre != vk::CommandBuffer::null() && super::tune::xq_pre_c();
+            s.pre = if s.pre_on_c { s.cpre } else { s.gpre };
         }
         // Deferred recording: this thread's commands for the batch's command
         // buffers (from their begin on) go to lists until the batch closes.
@@ -11837,6 +11900,8 @@ impl Exec {
         let (cmd, fence) = (self.slots[i].cmd, self.slots[i].fence);
         let bq = self.slots[i].bq;
         let pre = self.end_pre();
+        // (A compute batch's prologue on the compute queue, `tune xq_pre_c`.)
+        let pre_on_c = pre.is_some() && self.slots[i].pre_on_c;
         let xpre = self.end_xpre();
         finish_main(cmd, bq, pre.is_some());
         let copy_wait = std::mem::take(&mut self.copy_wait);
@@ -11877,7 +11942,7 @@ impl Exec {
             let cpu = self.span_cpu();
             super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why}{cpu})", self.batch_shaders.len()));
             let lists = std::mem::take(&mut self.batch_lists).then(super::vk::defer::release);
-            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, cpu_wait: std::mem::take(&mut self.cpu_wait), kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises, fe2_up: Vec::new(), fe2_spans: Vec::new(), lists, xq: (self.xq_dep, self.xq_why, self.xq_img), on_c: self.batch_c });
+            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, cpu_wait: std::mem::take(&mut self.cpu_wait), kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises, fe2_up: Vec::new(), fe2_spans: Vec::new(), lists, xq: (self.xq_dep, self.xq_why, self.xq_img), on_c: self.batch_c, pre_on_c });
             (self.xq_dep, self.xq_why, self.xq_img) = (0, 0, false);
             self.res_mine.clear();
             if let Some(b) = self.closed.last_mut() {
@@ -11926,7 +11991,14 @@ impl Exec {
                 CPU_WAITS_GPU.fetch_add(1, Ordering::Relaxed);
             }
         }
-        let xq = xq_tracking().then_some(XqBatch { compute: self.xq_c, on_c, acb: acb_id(&self.name), writes: &self.pending, ups: &self.fe2_up, dep: self.xq_dep, why: self.xq_why, images: self.xq_img });
+        // (A prologue on the compute queue runs after the main queue's work queued meanwhile
+        // may have used the mirror: its uploads count for other batches once it completed.)
+        let mut actions = actions;
+        if pre_on_c && !self.fe2_up.is_empty() {
+            let (up, gens) = (self.fe2_up.clone(), self.fe2_gens.clone());
+            actions.push(Box::new(move || super::fe2::uploaded(&up, &gens, fe2_ep)));
+        }
+        let xq = xq_tracking().then_some(XqBatch { compute: self.xq_c, on_c, acb: acb_id(&self.name), writes: &self.pending, ups: &self.fe2_up, dep: self.xq_dep, why: self.xq_why, images: self.xq_img, pre_on_c });
         // (Pushed and its writes noted under the note gate: `NOTE_GATE`.)
         let note_gate = super::fe2::c4_on().then(|| NOTE_GATE.read_recursive());
         let seq = push_batch(fence, self.slots[i].queries, bq, actions, checks, std::mem::take(&mut self.batch_shaders), &self.name, gpu_labels, self.ops, std::mem::take(&mut self.segs), reset, on_c, xq, move |seq| {
@@ -11935,7 +12007,7 @@ impl Exec {
             }
             // (Deferred recording: `submit_specs` plays the lists.)
             let _ = seq;
-            Some(SubmitSpec { xpre, pre, cmd, lists, wait: copy_wait, on_c, xwait: 0, cpu_wait, name })
+            Some(SubmitSpec { xpre, pre, cmd, lists, wait: copy_wait, on_c, pre_on_c, xwait: 0, cpu_wait, name })
         });
         let cpu = self.span_cpu();
         super::timeline::end(&self.name, self.begun_mark.take(), || format!("batch #{seq}, {commands} commands ({why}{cpu})"));
@@ -11954,7 +12026,9 @@ impl Exec {
         self.slots[i].seq = seq;
         self.open_gen.store(u64::MAX, Ordering::SeqCst);
         if !self.fe2_up.is_empty() {
-            super::fe2::uploaded(&self.fe2_up, &self.fe2_gens, fe2_ep);
+            if !pre_on_c {
+                super::fe2::uploaded(&self.fe2_up, &self.fe2_gens, fe2_ep);
+            }
             self.fe2_up.clear();
         }
         if !self.fe2_spans.is_empty() {
@@ -16435,14 +16509,21 @@ impl Exec {
                     HELD_CPU_WAITS.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            let xq = xq_tracking().then_some(XqBatch { compute: self.xq_c, on_c, acb: acb_id(&self.name), writes: &b.writes, ups: &b.fe2_up, dep: b.xq.0, why: b.xq.1, images: b.xq.2 });
+            let pre_on_c = b.pre_on_c && pre.is_some();
+            let xq = xq_tracking().then_some(XqBatch { compute: self.xq_c, on_c, acb: acb_id(&self.name), writes: &b.writes, ups: &b.fe2_up, dep: b.xq.0, why: b.xq.1, images: b.xq.2, pre_on_c });
             let note_gate = super::fe2::c4_on().then(|| NOTE_GATE.read_recursive());
-            let seq = push_batch(fence, queries, bq, b.eager_action.into_iter().collect(), b.checks, b.shaders, &self.name, Vec::new(), b.ops, b.segs, reset, on_c, xq, move |_| {
+            let mut acts: Vec<Action> = b.eager_action.into_iter().collect();
+            // (A prologue on the compute queue: its uploads count once it completed.)
+            if pre_on_c && !b.fe2_up.is_empty() {
+                let (up, gens) = (b.fe2_up.clone(), self.fe2_gens.clone());
+                acts.push(Box::new(move || super::fe2::uploaded(&up, &gens, fe2_ep)));
+            }
+            let seq = push_batch(fence, queries, bq, acts, b.checks, b.shaders, &self.name, Vec::new(), b.ops, b.segs, reset, on_c, xq, move |_| {
                 if DEVICE_LOST.load(Ordering::Relaxed) {
                     return None;
                 }
                 // (Deferred recording: `submit_specs` plays the lists.)
-                Some(SubmitSpec { xpre: None, pre, cmd, lists, wait: copy_wait, on_c, xwait: 0, cpu_wait, name })
+                Some(SubmitSpec { xpre: None, pre, cmd, lists, wait: copy_wait, on_c, pre_on_c, xwait: 0, cpu_wait, name })
             });
             if cpu_wait > 0 {
                 let mut l = CPU_WAIT_LOG.lock();
@@ -16452,7 +16533,7 @@ impl Exec {
                 l.push_back((seq, cpu_wait));
             }
             self.slots[b.slot].seq = seq;
-            if !b.fe2_up.is_empty() {
+            if !b.fe2_up.is_empty() && !pre_on_c {
                 super::fe2::uploaded(&b.fe2_up, &self.fe2_gens, fe2_ep);
             }
             if !b.fe2_spans.is_empty() {

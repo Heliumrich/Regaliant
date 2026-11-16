@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 177] = [
+    static ALL: [Tunable; 178] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -209,6 +209,7 @@ pub mod tune {
         Tunable { name: "held_min", env: "DS_HELD_MIN", default: 192, value: AtomicU64::new(UNSET) },
         Tunable { name: "async_gfx_inline", env: "DS_ASYNC_GFX_INLINE", default: 12, value: AtomicU64::new(UNSET) },
         Tunable { name: "zk", env: "DS_ZK", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "xq_pre_c", env: "DS_XQ_PRE_C", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1436,6 +1437,15 @@ pub mod tune {
     /// only the main queue's zero stores set bits: `Exec::fill_in_place_parts`).
     pub fn zk() -> bool {
         get(176) != 0
+    }
+
+    /// Ordered async compute: a compute batch's prologue (its uploads into the mirror) on the
+    /// compute family's queue right before it instead of on the main queue (`Exec::begin_batch`;
+    /// live at batch boundaries): no main-queue wait for an earlier compute batch whose writes
+    /// its uploads would undo; its uploads count for other batches once it completed, and the
+    /// main queue's later batches that write into its pages wait for it (`exec::XC_UPLOADS`).
+    pub fn xq_pre_c() -> bool {
+        get(177) != 0
     }
 
     /// Whether translations get `rdna::translate::Spec::hw_bounds` (scalar
