@@ -1102,6 +1102,24 @@ pub fn arm_watch_current_thread(guest: bool) {
     }
 }
 
+/// Re-applies the active watch slots to the calling thread (`set_watch` updates every other
+/// registered thread; a hook arming a slot on the thread it runs on calls this after it).
+pub fn arm_watch_here(guest: bool) {
+    use windows_sys::Win32::System::Diagnostics::Debug::{GetThreadContext, SetThreadContext};
+    use windows_sys::Win32::System::Threading::GetCurrentThread;
+    unsafe {
+        let mut c: AlignedContext = std::mem::zeroed();
+        c.0.ContextFlags = CONTEXT_DEBUG_REGISTERS_AMD64;
+        if GetThreadContext(GetCurrentThread(), &mut c.0) == 0 {
+            return;
+        }
+        apply_slots(&mut c.0, guest);
+        if SetThreadContext(GetCurrentThread(), &c.0) == 0 {
+            crate::warn!("watch: SetThreadContext failed on this thread");
+        }
+    }
+}
+
 /// Sets watch slot `slot` (address 0: off) and re-arms every registered
 /// thread (suspended while its debug registers change). Returns how many
 /// threads were updated.

@@ -183,6 +183,7 @@ pub extern "sysv64" fn handoff_hook(regs: *const u64, _arg: u32) {
     CALLS[0].fetch_add(1, Ordering::Relaxed);
     HANDED_ITEMS.lock().get_or_insert_with(HashSet::new).insert(item);
     let Some(model) = model else { return };
+    watch_model(model);
     let (flags, p158) = (rd64(model + 0x198).unwrap_or(0), rd64(model + 0x158).unwrap_or(0));
     let mut g = HANDED.lock();
     let e = g.get_or_insert_with(HashMap::new).entry(model).or_insert((0, item, flags, p158));
@@ -199,6 +200,34 @@ pub extern "sysv64" fn handoff_hook(regs: *const u64, _arg: u32) {
 /// Per model: the pass kinds whose list held it (bit = kind, `listed_hook`) and the LODs
 /// eboot+0xab4210 was asked for (bit = LOD index, `lod_hook`).
 static KINDS: Mutex<Option<HashMap<u64, (u32, u32)>>> = Mutex::new(None);
+
+/// `DS_CPUDRAW_WATCH=x/y/z` (census): watch slot 1 armed for writes of the LOD count (+0x14a, two
+/// bytes) of the first handed-off model whose box center lies within 1.5 m of (x, y, z), on every
+/// guest thread and this one (the log names each writer: who empties the absorbed models' LODs).
+fn watch_model(model: u64) {
+    static AT: std::sync::OnceLock<Option<[f32; 3]>> = std::sync::OnceLock::new();
+    static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let Some(p) = *AT.get_or_init(|| {
+        std::env::var("DS_CPUDRAW_WATCH").ok().and_then(|v| {
+            let f: Vec<f32> = v.replace([';', ':', ','], "/").split('/').filter_map(|x| x.trim().parse().ok()).collect();
+            (f.len() >= 3).then(|| [f[0], f[1], f[2]])
+        })
+    }) else {
+        return;
+    };
+    if ARMED.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(b) = rd64(model + 0x128) else { return };
+    let c = [(rdf(b) + rdf(b + 12)) / 2.0, (rdf(b + 4) + rdf(b + 16)) / 2.0, (rdf(b + 8) + rdf(b + 20)) / 2.0];
+    let d = ((c[0] - p[0]).powi(2) + (c[1] - p[1]).powi(2) + (c[2] - p[2]).powi(2)).sqrt();
+    if !(d <= 1.5) || ARMED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let n = crate::exception::set_watch(1, model + 0x14a, 1, 2, true);
+    crate::exception::arm_watch_here(true);
+    crate::info!("cpu draw census: watching the LOD count of model {model:#x} (+0x14a = {:#x}, center {:.1} {:.1} {:.1}) for writes on {n} other threads and this one", rd16(model + 0x14a).unwrap_or(0), c[0], c[1], c[2]);
+}
 
 /// At eboot+0xab4210's entry: the model in rsi, the LOD index in edx. (Its per-item test
 /// is eboot+0x99c770 on the item's world box at +0x18, which eboot+0xabaca0 writes from its
