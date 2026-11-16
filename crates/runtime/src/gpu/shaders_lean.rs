@@ -104,6 +104,9 @@ pub(super) struct LeanPlan {
     trs: RefCell<Vec<TrEntry>>,
     /// The next entry `learn` replaces when `trs` is full.
     next: Cell<usize>,
+    /// `DS_LEAN_REPEATS=1`: the last preparation's user data and words read (a census of
+    /// preparations that repeat the one before on this thread).
+    last: RefCell<(Vec<u32>, Vec<u32>, u64)>,
     /// Per buffer resource: the format and swizzle `single_format` last answered for, with
     /// the thread's format-memo generation and the answer.
     single: RefCell<Vec<Option<(u32, u64, bool)>>>,
@@ -231,6 +234,7 @@ fn plan_for(key: u64, insts: &[rdna::Inst], stage: Stage) -> Option<Rc<LeanPlan>
         hints: Cell::new(super::READ_HINTS.with(|h| h.borrow().get(&key).copied().unwrap_or([0; 3]))),
         trs: RefCell::new(Vec::new()),
         next: Cell::new(0),
+        last: RefCell::new((Vec::new(), Vec::new(), 0)),
         single: RefCell::new(vec![None; n]),
     });
     PLANS.with(|t| {
@@ -245,20 +249,32 @@ fn plan_for(key: u64, insts: &[rdna::Inst], stage: Stage) -> Option<Rc<LeanPlan>
 
 /// A node's value, read once per preparation (`Reader::ptr`'s order: the chain it comes from
 /// first, then its two words).
-fn node_val(i: usize, lp: &LeanPlan, nodes: &[(Ptr, Node)], vals: &mut [Option<u64>; MAX_NODES], rd: &mut Reader, user: &[u32], code_base: u64) -> Option<u64> {
-    if let Some(v) = vals[i] {
-        return Some(v);
+/// The values of a preparation's nodes and which of them are evaluated (bit i: node i).
+struct Vals {
+    v: [std::mem::MaybeUninit<u64>; MAX_NODES],
+    have: u64,
+}
+
+fn node_val(i: usize, lp: &LeanPlan, nodes: &[(Ptr, Node)], vals: &mut Vals, rd: &mut Reader, user: &[u32], code_base: u64) -> Option<u64> {
+    if vals.have & (1 << i) != 0 {
+        // SAFETY: bit i of `have` is set only once entry i was written.
+        return Some(unsafe { vals.v[i].assume_init() });
     }
     let n = nodes[i].1;
     let base = root_val(n.from, lp, nodes, vals, rd, user, code_base)? + n.off as u64;
-    let lo = rd.u32(base)? as u64;
-    let hi = rd.u32(base + 4)? as u64;
-    let v = lo | (hi << 32);
-    vals[i] = Some(v);
+    // (The pointer's two words in one read: the full path's two reads of consecutive words make
+    // the same range and words.)
+    let mut w = [0u32; 2];
+    if base % 4 != 0 || !rd.read_into(base, &mut w) {
+        return None;
+    }
+    let v = w[0] as u64 | (w[1] as u64) << 32;
+    vals.v[i].write(v);
+    vals.have |= 1 << i;
     Some(v)
 }
 
-fn root_val(r: Root, lp: &LeanPlan, nodes: &[(Ptr, Node)], vals: &mut [Option<u64>; MAX_NODES], rd: &mut Reader, user: &[u32], code_base: u64) -> Option<u64> {
+fn root_val(r: Root, lp: &LeanPlan, nodes: &[(Ptr, Node)], vals: &mut Vals, rd: &mut Reader, user: &[u32], code_base: u64) -> Option<u64> {
     match r {
         Root::User(k) => Some((*user.get(k as usize)? as u64) | ((*user.get(k as usize + 1)? as u64) << 32)),
         Root::Pc(o) => Some(code_base + o),
@@ -266,7 +282,7 @@ fn root_val(r: Root, lp: &LeanPlan, nodes: &[(Ptr, Node)], vals: &mut [Option<u6
     }
 }
 
-fn eval_word(w: Word, lp: &LeanPlan, nodes: &[(Ptr, Node)], vals: &mut [Option<u64>; MAX_NODES], rd: &mut Reader, user: &[u32], code_base: u64) -> Option<u32> {
+fn eval_word(w: Word, lp: &LeanPlan, nodes: &[(Ptr, Node)], vals: &mut Vals, rd: &mut Reader, user: &[u32], code_base: u64) -> Option<u32> {
     match w {
         Word::User(k) => user.get(k as usize).copied(),
         Word::Const(c) => Some(c),
@@ -323,6 +339,15 @@ thread_local! {
     static PHASE_FIRST: Cell<bool> = const { Cell::new(true) };
 }
 
+/// `DS_LEAN_REPEATS=1`: [lean preparations, with the user data of the plan's last one on this
+/// thread, of those with its words read too, of those with its translation too, the words alone].
+static REPEATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+fn repeats_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_LEAN_REPEATS").ok().as_deref() == Some("1"))
+}
+
 /// `DS_LEAN_TWICE=1` (a diagnosis): each lean preparation made twice, the second on warm caches
 /// timed apart (`time` kind 3).
 fn twice_on() -> bool {
@@ -361,7 +386,7 @@ pub fn reset_cycles() {
             c.store(0, Ordering::Relaxed);
         }
     }
-    for c in &PHASES {
+    for c in PHASES.iter().chain(REPEATS.iter()) {
         c.store(0, Ordering::Relaxed);
     }
 }
@@ -389,11 +414,12 @@ fn prepare_with(addr: u64, insts: &Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, 
     }
     let map_gen = crate::mem::MAP_GEN.load(Ordering::Acquire);
     let images_gen = super::super::images::GPU_IMAGES_GEN.load(Ordering::Acquire);
-    let mut rd = Reader::with_sizes(addr, lp.hints.get());
+    let mut rd = Reader::lean(addr, lp.hints.get());
     rd.load_spans();
     let nodes_ref = lp.nodes.borrow();
     let nodes: &[(Ptr, Node)] = &nodes_ref;
-    let mut vals = [None::<u64>; MAX_NODES];
+    // (Not zeroed: `have` says which entries hold values.)
+    let mut vals = Vals { v: [std::mem::MaybeUninit::uninit(); MAX_NODES], have: 0 };
     let code_base = addr;
     let nres = lp.res.len();
     let mut resources = pool::resolved(nres);
@@ -583,6 +609,29 @@ fn prepare_with(addr: u64, insts: &Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, 
     }
     drop(trs);
     mark(3);
+    if repeats_on() {
+        let mut last = lp.last.borrow_mut();
+        let same_user = last.0.as_slice() == user;
+        let same_words = last.1 == rd.words;
+        let same_tr = last.2 == Arc::as_ptr(&tr) as u64;
+        REPEATS[0].fetch_add(1, Ordering::Relaxed);
+        if same_user {
+            REPEATS[1].fetch_add(1, Ordering::Relaxed);
+            if same_words {
+                REPEATS[2].fetch_add(1, Ordering::Relaxed);
+                if same_tr {
+                    REPEATS[3].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        } else if same_words {
+            REPEATS[4].fetch_add(1, Ordering::Relaxed);
+        }
+        last.0.clear();
+        last.0.extend_from_slice(user);
+        last.1.clear();
+        last.1.extend_from_slice(&rd.words);
+        last.2 = Arc::as_ptr(&tr) as u64;
+    }
     let used = [rd.reads.len() as u32, rd.words.len() as u32, 0];
     lp.hints.set(used);
     rd.save_spans();
@@ -717,6 +766,17 @@ pub fn status() -> String {
 ",
             ph[5], ns(ph[0]), ns(ph[1]), ns(ph[2]), ns(ph[3]), ns(ph[4])
         )
+    };
+    let r: Vec<u64> = REPEATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let phase_line = if r[0] == 0 {
+        phase_line
+    } else {
+        phase_line
+            + &format!(
+                "    lean preparations repeating the plan's last one on their thread (`DS_LEAN_REPEATS`): {} made, same user data {}, and same words read {}, and same translation {}; same words with other user data {}
+",
+                r[0], r[1], r[2], r[3], r[4]
+            )
     };
     let timing = phase_line + &format!("    stage preparation cycles (since the last profile reset): lean {}, full path with the lane off {}, full path for what the lane left {}, lean again on warm caches {}
 ", per(0), per(1), per(2), per(3));
