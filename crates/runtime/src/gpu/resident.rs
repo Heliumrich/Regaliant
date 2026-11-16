@@ -1681,6 +1681,27 @@ pub fn back(base: u64, len: u64) -> Result<(), String> {
     back_in(MIRROR.get().ok_or("no mirror")?, base, len, &STATS[S_BACKED])
 }
 
+/// Whether the mirror's pages of [base, base + len) are all backed, their words' last placement
+/// stamped as `back` stamps it (front end 2's lean placement, `Exec::fe2_place_quick`). False:
+/// `back` binds what is missing.
+#[inline]
+pub fn backed_now(base: u64, len: u64) -> bool {
+    let Some(m) = MIRROR.get() else { return false };
+    if len == 0 || base < MIRROR_BASE || base + len > MIRROR_END {
+        return false;
+    }
+    let first = (base - MIRROR_BASE) / m.page;
+    let last = (base + len - 1 - MIRROR_BASE) / m.page;
+    let flip = super::FRAMES.load(Ordering::Relaxed) as u32;
+    for w in (first / 64)..=(last / 64) {
+        let u = &m.used[w as usize];
+        if u.load(Ordering::Relaxed) != flip {
+            u.store(flip, Ordering::Relaxed);
+        }
+    }
+    (first..=last).all(|p| m.backed[(p / 64) as usize].load(Ordering::Acquire) & (1u64 << (p % 64)) != 0)
+}
+
 /// Backing ahead: a recording thread's backing that bound granules right
 /// after a backed one (a region growing in order: ~40% of the walk's backing
 /// time) has the next `BACK_AHEAD` granules bound by a helper thread, so the

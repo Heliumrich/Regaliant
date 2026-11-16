@@ -464,6 +464,25 @@ pub fn last_fine() -> u8 {
     LAST_FINE.with(|c| c.get())
 }
 
+/// Front end 2's lean check (`Exec::fe2_place_quick`): whether every page of the read-only range
+/// [lo, hi) (page-aligned, a few words at most) is current for `want` as its state stands
+/// (valid and clean for it, or armed), which `ensure` would find with nothing to do. False:
+/// `ensure` runs (pages its caller's batch uploaded are current too, which only it knows).
+#[inline]
+pub fn quick_fine(lo: u64, hi: u64, want: u32) -> bool {
+    let mut a = lo;
+    while a < hi {
+        let e = word_end(a, hi);
+        let Some(c) = chunk(a, false) else { return false };
+        let m = word_mask(a, e);
+        if word_ok(c, a, e, want) & m != m {
+            return false;
+        }
+        a = e;
+    }
+    true
+}
+
 /// `DS_STEP_LAPS=1`: front end 2's checks with work timed by the kind of each run they
 /// handled (`WORK_PARTS`).
 fn work_laps() -> bool {
@@ -6498,6 +6517,29 @@ thread_local! {
     static READ_MARKED: std::cell::RefCell<Box<[u64; READ_MARKED_SLOTS]>> = std::cell::RefCell::new(Box::new([u64::MAX; READ_MARKED_SLOTS]));
 }
 const READ_MARKED_SLOTS: usize = 1024;
+
+/// Whether `c4_release_reads` would do nothing for `reads`: front end 4 off, or every page of
+/// them in this thread's read memo (`READ_MARKED`; the lean shader-read sync).
+#[inline]
+pub fn c4_reads_known(reads: &[(u64, u64)]) -> bool {
+    if !c4_on() {
+        return true;
+    }
+    READ_MARKED.with(|m| {
+        let m = m.borrow();
+        reads.iter().all(|&(a, n)| {
+            let (lo, hi) = (a & !(PAGE - 1), a.saturating_add(n.max(1)).next_multiple_of(PAGE));
+            let mut p = lo;
+            while p < hi {
+                if m[(p / PAGE) as usize & (READ_MARKED_SLOTS - 1)] != p {
+                    return false;
+                }
+                p += PAGE;
+            }
+            true
+        })
+    })
+}
 
 /// Our command processors read `reads` on the CPU: held pages released first.
 pub fn c4_release_reads(reads: &[(u64, u64)]) {

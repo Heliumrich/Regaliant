@@ -211,7 +211,7 @@ pub mod tune {
         Tunable { name: "zk", env: "DS_ZK", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "xq_pre_c", env: "DS_XQ_PRE_C", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lean", env: "DS_LEAN", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "page_memo", env: "DS_PAGE_MEMO", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "lane", env: "DS_LANE", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1462,12 +1462,13 @@ pub mod tune {
         get(178) != 0
     }
 
-    /// Front end 2's page memo (`exec::PageMemo`; the lean lane's placement part): a range on
-    /// pages the executor's batch placed under the same epoch, wanted state and mappings is
-    /// placed without front end 2's check. Default since 2026-11-16 night (exact in 89 M
-    /// checked answers, Castlewall turning x1.028); `DS_PAGE_MEMO=0` the fallback;
-    /// `DS_PAGE_MEMO_CHECK=1` places each answer again in full and compares.
-    pub fn page_memo() -> bool {
+    /// The lean lane's run-time parts (2026-11-16 night; the preparations are `lean`): front end
+    /// 2's page memo (`exec::PageMemo`: a range on pages the executor's batch placed under the
+    /// same epoch, wanted state and mappings is placed without front end 2's check), its lean
+    /// check of small read-only ranges (`Exec::fe2_place_quick`) and the lean shader-read sync
+    /// (`Exec::sync_quick`). `DS_LANE=0` the fallback; `DS_PAGE_MEMO_CHECK=1` places every memo
+    /// and lean-check answer again in full and compares.
+    pub fn lane() -> bool {
         get(179) != 0
     }
 

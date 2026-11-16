@@ -3842,12 +3842,12 @@ pub(super) fn push_line() -> String {
     ) + &batch_miss_line()
         + &place_memo_cycles_line()
         + &super::fe2::work_parts_line()
-        + &format!("    front end 2's placement memo: {} repeats answered, {} by the page memo, {} placements made
-", PLACE_MEMO[0].load(Ordering::Relaxed), PLACE_MEMO[2].load(Ordering::Relaxed), PLACE_MEMO[1].load(Ordering::Relaxed))
+        + &format!("    front end 2's placement memo: {} repeats answered, {} by the page memo, {} by the lean check, {} placements made
+", PLACE_MEMO[0].load(Ordering::Relaxed), PLACE_MEMO[2].load(Ordering::Relaxed), PLACE_MEMO[3].load(Ordering::Relaxed), PLACE_MEMO[1].load(Ordering::Relaxed))
         + &if page_memo_check_on() {
             let c: Vec<u64> = PAGE_MEMO_CHECKS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-            format!("    page memo checked (`DS_PAGE_MEMO_CHECK`): {} answers, {} results differed, {} full placements had work to do; the placement memo's answers: {}, {} differed, {} with work
-", c[0], c[1], c[2], c[3], c[4], c[5])
+            format!("    page memo checked (`DS_PAGE_MEMO_CHECK`): {} answers, {} results differed, {} full placements had work to do; the placement memo's answers: {}, {} differed, {} with work; the lean check's answers: {}, {} differed, {} with work; the lean sync's answers: {}, {} where the full sync waited
+", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10])
         } else {
             String::new()
         }
@@ -9178,11 +9178,13 @@ struct PageMemo {
     stamp: u64,
 }
 
-/// The page memo checked (`DS_PAGE_MEMO_CHECK=1`, diagnosis): each answer placed again by the
-/// full path and compared: [answers checked, results that differed, full placements that had
-/// work to do], then the same for the placement memo's answers (the rate of work found after
-/// an answer that memo has always given: pages another thread's take found written since).
-static PAGE_MEMO_CHECKS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// The lane's answers checked (`DS_PAGE_MEMO_CHECK=1`, diagnosis): each answer placed again by
+/// the full path and compared: [answers checked, results that differed, full placements that
+/// had work to do] for the page memo, the placement memo (the rate of work found after an
+/// answer that memo has always given: pages another thread's take found written since) and the
+/// lean check (`Exec::fe2_place_quick`), then the lean sync's answers with the full sync run as
+/// well [answers, those where it waited].
+static PAGE_MEMO_CHECKS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
 fn page_memo_check_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -9202,9 +9204,9 @@ fn place_memo_set(base: u64, size: u64, written: bool) -> usize {
     ((h >> (64 - (PLACE_MEMO_SLOTS / PLACE_MEMO_WAYS).trailing_zeros())) as usize) * PLACE_MEMO_WAYS
 }
 
-/// The placement memo's [hits, misses, page memo answers] (`Exec::fe2_place`), added per
-/// thread every 4,096.
-pub static PLACE_MEMO: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// The placement memo's [hits, misses, page memo answers, lean checks' answers]
+/// (`Exec::fe2_place`), added per thread every 4,096.
+pub static PLACE_MEMO: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// Batch starts' census (`DS_PLACE_CENSUS=1`, diagnosis): placements the memo did not answer,
 /// [the batch's first command, later ones] x [the memo's slot holds the same range, epoch,
@@ -9242,33 +9244,34 @@ fn place_census_line() -> String {
 }
 
 thread_local! {
-    static PLACE_MEMO_LOCAL: std::cell::Cell<[u64; 3]> = const { std::cell::Cell::new([0; 3]) };
+    static PLACE_MEMO_LOCAL: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
 }
 
 /// Counts a placement by how it was answered (`PLACE_HOW`'s numbering: 0 the placement memo,
-/// 1 the page memo, 2 a full placement).
+/// 1 the page memo, 2 a full placement, 3 the lean check).
 #[inline]
 fn place_memo_count(how: u8) {
     PLACE_HOW.with(|c| c.set(how));
     PLACE_MEMO_LOCAL.with(|c| {
         let mut v = c.get();
-        v[[0, 2, 1][how as usize]] += 1;
-        if v[0] + v[1] + v[2] >= 4096 {
+        v[[0, 2, 1, 3][how as usize]] += 1;
+        if v.iter().sum::<u64>() >= 4096 {
             for (a, b) in PLACE_MEMO.iter().zip(v.iter()) {
                 a.fetch_add(*b, Ordering::Relaxed);
             }
-            v = [0; 3];
+            v = [0; 4];
         }
         c.set(v);
     });
 }
 
 /// The placement memo's answers timed (`DS_STEP_LAPS`): [hit cycles, hits, miss cycles, misses,
-/// page memo cycles, page memo answers], added per thread every 4,096.
-pub static PLACE_MEMO_CYCLES: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// page memo cycles, page memo answers, lean checks' cycles, their answers], added per thread
+/// every 4,096.
+pub static PLACE_MEMO_CYCLES: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 thread_local! {
-    static PLACE_MEMO_CYC: std::cell::Cell<[u64; 6]> = const { std::cell::Cell::new([0; 6]) };
+    static PLACE_MEMO_CYC: std::cell::Cell<[u64; 8]> = const { std::cell::Cell::new([0; 8]) };
 }
 
 /// A placement miss's parts timed (`DS_STEP_LAPS`): [before the check, the check when the range
@@ -9320,6 +9323,33 @@ thread_local! {
 
 /// Adds `cycles` to sync part `k` (`SYNC_PARTS`; only while `laps()`).
 #[inline]
+/// Whether a diagnosis hook of `Exec::sync_for` is on (its lean path then never answers).
+fn sync_hooks_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::hscensus::on() || !read_census_rules().is_empty() || super::fe2::wb_buckets() || super::runprobe::on() || super::xwait::on() || super::smalltrack::on() || std::env::var("DS_TRACE_SYNC").ok().is_some_and(|v| !v.is_empty() && v != "0") || clean_check_on()
+    })
+}
+
+/// Syncs the lean path answered (`DS_STEP_LAPS`; `Exec::sync_quick`), added per thread every 4,096.
+static SYNC_QUICK: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static SYNC_QUICK_LOCAL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn sync_quick_count() {
+    SYNC_QUICK_LOCAL.with(|c| {
+        let v = c.get() + 1;
+        if v >= 4096 {
+            SYNC_QUICK.fetch_add(v, Ordering::Relaxed);
+            c.set(0);
+        } else {
+            c.set(v);
+        }
+    });
+}
+
 fn sync_part(k: usize, t: &mut u64) {
     if *t == 0 {
         return;
@@ -9409,7 +9439,7 @@ fn sync_time(cycles: u64) {
 /// `PLACE_MEMO_CYCLES` as a status line ("" before any).
 fn place_memo_cycles_line() -> String {
     let v: Vec<u64> = PLACE_MEMO_CYCLES.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    if v[1] + v[3] + v[5] == 0 {
+    if v[1] + v[3] + v[5] + v[7] == 0 {
         return String::new();
     }
     let hz = super::threadcpu::tsc_hz();
@@ -9421,10 +9451,11 @@ fn place_memo_cycles_line() -> String {
     let parts: Vec<String> = SYNC_PART_NAMES.iter().enumerate().map(|(k, name)| format!("{name} {:.0}", ns(sp[k], sp[8]))).collect();
     let cl: Vec<u64> = CLEAN_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let sync = format!(
-        "    stages' shader-read syncs timed (`DS_STEP_LAPS`): {} at {:.0} ns; by part, ns a call ({} timed): {}; the clean-page memo: {} syncs, reset by writes noted in flight {}, by stale homes {}; pages clean in it {}, checked {}
+        "    stages' shader-read syncs timed (`DS_STEP_LAPS`): {} at {:.0} ns, {} of all syncs answered by the lean path; by part, ns a call ({} timed): {}; the clean-page memo: {} syncs, reset by writes noted in flight {}, by stale homes {}; pages clean in it {}, checked {}
 ",
         sc[1],
         ns(sc[0], sc[1]),
+        SYNC_QUICK.load(Ordering::Relaxed),
         sp[8],
         parts.join(", "),
         cl[0],
@@ -9439,12 +9470,14 @@ fn place_memo_cycles_line() -> String {
         String::new()
     };
     format!(
-        "    front end 2's placements timed (`DS_STEP_LAPS`, since the last profile reset): memo hits {} at {:.0} ns, page memo answers {} at {:.0} ns, misses {} at {:.0} ns; a miss's parts ({n} timed): before the check {:.0} ns, the check {:.0} ns when the range cache answered ({}), {:.0} ns otherwise ({}; with nothing to do {:.0} ns ({})), after it {:.0} ns
+        "    front end 2's placements timed (`DS_STEP_LAPS`, since the last profile reset): memo hits {} at {:.0} ns, page memo answers {} at {:.0} ns, lean checks' answers {} at {:.0} ns, misses {} at {:.0} ns; a miss's parts ({n} timed): before the check {:.0} ns, the check {:.0} ns when the range cache answered ({}), {:.0} ns otherwise ({}; with nothing to do {:.0} ns ({})), after it {:.0} ns
 ",
         v[1],
         ns(v[0], v[1]),
         v[5],
         ns(v[4], v[5]),
+        v[7],
+        ns(v[6], v[7]),
         v[3],
         ns(v[2], v[3]),
         ns(m[0], n),
@@ -9461,14 +9494,14 @@ fn place_memo_cycles_line() -> String {
 fn place_memo_time(how: u8, cycles: u64) {
     PLACE_MEMO_CYC.with(|c| {
         let mut v = c.get();
-        let k = [0, 4, 2][how.min(2) as usize];
+        let k = [0, 4, 2, 6][how.min(3) as usize];
         v[k] += cycles;
         v[k + 1] += 1;
-        if v[1] + v[3] + v[5] >= 4096 {
+        if v[1] + v[3] + v[5] + v[7] >= 4096 {
             for (a, b) in PLACE_MEMO_CYCLES.iter().zip(v.iter()) {
                 a.fetch_add(*b, Ordering::Relaxed);
             }
-            v = [0; 6];
+            v = [0; 8];
         }
         c.set(v);
     });
@@ -11208,6 +11241,7 @@ static BATCH_MISS_SITES: Mutex<Option<HashMap<u32, u64>>> = Mutex::new(None);
 /// A new window for the batched dispatches' statistics (`profile reset`).
 pub(super) fn reset_batch_misses() {
     super::fe2::reset_work_parts();
+    SYNC_QUICK.store(0, Ordering::Relaxed);
     for c in BATCHED.iter().chain(BATCH_MISS.iter()).chain(SHADOWS_PRE.iter()).chain(PLACE_MEMO_CYCLES.iter()).chain(MISS_PARTS.iter()).chain(SYNC_CYCLES.iter()).chain(SYNC_PARTS.iter()).chain(CLEAN_STATS.iter()) {
         c.store(0, Ordering::Relaxed);
     }
@@ -13036,6 +13070,35 @@ impl Exec {
     /// only at a later batch's: the title's per-view block found stale after its copy in every
     /// boot since the memo, its forwarding then refused, the vista's graphics CP waiting ~5 ms
     /// a flip for its own batches, FINDINGS.md 2026-11-06).
+    /// Front end 2's lean placement of a small read-only range (`tune page_memo`; a lane part):
+    /// inside one readable mapping run by the readability map, its mirror pages backed and its
+    /// pages current for `want` as their state stands (`fe2::quick_fine`), which front end 2's
+    /// full placement (`fe2_place_inner`) would find with nothing to do and place the same way.
+    /// None: the full placement runs.
+    #[inline]
+    fn fe2_place_quick(&mut self, base: u64, size: u64, want: u32) -> Option<(vk::Buffer, u64, u64)> {
+        use super::resident::{MIRROR_BASE, PAGE};
+        let end = base.checked_add(size)?;
+        if size == 0 || !super::fe2::in_span(base, size) {
+            return None;
+        }
+        let lo = base & !(PAGE - 1);
+        let hi = end.next_multiple_of(PAGE);
+        if hi - lo > PAGE_MEMO_RANGE * PAGE {
+            return None;
+        }
+        // (The end the full placement takes by the readability map, its R2 rule.)
+        if !(super::tune::r2() && (end - 1) >> 16 <= (base >> 16) + 64 && crate::mem::rg_readable(base, size) == Some(true)) {
+            return None;
+        }
+        let (mbuf, _) = super::resident::mirror_buffer()?;
+        if !super::resident::backed_now(lo, hi - lo) || !super::fe2::quick_fine(lo, hi, want) {
+            return None;
+        }
+        self.fe2_min_want = self.fe2_min_want.min(want);
+        Some((mbuf, base - MIRROR_BASE, hi - base))
+    }
+
     #[inline]
     fn fe2_memo_answer(&mut self, base: u64, size: u64, written: bool, want: u32) {
         if let Some(s) = CP_WRITES.latest(&[(base, size)]) {
@@ -13116,7 +13179,7 @@ impl Exec {
                 return Some(m.result);
             }
             // The page memo: a range on pages this batch placed under the same key.
-            let pm = super::tune::page_memo() && watch_range().is_none();
+            let pm = super::tune::lane() && watch_range().is_none();
             if pm {
                 let stamp = self.pm_gen_for(ep, want, map_gen);
                 if let Some(hi) = self.page_memo_hit(base, size, written, stamp) {
@@ -13143,8 +13206,35 @@ impl Exec {
                     self.fe2_memo_answer(base, size, written, want);
                     place_memo_count(1);
                     // (The range itself into the placement memo.)
-                    let k = self.place_memo_slot(set, None);
+                    let k = self.place_memo_slot(set, found);
                     self.place_memo[k] = PlaceMemo { base, size, batch: self.batch_count, ep, want, written, map_gen, result };
+                    return Some(result);
+                }
+            }
+            // The lean check: a small read-only range whose pages are current as they stand.
+            if pm && !written {
+                if let Some(result) = self.fe2_place_quick(base, size, want) {
+                    if page_memo_check_on() {
+                        // (Diagnosis: the full placement as well, compared.)
+                        let full = self.fe2_place_timed(base, size, written);
+                        PAGE_MEMO_CHECKS[6].fetch_add(1, Ordering::Relaxed);
+                        if super::fe2::last_fine() == 2 {
+                            PAGE_MEMO_CHECKS[8].fetch_add(1, Ordering::Relaxed);
+                        }
+                        if full != Some(result) {
+                            let k = PAGE_MEMO_CHECKS[7].fetch_add(1, Ordering::Relaxed);
+                            if k < 20 {
+                                crate::info!("gpu[{}]: lean check: {base:#x}+{size:#x} answered {result:x?}, placed {full:x?}", self.name);
+                            }
+                        }
+                    }
+                    self.fe2_memo_answer(base, size, false, want);
+                    place_memo_count(3);
+                    let k = self.place_memo_slot(set, found);
+                    self.place_memo[k] = PlaceMemo { base, size, batch: self.batch_count, ep, want, written, map_gen, result };
+                    use super::resident::PAGE;
+                    let stamp = self.pm_gen_for(ep, want, map_gen);
+                    self.page_memo_note(base & !(PAGE - 1), (base + result.2).next_multiple_of(PAGE), false, stamp);
                     return Some(result);
                 }
             }
@@ -15220,7 +15310,53 @@ impl Exec {
         r
     }
 
+    /// The lean shader-read sync (a lane part, 2026-11-16 night): whether every page of `reads`
+    /// is in the clean-page memo under the tag now and in front end 4's read memo, with no run
+    /// or held work's writes to stop at and no diagnosis hook on. Then `sync_for` would find
+    /// nothing to wait for or release (its forwarded cover only narrows the reads) and is not
+    /// run: it cost ~0.75-0.9 us a stage, every one of its steps paid even when all was clean.
+    #[inline]
+    fn sync_quick(&self, reads: &[(u64, u64)]) -> bool {
+        if !super::tune::lane() || !super::tune::clean_pages() || !self.run_writes.is_empty() || self.held_run_writes.is_some() || sync_hooks_on() || super::tune::get_trace_sync() {
+            return false;
+        }
+        let tag = [0, INFLIGHT.notes.load(Ordering::Acquire), super::homes::STALE_ADDED.load(Ordering::Acquire)];
+        if tag != self.clean_tag {
+            return false;
+        }
+        for &(a, n) in reads {
+            if n == 0 {
+                continue;
+            }
+            for page in (a >> CLEAN_SHIFT)..=((a + n - 1) >> CLEAN_SHIFT) {
+                if self.clean_pages[(page as usize) & (CLEAN_SLOTS - 1)] != page {
+                    return false;
+                }
+            }
+        }
+        super::fe2::c4_reads_known(reads)
+    }
+
     pub fn sync_for(&mut self, reads: &[(u64, u64)], why: usize) -> bool {
+        if self.sync_quick(reads) {
+            if laps() {
+                sync_quick_count();
+            }
+            if !page_memo_check_on() {
+                return false;
+            }
+            // (Diagnosis: the full sync as well; a wait it finds is a wrong answer.)
+            let w = self.sync_for_full(reads, why);
+            PAGE_MEMO_CHECKS[9].fetch_add(1, Ordering::Relaxed);
+            if w && PAGE_MEMO_CHECKS[10].fetch_add(1, Ordering::Relaxed) < 20 {
+                crate::info!("gpu[{}]: lean sync check: reads {:x?} answered clean, the full sync waited", self.name, &reads[..reads.len().min(4)]);
+            }
+            return w;
+        }
+        self.sync_for_full(reads, why)
+    }
+
+    fn sync_for_full(&mut self, reads: &[(u64, u64)], why: usize) -> bool {
         let mut tp = if laps() { unsafe { core::arch::x86_64::_rdtsc() } } else { 0 };
         self.sync_t = tp;
         // (Front end 4's held pages read on the CPU: released first.)
