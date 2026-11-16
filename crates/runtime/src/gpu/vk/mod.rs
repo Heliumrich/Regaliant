@@ -92,9 +92,6 @@ pub struct Ctx {
     /// The copy queue (a transfer-only queue family; `DS_COPY_QUEUE=0`:
     /// none): batch-start copies run on it beside the main queue (`exec`).
     pub copy: Option<CopyQueue>,
-    /// The copy family's second queue (where it has one with sparse binding): the mirror's
-    /// binds of new pages (`bind_sparse_new`, `tune bind_queue`).
-    pub bind_queue: Option<Mutex<vk::Queue>>,
     /// Ordered async compute (RENDERER.md; `DS_ASYNC_COMPUTE` 2 or more at
     /// boot, `async_compute_boot`): a queue of a compute-only family that the
     /// compute queues' batches run on beside the main queue.
@@ -383,15 +380,8 @@ fn init_inner() -> Result<(), String> {
             None
         };
         let mut qci = vec![vk::DeviceQueueCreateInfo::default().queue_family_index(qf).queue_priorities(&prio)];
-        // The copy family's second queue, where it has one with sparse binding: the mirror's binds
-        // of new pages (`bind_queue`), which on the main queue waited behind its submitted work.
-        let prio2 = [1.0f32, 1.0];
-        let bind_family = copy_family.filter(|&f| {
-            let q = instance.get_physical_device_queue_family_properties(pdev)[f as usize];
-            q.queue_count >= 2 && q.queue_flags.contains(vk::QueueFlags::SPARSE_BINDING)
-        });
         if let Some(f) = copy_family {
-            qci.push(vk::DeviceQueueCreateInfo::default().queue_family_index(f).queue_priorities(if bind_family.is_some() { &prio2 } else { &prio }));
+            qci.push(vk::DeviceQueueCreateInfo::default().queue_family_index(f).queue_priorities(&prio));
         }
         if let Some(f) = compute_family {
             qci.push(vk::DeviceQueueCreateInfo::default().queue_family_index(f).queue_priorities(&prio));
@@ -815,10 +805,6 @@ fn init_inner() -> Result<(), String> {
         if let Some(c) = &copy {
             crate::info!("Vulkan: copy queue in family {} (batch-start copies beside the main queue)", c.family);
         }
-        let bind_queue = bind_family.map(|f| Mutex::new(device.get_device_queue(f, 1)));
-        if bind_queue.is_some() {
-            crate::info!("Vulkan: bind queue: the copy family's second queue (the mirror's binds of new pages, `tune bind_queue`)");
-        }
         // Formats the title samples with depth comparison: which support it
         // (VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT).
         {
@@ -880,7 +866,6 @@ fn init_inner() -> Result<(), String> {
             draw_parameters: draw_parameters && first_instance,
             families,
             copy,
-            bind_queue,
             compute,
             g_progress,
             g_count: AtomicU64::new(0),
@@ -1630,22 +1615,6 @@ impl Ctx {
 
     /// The main queue's progress value of its latest submission (a batch
     /// on the compute family's queue waits for it).
-    /// A sparse bind of pages no submitted work uses yet (the mirror's new backings): on the
-    /// bind queue (`tune bind_queue`), where it does not wait behind the main queue's submitted
-    /// work, else on the main queue. The caller waits for `fence` before any work uses the pages.
-    /// Returns when the call was made and when it returned (the queue's lock waited for between).
-    pub fn bind_sparse_new(&self, infos: &[vk::BindSparseInfo], fence: vk::Fence) -> (ash::prelude::VkResult<()>, std::time::Instant, std::time::Instant) {
-        let t0 = std::time::Instant::now();
-        let q = match (&self.bind_queue, super::tune::bind_queue()) {
-            (Some(b), true) => b.lock(),
-            _ => self.queue.lock(),
-        };
-        let t1 = std::time::Instant::now();
-        let r = unsafe { self.device.queue_bind_sparse(*q, infos, fence) };
-        drop(q);
-        (r, t0, t1)
-    }
-
     pub fn g_progress_value(&self) -> u64 {
         self.g_count.load(Ordering::Acquire)
     }

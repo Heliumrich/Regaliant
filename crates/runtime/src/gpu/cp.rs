@@ -4267,7 +4267,7 @@ impl Cp {
             pr.run.grant(i);
             let tw = super::timeline::wait_start();
             let (done, waited) = pr.run.collect(i);
-            tw.end(&self.name, || "wait: parallel chunk (settling)".into());
+            tw.end(&self.name, || format!("wait: parallel chunk (settling at {why})"));
             pr.waited_ns += waited;
             if let (Some(seq), Some(e)) = (done.last, self.exec.as_mut()) {
                 e.depend_on(seq, false);

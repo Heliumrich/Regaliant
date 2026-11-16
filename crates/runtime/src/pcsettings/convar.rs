@@ -65,6 +65,14 @@ pub const VARS: &[Var] = &[
     v("r_windSimEnable", 0x2482de5, 0x2f24508, Kind::Bool),
     v("r_windSimAsync", 0x2407e6d, 0x2f245f8, Kind::Bool),
     v("r_virtualGeometryDisplacement_Enable", 0x24a087d, 0x2f2e1b8, Kind::Bool),
+    // The title's index-buffer culling, for diagnosis (`convar <name> 0|1|title`): per visible
+    // item, compute passes that compact the item's index buffer before its draw (bool ConVars
+    // built at eboot+0x97626e and +0x9762ef; their storage the render settings' +0xcaa and
+    // +0xcab: the culling's own value at +0x68 stayed 1 while the title's console turned it off,
+    // memory dumps of run -022418). Off ran x0.944-0.997 in-run everywhere measured (FINDINGS.md
+    // 2026-11-16).
+    v("doIndexBufferCulling", 0x24a093d, 0x2f32cc0, Kind::Bool),
+    v("doSunShadowIndexBufferCulling", 0x23d9927, 0x2f32db0, Kind::Bool),
 ];
 
 const VALUE: u64 = 0x68;

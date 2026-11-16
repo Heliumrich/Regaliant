@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 179] = [
+    static ALL: [Tunable; 178] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -210,7 +210,6 @@ pub mod tune {
         Tunable { name: "async_gfx_inline", env: "DS_ASYNC_GFX_INLINE", default: 12, value: AtomicU64::new(UNSET) },
         Tunable { name: "zk", env: "DS_ZK", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "xq_pre_c", env: "DS_XQ_PRE_C", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "bind_queue", env: "DS_BIND_QUEUE", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1449,13 +1448,6 @@ pub mod tune {
     /// swamp x1.005, every cycle (FINDINGS.md 2026-11-16).
     pub fn xq_pre_c() -> bool {
         get(177) != 0
-    }
-
-    /// The mirror's binds of new pages on the copy family's second queue (`vk::Ctx::
-    /// bind_sparse_new`; live): on the main queue each waited behind its submitted work (median
-    /// ~0.9 ms, up to ~10 ms; 3.6 a frame at Castlewall turning, 1.5 ms of its critical path).
-    pub fn bind_queue() -> bool {
-        get(178) != 0
     }
 
     /// Whether translations get `rdna::translate::Spec::hw_bounds` (scalar
