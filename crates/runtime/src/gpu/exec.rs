@@ -9142,24 +9142,28 @@ thread_local! {
 }
 
 /// A placement miss's parts timed (`DS_STEP_LAPS`): [before the check, the check when the range
-/// cache answered, such checks, the check otherwise, such checks, after the check], added per
-/// thread every 4,096.
-pub static MISS_PARTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// cache answered, such checks, the check otherwise, such checks, after the check, the full
+/// checks with nothing to do, such checks], added per thread every 4,096.
+pub static MISS_PARTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 thread_local! {
-    static MISS_LOCAL: std::cell::Cell<([u64; 6], u32)> = const { std::cell::Cell::new(([0; 6], 0)) };
+    static MISS_LOCAL: std::cell::Cell<([u64; 8], u32)> = const { std::cell::Cell::new(([0; 8], 0)) };
 }
 
-fn miss_parts(before: u64, check: u64, fine: bool, after: u64) {
+fn miss_parts(before: u64, check: u64, how: u8, after: u64) {
     MISS_LOCAL.with(|c| {
         let (mut v, mut n) = c.get();
         v[0] += before;
-        if fine {
+        if how == 0 {
             v[1] += check;
             v[2] += 1;
         } else {
             v[3] += check;
             v[4] += 1;
+            if how == 1 {
+                v[6] += check;
+                v[7] += 1;
+            }
         }
         v[5] += after;
         n += 1;
@@ -9167,7 +9171,7 @@ fn miss_parts(before: u64, check: u64, fine: bool, after: u64) {
             for (a, b) in MISS_PARTS.iter().zip(v.iter()) {
                 a.fetch_add(*b, Ordering::Relaxed);
             }
-            v = [0; 6];
+            v = [0; 8];
             n = 0;
         }
         c.set((v, n));
@@ -9185,7 +9189,7 @@ fn place_memo_cycles_line() -> String {
     let m: Vec<u64> = MISS_PARTS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let n = m[2] + m[4];
     format!(
-        "    front end 2's placements timed (`DS_STEP_LAPS`, since the last profile reset): memo hits {} at {:.0} ns, misses {} at {:.0} ns; a miss's parts ({n} timed): before the check {:.0} ns, the check {:.0} ns when the range cache answered ({}), {:.0} ns otherwise ({}), after it {:.0} ns
+        "    front end 2's placements timed (`DS_STEP_LAPS`, since the last profile reset): memo hits {} at {:.0} ns, misses {} at {:.0} ns; a miss's parts ({n} timed): before the check {:.0} ns, the check {:.0} ns when the range cache answered ({}), {:.0} ns otherwise ({}; with nothing to do {:.0} ns ({})), after it {:.0} ns
 ",
         v[1],
         ns(v[0], v[1]),
@@ -9196,6 +9200,8 @@ fn place_memo_cycles_line() -> String {
         m[2],
         ns(m[3], m[4]),
         m[4],
+        ns(m[6], m[7]),
+        m[7],
         ns(m[5], n)
     )
 }
@@ -12719,7 +12725,7 @@ impl Exec {
         // frames +1.9% there: FINDINGS.md 2026-11-06 small hours; a hash-map
         // memo measured level on 2026-10-28, its map's upkeep taking what it
         // saved.)
-        if self.recording && !self.stopped && !self.past_grow && !super::fe2::callers_on() && super::fe2::slow_place_us() == 0 {
+        if self.recording && !self.stopped && !self.past_grow && (!super::fe2::callers_on() || super::fe2::callers_keep_memo()) && super::fe2::slow_place_us() == 0 {
             let ep = super::precache::epoch() as u32;
             let want = self.fe2_want(ep);
             let map_gen = crate::mem::MAP_GEN.load(Ordering::Acquire);

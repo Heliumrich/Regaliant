@@ -427,12 +427,13 @@ fn changed(f: &Fine) -> Option<usize> {
 }
 
 thread_local! {
-    /// The last `ensure` on this thread was answered by its range cache (`range_fine`).
-    static LAST_FINE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// How the last `ensure` on this thread was answered: 0 by its range cache (`range_fine`),
+    /// 1 by a full check with nothing to do, 2 by one with takes or uploads.
+    static LAST_FINE: std::cell::Cell<u8> = const { std::cell::Cell::new(2) };
 }
 
-/// Whether the last `ensure` on this thread was answered by its range cache.
-pub fn last_fine() -> bool {
+/// How the last `ensure` on this thread was answered (`LAST_FINE`).
+pub fn last_fine() -> u8 {
     LAST_FINE.with(|c| c.get())
 }
 
@@ -441,6 +442,13 @@ pub fn last_fine() -> bool {
 pub fn callers_on() -> bool {
     static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *W.get_or_init(|| std::env::var("DS_FE2_CALLERS").ok().as_deref() == Some("1"))
+}
+
+/// `DS_FE2_CALLERS_MEMO=1` with `DS_FE2_CALLERS=1`: the executors' placement memo stays on, so
+/// the census sees the placements the memo misses (its parts as in a normal run).
+pub fn callers_keep_memo() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("DS_FE2_CALLERS_MEMO").ok().as_deref() == Some("1"))
 }
 
 const CALLER_NAMES: [&str; 4] = ["graphics CP", "its parallel workers", "queue 0x50", "other compute queues"];
@@ -1603,7 +1611,7 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
     let gpu_writes = gpu_writes && !arm_gpu() && !crate::mem::view_span(lo, hi);
     let tc = tsc();
     let fine = range_fine(lo, hi, want, gpu_writes);
-    LAST_FINE.with(|c| c.set(fine));
+    LAST_FINE.with(|c| c.set(if fine { 0 } else { 2 }));
     caller_since(C_CACHE, tc);
     probe_add(P_CHECKS, 1);
     if fine {
@@ -1744,6 +1752,7 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
         let _probe_runs = ProbeRuns(probe_r);
         if bad.is_empty() {
             local_add(L_FAST, 1);
+            LAST_FINE.with(|c| c.set(1));
             // (Not for ranges with pages the caller's batch uploaded: they are
             // fine for its batch only, until it is queued.)
             if let (true, Some((gens, host))) = (mine_none, snap) {
