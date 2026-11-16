@@ -9182,6 +9182,81 @@ fn miss_parts(before: u64, check: u64, how: u8, after: u64) {
     });
 }
 
+/// A stage's shader-read sync by part (`DS_STEP_LAPS`), TSC cycles: [front end 4's release, the
+/// diagnosis hooks and trace setup, forwarded copies' cover, the clean-page memo, video-memory
+/// homes, the executor's pending writes, other queues' writes in flight, the rest], then calls.
+pub static SYNC_PARTS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+const SYNC_PART_NAMES: [&str; 8] = ["front end 4's release", "hooks", "forwarded cover", "clean-page memo", "homes", "own pending writes", "writes in flight", "rest"];
+
+thread_local! {
+    static SYNC_PARTS_LOCAL: std::cell::Cell<([u64; 9], u64)> = const { std::cell::Cell::new(([0; 9], 0)) };
+}
+
+/// Adds `cycles` to sync part `k` (`SYNC_PARTS`; only while `laps()`).
+#[inline]
+fn sync_part(k: usize, t: &mut u64) {
+    if *t == 0 {
+        return;
+    }
+    let now = unsafe { core::arch::x86_64::_rdtsc() };
+    let d = now.wrapping_sub(*t);
+    *t = now;
+    SYNC_PARTS_LOCAL.with(|c| {
+        let (mut v, n) = c.get();
+        v[k] += d;
+        c.set((v, n));
+    });
+}
+
+fn sync_parts_call() {
+    SYNC_PARTS_LOCAL.with(|c| {
+        let (mut v, mut n) = c.get();
+        v[8] += 1;
+        n += 1;
+        if n >= 4096 {
+            for (a, b) in SYNC_PARTS.iter().zip(v.iter()) {
+                a.fetch_add(*b, Ordering::Relaxed);
+            }
+            v = [0; 9];
+            n = 0;
+        }
+        c.set((v, n));
+    });
+}
+
+/// `DS_CLEAN_CHECK=1`: [memo answers checked in full, of them found written].
+pub static CLEAN_CHECKS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+fn clean_check_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_CLEAN_CHECK").ok().as_deref() == Some("1"))
+}
+
+/// The clean-page memo (`DS_STEP_LAPS`): [syncs, (unused since its own writes drop only their
+/// pages), resets by writes noted in flight, by stale homes, pages found clean in it, pages
+/// checked].
+pub static CLEAN_STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+thread_local! {
+    static CLEAN_LOCAL: std::cell::Cell<([u64; 6], u32)> = const { std::cell::Cell::new(([0; 6], 0)) };
+}
+
+fn clean_count(k: usize) {
+    CLEAN_LOCAL.with(|c| {
+        let (mut v, mut n) = c.get();
+        v[k] += 1;
+        n += 1;
+        if n >= 8192 {
+            for (a, b) in CLEAN_STATS.iter().zip(v.iter()) {
+                a.fetch_add(*b, Ordering::Relaxed);
+            }
+            v = [0; 6];
+            n = 0;
+        }
+        c.set((v, n));
+    });
+}
+
 /// Stages' shader-read syncs timed (`DS_STEP_LAPS`): [cycles, calls], added per thread every
 /// 4,096.
 pub static SYNC_CYCLES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -9216,8 +9291,27 @@ fn place_memo_cycles_line() -> String {
     let m: Vec<u64> = MISS_PARTS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let n = m[2] + m[4];
     let sc: Vec<u64> = SYNC_CYCLES.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    let sync = format!("    stages' shader-read syncs timed (`DS_STEP_LAPS`): {} at {:.0} ns
-", sc[1], ns(sc[0], sc[1]));
+    let sp: Vec<u64> = SYNC_PARTS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let parts: Vec<String> = SYNC_PART_NAMES.iter().enumerate().map(|(k, name)| format!("{name} {:.0}", ns(sp[k], sp[8]))).collect();
+    let cl: Vec<u64> = CLEAN_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let sync = format!(
+        "    stages' shader-read syncs timed (`DS_STEP_LAPS`): {} at {:.0} ns; by part, ns a call ({} timed): {}; the clean-page memo: {} syncs, reset by writes noted in flight {}, by stale homes {}; pages clean in it {}, checked {}
+",
+        sc[1],
+        ns(sc[0], sc[1]),
+        sp[8],
+        parts.join(", "),
+        cl[0],
+        cl[2],
+        cl[3],
+        cl[4],
+        cl[5]
+    ) + &if clean_check_on() {
+        format!("    clean-page memo checked (`DS_CLEAN_CHECK`): {} answers, {} of them found written
+", CLEAN_CHECKS[0].load(Ordering::Relaxed), CLEAN_CHECKS[1].load(Ordering::Relaxed))
+    } else {
+        String::new()
+    };
     format!(
         "    front end 2's placements timed (`DS_STEP_LAPS`, since the last profile reset): memo hits {} at {:.0} ns, misses {} at {:.0} ns; a miss's parts ({n} timed): before the check {:.0} ns, the check {:.0} ns when the range cache answered ({}), {:.0} ns otherwise ({}; with nothing to do {:.0} ns ({})), after it {:.0} ns
 ",
@@ -10178,6 +10272,8 @@ pub struct Exec {
     bind_note: Option<([u64; 3], bool)>,
     /// The reads `sync_for_reads` still checks (the vector reused).
     dirty_reads: Vec<(u64, u64)>,
+    /// The TSC of the shader-read sync being timed by part (`sync_part`; 0: not timed).
+    sync_t: u64,
     /// The written ranges (all, sized) this executor's last dispatch noted in
     /// the image cache, the write tracker and the copy cache, with their
     /// generations after it (`note_gens`): a dispatch writing the same ranges
@@ -10978,7 +11074,7 @@ static BATCH_MISS_SITES: Mutex<Option<HashMap<u32, u64>>> = Mutex::new(None);
 
 /// A new window for the batched dispatches' statistics (`profile reset`).
 pub(super) fn reset_batch_misses() {
-    for c in BATCHED.iter().chain(BATCH_MISS.iter()).chain(SHADOWS_PRE.iter()).chain(PLACE_MEMO_CYCLES.iter()).chain(MISS_PARTS.iter()).chain(SYNC_CYCLES.iter()) {
+    for c in BATCHED.iter().chain(BATCH_MISS.iter()).chain(SHADOWS_PRE.iter()).chain(PLACE_MEMO_CYCLES.iter()).chain(MISS_PARTS.iter()).chain(SYNC_CYCLES.iter()).chain(SYNC_PARTS.iter()).chain(CLEAN_STATS.iter()) {
         c.store(0, Ordering::Relaxed);
     }
     *BATCH_MISS_PROGRAMS.lock() = None;
@@ -11374,6 +11470,7 @@ impl Exec {
                 bind_reuse: None,
                 bind_note: None,
                 dirty_reads: Vec::new(),
+                sync_t: 0,
                 last_notes: (Vec::new(), Vec::new(), [u64::MAX; 4]),
                 draw_bounds: Vec::new(),
                 pool_use: [0; 6],
@@ -12211,6 +12308,7 @@ impl Exec {
         self.inflight.insert_all(seq, &writes);
         st.mark(10);
         self.own_gen += 1;
+        self.clean_evict(writes.iter());
         self.last_seq = seq;
         if has_actions {
             self.last_action_seq = seq;
@@ -14647,6 +14745,7 @@ impl Exec {
                 }
                 self.inflight.insert(self.last_seq, w.0, w.1);
                 self.own_gen += 1;
+                self.clean_evict(std::iter::once(w));
             }
             drop(note_gate);
             Some(self.last_seq)
@@ -14665,6 +14764,7 @@ impl Exec {
                 }
                 self.inflight.insert(seq, w.0, w.1);
                 self.own_gen += 1;
+                self.clean_evict(std::iter::once(w));
             }
             drop(note_gate);
             Some(seq)
@@ -14836,6 +14936,29 @@ impl Exec {
         self.sync_for(&fine, why)
     }
 
+    /// Drops the pages of this executor's new writes from its clean-page memo (`sync_for_reads`):
+    /// the memo holds pages found without pending or in-flight writes, and a write of its own
+    /// changes only its own pages (2026-11-16: emptying the memo at every own write emptied it
+    /// at 28% of the syncs at Castlewall, its hits 89% of pages).
+    fn clean_evict(&mut self, writes: impl Iterator<Item = (u64, u64)>) {
+        for (a, n) in writes {
+            if n == 0 {
+                continue;
+            }
+            let (first, last) = (a >> CLEAN_SHIFT, (a + n - 1) >> CLEAN_SHIFT);
+            if last - first >= CLEAN_SLOTS as u64 {
+                self.clean_pages.fill(u64::MAX);
+                return;
+            }
+            for page in first..=last {
+                let slot = (page as usize) & (CLEAN_SLOTS - 1);
+                if self.clean_pages[slot] == page {
+                    self.clean_pages[slot] = u64::MAX;
+                }
+            }
+        }
+    }
+
     /// `sync_for_reads`, counted by the reason (`SYNC_WHY`) when it waited.
     /// `sync_for` of a stage's reads (`tune skip_read_waits`: none, a timing
     /// diagnosis with wrong results).
@@ -14853,8 +14976,11 @@ impl Exec {
     }
 
     pub fn sync_for(&mut self, reads: &[(u64, u64)], why: usize) -> bool {
+        let mut tp = if laps() { unsafe { core::arch::x86_64::_rdtsc() } } else { 0 };
+        self.sync_t = tp;
         // (Front end 4's held pages read on the CPU: released first.)
         super::fe2::c4_release_reads(reads);
+        sync_part(0, &mut tp);
         if !self.run_writes.is_empty() && reads.iter().any(|&(a, n)| self.run_writes.iter().any(|&(w, m)| a < w + m && w < a + n)) {
             RUN_WRITE_STOPS.fetch_add(1, Ordering::Relaxed);
             self.stop("reads a CP write of its run's earlier chunks");
@@ -14904,6 +15030,8 @@ impl Exec {
         // the read waited: forwarded copies spare many that would).
         let live = super::tune::get_trace_sync() && self.would_wait(reads);
         let trace = (traced_here && TRACED.load(Ordering::Relaxed) < 400) || live;
+        sync_part(1, &mut tp);
+        self.sync_t = tp;
         let culprit = if trace {
             let done = done_seq();
             // What forwarded copies leave to wait for (as `sync_for_reads`
@@ -14929,6 +15057,11 @@ impl Exec {
             None
         };
         let waited = self.sync_for_reads(reads);
+        let mut tp = self.sync_t;
+        if tp != 0 {
+            sync_parts_call();
+        }
+        sync_part(7, &mut tp);
         let w = waited.is_some();
         if w {
             if let Some(&(a, _)) = reads.first() {
@@ -15010,9 +15143,11 @@ impl Exec {
     /// this queue's batch submitted, other queues' batches done): when it
     /// waited, since when.
     pub fn sync_for_reads(&mut self, reads: &[(u64, u64)]) -> Option<std::time::Instant> {
+        let mut tp = std::mem::take(&mut self.sync_t);
         // Words a copy recorded earlier leaves there were read as forwarded
         // (`gpu::forward`): the copy need not complete first.
         let forwarded = super::forward::uncovered(reads);
+        sync_part(2, &mut tp);
         let reads: &[(u64, u64)] = forwarded.as_deref().unwrap_or(reads);
         if reads.is_empty() {
             return None;
@@ -15037,10 +15172,20 @@ impl Exec {
         let mut dirty = std::mem::take(&mut self.dirty_reads);
         dirty.clear();
         let reads: &[(u64, u64)] = if super::tune::clean_pages() {
-            let tag = [self.own_gen, INFLIGHT.notes.load(Ordering::Acquire), super::homes::STALE_ADDED.load(Ordering::Acquire)];
+            // (This executor's own writes drop their pages from the memo as they are noted,
+            // `clean_evict`; any queue's writes in flight and stale homes empty it.)
+            let tag = [0, INFLIGHT.notes.load(Ordering::Acquire), super::homes::STALE_ADDED.load(Ordering::Acquire)];
+            let counted = laps();
+            let check = clean_check_on();
             if tag != self.clean_tag {
+                if counted {
+                    clean_count(if tag[1] != self.clean_tag[1] { 2 } else { 3 });
+                }
                 self.clean_pages.fill(u64::MAX);
                 self.clean_tag = tag;
+            }
+            if counted {
+                clean_count(0);
             }
             for &(a, n) in reads {
                 if n == 0 {
@@ -15051,7 +15196,23 @@ impl Exec {
                 for page in first..=last {
                     let slot = (page as usize) & (CLEAN_SLOTS - 1);
                     if self.clean_pages[slot] == page {
+                        if counted {
+                            clean_count(4);
+                        }
+                        // `DS_CLEAN_CHECK=1`: the page the memo answers checked in full too.
+                        if check {
+                            let whole = [(page << CLEAN_SHIFT, 1u64 << CLEAN_SHIFT)];
+                            let dirty_now = super::homes::any_stale(&whole) || self.overlaps_pending(&whole) || INFLIGHT.latest(&whole).is_some();
+                            CLEAN_CHECKS[0].fetch_add(1, Ordering::Relaxed);
+                            if dirty_now && CLEAN_CHECKS[1].fetch_add(1, Ordering::Relaxed) < 20 {
+                                let pending = self.overlaps_pending(&whole);
+                                crate::info!("gpu[{}]: clean check: page {:#x} answered clean by the memo, written in full ({} pending)", self.name, page << CLEAN_SHIFT, pending);
+                            }
+                        }
                         continue;
+                    }
+                    if counted {
+                        clean_count(5);
                     }
                     let whole = [(page << CLEAN_SHIFT, 1u64 << CLEAN_SHIFT)];
                     if super::homes::any_stale(&whole) || self.overlaps_pending(&whole) || INFLIGHT.latest(&whole).is_some() {
@@ -15071,9 +15232,11 @@ impl Exec {
         } else {
             reads
         };
+        sync_part(3, &mut tp);
         if reads.is_empty() {
             lap(0, &mut t);
             self.dirty_reads = dirty;
+            self.sync_t = tp;
             return None;
         }
         if super::homes::any_stale(reads) {
@@ -15084,6 +15247,7 @@ impl Exec {
             self.flush();
         }
         lap(0, &mut t);
+        sync_part(4, &mut tp);
         if self.overlaps_pending(reads) {
             waited.get_or_insert_with(std::time::Instant::now);
             if self.past_grow && !(self.pending.overlaps_any(reads) || self.closed_overlap(reads)) {
@@ -15127,6 +15291,7 @@ impl Exec {
             }
         }
         lap(1, &mut t);
+        sync_part(5, &mut tp);
         if let Some(s) = INFLIGHT.latest(reads) {
             if s > done_seq() {
                 waited.get_or_insert_with(std::time::Instant::now);
@@ -15139,6 +15304,8 @@ impl Exec {
             }
         }
         lap(2, &mut t);
+        sync_part(6, &mut tp);
+        self.sync_t = tp;
         self.dirty_reads = dirty;
         waited
     }
@@ -15186,6 +15353,7 @@ impl Exec {
         }
         self.note_since(a, n);
         self.own_gen += 1;
+        self.clean_evict(std::iter::once((a, n)));
         if verify::enabled() {
             self.pending_log.push((a, n));
         }
@@ -16736,6 +16904,7 @@ impl Exec {
                 super::cp::promise(seq, a, v, n, false, self.promise_view());
             }
             self.own_gen += 1;
+            self.clean_evict(b.writes.iter());
             self.last_seq = seq;
             last = Some(seq);
         }
@@ -18694,6 +18863,7 @@ impl Exec {
         if repeat {
             // This batch's own record of them still: it may have begun since.
             self.own_gen += 1;
+            self.clean_evict(writes_here.iter().copied());
             for &(b, n) in &writes_here {
                 super::forward::written(b, n);
                 if super::tune::race_checks() {
