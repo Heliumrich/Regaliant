@@ -15202,11 +15202,18 @@ impl Exec {
                         // `DS_CLEAN_CHECK=1`: the page the memo answers checked in full too.
                         if check {
                             let whole = [(page << CLEAN_SHIFT, 1u64 << CLEAN_SHIFT)];
-                            let dirty_now = super::homes::any_stale(&whole) || self.overlaps_pending(&whole) || INFLIGHT.latest(&whole).is_some();
+                            let stale = super::homes::any_stale(&whole);
+                            let pending = self.overlaps_pending(&whole);
+                            let inflight = INFLIGHT.latest(&whole);
                             CLEAN_CHECKS[0].fetch_add(1, Ordering::Relaxed);
-                            if dirty_now && CLEAN_CHECKS[1].fetch_add(1, Ordering::Relaxed) < 20 {
-                                let pending = self.overlaps_pending(&whole);
-                                crate::info!("gpu[{}]: clean check: page {:#x} answered clean by the memo, written in full ({} pending)", self.name, page << CLEAN_SHIFT, pending);
+                            if (stale || pending || inflight.is_some()) && CLEAN_CHECKS[1].fetch_add(1, Ordering::Relaxed) < 20 {
+                                crate::info!(
+                                    "gpu[{}]: clean check: page {:#x} answered clean by the memo, found written in full: stale home {stale}, own pending {pending}, in flight {inflight:?} (completed {}, notes {})",
+                                    self.name,
+                                    page << CLEAN_SHIFT,
+                                    done_seq(),
+                                    INFLIGHT.notes.load(Ordering::Acquire)
+                                );
                             }
                         }
                         continue;
