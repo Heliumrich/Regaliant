@@ -18,8 +18,9 @@
 //! model's: measured and removed), but because the cell builder that builds a section
 //! (eboot+0xe97880) then removes the entities it absorbed from the scene (its +0x1c8 list,
 //! eboot+0xaaafc0): at Castlewall's boot 59 sections absorbed 35,658 entities, ~94.5% of the
-//! handed-off items. The batches are their only path; a CPU path for them needs the entities
-//! kept in the scene too.
+//! handed-off items. The batches are their only path: skipping that removal as well (mode 10,
+//! measured and removed) loses the same geometry, so the absorbed models are not in the CPU
+//! path's lists either (their LOD count reads zero after the build).
 
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
