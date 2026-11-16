@@ -426,6 +426,16 @@ fn changed(f: &Fine) -> Option<usize> {
     None
 }
 
+thread_local! {
+    /// The last `ensure` on this thread was answered by its range cache (`range_fine`).
+    static LAST_FINE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the last `ensure` on this thread was answered by its range cache.
+pub fn last_fine() -> bool {
+    LAST_FINE.with(|c| c.get())
+}
+
 /// `DS_FE2_CALLERS=1` (diagnosis): placement checks counted by caller
 /// (`set_caller`), with why the range cache missed.
 pub fn callers_on() -> bool {
@@ -1593,6 +1603,7 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
     let gpu_writes = gpu_writes && !arm_gpu() && !crate::mem::view_span(lo, hi);
     let tc = tsc();
     let fine = range_fine(lo, hi, want, gpu_writes);
+    LAST_FINE.with(|c| c.set(fine));
     caller_since(C_CACHE, tc);
     probe_add(P_CHECKS, 1);
     if fine {

@@ -3775,6 +3775,7 @@ pub(super) fn push_line() -> String {
         BATCHED[0].load(Ordering::Relaxed),
         BATCHED[2].load(Ordering::Relaxed)
     ) + &batch_miss_line()
+        + &place_memo_cycles_line()
         + &format!("    front end 2's placement memo: {} repeats answered, {} placements made
 ", PLACE_MEMO[0].load(Ordering::Relaxed), PLACE_MEMO[1].load(Ordering::Relaxed))
         + &place_census_line()
@@ -9132,6 +9133,89 @@ fn place_memo_count(hit: bool) {
     });
 }
 
+/// The placement memo's answers timed (`DS_STEP_LAPS`): [hit cycles, hits, miss cycles, misses],
+/// added per thread every 4,096.
+pub static PLACE_MEMO_CYCLES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+thread_local! {
+    static PLACE_MEMO_CYC: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
+}
+
+/// A placement miss's parts timed (`DS_STEP_LAPS`): [before the check, the check when the range
+/// cache answered, such checks, the check otherwise, such checks, after the check], added per
+/// thread every 4,096.
+pub static MISS_PARTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+thread_local! {
+    static MISS_LOCAL: std::cell::Cell<([u64; 6], u32)> = const { std::cell::Cell::new(([0; 6], 0)) };
+}
+
+fn miss_parts(before: u64, check: u64, fine: bool, after: u64) {
+    MISS_LOCAL.with(|c| {
+        let (mut v, mut n) = c.get();
+        v[0] += before;
+        if fine {
+            v[1] += check;
+            v[2] += 1;
+        } else {
+            v[3] += check;
+            v[4] += 1;
+        }
+        v[5] += after;
+        n += 1;
+        if n >= 4096 {
+            for (a, b) in MISS_PARTS.iter().zip(v.iter()) {
+                a.fetch_add(*b, Ordering::Relaxed);
+            }
+            v = [0; 6];
+            n = 0;
+        }
+        c.set((v, n));
+    });
+}
+
+/// `PLACE_MEMO_CYCLES` as a status line ("" before any).
+fn place_memo_cycles_line() -> String {
+    let v: Vec<u64> = PLACE_MEMO_CYCLES.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    if v[1] + v[3] == 0 {
+        return String::new();
+    }
+    let hz = super::threadcpu::tsc_hz();
+    let ns = |c: u64, n: u64| if n == 0 { 0.0 } else { c as f64 * 1e9 / hz / n as f64 };
+    let m: Vec<u64> = MISS_PARTS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let n = m[2] + m[4];
+    format!(
+        "    front end 2's placements timed (`DS_STEP_LAPS`, since the last profile reset): memo hits {} at {:.0} ns, misses {} at {:.0} ns; a miss's parts ({n} timed): before the check {:.0} ns, the check {:.0} ns when the range cache answered ({}), {:.0} ns otherwise ({}), after it {:.0} ns
+",
+        v[1],
+        ns(v[0], v[1]),
+        v[3],
+        ns(v[2], v[3]),
+        ns(m[0], n),
+        ns(m[1], m[2]),
+        m[2],
+        ns(m[3], m[4]),
+        m[4],
+        ns(m[5], n)
+    )
+}
+
+fn place_memo_time(hit: bool, cycles: u64) {
+    PLACE_MEMO_CYC.with(|c| {
+        let mut v = c.get();
+        let k = if hit { 0 } else { 2 };
+        v[k] += cycles;
+        v[k + 1] += 1;
+        if v[1] + v[3] >= 4096 {
+            for (a, b) in PLACE_MEMO_CYCLES.iter().zip(v.iter()) {
+                a.fetch_add(*b, Ordering::Relaxed);
+            }
+            v = [0; 4];
+        }
+        c.set(v);
+    });
+}
+
 /// Slow placements (`DS_SLOW_PLACE`): per (executor, shader, base, size,
 /// written) [count, us, max us, placed bytes, probe sums].
 type SlowKey = (String, u64, u64, u64, bool);
@@ -10856,7 +10940,7 @@ static BATCH_MISS_SITES: Mutex<Option<HashMap<u32, u64>>> = Mutex::new(None);
 
 /// A new window for the batched dispatches' statistics (`profile reset`).
 pub(super) fn reset_batch_misses() {
-    for c in BATCHED.iter().chain(BATCH_MISS.iter()).chain(SHADOWS_PRE.iter()) {
+    for c in BATCHED.iter().chain(BATCH_MISS.iter()).chain(SHADOWS_PRE.iter()).chain(PLACE_MEMO_CYCLES.iter()).chain(MISS_PARTS.iter()) {
         c.store(0, Ordering::Relaxed);
     }
     *BATCH_MISS_PROGRAMS.lock() = None;
@@ -12586,6 +12670,14 @@ impl Exec {
         if place_census_on() && !self.stopped && !self.past_grow && !super::fe2::callers_on() && super::fe2::slow_place_us() == 0 {
             return self.fe2_place_census(base, size, written);
         }
+        if laps() {
+            let before = PLACE_MEMO_LOCAL.with(|c| c.get()[0]);
+            let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+            let r = self.fe2_place_memo(base, size, written);
+            let hit = PLACE_MEMO_LOCAL.with(|c| c.get()[0]) != before;
+            place_memo_time(hit, unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0));
+            return r;
+        }
         self.fe2_place_memo(base, size, written)
     }
 
@@ -12740,6 +12832,9 @@ impl Exec {
         // (Parts timed for `DS_FE2_CALLERS`.)
         let tsc = || if super::fe2::callers_on() { unsafe { core::arch::x86_64::_rdtsc() } } else { 0 };
         let t0 = tsc();
+        let lp = laps();
+        let rd = || if lp { unsafe { core::arch::x86_64::_rdtsc() } } else { 0 };
+        let m0 = rd();
         let (mbuf, _) = super::resident::mirror_buffer()?;
         let end = base.checked_add(size)?;
         if size == 0 || !super::fe2::in_span(base, size) {
@@ -12817,6 +12912,7 @@ impl Exec {
         // run has no claims.)
         let run = Some(self.fe2_share()).filter(|r| r.0 != 0 && super::fe2::run_any(r.0)).unwrap_or((0, 0));
         let mine_any = !mine.is_empty() || run.0 != 0;
+        let m1 = rd();
         let r = super::fe2::ensure(lo, hi, want, ep, written, &|p| (!mine.is_empty() && mine.contains(&p)) || (run.0 != 0 && super::fe2::run_shared(p, run.0, run.1)), mine_any, &mut |a, b| self.fe2_upload(mbuf, a, b, &mut up), &fe2_armable);
         // Past a label wait the CPU may write the pages it rewrites every
         // frame again before the label (FINDINGS.md 2026-10-29): a small
@@ -12847,6 +12943,7 @@ impl Exec {
             }
         }
         let t3 = tsc();
+        let m2 = rd();
         if watch_range().is_some() {
             // (A small read-only range's first page: valid in the mirror,
             // uploaded by this batch, claimed by an earlier chunk of this
@@ -12884,6 +12981,9 @@ impl Exec {
         // queued after them (its prologue's copies read what they wrote).
         if let Some(s) = CP_WRITES.latest(&[(base, size)]) {
             self.submit_after = self.submit_after.max(s);
+        }
+        if lp {
+            miss_parts(m1.wrapping_sub(m0), m2.wrapping_sub(m1), super::fe2::last_fine(), unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(m2));
         }
         if t0 != 0 {
             super::fe2::note_place_parts(t1.wrapping_sub(t0), t2.wrapping_sub(t1), tb, tsc().wrapping_sub(t3));
