@@ -3463,6 +3463,7 @@ pub fn profile_report() -> String {
     s.push_str(&fe3_probe::line(exec::profile_flips()));
     s.push_str(&cp::wait_stats());
     s.push_str(&cp::classes_line());
+    s.push_str(&cp::op_census_line());
     s.push_str(&cp::cb_census_line());
     s.push_str(&exec::write_logs_line());
     s.push_str(&exec::f3_regions_line());

@@ -1832,9 +1832,54 @@ fn class_end(k: usize, t: Option<(Instant, u64)>) {
     c[2].fetch_add(waited, Ordering::Relaxed);
 }
 
+/// `DS_OP_CENSUS=1` (diagnosis, 2026-11-16 night): the main graphics command processor's
+/// packets outside its own share of runs, by opcode and nesting (top-level buffer, deeper),
+/// and those a held recorder refuses (`Cp::held_refuses`) by reason: where a command processor
+/// that only walks and plans (its stretches recorded held on the workers) would have to stop.
+fn op_census_on() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("DS_OP_CENSUS").ok().as_deref() == Some("1"))
+}
+static OP_CENSUS: [[AtomicU64; 256]; 2] = [const { [const { AtomicU64::new(0) }; 256] }; 2];
+static OP_REFUSED: parking_lot::Mutex<Vec<(&'static str, u64)>> = parking_lot::Mutex::new(Vec::new());
+
+fn op_census(opcode: u32, depth: u32, refused: Option<&'static str>) {
+    OP_CENSUS[(depth > 1) as usize][(opcode & 0xFF) as usize].fetch_add(1, Ordering::Relaxed);
+    if let Some(why) = refused {
+        let mut g = OP_REFUSED.lock();
+        match g.iter_mut().find(|e| e.0 == why) {
+            Some(e) => e.1 += 1,
+            None => g.push((why, 1)),
+        }
+    }
+}
+
+/// The census line (`DS_OP_CENSUS=1`; "" otherwise), per flip since the profile's reset.
+pub fn op_census_line() -> String {
+    if !op_census_on() {
+        return String::new();
+    }
+    let flips = super::FRAMES.load(Ordering::Relaxed).saturating_sub(CP_CLASSES_FROM.load(Ordering::Relaxed)).max(1) as f64;
+    let mut parts = Vec::new();
+    for (d, name) in [(0usize, "top level"), (1, "nested")] {
+        let mut v: Vec<(usize, u64)> = OP_CENSUS[d].iter().enumerate().map(|(k, c)| (k, c.load(Ordering::Relaxed))).filter(|x| x.1 > 0).collect();
+        v.sort_by_key(|x| std::cmp::Reverse(x.1));
+        let s: Vec<String> = v.iter().map(|&(k, n)| format!("{} {:.1}", op_name(k as u32), n as f64 / flips)).collect();
+        parts.push(format!("{name}: {}", s.join(", ")));
+    }
+    let mut r = OP_REFUSED.lock().clone();
+    r.sort_by_key(|x| std::cmp::Reverse(x.1));
+    let rs: Vec<String> = r.iter().map(|&(w, n)| format!("{w} {:.1}", n as f64 / flips)).collect();
+    format!("    graphics command processor's own packets per flip outside its run shares (`DS_OP_CENSUS`): {}; held recording refuses: {}\n", parts.join("; "), rs.join(", "))
+}
+
 /// Clears the packet classes (`profile reset`).
 pub fn reset_classes() {
     PLAN_CLONE_NS.store(0, Ordering::Relaxed);
+    for c in OP_CENSUS.iter().flatten() {
+        c.store(0, Ordering::Relaxed);
+    }
+    OP_REFUSED.lock().clear();
     for c in CP_CLASSES.iter().flatten().chain(ACB_OPS.iter().flatten()).chain(STRETCH_OPS.iter().flatten()).chain(IDRAW_PARTS.iter().flatten()).chain(SERIAL_WHY.iter()).chain(SERIAL_WHY_ACB.iter()).chain(HS_CENSUS.iter()).chain(PLAN_PHASES.iter()).chain(PLAN_WALK.iter()).chain(PLAN_MAIN_WRITES.iter()).chain(RUN_EPOCHS.iter()).chain(CB_CENSUS.iter().flatten()) {
         c.store(0, Ordering::Relaxed);
     }
@@ -5908,6 +5953,11 @@ impl Cp {
                 }
             }
             PACKETS.fetch_add(1, Ordering::Relaxed);
+            if self.main_gfx && !self.compute && self.par.is_none() && op_census_on() {
+                let at = cur;
+                let p = |i: u64| f.rd(at + 4 * (1 + i));
+                op_census(opcode, self.depth, self.held_refuses(opcode, n, &p));
+            }
             if self.depth == 1 && self.shape() {
                 crate::info!("cb shape: packet {} at {cur:#x}{}", op_name(opcode), self.held_tag());
             }
