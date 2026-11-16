@@ -15,7 +15,11 @@
 //! bowl, the burning tower's frame or the buildings behind (FINDINGS.md 2026-11-16 morning):
 //! not because it skips their items by bit 0 (cleared, mode 4), their pass flags (set, measured
 //! and removed), a missing record (present, mode 4) or stale item boxes (none outside their
-//! model's: measured and removed). Where it loses them is open.
+//! model's: measured and removed), but because the cell builder that builds a section
+//! (eboot+0xe97880) then removes the entities it absorbed from the scene (its +0x1c8 list,
+//! eboot+0xaaafc0): at Castlewall's boot 59 sections absorbed 35,658 entities, ~94.5% of the
+//! handed-off items. The batches are their only path; a CPU path for them needs the entities
+//! kept in the scene too.
 
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -65,10 +69,28 @@ fn rdf(a: u64) -> f32 {
 /// the hand-off: both paths draw it), 4 as 3 with the item's hand-off records given no pass
 /// (`epilogue_hook`). (2, the items of models linked into the scene at their section's build
 /// kept on the CPU path, and 5, 4 with the models' CPU pass bits set, were measured on
-/// 2026-11-16 and removed: TRIED.md.)
+/// 2026-11-16 and removed: TRIED.md; so were 6 and 7 (item boxes), 8 (models with a LOD count:
+/// all have one at the build) and 9 (models the section does not absorb: 5.5% of the items).)
 fn mode() -> u8 {
     static M: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *M.get_or_init(|| std::env::var("DS_CPU_DRAW_PATH").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// `DS_CPU_DRAW_REGION=x/y/z/r` (with mode 1): only models whose box center (+0x128) lies within
+/// r of (x, y, z) are kept off the batches.
+fn in_region(model: u64) -> bool {
+    static R: std::sync::OnceLock<Option<[f32; 4]>> = std::sync::OnceLock::new();
+    let Some(r) = *R.get_or_init(|| {
+        std::env::var("DS_CPU_DRAW_REGION").ok().and_then(|v| {
+            let f: Vec<f32> = v.replace([';', ':', ','], "/").split('/').filter_map(|x| x.trim().parse().ok()).collect();
+            (f.len() >= 4).then(|| [f[0], f[1], f[2], f[3]])
+        })
+    }) else {
+        return true;
+    };
+    let Some(b) = rd64(model + 0x128) else { return false };
+    let c = [(rdf(b) + rdf(b + 12)) / 2.0, (rdf(b + 4) + rdf(b + 16)) / 2.0, (rdf(b + 8) + rdf(b + 20)) / 2.0];
+    ((c[0] - r[0]).powi(2) + (c[1] - r[1]).powi(2) + (c[2] - r[2]).powi(2)).sqrt() <= r[3]
 }
 
 fn census() -> bool {
@@ -147,7 +169,7 @@ pub extern "sysv64" fn handoff_hook(regs: *const u64, _arg: u32) {
     let item = unsafe { std::ptr::read_volatile(rbp.wrapping_sub(0x70) as *const u64) };
     let p2 = unsafe { std::ptr::read_volatile(rbp.wrapping_sub(0x68) as *const u64) };
     let model = rd64(p2).and_then(rd64);
-    let keep = mode() == 1;
+    let keep = mode() == 1 && model.is_some_and(in_region);
     if keep {
         unsafe { *(regs as *mut u64).add(3) = stand_part() };
         KEPT[0].fetch_add(1, Ordering::Relaxed);
@@ -404,7 +426,23 @@ fn census_status() -> String {
     let mut kh: Vec<(u32, u64)> = kh.into_iter().collect();
     kh.sort_by(|a, b| b.1.cmp(&a.1));
     let kinds_line = format!("    cpu draw census: models by the pass kinds listing them (mask: models): {}\n", kh.iter().map(|(k, n)| format!("{k:#x}: {n}")).collect::<Vec<_>>().join(", "));
-    let added_line = kinds_line + &format!(
+    // Every recorded model within 15 m of the sort point, unfiltered.
+    let mut raw: Vec<(f32, String)> = Vec::new();
+    for (&m, &(n, item, flags0, _)) in handed.iter() {
+        let d = dist(m);
+        if !(d <= 15.0) {
+            continue;
+        }
+        let flags = rd64(m + 0x198).unwrap_or(0);
+        let lods = rd16(m + 0x14a).unwrap_or(0) & 0xff;
+        let (kl, ll) = kinds.get(&m).copied().unwrap_or((0, 0));
+        let item_added = ad.contains(&item);
+        raw.push((d, format!("{} live {} flags0 {flags0:#x} lods {lods} listed {} walked {} kinds {kl:#x} asked {ll:#x} first item {item:#x} added {item_added} ({n} hand-offs, {d:.0} m)", describe(m), live(m, item), w2.contains(&m), w0.contains(&m) || w1.contains(&m))));
+        let _ = flags;
+    }
+    raw.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let raw_line = format!("    cpu draw census: recorded models within 15 m ({}): {}\n", raw.len(), raw.iter().take(60).map(|x| x.1.clone()).collect::<Vec<_>>().join("; "));
+    let added_line = raw_line + &kinds_line + &format!(
         "    cpu draw census: of the live models' handed-off items {items_h} (bit 0 set now {bit_set}, clear {bit_clear}; by LOD [not added, added] {:?}; by own bounds [none: not added, added; bounds: not added, added] {:?}: {}), {items_a} in a CPU draw list; models with none there {none_models} ({none_items} items): {}; models with some: {}
 ",
         by_lod,
