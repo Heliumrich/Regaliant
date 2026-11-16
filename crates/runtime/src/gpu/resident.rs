@@ -1854,13 +1854,10 @@ fn back_in(m: &Mirror, base: u64, len: u64, count: &AtomicU64) -> Result<(), Str
             let info = vk::BindSparseInfo::default().buffer_binds(&bufs);
             let fence = unsafe { c.device.create_fence(&vk::FenceCreateInfo::default(), None) }.map_err(|e| format!("vkCreateFence: {e}"))?;
             let r = {
-                // (On the main family's second queue it cost the same:
-                // FINDINGS.md 2026-11-01.)
-                let t0 = std::time::Instant::now();
-                let q = c.queue.lock();
-                let t1 = std::time::Instant::now();
-                let r = unsafe { c.device.queue_bind_sparse(*q, &[info], fence) };
-                drop(q);
+                // (On the main family's second queue it cost the same, waiting behind the
+                // main queue's work: FINDINGS.md 2026-11-01; the copy family's second queue
+                // does not share its hardware queue: `tune bind_queue`.)
+                let (r, t0, t1) = c.bind_sparse_new(&[info], fence);
                 super::vk::note_submit("vkQueueBindSparse", t0, t1);
                 r
             };
