@@ -14,7 +14,8 @@
 //! flips/s against 47-49, but the CPU path then draws none of the trebuchets, the brazier's
 //! bowl, the burning tower's frame or the buildings behind (FINDINGS.md 2026-11-16 morning):
 //! not because it skips their items by bit 0 (cleared, mode 4), their pass flags (set, measured
-//! and removed) or a missing record (present, mode 4). Where it loses them is open.
+//! and removed), a missing record (present, mode 4) or stale item boxes (none outside their
+//! model's: measured and removed). Where it loses them is open.
 
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -172,20 +173,30 @@ pub extern "sysv64" fn handoff_hook(regs: *const u64, _arg: u32) {
     }
 }
 
-/// At eboot+0xab4210's entry: the model in rsi.
+/// Per model: the pass kinds whose list held it (bit = kind, `listed_hook`) and the LODs
+/// eboot+0xab4210 was asked for (bit = LOD index, `lod_hook`).
+static KINDS: Mutex<Option<HashMap<u64, (u32, u32)>>> = Mutex::new(None);
+
+/// At eboot+0xab4210's entry: the model in rsi, the LOD index in edx. (Its per-item test
+/// is eboot+0x99c770 on the item's world box at +0x18, which eboot+0xabaca0 writes from its
+/// local box and a transform; then bit 0.)
 pub extern "sysv64" fn lod_hook(regs: *const u64, _arg: u32) {
-    let model = unsafe { *regs.add(6) };
+    let (model, lod) = unsafe { (*regs.add(6), *regs.add(2) as u32) };
     CALLS[1].fetch_add(1, Ordering::Relaxed);
     WALKED[0].lock().get_or_insert_with(HashSet::new).insert(model);
+    KINDS.lock().get_or_insert_with(HashMap::new).entry(model).or_insert((0, 0)).1 |= 1 << lod.min(31);
 }
 
 /// At eboot+0xab4e7d (FUN_00ab4df0's loop over a pass's model list, before its pass checks of
 /// the model's flags at +0x198: pass kind 4 bit 7, kind 3 bit 6, kinds 1-2 bit 1, others bit
 /// 0, while the title's settings bytes there are zero): the model at [r13].
 pub extern "sysv64" fn listed_hook(regs: *const u64, _arg: u32) {
-    let r13 = unsafe { *regs.add(13) };
+    let (r13, r15) = unsafe { (*regs.add(13), *regs.add(15)) };
     let Some(model) = rd64(r13) else { return };
     WALKED[2].lock().get_or_insert_with(HashSet::new).insert(model);
+    // (The pass's kind at [[r15+0x70]+0x30], eboot+0xab4df0's iVar3.)
+    let kind = rd64(r15 + 0x70).and_then(|v| rd16(v + 0x30)).unwrap_or(31) as u32;
+    KINDS.lock().get_or_insert_with(HashMap::new).entry(model).or_insert((0, 0)).0 |= 1 << kind.min(31);
 }
 
 /// At eboot+0xab4040's entry: the model in rdi.
@@ -332,6 +343,7 @@ fn census_status() -> String {
     // Live models whose handed-off items the CPU path never put in a draw list: their LOD and
     // fade fields (+0x14b and +0x17c/+0x17d LODs, +0x174 and +0x180.. fades).
     let hi = HANDED_ITEMS.lock().clone().unwrap_or_default();
+    let kinds = KINDS.lock().clone().unwrap_or_default();
     let ad = ADDED.lock().clone().unwrap_or_default();
     let (mut items_h, mut items_a, mut none_models, mut none_items) = (0u64, 0u64, 0u64, 0u64);
     // Handed-off items of live models with bit 0 of +0x30 set now / clear now, and by LOD index.
@@ -373,7 +385,8 @@ fn census_status() -> String {
         items_h += h;
         items_a += a;
         let rd8 = |x: u64| rd16(x).map_or(-99, |v| (v & 0xff) as u8 as i8 as i32);
-        let fields = format!("{} lod {} {} {} fade {:.2} [{:.2} {:.2} {:.2} {:.2}] +1a0 {:#x}", describe(m), rd8(m + 0x14b), rd8(m + 0x17c), rd8(m + 0x17d), rdf(m + 0x174), rdf(m + 0x180), rdf(m + 0x184), rdf(m + 0x188), rdf(m + 0x18c), rd64(m + 0x1a0).unwrap_or(0));
+        let (kl, ll) = kinds.get(&m).copied().unwrap_or((0, 0));
+        let fields = format!("{} kinds {kl:#x} lods asked {ll:#x} lod {} {} {} fade {:.2} [{:.2} {:.2} {:.2} {:.2}] +1a0 {:#x}", describe(m), rd8(m + 0x14b), rd8(m + 0x17c), rd8(m + 0x17d), rdf(m + 0x174), rdf(m + 0x180), rdf(m + 0x184), rdf(m + 0x188), rdf(m + 0x18c), rd64(m + 0x1a0).unwrap_or(0));
         if h > 0 && a == 0 {
             none_models += 1;
             none_items += h;
@@ -384,7 +397,14 @@ fn census_status() -> String {
     }
     none.sort_by(|a, b| a.0.total_cmp(&b.0));
     some.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let added_line = format!(
+    let mut kh: HashMap<u32, u64> = HashMap::new();
+    for (_, &(kl, _)) in kinds.iter() {
+        *kh.entry(kl).or_insert(0) += 1;
+    }
+    let mut kh: Vec<(u32, u64)> = kh.into_iter().collect();
+    kh.sort_by(|a, b| b.1.cmp(&a.1));
+    let kinds_line = format!("    cpu draw census: models by the pass kinds listing them (mask: models): {}\n", kh.iter().map(|(k, n)| format!("{k:#x}: {n}")).collect::<Vec<_>>().join(", "));
+    let added_line = kinds_line + &format!(
         "    cpu draw census: of the live models' handed-off items {items_h} (bit 0 set now {bit_set}, clear {bit_clear}; by LOD [not added, added] {:?}; by own bounds [none: not added, added; bounds: not added, added] {:?}: {}), {items_a} in a CPU draw list; models with none there {none_models} ({none_items} items): {}; models with some: {}
 ",
         by_lod,
