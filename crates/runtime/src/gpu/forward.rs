@@ -532,6 +532,13 @@ pub fn written(a: u64, n: u64) {
     if handled || COUNT.load(Ordering::Acquire) == 0 {
         return;
     }
+    // (Most writes end no entry: looked for under the read lock first. Every written range of
+    // every recording thread took the write lock and walked the entries, ~2% of the graphics
+    // workers' busy samples at Castlewall, 2026-11-16 night; an entry added meanwhile is one
+    // the write lock would have seen only by the same race.)
+    if super::tune::lane() && !ENTRIES.read().iter().any(|e| e.base < a + n && a < e.base + 4 * e.words.len() as u64) {
+        return;
+    }
     let mut g = ENTRIES.write();
     let before = g.len();
     if trace_on(a, n) {
