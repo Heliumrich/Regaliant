@@ -464,6 +464,81 @@ pub fn last_fine() -> u8 {
     LAST_FINE.with(|c| c.get())
 }
 
+/// `DS_STEP_LAPS=1`: front end 2's checks with work timed by the kind of each run they
+/// handled (`WORK_PARTS`).
+fn work_laps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_STEP_LAPS").ok().as_deref() == Some("1"))
+}
+
+/// Checks with work by run kind (`DS_STEP_LAPS`), TSC cycles: [runs of pages written lately
+/// uploaded without a take: cycles, runs, pages; runs another thread's take covered: cycles,
+/// runs, pages; runs taken: cycles, runs, pages; the checks with work: cycles of their run
+/// loops, checks], added per thread every 1,024 checks.
+pub static WORK_PARTS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+
+thread_local! {
+    static WORK_LOCAL: std::cell::Cell<[u64; 11]> = const { std::cell::Cell::new([0; 11]) };
+}
+
+/// Adds run kind `k`'s cycles and pages (`WORK_PARTS`).
+fn work_part(k: usize, cycles: u64, pages: u64) {
+    WORK_LOCAL.with(|c| {
+        let mut v = c.get();
+        v[3 * k] += cycles;
+        v[3 * k + 1] += 1;
+        v[3 * k + 2] += pages;
+        c.set(v);
+    });
+}
+
+/// Ends a check with work (`WORK_PARTS`).
+fn work_check(cycles: u64) {
+    WORK_LOCAL.with(|c| {
+        let mut v = c.get();
+        v[9] += cycles;
+        v[10] += 1;
+        if v[10] >= 1024 {
+            for (a, x) in WORK_PARTS.iter().zip(v.iter()) {
+                a.fetch_add(*x, Ordering::Relaxed);
+            }
+            v = [0; 11];
+        }
+        c.set(v);
+    });
+}
+
+/// `WORK_PARTS` as a status line ("" before any).
+pub fn work_parts_line() -> String {
+    let v: Vec<u64> = WORK_PARTS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    if v[10] == 0 {
+        return String::new();
+    }
+    let hz = super::threadcpu::tsc_hz();
+    let us = |c: u64, n: u64| if n == 0 { 0.0 } else { c as f64 * 1e6 / hz / n as f64 };
+    format!(
+        "    front end 2's checks with work (`DS_STEP_LAPS`): {} at {:.2} us of run handling; runs written lately uploaded without a take {} at {:.2} us ({} pages), runs another thread's take covered {} at {:.2} us ({} pages), runs taken {} at {:.2} us ({} pages)\n",
+        v[10],
+        us(v[9], v[10]),
+        v[1],
+        us(v[0], v[1]),
+        v[2],
+        v[4],
+        us(v[3], v[4]),
+        v[5],
+        v[7],
+        us(v[6], v[7]),
+        v[8]
+    )
+}
+
+/// Resets `WORK_PARTS` (`profile reset`).
+pub fn reset_work_parts() {
+    for c in WORK_PARTS.iter() {
+        c.store(0, Ordering::Relaxed);
+    }
+}
+
 /// `DS_FE2_CALLERS=1` (diagnosis): placement checks counted by caller
 /// (`set_caller`), with why the range cache missed.
 pub fn callers_on() -> bool {
@@ -1800,8 +1875,12 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
             return Ok(());
         }
         let t0 = std::time::Instant::now();
+        let wl = work_laps();
+        let rd = || if wl { unsafe { core::arch::x86_64::_rdtsc() } } else { 0 };
+        let w0 = rd();
         let frame = super::FRAMES.load(Ordering::Relaxed);
         for &(a, b) in bad.iter() {
+            let wr = rd();
             note_arming_ended(a, b);
             // Every page written lately: uploaded as it is, without a take.
             if hot_run(a, b, frame) {
@@ -1831,6 +1910,9 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
                     x = y;
                 }
                 caller_since(C_UPLOAD, tu);
+                if wl {
+                    work_part(0, rd().wrapping_sub(wr), (b - a) / PAGE);
+                }
                 continue;
             }
             // Another thread's take around this run, for a requirement at
@@ -1844,7 +1926,12 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
                 };
                 caller_since(C_FOLLOW, tf);
                 match r {
-                    Ok(true) => continue,
+                    Ok(true) => {
+                        if wl {
+                            work_part(1, rd().wrapping_sub(wr), (b - a) / PAGE);
+                        }
+                        continue;
+                    }
                     Ok(false) => {}
                     Err(e) => {
                         STATS[S_SLOW_NS].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -1865,6 +1952,12 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
             if let Some(k) = reasons {
                 note_source_take(a, b, k);
             }
+            if wl {
+                work_part(2, rd().wrapping_sub(wr), (b - a) / PAGE);
+            }
+        }
+        if wl {
+            work_check(rd().wrapping_sub(w0));
         }
         STATS[S_SLOW_NS].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         // (A long one is a hitch cause: `gpu::hitch`.)
@@ -6393,16 +6486,18 @@ pub fn c4_cp_target(a: u64, n: u64) {
 }
 
 thread_local! {
-    /// Page ranges this thread's reads marked never held and found unheld
-    /// (`c4_release_reads`), the last RECENT_READS of them: a read inside
-    /// one needs neither again (a never-held mark is never cleared, and a
-    /// hold that raced the mark ends by the read's fault as before). The
-    /// preparations' reads repeat their pages draw after draw (the marking
-    /// was ~0.8% of the graphics CP's busy samples and ~1.4% of its
-    /// workers' at Castlewall Front, 2026-11-11).
-    static READ_MARKED: std::cell::RefCell<([(u64, u64); RECENT_READS], usize)> = const { std::cell::RefCell::new(([(0, 0); RECENT_READS], 0)) };
+    /// Pages this thread's reads marked never held and found unheld
+    /// (`c4_release_reads`), direct-mapped by page number: a read on such pages
+    /// only needs neither again (a never-held mark is never cleared, and a hold
+    /// that raced the mark ends by the read's fault as before). The
+    /// preparations' reads repeat their pages draw after draw (the marking was
+    /// ~0.8% of the graphics CP's busy samples and ~1.4% of its workers' at
+    /// Castlewall Front, 2026-11-11). (Until 2026-11-16 night the last 16 page
+    /// ranges, scanned per read: ~200 ns of a stage's ~15 reads, the largest
+    /// part of its shader-read sync.)
+    static READ_MARKED: std::cell::RefCell<Box<[u64; READ_MARKED_SLOTS]>> = std::cell::RefCell::new(Box::new([u64::MAX; READ_MARKED_SLOTS]));
 }
-const RECENT_READS: usize = 16;
+const READ_MARKED_SLOTS: usize = 1024;
 
 /// Our command processors read `reads` on the CPU: held pages released first.
 pub fn c4_release_reads(reads: &[(u64, u64)]) {
@@ -6413,7 +6508,12 @@ pub fn c4_release_reads(reads: &[(u64, u64)]) {
         let mut m = m.borrow_mut();
         for &(a, n) in reads {
             let (lo, hi) = (a & !(PAGE - 1), a.saturating_add(n.max(1)).next_multiple_of(PAGE));
-            if m.0.iter().any(|&(x, y)| x <= lo && hi <= y) {
+            let slot = |p: u64| (p / PAGE) as usize & (READ_MARKED_SLOTS - 1);
+            let mut p = lo;
+            while p < hi && m[slot(p)] == p {
+                p += PAGE;
+            }
+            if p >= hi {
                 continue;
             }
             // (Pages our command processors read are not held: marked first,
@@ -6422,9 +6522,13 @@ pub fn c4_release_reads(reads: &[(u64, u64)]) {
             if c4_any_held(a, a.saturating_add(n.max(1))) {
                 c4_release_sync(a, n, false);
             }
-            let k = m.1;
-            m.0[k] = (lo, hi);
-            m.1 = (k + 1) % RECENT_READS;
+            if hi - lo <= 16 * PAGE {
+                let mut p = lo;
+                while p < hi {
+                    m[slot(p)] = p;
+                    p += PAGE;
+                }
+            }
         }
     });
 }

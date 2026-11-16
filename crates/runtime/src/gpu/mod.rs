@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 179] = [
+    static ALL: [Tunable; 180] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -211,6 +211,7 @@ pub mod tune {
         Tunable { name: "zk", env: "DS_ZK", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "xq_pre_c", env: "DS_XQ_PRE_C", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lean", env: "DS_LEAN", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "page_memo", env: "DS_PAGE_MEMO", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1459,6 +1460,15 @@ pub mod tune {
     #[inline]
     pub fn lean() -> bool {
         get(178) != 0
+    }
+
+    /// Front end 2's page memo (`exec::PageMemo`; the lean lane's placement part): a range on
+    /// pages the executor's batch placed under the same epoch, wanted state and mappings is
+    /// placed without front end 2's check. Default since 2026-11-16 night (exact in 89 M
+    /// checked answers, Castlewall turning x1.028); `DS_PAGE_MEMO=0` the fallback;
+    /// `DS_PAGE_MEMO_CHECK=1` places each answer again in full and compares.
+    pub fn page_memo() -> bool {
+        get(179) != 0
     }
 
     /// Whether translations get `rdna::translate::Spec::hw_bounds` (scalar

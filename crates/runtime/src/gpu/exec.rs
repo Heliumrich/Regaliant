@@ -990,6 +990,77 @@ fn flip_now() -> u32 {
     super::FRAMES.load(Ordering::Relaxed) as u32
 }
 
+/// Advances when pipelines leave `PIPES` or `GFX_PIPES` (`maybe_evict_pipes`): a recording
+/// thread's cache of them (`PIPE_TL`) holds none from before.
+static PIPES_GEN: AtomicU64 = AtomicU64::new(1);
+
+/// A recording thread's recent pipelines (`pipe_lookup`; the lean lane, 2026-11-16 night):
+/// every draw's and dispatch's lookup took one global mutex and a SipHash map, shared by
+/// ~10 recording threads (~0.3 us a command at Castlewall). Direct-mapped by key; an entry
+/// stamps its pipeline's last use in the map once every `PIPE_TL_STAMP` flips (idle ones go
+/// after `PIPE_IDLE_FLIPS`).
+#[derive(Clone, Copy)]
+struct TlPipe {
+    key: u64,
+    gfx: bool,
+    pipe: Pipe,
+    /// `PIPES_GEN` when it was taken from the map.
+    pgen: u64,
+    /// The flip its use was last stamped in the map.
+    stamped: u32,
+}
+
+const PIPE_TL_SLOTS: usize = 256;
+const PIPE_TL_STAMP: u32 = 64;
+
+thread_local! {
+    static PIPE_TL: std::cell::RefCell<Vec<Option<TlPipe>>> = std::cell::RefCell::new(vec![None; PIPE_TL_SLOTS]);
+}
+
+/// The pipeline kept under `key` in `map` (`gfx`: `GFX_PIPES`), from this thread's cache
+/// when it holds it (`PIPE_TL`), its use stamped. `noted`: called the first time this thread
+/// takes it from the map (`pipeuse::note`).
+#[inline]
+fn pipe_lookup(map: &Mutex<Option<HashMap<u64, PipeEntry>>>, gfx: bool, key: u64, noted: fn(u64)) -> Option<Pipe> {
+    let pgen = PIPES_GEN.load(Ordering::Acquire);
+    let now = flip_now();
+    let slot = ((key ^ gfx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - PIPE_TL_SLOTS.trailing_zeros())) as usize;
+    let hit = PIPE_TL.with(|t| {
+        let mut t = t.borrow_mut();
+        match t[slot] {
+            Some(e) if e.key == key && e.gfx == gfx && e.pgen == pgen => {
+                let stamp = now.wrapping_sub(e.stamped) >= PIPE_TL_STAMP;
+                if stamp {
+                    t[slot] = Some(TlPipe { stamped: now, ..e });
+                }
+                Some((e.pipe, stamp))
+            }
+            _ => None,
+        }
+    });
+    match hit {
+        Some((pipe, stamp)) => {
+            if stamp {
+                if let Some(e) = map.lock().as_mut().and_then(|m| m.get_mut(&key)) {
+                    e.last = now;
+                }
+            }
+            Some(pipe)
+        }
+        None => {
+            let r = map.lock().as_mut().and_then(|m| m.get_mut(&key)).map(|e| {
+                e.last = now;
+                e.pipe
+            });
+            if let Some(pipe) = r {
+                noted(key);
+                PIPE_TL.with(|t| t.borrow_mut()[slot] = Some(TlPipe { key, gfx, pipe, pgen, stamped: now }));
+            }
+            r
+        }
+    }
+}
+
 /// `DS_UPLOAD_HAZARD=1` (diagnosis, `Exec::note_upload_hazard`).
 fn upload_hazard_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1096,6 +1167,10 @@ fn maybe_evict_pipes() {
     }
     PIPE_EVICTS[0].fetch_add(dead.len() as u64, Ordering::Relaxed);
     PIPE_EVICTS[2].fetch_add(1, Ordering::Relaxed);
+    if !dead.is_empty() {
+        // (The recording threads' caches let go of them: `PIPE_TL`.)
+        PIPES_GEN.fetch_add(1, Ordering::AcqRel);
+    }
     let mut g = PIPE_GRAVE.lock();
     g.extend(dead);
     PIPE_GRAVE_LEN.store(g.len() as u64, Ordering::Release);
@@ -2821,14 +2896,7 @@ pub fn inflight_stats() -> (u64, u64, u64) {
 /// use noted, `pipeuse`).
 fn cached_compute_pipe(p: &Prepared) -> Option<Pipe> {
     let key = push_key(p.tr.key, push_fits(&[p]));
-    let r = PIPES.lock().as_mut().and_then(|m| m.get_mut(&key)).map(|e| {
-        e.last = flip_now();
-        e.pipe
-    });
-    if r.is_some() {
-        super::pipeuse::note(key);
-    }
-    r
+    pipe_lookup(&PIPES, false, key, super::pipeuse::note)
 }
 
 /// Background compiles of particle programs' pipelines (`tune
@@ -3197,10 +3265,7 @@ fn gfx_pipe(hkey: u64) -> Option<Pipe> {
 /// A draw's graphics pipeline cached under a state hash, if any (its last
 /// use stamped: `maybe_evict_pipes`).
 fn gfx_pipe_use(hkey: u64) -> Option<Pipe> {
-    GFX_PIPES.lock().as_mut().and_then(|m| m.get_mut(&hkey)).map(|e| {
-        e.last = flip_now();
-        e.pipe
-    })
+    pipe_lookup(&GFX_PIPES, true, hkey, |_| {})
 }
 
 fn keep_gfx_pipe(hkey: u64, pipe: Pipe) -> Pipe {
@@ -3776,8 +3841,16 @@ pub(super) fn push_line() -> String {
         BATCHED[2].load(Ordering::Relaxed)
     ) + &batch_miss_line()
         + &place_memo_cycles_line()
-        + &format!("    front end 2's placement memo: {} repeats answered, {} placements made
-", PLACE_MEMO[0].load(Ordering::Relaxed), PLACE_MEMO[1].load(Ordering::Relaxed))
+        + &super::fe2::work_parts_line()
+        + &format!("    front end 2's placement memo: {} repeats answered, {} by the page memo, {} placements made
+", PLACE_MEMO[0].load(Ordering::Relaxed), PLACE_MEMO[2].load(Ordering::Relaxed), PLACE_MEMO[1].load(Ordering::Relaxed))
+        + &if page_memo_check_on() {
+            let c: Vec<u64> = PAGE_MEMO_CHECKS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+            format!("    page memo checked (`DS_PAGE_MEMO_CHECK`): {} answers, {} results differed, {} full placements had work to do; the placement memo's answers: {}, {} differed, {} with work
+", c[0], c[1], c[2], c[3], c[4], c[5])
+        } else {
+            String::new()
+        }
         + &place_census_line()
 }
 
@@ -9085,6 +9158,43 @@ impl Default for PlaceMemo {
     }
 }
 
+/// Front end 2's page memo (`tune page_memo`; the lean lane's placement part, 2026-11-16
+/// night): the pages of this executor's placements under one batch, epoch, wanted state and
+/// mappings (`Exec::pm_key`, numbered by `Exec::pm_gen`). A later range of the batch on such
+/// pages only, at most `PAGE_MEMO_RANGE` of them, is placed without front end 2's check: its
+/// pages are current for the batch's work (found so, or uploaded in its prologue), as for a
+/// repeat of a whole placement (the placement memo). Per-item blocks of a pool are new
+/// ranges on pages the batch placed a moment before (~45% of placements missed the memo at
+/// ~1.1 us). Direct-mapped by page number, 16 bytes an entry.
+const PAGE_MEMO_SLOTS: usize = 1024;
+const PAGE_MEMO_RANGE: u64 = 16;
+
+#[derive(Clone, Copy, Default)]
+struct PageMemo {
+    /// The page's address; bit 0 set when a written range placed it (its pages marked
+    /// GPU-written and imported for write-backs: it serves written ranges too).
+    page: u64,
+    /// `Exec::pm_gen` it was placed under (0: none).
+    stamp: u64,
+}
+
+/// The page memo checked (`DS_PAGE_MEMO_CHECK=1`, diagnosis): each answer placed again by the
+/// full path and compared: [answers checked, results that differed, full placements that had
+/// work to do], then the same for the placement memo's answers (the rate of work found after
+/// an answer that memo has always given: pages another thread's take found written since).
+static PAGE_MEMO_CHECKS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+fn page_memo_check_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_PAGE_MEMO_CHECK").ok().as_deref() == Some("1"))
+}
+
+thread_local! {
+    /// How the last placement was answered (`Exec::fe2_place_memo`): 0 the placement memo, 1
+    /// the page memo, 2 front end 2's full placement.
+    static PLACE_HOW: std::cell::Cell<u8> = const { std::cell::Cell::new(2) };
+}
+
 /// The first entry of the placement memo's set for a range.
 #[inline]
 fn place_memo_set(base: u64, size: u64, written: bool) -> usize {
@@ -9092,9 +9202,9 @@ fn place_memo_set(base: u64, size: u64, written: bool) -> usize {
     ((h >> (64 - (PLACE_MEMO_SLOTS / PLACE_MEMO_WAYS).trailing_zeros())) as usize) * PLACE_MEMO_WAYS
 }
 
-/// The placement memo's [hits, misses] (`Exec::fe2_place`), added per
+/// The placement memo's [hits, misses, page memo answers] (`Exec::fe2_place`), added per
 /// thread every 4,096.
-pub static PLACE_MEMO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+pub static PLACE_MEMO: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// Batch starts' census (`DS_PLACE_CENSUS=1`, diagnosis): placements the memo did not answer,
 /// [the batch's first command, later ones] x [the memo's slot holds the same range, epoch,
@@ -9132,29 +9242,33 @@ fn place_census_line() -> String {
 }
 
 thread_local! {
-    static PLACE_MEMO_LOCAL: std::cell::Cell<[u64; 2]> = const { std::cell::Cell::new([0; 2]) };
+    static PLACE_MEMO_LOCAL: std::cell::Cell<[u64; 3]> = const { std::cell::Cell::new([0; 3]) };
 }
 
+/// Counts a placement by how it was answered (`PLACE_HOW`'s numbering: 0 the placement memo,
+/// 1 the page memo, 2 a full placement).
 #[inline]
-fn place_memo_count(hit: bool) {
+fn place_memo_count(how: u8) {
+    PLACE_HOW.with(|c| c.set(how));
     PLACE_MEMO_LOCAL.with(|c| {
         let mut v = c.get();
-        v[if hit { 0 } else { 1 }] += 1;
-        if v[0] + v[1] >= 4096 {
-            PLACE_MEMO[0].fetch_add(v[0], Ordering::Relaxed);
-            PLACE_MEMO[1].fetch_add(v[1], Ordering::Relaxed);
-            v = [0; 2];
+        v[[0, 2, 1][how as usize]] += 1;
+        if v[0] + v[1] + v[2] >= 4096 {
+            for (a, b) in PLACE_MEMO.iter().zip(v.iter()) {
+                a.fetch_add(*b, Ordering::Relaxed);
+            }
+            v = [0; 3];
         }
         c.set(v);
     });
 }
 
-/// The placement memo's answers timed (`DS_STEP_LAPS`): [hit cycles, hits, miss cycles, misses],
-/// added per thread every 4,096.
-pub static PLACE_MEMO_CYCLES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// The placement memo's answers timed (`DS_STEP_LAPS`): [hit cycles, hits, miss cycles, misses,
+/// page memo cycles, page memo answers], added per thread every 4,096.
+pub static PLACE_MEMO_CYCLES: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 thread_local! {
-    static PLACE_MEMO_CYC: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
+    static PLACE_MEMO_CYC: std::cell::Cell<[u64; 6]> = const { std::cell::Cell::new([0; 6]) };
 }
 
 /// A placement miss's parts timed (`DS_STEP_LAPS`): [before the check, the check when the range
@@ -9295,7 +9409,7 @@ fn sync_time(cycles: u64) {
 /// `PLACE_MEMO_CYCLES` as a status line ("" before any).
 fn place_memo_cycles_line() -> String {
     let v: Vec<u64> = PLACE_MEMO_CYCLES.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    if v[1] + v[3] == 0 {
+    if v[1] + v[3] + v[5] == 0 {
         return String::new();
     }
     let hz = super::threadcpu::tsc_hz();
@@ -9325,10 +9439,12 @@ fn place_memo_cycles_line() -> String {
         String::new()
     };
     format!(
-        "    front end 2's placements timed (`DS_STEP_LAPS`, since the last profile reset): memo hits {} at {:.0} ns, misses {} at {:.0} ns; a miss's parts ({n} timed): before the check {:.0} ns, the check {:.0} ns when the range cache answered ({}), {:.0} ns otherwise ({}; with nothing to do {:.0} ns ({})), after it {:.0} ns
+        "    front end 2's placements timed (`DS_STEP_LAPS`, since the last profile reset): memo hits {} at {:.0} ns, page memo answers {} at {:.0} ns, misses {} at {:.0} ns; a miss's parts ({n} timed): before the check {:.0} ns, the check {:.0} ns when the range cache answered ({}), {:.0} ns otherwise ({}; with nothing to do {:.0} ns ({})), after it {:.0} ns
 ",
         v[1],
         ns(v[0], v[1]),
+        v[5],
+        ns(v[4], v[5]),
         v[3],
         ns(v[2], v[3]),
         ns(m[0], n),
@@ -9342,17 +9458,17 @@ fn place_memo_cycles_line() -> String {
     ) + &sync
 }
 
-fn place_memo_time(hit: bool, cycles: u64) {
+fn place_memo_time(how: u8, cycles: u64) {
     PLACE_MEMO_CYC.with(|c| {
         let mut v = c.get();
-        let k = if hit { 0 } else { 2 };
+        let k = [0, 4, 2][how.min(2) as usize];
         v[k] += cycles;
         v[k + 1] += 1;
-        if v[1] + v[3] >= 4096 {
+        if v[1] + v[3] + v[5] >= 4096 {
             for (a, b) in PLACE_MEMO_CYCLES.iter().zip(v.iter()) {
                 a.fetch_add(*b, Ordering::Relaxed);
             }
-            v = [0; 4];
+            v = [0; 6];
         }
         c.set(v);
     });
@@ -10160,6 +10276,11 @@ pub struct Exec {
     place_memo: Box<[PlaceMemo; PLACE_MEMO_SLOTS]>,
     /// The placement memo's next replaced entry in a full set (`fe2_place_memo`).
     place_memo_next: u8,
+    /// Front end 2's page memo (`PageMemo`), the key its entries are made under now (batch,
+    /// epoch, wanted state, mappings) and that key's number (`pm_gen_for`).
+    page_memo: Box<[PageMemo; PAGE_MEMO_SLOTS]>,
+    pm_key: (u64, u32, u32, u64),
+    pm_gen: u64,
     fe2_gens: Vec<u32>,
     /// This queue's view (`fe2::view_cell`): what its checks need.
     fe2_view: std::sync::Arc<std::sync::atomic::AtomicU32>,
@@ -11086,6 +11207,7 @@ static BATCH_MISS_SITES: Mutex<Option<HashMap<u32, u64>>> = Mutex::new(None);
 
 /// A new window for the batched dispatches' statistics (`profile reset`).
 pub(super) fn reset_batch_misses() {
+    super::fe2::reset_work_parts();
     for c in BATCHED.iter().chain(BATCH_MISS.iter()).chain(SHADOWS_PRE.iter()).chain(PLACE_MEMO_CYCLES.iter()).chain(MISS_PARTS.iter()).chain(SYNC_CYCLES.iter()).chain(SYNC_PARTS.iter()).chain(CLEAN_STATS.iter()) {
         c.store(0, Ordering::Relaxed);
     }
@@ -11428,6 +11550,9 @@ impl Exec {
                 fe2_memo: Default::default(),
                 place_memo: Box::new([PlaceMemo::default(); PLACE_MEMO_SLOTS]),
                 place_memo_next: 0,
+                page_memo: Box::new([PageMemo::default(); PAGE_MEMO_SLOTS]),
+                pm_key: (0, 0, 0, 0),
+                pm_gen: 1,
                 fe2_gens: Vec::new(),
                 fe2_view: super::fe2::view_cell(name),
                 f3_ranges: Vec::new(),
@@ -12820,14 +12945,63 @@ impl Exec {
             return self.fe2_place_census(base, size, written);
         }
         if laps() {
-            let before = PLACE_MEMO_LOCAL.with(|c| c.get()[0]);
+            PLACE_HOW.with(|c| c.set(2));
             let t0 = unsafe { core::arch::x86_64::_rdtsc() };
             let r = self.fe2_place_memo(base, size, written);
-            let hit = PLACE_MEMO_LOCAL.with(|c| c.get()[0]) != before;
-            place_memo_time(hit, unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0));
+            place_memo_time(PLACE_HOW.with(|c| c.get()), unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0));
             return r;
         }
         self.fe2_place_memo(base, size, written)
+    }
+
+    /// The page memo's number for the key now (a new number when the key changed).
+    #[inline]
+    fn pm_gen_for(&mut self, ep: u32, want: u32, map_gen: u64) -> u64 {
+        let k = (self.batch_count, ep, want, map_gen);
+        if k != self.pm_key {
+            self.pm_key = k;
+            self.pm_gen += 1;
+        }
+        self.pm_gen
+    }
+
+    /// Where a range on pages the page memo holds under `stamp` ends (its last page's end): every
+    /// page of [base, base + size) placed under that number (a written range: by a written
+    /// one), at most `PAGE_MEMO_RANGE` of them. None otherwise.
+    #[inline]
+    fn page_memo_hit(&self, base: u64, size: u64, written: bool, stamp: u64) -> Option<u64> {
+        use super::resident::PAGE;
+        let end = base.checked_add(size)?;
+        let lo = base & !(PAGE - 1);
+        let hi = end.next_multiple_of(PAGE);
+        if size == 0 || hi - lo > PAGE_MEMO_RANGE * PAGE {
+            return None;
+        }
+        let mut p = lo;
+        while p < hi {
+            let e = &self.page_memo[(p / PAGE) as usize & (PAGE_MEMO_SLOTS - 1)];
+            if e.stamp != stamp || e.page & !1 != p || (written && e.page & 1 == 0) {
+                return None;
+            }
+            p += PAGE;
+        }
+        Some(hi)
+    }
+
+    /// Notes pages [lo, hi) (page-aligned) placed under `stamp` in the page memo.
+    fn page_memo_note(&mut self, lo: u64, hi: u64, written: bool, stamp: u64) {
+        use super::resident::PAGE;
+        if hi <= lo || hi - lo > PAGE_MEMO_RANGE * PAGE {
+            return;
+        }
+        let mut p = lo;
+        while p < hi {
+            let e = &mut self.page_memo[(p / PAGE) as usize & (PAGE_MEMO_SLOTS - 1)];
+            // (A written range's mark stays for the same page and number.)
+            let kept = e.stamp == stamp && e.page == p | 1;
+            *e = PageMemo { page: p | (written || kept) as u64, stamp };
+            p += PAGE;
+        }
     }
 
     /// The entry of the placement memo's set `set` holding the range (any batch's).
@@ -12837,6 +13011,43 @@ impl Exec {
             let m = &self.place_memo[i];
             m.batch != 0 && m.base == base && m.size == size && m.written == written
         })
+    }
+
+    /// The placement memo's entry a new placement goes into: the range's own (`found`), else
+    /// one of an earlier batch, else the set's next in turn.
+    #[inline]
+    fn place_memo_slot(&mut self, set: usize, found: Option<usize>) -> usize {
+        match found {
+            Some(k) => k,
+            None => match (set..set + PLACE_MEMO_WAYS).find(|&i| self.place_memo[i].batch != self.batch_count) {
+                Some(k) => k,
+                None => {
+                    self.place_memo_next = self.place_memo_next.wrapping_add(1);
+                    set + (self.place_memo_next as usize & (PLACE_MEMO_WAYS - 1))
+                }
+            },
+        }
+    }
+
+    /// What a placement answered by a memo still does: deferred CP writes into the range
+    /// order the batch, the epoch wanted lowers the run's, and a written range marks the batch
+    /// for its write-back again (a write-back since, before a CP write the GPU performs,
+    /// cleared it, and the batch then closed without one, its GPU writes reaching guest memory
+    /// only at a later batch's: the title's per-view block found stale after its copy in every
+    /// boot since the memo, its forwarding then refused, the vista's graphics CP waiting ~5 ms
+    /// a flip for its own batches, FINDINGS.md 2026-11-06).
+    #[inline]
+    fn fe2_memo_answer(&mut self, base: u64, size: u64, written: bool, want: u32) {
+        if let Some(s) = CP_WRITES.latest(&[(base, size)]) {
+            self.submit_after = self.submit_after.max(s);
+        }
+        self.fe2_min_want = self.fe2_min_want.min(want);
+        if written {
+            self.fe2_marked = true;
+            if wb_empty_census() && !super::fe2::c4_all_held(base, base + size) {
+                self.wb_unheld |= 1u64 << crate::engine::owner(base).min(63);
+            }
+        }
     }
 
     /// `fe2_place_memo` with the batch starts' census (`PLACE_CENSUS`).
@@ -12886,48 +13097,70 @@ impl Exec {
             let found = self.place_memo_way(set, base, size, written);
             let m = found.map_or_else(PlaceMemo::default, |k| self.place_memo[k]);
             if found.is_some() && m.batch == self.batch_count && m.ep == ep && m.want == want && m.map_gen == map_gen {
-                if let Some(s) = CP_WRITES.latest(&[(base, size)]) {
-                    self.submit_after = self.submit_after.max(s);
-                }
-                self.fe2_min_want = self.fe2_min_want.min(want);
-                // A written range marks the batch for its write-back again: a
-                // write-back since (before a CP write the GPU performs) cleared
-                // it, and the batch then closed without one, its GPU writes
-                // reaching guest memory only at a later batch's (the title's
-                // per-view block found stale after its copy in every boot since
-                // the memo, its forwarding then refused: the vista's graphics
-                // CP waited ~5 ms a flip for its own batches, FINDINGS.md
-                // 2026-11-06).
-                if written {
-                    self.fe2_marked = true;
-                    if wb_empty_census() && !super::fe2::c4_all_held(base, base + size) {
-                        self.wb_unheld |= 1u64 << crate::engine::owner(base).min(63);
+                if page_memo_check_on() {
+                    // (Diagnosis: the placement memo's answers checked the same way.)
+                    let full = self.fe2_place_timed(base, size, written);
+                    PAGE_MEMO_CHECKS[3].fetch_add(1, Ordering::Relaxed);
+                    if super::fe2::last_fine() == 2 {
+                        PAGE_MEMO_CHECKS[5].fetch_add(1, Ordering::Relaxed);
+                    }
+                    if full != Some(m.result) {
+                        PAGE_MEMO_CHECKS[4].fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                place_memo_count(true);
+                self.fe2_memo_answer(base, size, written, want);
+                place_memo_count(0);
                 if watch_range().is_some() {
                     watch_place(base, size, 0, true, String::new());
                 }
                 return Some(m.result);
             }
-            place_memo_count(false);
+            // The page memo: a range on pages this batch placed under the same key.
+            let pm = super::tune::page_memo() && watch_range().is_none();
+            if pm {
+                let stamp = self.pm_gen_for(ep, want, map_gen);
+                if let Some(hi) = self.page_memo_hit(base, size, written, stamp) {
+                    let (mbuf, _) = super::resident::mirror_buffer()?;
+                    let result = (mbuf, base - super::resident::MIRROR_BASE, hi - base);
+                    if page_memo_check_on() {
+                        // (Diagnosis: the full placement as well, compared.)
+                        let full = self.fe2_place_timed(base, size, written);
+                        let work = super::fe2::last_fine() == 2;
+                        PAGE_MEMO_CHECKS[0].fetch_add(1, Ordering::Relaxed);
+                        if work {
+                            PAGE_MEMO_CHECKS[2].fetch_add(1, Ordering::Relaxed);
+                        }
+                        if full != Some(result) {
+                            let k = PAGE_MEMO_CHECKS[1].fetch_add(1, Ordering::Relaxed);
+                            if k < 20 {
+                                crate::info!("gpu[{}]: page memo check: {base:#x}+{size:#x} (written {written}) answered {result:x?}, placed {full:x?}", self.name);
+                            }
+                        }
+                        if work && PAGE_MEMO_CHECKS[2].load(Ordering::Relaxed) <= 20 {
+                            crate::info!("gpu[{}]: page memo check: {base:#x}+{size:#x} (written {written}) answered from the memo, but the full placement had work to do", self.name);
+                        }
+                    }
+                    self.fe2_memo_answer(base, size, written, want);
+                    place_memo_count(1);
+                    // (The range itself into the placement memo.)
+                    let k = self.place_memo_slot(set, None);
+                    self.place_memo[k] = PlaceMemo { base, size, batch: self.batch_count, ep, want, written, map_gen, result };
+                    return Some(result);
+                }
+            }
+            place_memo_count(2);
             let r = self.fe2_place_timed(base, size, written);
             if let Some(result) = r {
                 // (Under the batch it was made in: a placement begins one when
                 // none is being recorded.)
                 if self.recording && !self.stopped && !self.past_grow && crate::mem::MAP_GEN.load(Ordering::Acquire) == map_gen && super::precache::epoch() as u32 == ep {
-                    // The range's own entry, else one of an earlier batch, else the set's next in turn.
-                    let k = match found {
-                        Some(k) => k,
-                        None => match (set..set + PLACE_MEMO_WAYS).find(|&i| self.place_memo[i].batch != self.batch_count) {
-                            Some(k) => k,
-                            None => {
-                                self.place_memo_next = self.place_memo_next.wrapping_add(1);
-                                set + (self.place_memo_next as usize & (PLACE_MEMO_WAYS - 1))
-                            }
-                        },
-                    };
+                    let k = self.place_memo_slot(set, found);
                     self.place_memo[k] = PlaceMemo { base, size, batch: self.batch_count, ep, want, written, map_gen, result };
+                    if pm {
+                        use super::resident::PAGE;
+                        let stamp = self.pm_gen_for(ep, want, map_gen);
+                        self.page_memo_note(base & !(PAGE - 1), (base + result.2).next_multiple_of(PAGE), written, stamp);
+                    }
                 }
             }
             return r;
