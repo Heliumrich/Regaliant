@@ -39,6 +39,7 @@ mod thread;
 mod titlefix;
 mod vgdiag;
 mod cullread;
+mod cpudraw;
 mod titlemem;
 mod textbox;
 mod uistate;

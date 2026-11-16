@@ -548,6 +548,32 @@ const FIXES: &[Fix] = &[
         why: "the port counts the engine's readbacks of GPU memory by caller and allocator (census)",
         only_with: Some("DS_RB_CENSUS"),
     },
+    // A static model section's hand-off of a mesh item to the GPU-driven batches
+    // (eboot+0xa21e10) at its program check (`mov rax,[rbx+20h]; cmp dword ptr [rax+3D8h],4`,
+    // then `jne` past the hand-off): `DS_CPU_DRAW_PATH=1` keeps every item on the title's CPU
+    // draw path (the stand-in of 2026-10-10; it loses geometry: diagnosis only); with
+    // `DS_CPUDRAW_CENSUS=1` the census of both paths (`cpudraw`; FINDINGS.md 2026-11-16).
+    Fix {
+        name: "static meshes on the CPU draw path",
+        offset: 0xa21e6c,
+        from: (11, 0xd65451942f7c6b6b),
+        change: Change::Hook { at: 0, handler: crate::cpudraw::handoff_hook },
+        kind: "rendering path (diagnosis)",
+        why: "the census of the title's static mesh hand-off, or its items on the CPU draw path (DS_CPU_DRAW_PATH=1)",
+        only_with: Some("DS_CPU_DRAW_PATH|DS_CPUDRAW_CENSUS"),
+    },
+    // The same function's epilogue (`add rsp,68h; pop rbx`): `DS_CPU_DRAW_PATH` 3 and 4 give
+    // an item it handed off to the CPU draw path too (`cpudraw::epilogue_hook`; 4 loses
+    // geometry: diagnosis only).
+    Fix {
+        name: "static meshes on both draw paths",
+        offset: 0xa222a8,
+        from: (5, 0xf107f2dab9ac2fc1),
+        change: Change::Hook { at: 0, handler: crate::cpudraw::epilogue_hook },
+        kind: "rendering path (diagnosis)",
+        why: "static mesh items the title hands to its GPU-driven batches are given to its CPU draw path too",
+        only_with: Some("DS_CPU_DRAW_PATH"),
+    },
     // The end of the Agc library's command-buffer init (eboot+0x1d0a4fb,
     // `mov dword ptr [rax+30h],0`: rax the buffer object, rsi its begin, rdx
     // its end; a leaf function without branches).
@@ -559,6 +585,46 @@ const FIXES: &[Fix] = &[
         kind: "engine map (read only)",
         why: "the port learns the command buffers' extents (the GPU arena's coherence census)",
         only_with: Some("DS_KCO"),
+    },
+    // The CPU draw path's per-model adders (eboot+0xab4210 a chosen LOD's items, eboot+0xab4040
+    // a model whole; both `push rbp; mov rbp,rsp; push r15`) and its loop over a pass's model
+    // list (eboot+0xab4e7d, `mov rax,[r15+68h]; mov rdi,[r13]`): the census of `cpudraw`
+    // (diagnosis; the hand-off's side is the hook above).
+    Fix {
+        name: "cpu draw census (LOD items)",
+        offset: 0xab4210,
+        from: (6, 0x82d75a35aabe38aa),
+        change: Change::Hook { at: 0, handler: crate::cpudraw::lod_hook },
+        kind: "diagnosis (read only)",
+        why: "the port lists the models the CPU draw path walks by LOD",
+        only_with: Some("DS_CPUDRAW_CENSUS"),
+    },
+    Fix {
+        name: "cpu draw census (items added)",
+        offset: 0xabac10,
+        from: (6, 0x82d75b35aabe3a5d),
+        change: Change::Hook { at: 0, handler: crate::cpudraw::added_hook },
+        kind: "diagnosis (read only)",
+        why: "the port lists the items the CPU draw path puts in its draw lists",
+        only_with: Some("DS_CPUDRAW_CENSUS"),
+    },
+    Fix {
+        name: "cpu draw census (listed models)",
+        offset: 0xab4e7d,
+        from: (8, 0xf726edfbb3111c5b),
+        change: Change::Hook { at: 0, handler: crate::cpudraw::listed_hook },
+        kind: "diagnosis (read only)",
+        why: "the port lists the models of the CPU draw path's per-pass lists",
+        only_with: Some("DS_CPUDRAW_CENSUS"),
+    },
+    Fix {
+        name: "cpu draw census (whole models)",
+        offset: 0xab4040,
+        from: (6, 0x82d75a35aabe38aa),
+        change: Change::Hook { at: 0, handler: crate::cpudraw::whole_hook },
+        kind: "diagnosis (read only)",
+        why: "the port lists the models the CPU draw path takes whole",
+        only_with: Some("DS_CPUDRAW_CENSUS"),
     },
 ];
 
@@ -637,5 +703,5 @@ pub fn status() -> String {
         .map(|(i, f)| format!("'{}' ran {} times", f.name, RUNS[i].load(Ordering::Relaxed)))
         .collect();
     let fixes = if runs.is_empty() { String::new() } else { format!("    title fixes: {}\n", runs.join(", ")) };
-    fixes + &crate::cullread::status() + &crate::jobidle::status() + &crate::camhook::status() + &crate::dispmode::status() + &crate::pcsettings::store::status()
+    fixes + &crate::cullread::status() + &crate::cpudraw::status() + &crate::jobidle::status() + &crate::camhook::status() + &crate::dispmode::status() + &crate::pcsettings::store::status()
 }
