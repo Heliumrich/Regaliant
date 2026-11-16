@@ -556,6 +556,56 @@ pub fn reset_work_parts() {
     for c in WORK_PARTS.iter() {
         c.store(0, Ordering::Relaxed);
     }
+    if let Some(m) = BIG_RUNS.lock().as_mut() {
+        m.clear();
+    }
+}
+
+/// `DS_STEP_LAPS`: runs of at least `BIG_RUN_PAGES` pages that checks took or waited on, by
+/// range: [takes, their cycles, waits on another thread's take, their cycles, pages written found].
+static BIG_RUNS: parking_lot::Mutex<Option<std::collections::HashMap<(u64, u64), [u64; 5]>>> = parking_lot::Mutex::new(None);
+const BIG_RUN_PAGES: u64 = 256;
+
+/// Notes a big run's take (`k` 0) or wait (`k` 1) (`BIG_RUNS`).
+fn note_big_run(a: u64, b: u64, k: usize, cycles: u64, written: u64) {
+    let mut g = BIG_RUNS.lock();
+    let m = g.get_or_insert_with(std::collections::HashMap::new);
+    if m.len() >= 4096 && !m.contains_key(&(a, b)) {
+        return;
+    }
+    let e = m.entry((a, b)).or_insert([0; 5]);
+    e[2 * k] += 1;
+    e[2 * k + 1] += cycles;
+    e[4] += written;
+}
+
+/// The big runs taken or waited on most, by time (`BIG_RUNS`; "" before any).
+pub fn big_runs_line() -> String {
+    let g = BIG_RUNS.lock();
+    let Some(m) = g.as_ref().filter(|m| !m.is_empty()) else { return String::new() };
+    let hz = super::threadcpu::tsc_hz();
+    let mut v: Vec<(&(u64, u64), &[u64; 5])> = m.iter().collect();
+    v.sort_unstable_by_key(|(_, e)| std::cmp::Reverse(e[1] + e[3]));
+    let total: u64 = m.values().map(|e| e[1] + e[3]).sum();
+    let names = crate::engine::names();
+    let parts: Vec<String> = v
+        .iter()
+        .take(12)
+        .map(|&(r, e)| {
+            let (a, b) = *r;
+            format!(
+                "{a:#x}+{:#x} ({}) taken {} at {:.0} us, waited on {} at {:.0} us, {} pages found written",
+                b - a,
+                names.get(&crate::engine::owner(a)).map_or("?", |s| s.as_str()),
+                e[0],
+                e[1] as f64 * 1e6 / hz / e[0].max(1) as f64,
+                e[2],
+                e[3] as f64 * 1e6 / hz / e[2].max(1) as f64,
+                e[4]
+            )
+        })
+        .collect();
+    format!("    front end 2's big runs (`DS_STEP_LAPS`, {} ranges, {:.0} ms in all): {}\n", m.len(), total as f64 * 1e3 / hz, parts.join("; "))
 }
 
 /// `DS_FE2_CALLERS=1` (diagnosis): placement checks counted by caller
@@ -1947,7 +1997,11 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
                 match r {
                     Ok(true) => {
                         if wl {
-                            work_part(1, rd().wrapping_sub(wr), (b - a) / PAGE);
+                            let c = rd().wrapping_sub(wr);
+                            work_part(1, c, (b - a) / PAGE);
+                            if (b - a) / PAGE >= BIG_RUN_PAGES {
+                                note_big_run(a, b, 1, c, 0);
+                            }
                         }
                         continue;
                     }
@@ -1972,7 +2026,11 @@ fn ensure_inner(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &d
                 note_source_take(a, b, k);
             }
             if wl {
-                work_part(2, rd().wrapping_sub(wr), (b - a) / PAGE);
+                let c = rd().wrapping_sub(wr);
+                work_part(2, c, (b - a) / PAGE);
+                if (b - a) / PAGE >= BIG_RUN_PAGES {
+                    note_big_run(a, b, 0, c, written.len() as u64);
+                }
             }
         }
         if wl {

@@ -3842,6 +3842,7 @@ pub(super) fn push_line() -> String {
     ) + &batch_miss_line()
         + &place_memo_cycles_line()
         + &super::fe2::work_parts_line()
+        + &super::fe2::big_runs_line()
         + &format!("    front end 2's placement memo: {} repeats answered, {} by the page memo, {} by the lean check, {} placements made
 ", PLACE_MEMO[0].load(Ordering::Relaxed), PLACE_MEMO[2].load(Ordering::Relaxed), PLACE_MEMO[3].load(Ordering::Relaxed), PLACE_MEMO[1].load(Ordering::Relaxed))
         + &if page_memo_check_on() {
