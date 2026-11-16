@@ -149,76 +149,14 @@ pub struct Done {
     /// the worker whose executor keeps its batches (`Pool::get`).
     pub held: Option<Box<super::exec::HeldChunk>>,
     pub worker: usize,
-    /// Where a thief took the rest of the chunk (`steal`): this is its head, its rest posted
-    /// apart (`Run::tails`) and merged into it when collected.
-    pub cut: Option<u64>,
 }
-
-/// Work stealing inside a run (`tune steal`): a worker that runs out of chunks takes the rest
-/// of the chunk with the most commands left. It sets the chunk's boundary at a command start
-/// about halfway through what is left and reads where the chunk's worker is; the worker
-/// publishes each command's start and then reads the boundary (both sequentially consistent),
-/// so when the thief sees it before the boundary it stops exactly there (`Cp::run_chunk`), and
-/// the thief records the rest at once, in parallel, from the chunk's start state walked to the
-/// cut (`Cp::walk_chunk_to`), into its own executor. (When it was past the boundary already,
-/// the thief waits for where it stops.) The head submits at the chunk's turn without passing
-/// it on (`commit_head`), the rest after the head (`head_done`), then passes the turn to the
-/// next chunk and posts the chunk (`commit_tail`); the command processor collects them as one
-/// (`Run::collect`). A head that stopped or failed before the cut keeps the chunk: the rest is
-/// dropped. Front end 2's parts order them: chunk i is part 2(i + 1), its rest 2(i + 1) + 1 (a
-/// page an earlier part claimed is left to it).
-pub struct Steal {
-    /// The chunk's start state (what a thief walks to its cut).
-    start: Arc<ChunkState>,
-    /// The command its worker records now (0: not started; u64::MAX: it finished or stopped).
-    at: AtomicU64,
-    /// Where its worker stops: the first command at or past it (the chunk's end until cut).
-    boundary: AtomicU64,
-    /// Where its worker stopped for the boundary (0: not yet).
-    cut: AtomicU64,
-    /// A thief took it (one at most).
-    taken: AtomicBool,
-    /// The head's batches went to the GPU (or were dropped): the rest's turn.
-    head_done: AtomicBool,
-}
-
-impl Steal {
-    /// The worker recording the chunk begins the command at `cur`: true when it stops there
-    /// (cut). (Published before the boundary is read, both sequentially consistent: a thief that
-    /// stored the boundary and then saw the worker before it knows it stops exactly there.)
-    #[inline]
-    pub fn command(&self, cur: u64) -> bool {
-        self.at.store(cur, Ordering::SeqCst);
-        if cur >= self.boundary.load(Ordering::SeqCst) {
-            self.cut.store(cur, Ordering::Release);
-            return true;
-        }
-        false
-    }
-}
-
-/// Work stealing (`steal`): [cuts asked, rests recorded, cuts that came too late (the chunk ended
-/// or stopped first), commands in the rests, ns walking states, ns waiting for the cut (when the
-/// worker was past it), rests that stopped, rests dropped (cancelled, or the head stopped
-/// before the cut), rests begun at once].
-static STEALS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
-
-/// Commands a thief keeps between the chunk's worker and its cut (the worker must see the
-/// boundary before it passes it).
-const STEAL_AHEAD: usize = 4;
 
 /// The chunks of a parallel run that the workers record (all but the main
 /// command processor's), in program order.
 pub struct Run {
     /// Chunk i: its start state (taken by the worker that records it), its
     /// first packet and the packet after it.
-    chunks: Vec<(Mutex<Option<Arc<ChunkState>>>, u64, u64)>,
-    /// Work stealing (`Steal`; `steal_on`: allowed in this run): per chunk its slot, where the
-    /// run's commands start (where a thief may cut), the thieves' records of the rests (chunk i's at i).
-    steal: Vec<Steal>,
-    pub cmd_starts: Arc<[u64]>,
-    pub steal_on: bool,
-    tails: Mutex<Vec<Option<Done>>>,
+    chunks: Vec<(Mutex<Option<Box<ChunkState>>>, u64, u64)>,
     /// The next chunk not taken.
     next: AtomicUsize,
     /// Chunks whose turn came: chunk i submits once this exceeds i.
@@ -240,8 +178,7 @@ pub struct Run {
     pub fe2_view: u32,
     /// Front end 2: the run's id for uploads its parts share (`Exec::
     /// fe2_share`): the main command processor's own part before the
-    /// workers' chunks is part 0, chunk i part 2(i + 1) and its rest a thief
-    /// takes 2(i + 1) + 1 (`Steal`; held runs: `part_base` + i + 1).
+    /// workers' chunks is part 0, chunk i part i + 1.
     pub id: u64,
     /// The label waits the run holds (their packets' addresses, ascending):
     /// they held in guest memory when it was planned (`Cp::run_pass`), or
@@ -280,17 +217,8 @@ impl Run {
     /// The run of `chunks` ([start state, first packet, end]).
     pub fn new(chunks: Vec<(Box<ChunkState>, u64, u64)>) -> Run {
         let n = chunks.len();
-        let chunks: Vec<(Arc<ChunkState>, u64, u64)> = chunks.into_iter().map(|(s, a, b)| (Arc::new(*s), a, b)).collect();
-        let steal = chunks
-            .iter()
-            .map(|(s, _, b)| Steal { start: s.clone(), at: AtomicU64::new(0), boundary: AtomicU64::new(*b), cut: AtomicU64::new(0), taken: AtomicBool::new(false), head_done: AtomicBool::new(false) })
-            .collect();
         Run {
             chunks: chunks.into_iter().map(|(s, a, b)| (Mutex::new(Some(s)), a, b)).collect(),
-            steal,
-            cmd_starts: Arc::from(Vec::new()),
-            steal_on: false,
-            tails: Mutex::new((0..n).map(|_| None).collect()),
             next: AtomicUsize::new(0),
             turn: AtomicUsize::new(0),
             posted: AtomicUsize::new(0),
@@ -413,18 +341,6 @@ impl Run {
         };
         WAIT_NS.fetch_add(ns, Ordering::Relaxed);
         let d = self.results.lock()[i].take().expect("parallel chunk posted twice");
-        // A chunk a thief cut: its head and its rest as one (`steal`).
-        let d = match d.cut {
-            Some(_) => {
-                let t = self.tails.lock()[i].take().expect("a cut chunk's rest posted");
-                let mut costs = d.costs;
-                costs.extend_from_slice(&t.costs);
-                let mut writes = d.writes;
-                writes.extend(&t.writes);
-                Done { stopped: t.stopped, state: t.state, last: t.last.or(d.last), why: t.why, costs, writes, held: None, worker: t.worker, cut: None }
-            }
-            None => d,
-        };
         (d, ns)
     }
 
@@ -707,13 +623,7 @@ fn take_chunks(w: &Worker, run: &Run, name: &str, k: usize, census: bool) {
             return;
         }
         let i = run.next.fetch_add(1, Ordering::AcqRel);
-        let Some((state, from, to)) = run.chunks.get(i) else {
-            // None left: the rest of the chunk with the most left (`Steal`).
-            if run.steal_on && !run.held {
-                while steal(w, run, name) {}
-            }
-            return;
-        };
+        let Some((state, from, to)) = run.chunks.get(i) else { return };
         let Some(state) = state.lock().take() else { return };
         let (from, to) = (*from, *to);
         let mut t = std::time::Instant::now();
@@ -727,26 +637,16 @@ fn take_chunks(w: &Worker, run: &Run, name: &str, k: usize, census: bool) {
         cp.chunk_waits = run.passed_waits.clone();
         cp.set_run_writes(run.cp_writes.iter().filter(|w| w.0 < from).map(|w| (w.1, w.2)).collect());
         cp.fe2_set_view(run.fe2_view);
-        cp.fe2_set_run(run.id, if run.held { run.part_base as usize + i + 1 } else { 2 * (i + 1) });
+        cp.fe2_set_run(run.id, if run.held { run.part_base as usize + i + 1 } else { i + 1 });
         cp.chunk_start();
         if run.held {
             cp.held_chunk_begin(run.held_writes.clone(), run.held_keys.clone());
         }
         cp.chunk_costs = run.timed.then(|| Vec::with_capacity(512));
         lap(1, &mut t);
-        // (A thief may cut it: `Steal`.)
-        let slot = (run.steal_on && !run.held).then(|| &run.steal[i]);
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cp.run_chunk(from, to, slot)));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cp.run_chunk(from, to)));
         let failed = r.is_err();
         let stopped = r.unwrap_or(Some(from));
-        let cut = cp.chunk_cut.take().filter(|_| !failed);
-        if let Some(s) = slot {
-            s.at.store(u64::MAX, Ordering::Release);
-            // (A thief waiting to know whether its rest stands.)
-            if s.taken.load(Ordering::Acquire) {
-                run.notify();
-            }
-        }
         lap(2, &mut t);
         cp.chunk_finish();
         cp.fe2_set_run(0, 0);
@@ -767,192 +667,15 @@ fn take_chunks(w: &Worker, run: &Run, name: &str, k: usize, census: bool) {
             }
             super::timeline::end(name, tl, || "wait: chunk turn".into());
         }
-        match cut {
-            Some(c) => commit_head(run, i, cp, c),
-            None => commit(run, i, cp, stopped, failed, state),
-        }
+        commit(run, i, cp, stopped, failed, state);
     }
-}
-
-/// A thief (`Steal`): the chunk being recorded with the most commands left after the one its
-/// worker records now (at least `tune steal_min`) is cut about halfway through them; the rest is
-/// recorded here at once when its worker was still before the cut, else from where it stopped,
-/// and committed after the head. Returns whether to look for another (false: none left to
-/// take, or the run cancelled).
-fn steal(w: &Worker, run: &Run, name: &str) -> bool {
-    if run.cancelled.load(Ordering::SeqCst) || run.cmd_starts.is_empty() {
-        return false;
-    }
-    let min = super::tune::steal_min().max(2 * STEAL_AHEAD as u64) as usize;
-    let starts = &run.cmd_starts;
-    let mut best: Option<(usize, usize, usize)> = None;
-    for (j, s) in run.steal.iter().enumerate() {
-        if s.taken.load(Ordering::Relaxed) {
-            continue;
-        }
-        let at = s.at.load(Ordering::Acquire);
-        if at == 0 || at == u64::MAX {
-            continue;
-        }
-        let b = s.boundary.load(Ordering::Acquire);
-        // The command it records now is starts[ia]; the commands after it before the end.
-        let Some(ia) = starts.partition_point(|&x| x <= at).checked_sub(1) else { continue };
-        let ib = starts.partition_point(|&x| x < b);
-        let left = ib.saturating_sub(ia + 1);
-        if left >= min && best.map_or(true, |x| left > x.2) {
-            best = Some((j, ia, left));
-        }
-    }
-    let Some((j, ia, left)) = best else { return false };
-    let s = &run.steal[j];
-    if s.taken.swap(true, Ordering::AcqRel) {
-        return true;
-    }
-    STEALS[0].fetch_add(1, Ordering::Relaxed);
-    let cut_at = starts[ia + (left / 2).max(STEAL_AHEAD)];
-    s.boundary.store(cut_at, Ordering::SeqCst);
-    let seen = s.at.load(Ordering::SeqCst);
-    let p = if seen < cut_at {
-        // It stops exactly there (`Steal::command`): the rest is ours from now.
-        STEALS[8].fetch_add(1, Ordering::Relaxed);
-        cut_at
-    } else {
-        // It was past the cut already: where it stops (or nothing, when it ends first).
-        let t0 = std::time::Instant::now();
-        let tl = super::timeline::mark();
-        let mut spins = 0u32;
-        let c = loop {
-            let c = s.cut.load(Ordering::Acquire);
-            if c != 0 {
-                break c;
-            }
-            if s.at.load(Ordering::Acquire) == u64::MAX {
-                // (The cut is stored before `at`: read it again.)
-                let c = s.cut.load(Ordering::Acquire);
-                if c != 0 {
-                    break c;
-                }
-                STEALS[2].fetch_add(1, Ordering::Relaxed);
-                return true;
-            }
-            if run.cancelled.load(Ordering::SeqCst) {
-                return false;
-            }
-            spins += 1;
-            if spins < 256 {
-                std::hint::spin_loop();
-            } else {
-                std::thread::yield_now();
-            }
-        };
-        super::timeline::end(name, tl, || "wait: a cut".into());
-        STEALS[5].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        c
-    };
-    let (_, from, to) = &run.chunks[j];
-    let to = *to;
-    let tw = std::time::Instant::now();
-    let state = Cp::walk_chunk_to(&s.start, *from, p);
-    STEALS[4].fetch_add(tw.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    let mut cp = w.cp.lock();
-    cp.set_chunk_state(&state);
-    cp.set_hs_seg(run.hs_seg);
-    cp.chunk_waits = run.passed_waits.clone();
-    cp.set_run_writes(run.cp_writes.iter().filter(|w| w.0 < p).map(|w| (w.1, w.2)).collect());
-    cp.fe2_set_view(run.fe2_view);
-    cp.fe2_set_run(run.id, 2 * (j + 1) + 1);
-    cp.chunk_start();
-    cp.chunk_costs = run.timed.then(|| Vec::with_capacity(256));
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cp.run_chunk(p, to, None)));
-    let failed = r.is_err();
-    let stopped = r.unwrap_or(Some(p));
-    cp.chunk_finish();
-    cp.fe2_set_run(0, 0);
-    // Its turn: after the head's batches; a head that ended before the cut (it stopped or
-    // failed) keeps the chunk, and the rest is dropped.
-    let head_ended = || s.at.load(Ordering::Acquire) == u64::MAX && s.cut.load(Ordering::Acquire) == 0;
-    let ready = || s.head_done.load(Ordering::Acquire) || run.cancelled.load(Ordering::Acquire) || head_ended();
-    if !ready() {
-        let tl = super::timeline::mark();
-        TURN_NS.fetch_add(run.wait_until(ready), Ordering::Relaxed);
-        super::timeline::end(name, tl, || "wait: chunk turn (rest)".into());
-    }
-    if !s.head_done.load(Ordering::Acquire) {
-        cp.worker_discard();
-        STEALS[7].fetch_add(1, Ordering::Relaxed);
-        return !run.cancelled.load(Ordering::Acquire);
-    }
-    commit_tail(run, j, cp, p, stopped, failed, state);
-    true
-}
-
-/// The head of a chunk a thief cut at `cut` (`steal`), at the chunk's turn: its batches to the
-/// GPU and its record posted for the rest to complete; the turn is not passed on (the rest
-/// passes it). Cancelled before its turn: discarded.
-fn commit_head(run: &Run, i: usize, mut cp: parking_lot::MutexGuard<'_, Cp>, cut: u64) {
-    let mut t = std::time::Instant::now();
-    let s = &run.steal[i];
-    if run.turn.load(Ordering::Acquire) <= i {
-        cp.worker_discard();
-        drop(cp);
-        s.head_done.store(true, Ordering::Release);
-        run.notify();
-        return;
-    }
-    let writes = if super::runprobe::on() || super::tune::past_runs() { cp.worker_writes() } else { Default::default() };
-    let last = cp.worker_submit();
-    let state = cp.chunk_state();
-    let done = Done { stopped: None, state, last, why: "", costs: cp.chunk_costs.take().unwrap_or_default(), writes, held: None, worker: 0, cut: Some(cut) };
-    drop(cp);
-    run.results.lock()[i] = Some(done);
-    s.head_done.store(true, Ordering::Release);
-    run.notify();
-    lap4(&mut t);
-}
-
-/// The rest of chunk `i` from `p` (`steal`), recorded in `cp`, after the head: submitted and
-/// posted as the chunk (or, failed, posted for the main command processor to record from `p`);
-/// one that ran to its end gives the next chunk its turn. Cancelled: discarded, not posted.
-#[allow(clippy::too_many_arguments)]
-fn commit_tail(run: &Run, i: usize, mut cp: parking_lot::MutexGuard<'_, Cp>, p: u64, stopped: Option<u64>, failed: bool, state: ChunkState) {
-    let granted = run.turn.load(Ordering::Acquire) > i && !run.cancelled.load(Ordering::Acquire);
-    if !granted || failed {
-        cp.worker_discard();
-    }
-    if !granted {
-        STEALS[7].fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-    let done = if failed {
-        Done { stopped: Some(p), state, last: None, why: "failed", costs: Vec::new(), writes: Default::default(), held: None, worker: 0, cut: None }
-    } else {
-        let writes = if super::runprobe::on() || super::tune::past_runs() { cp.worker_writes() } else { Default::default() };
-        let last = cp.worker_submit();
-        let why = if stopped.is_some() { cp.worker_stop_why() } else { "" };
-        let state = cp.chunk_state();
-        let costs = cp.chunk_costs.take().unwrap_or_default();
-        STEALS[3].fetch_add(costs.len() as u64, Ordering::Relaxed);
-        Done { stopped, state, last, why, costs, writes, held: None, worker: 0, cut: None }
-    };
-    drop(cp);
-    STEALS[1].fetch_add(1, Ordering::Relaxed);
-    if done.stopped.is_some() {
-        STEALS[6].fetch_add(1, Ordering::Relaxed);
-    }
-    let ran = done.stopped.is_none();
-    run.tails.lock()[i] = Some(done);
-    run.posted.store(i + 1, Ordering::Release);
-    if ran {
-        run.turn.fetch_max(i + 2, Ordering::AcqRel);
-    }
-    run.notify();
 }
 
 /// Chunk `i` of `run` at its turn, recorded in `cp` (or the run cancelled
 /// before its turn: discarded, not posted): submitted and posted, or
 /// discarded and posted for the main command processor to record again;
 /// one that ran to its end gives the next chunk its turn.
-fn commit(run: &Run, i: usize, mut cp: parking_lot::MutexGuard<'_, Cp>, stopped: Option<u64>, failed: bool, state: Arc<ChunkState>) {
+fn commit(run: &Run, i: usize, mut cp: parking_lot::MutexGuard<'_, Cp>, stopped: Option<u64>, failed: bool, state: Box<ChunkState>) {
     let mut t = std::time::Instant::now();
     let granted = run.turn.load(Ordering::Acquire) > i;
     if !granted || failed {
@@ -964,13 +687,13 @@ fn commit(run: &Run, i: usize, mut cp: parking_lot::MutexGuard<'_, Cp>, stopped:
         return;
     }
     let done = if failed {
-        Done { stopped, state: (*state).clone(), last: None, why: "failed", costs: Vec::new(), writes: Default::default(), held: None, worker: 0, cut: None }
+        Done { stopped, state: *state, last: None, why: "failed", costs: Vec::new(), writes: Default::default(), held: None, worker: 0 }
     } else {
         let writes = if super::runprobe::on() || super::tune::past_runs() { cp.worker_writes() } else { Default::default() };
         let last = cp.worker_submit();
         let why = if stopped.is_some() { cp.worker_stop_why() } else { "" };
         let state = cp.chunk_state();
-        Done { stopped, state, last, why, costs: cp.chunk_costs.take().unwrap_or_default(), writes, held: None, worker: 0, cut: None }
+        Done { stopped, state, last, why, costs: cp.chunk_costs.take().unwrap_or_default(), writes, held: None, worker: 0 }
     };
     drop(cp);
     run.results.lock()[i] = Some(done);
@@ -988,7 +711,7 @@ fn commit(run: &Run, i: usize, mut cp: parking_lot::MutexGuard<'_, Cp>, stopped:
 /// (`Cp::held_commit`); cancelled, its batches are dropped and it is not posted; failed, they
 /// are dropped and it is posted for the main command processor to record from its start.
 #[allow(clippy::too_many_arguments)]
-fn post_held(run: &Run, i: usize, mut cp: parking_lot::MutexGuard<'_, Cp>, stopped: Option<u64>, failed: bool, state: Arc<ChunkState>, held: super::exec::HeldChunk, worker: usize) {
+fn post_held(run: &Run, i: usize, mut cp: parking_lot::MutexGuard<'_, Cp>, stopped: Option<u64>, failed: bool, state: Box<ChunkState>, held: super::exec::HeldChunk, worker: usize) {
     let mut t = std::time::Instant::now();
     let cancelled = run.cancelled.load(Ordering::SeqCst);
     if failed || cancelled {
@@ -999,11 +722,11 @@ fn post_held(run: &Run, i: usize, mut cp: parking_lot::MutexGuard<'_, Cp>, stopp
         }
     }
     let done = if failed {
-        Done { stopped, state: (*state).clone(), last: None, why: "failed", costs: Vec::new(), writes: Default::default(), held: None, worker, cut: None }
+        Done { stopped, state: *state, last: None, why: "failed", costs: Vec::new(), writes: Default::default(), held: None, worker }
     } else {
         let why = if stopped.is_some() { cp.worker_stop_why() } else { "" };
         let state = cp.chunk_state();
-        Done { stopped, state, last: None, why, costs: cp.chunk_costs.take().unwrap_or_default(), writes: Default::default(), held: Some(Box::new(held)), worker, cut: None }
+        Done { stopped, state, last: None, why, costs: cp.chunk_costs.take().unwrap_or_default(), writes: Default::default(), held: Some(Box::new(held)), worker }
     };
     drop(cp);
     run.results.lock()[i] = Some(done);
@@ -1056,33 +779,6 @@ pub fn reset_stats() {
     *LENGTHS_C.lock() = [[0; 2]; 6];
     ENDS_C.lock().clear();
     ENDS_SHORT.lock().clear();
-    for c in &STEALS {
-        c.store(0, Ordering::Relaxed);
-    }
-}
-
-/// The work stealing line (`Steal`; "" before any cut).
-fn steal_line() -> String {
-    let v = |i: usize| STEALS[i].load(Ordering::Relaxed);
-    if v(0) == 0 {
-        return String::new();
-    }
-    let late = v(0) - v(8);
-    format!(
-        "    work stealing in runs (`tune steal`): {} cuts asked ({} begun at once, {} after waiting {:.0} us on average for the worker to stop past them), {} rests recorded ({} commands, {:.1} each; {} stopped, {} dropped), {} too late (the chunk ended first); {:.1} us walking a state
-",
-        v(0),
-        v(8),
-        late,
-        v(5) as f64 / 1e3 / late.max(1) as f64,
-        v(1),
-        v(3),
-        v(3) as f64 / v(1).max(1) as f64,
-        v(6),
-        v(7),
-        v(2),
-        v(4) as f64 / 1e3 / (v(1) + v(7)).max(1) as f64
-    )
 }
 
 /// The workers' idle census line (`DS_IDLE_CENSUS=1`), per flip since the
@@ -1193,7 +889,6 @@ pub fn status() -> String {
         ends_c.join(", "),
         super::cp::run_passed_line()
     ) + &super::hscensus::line()
-        + &steal_line()
         + &idle_line()
         + &{
             let (lo, hi) = (MIN_LOW.load(Ordering::Relaxed), MIN_HIGH.load(Ordering::Relaxed));

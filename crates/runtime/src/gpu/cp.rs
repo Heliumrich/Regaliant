@@ -355,8 +355,6 @@ pub struct Cp {
     par_pool: super::par::Pool,
     /// A worker's per-command recording cost in its chunk (`tune par_cost`).
     pub chunk_costs: Option<Vec<u32>>,
-    /// A worker stopped its chunk here for a thief's cut (`par::Steal`).
-    pub chunk_cut: Option<u64>,
     /// A parallel worker: the label waits its run holds (`par::Run::
     /// passed_waits`).
     pub chunk_waits: std::sync::Arc<[u64]>,
@@ -2195,7 +2193,6 @@ impl Cp {
             run_watch: None,
             par_pool: super::par::Pool::new(),
             chunk_costs: None,
-            chunk_cut: None,
             chunk_waits: std::sync::Arc::from(Vec::new()),
             hs_until: (0, 0),
             run_costs: HashMap::new(),
@@ -2423,12 +2420,11 @@ impl Cp {
     /// Executes the packets in [from, to) of a run (a parallel worker):
     /// returns the address of the packet where the executor stopped (it
     /// and the rest are left to the main command processor), or None.
-    pub fn run_chunk(&mut self, from: u64, to: u64, steal: Option<&super::par::Steal>) -> Option<u64> {
+    pub fn run_chunk(&mut self, from: u64, to: u64) -> Option<u64> {
         let f = Fetched::new(from, 0);
         let mut cur = from;
         let mut commands = 0u64;
         let mut last = unsafe { core::arch::x86_64::_rdtsc() };
-        self.chunk_cut = None;
         while cur < to {
             if super::shutting_down() || !valid(cur, 4) {
                 return Some(cur);
@@ -2475,15 +2471,8 @@ impl Cp {
                 cur = next;
                 continue;
             }
-            let command = is_command(opcode) || multi;
-            // A thief's cut (`par::Steal`): the rest from this command is its.
-            if command && steal.is_some_and(|s| s.command(cur)) {
-                self.chunk_cut = Some(cur);
-                super::par::COMMANDS.fetch_add(commands, Ordering::Relaxed);
-                self.drop_ahead();
-                return Some(cur);
-            }
             // Stages prepared ahead within the chunk, as in `run`.
+            let command = is_command(opcode) || multi;
             if is_command(opcode) && !self.ahead.is_empty() {
                 if self.ahead.front().is_some_and(|c| c.at == cur) {
                     let c = self.ahead.pop_front().unwrap();
@@ -2529,49 +2518,6 @@ impl Cp {
         super::par::COMMANDS.fetch_add(commands, Ordering::Relaxed);
         self.drop_ahead();
         None
-    }
-
-    /// The state at packet `to` of a chunk that starts at `from` with `start`, walked as
-    /// `par_plan` walks a run to each chunk's start: where a thief records a chunk's rest from
-    /// (`par::Steal`).
-    pub fn walk_chunk_to(start: &ChunkState, from: u64, to: u64) -> ChunkState {
-        let f = Fetched::new(from, 0);
-        let mut st = start.clone();
-        let mut c = from;
-        while c < to {
-            let h = f.rd(c);
-            if h >> 30 == 2 {
-                c += 4;
-                continue;
-            }
-            let count = (h >> 16) & 0x3FFF;
-            if count == 0x3FFF {
-                c += 4;
-                continue;
-            }
-            let n = count as u64 + 1;
-            let at = c;
-            let opc = (h >> 8) & 0xFF;
-            let regs = match opc {
-                op::SET_CONTEXT_REG | op::SET_CONTEXT_REG_INDEX => Some((Space::Ctx, CTX_DWORDS)),
-                op::SET_SH_REG | op::SET_SH_REG_INDEX => Some((Space::Sh, SH_DWORDS)),
-                op::SET_UCONFIG_REG | op::SET_UCONFIG_REG_INDEX => Some((Space::Uc, UC_DWORDS)),
-                _ => None,
-            };
-            match regs {
-                Some((space, cap)) if n >= 2 => {
-                    let v = match space {
-                        Space::Ctx => &mut st.regs.ctx,
-                        Space::Sh => &mut st.regs.sh,
-                        Space::Uc => &mut st.regs.uc,
-                    };
-                    put_regs(v, space, cap, (f.rd(at + 4) & 0xFFFF) as usize, &f, at + 8, (n - 1) as usize);
-                }
-                _ => Self::apply_state(&mut st, opc, n, &|i: u64| f.rd(at + 4 * (1 + i))),
-            }
-            c += 4 * (n + 1);
-        }
-        st
     }
 
     /// A packet the graphics queue's runs hold although it is neither state
@@ -3207,9 +3153,6 @@ impl Cp {
         let held_run = self.held.is_some();
         // The run's commands, its end and the indirect arguments read in it.
         let mut ends: Vec<u64> = Vec::new();
-        // (Work stealing, `tune steal`: where each command starts, a thief's cuts.)
-        let steal_run = super::tune::steal() && !held_run;
-        let mut cmd_starts: Vec<u64> = Vec::new();
         let mut args: Vec<(u64, u64)> = Vec::new();
         let (mut draw_base, mut disp_base) = (self.draw_indirect_base, self.dispatch_indirect_base);
         let mut c = from;
@@ -3265,9 +3208,6 @@ impl Cp {
             let p = |i: u64| f.rd(at + 4 * (1 + i));
             if is_command(opc) || self.run_multi(opc) {
                 ends.push(next);
-                if steal_run {
-                    cmd_starts.push(at);
-                }
                 match opc {
                     op::DRAW_INDIRECT => args.push((draw_base + p(0) as u64, 16)),
                     op::DRAW_INDEX_INDIRECT => args.push((draw_base + p(0) as u64, 20)),
@@ -3642,11 +3582,6 @@ impl Cp {
         let queue = states.into_iter().enumerate().map(|(i, st)| (st, starts[i], if i + 1 < starts.len() { starts[i + 1] } else { run_end })).collect();
         let mut run = super::par::Run::new(queue);
         run.timed = true;
-        // Work stealing (`tune steal`, not in held runs): the command starts a thief may cut at.
-        if steal_run {
-            run.steal_on = true;
-            run.cmd_starts = std::sync::Arc::from(std::mem::take(&mut cmd_starts));
-        }
         let mut approved: Vec<u64> = passed.iter().map(|w| w.0).chain(own_waits.iter().copied()).collect();
         approved.sort_unstable();
         run.passed_waits = std::sync::Arc::from(approved);
