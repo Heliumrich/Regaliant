@@ -1794,6 +1794,9 @@ static PLAN_PHASES: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 /// The chunk start states' and the end state's clones inside `PLAN_PHASES[4]`
 /// (ns; `tune cp_classes`).
 static PLAN_CLONE_NS: AtomicU64 = AtomicU64::new(0);
+/// The chunk start states' walk (`tune cp_classes`): [packets walked, indirect draws among
+/// them, ns applying those (their arguments read for the user SGPRs they set)].
+static PLAN_WALK: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// Runs planned while the batch being recorded had writes (`tune
 /// cp_classes`): [such runs, runs whose writes the forwarded copies all
 /// cover, the written ranges, the ranges' pieces not covered].
@@ -1832,7 +1835,7 @@ fn class_end(k: usize, t: Option<(Instant, u64)>) {
 /// Clears the packet classes (`profile reset`).
 pub fn reset_classes() {
     PLAN_CLONE_NS.store(0, Ordering::Relaxed);
-    for c in CP_CLASSES.iter().flatten().chain(ACB_OPS.iter().flatten()).chain(STRETCH_OPS.iter().flatten()).chain(IDRAW_PARTS.iter().flatten()).chain(SERIAL_WHY.iter()).chain(SERIAL_WHY_ACB.iter()).chain(HS_CENSUS.iter()).chain(PLAN_PHASES.iter()).chain(PLAN_MAIN_WRITES.iter()).chain(RUN_EPOCHS.iter()).chain(CB_CENSUS.iter().flatten()) {
+    for c in CP_CLASSES.iter().flatten().chain(ACB_OPS.iter().flatten()).chain(STRETCH_OPS.iter().flatten()).chain(IDRAW_PARTS.iter().flatten()).chain(SERIAL_WHY.iter()).chain(SERIAL_WHY_ACB.iter()).chain(HS_CENSUS.iter()).chain(PLAN_PHASES.iter()).chain(PLAN_WALK.iter()).chain(PLAN_MAIN_WRITES.iter()).chain(RUN_EPOCHS.iter()).chain(CB_CENSUS.iter().flatten()) {
         c.store(0, Ordering::Relaxed);
     }
     CP_CLASSES_FROM.store(super::FRAMES.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -1941,7 +1944,7 @@ pub fn classes_line() -> String {
     let ph: Vec<u64> = PLAN_PHASES.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let us = |ns: u64, n: u64| ns as f64 / n.max(1) as f64 / 1e3;
     s.push_str(&format!(
-        "    planning per flip: {:.1} runs left serial at {:.1} us each; {:.1} runs split at {:.1} us each (scan {:.1}, setup {:.1}, chunk start states {:.1} (clones {:.1}; register files' high-water marks {}/{}/{} dwords), starting workers {:.1}: getting them and the unsubmitted writes {:.1}, submitting the batch before the run {:.1}, making the run {:.1}, waking them {:.1}, the rest {:.1})\n",
+        "    planning per flip: {:.1} runs left serial at {:.1} us each; {:.1} runs split at {:.1} us each (scan {:.1}, setup {:.1}, chunk start states {:.1} (clones {:.1}; {:.0} packets walked a run, {:.0} indirect draws among them taking {:.1} us; register files' high-water marks {}/{}/{} dwords), starting workers {:.1}: getting them and the unsubmitted writes {:.1}, submitting the batch before the run {:.1}, making the run {:.1}, waking them {:.1}, the rest {:.1})\n",
         ph[1] as f64 / flips,
         us(ph[0], ph[1]),
         ph[6] as f64 / flips,
@@ -1950,6 +1953,9 @@ pub fn classes_line() -> String {
         us(ph[3], ph[6]),
         us(ph[4], ph[6]),
         us(PLAN_CLONE_NS.load(Ordering::Relaxed), ph[6]),
+        PLAN_WALK[0].load(Ordering::Relaxed) as f64 / ph[6].max(1) as f64,
+        PLAN_WALK[1].load(Ordering::Relaxed) as f64 / ph[6].max(1) as f64,
+        us(PLAN_WALK[2].load(Ordering::Relaxed), ph[6]),
         high(Space::Ctx, CTX_DWORDS),
         high(Space::Sh, SH_DWORDS),
         high(Space::Uc, UC_DWORDS),
@@ -3473,7 +3479,16 @@ impl Cp {
                         };
                         put_regs(v, space, cap, (f.rd(at + 4) & 0xFFFF) as usize, f, at + 8, (n - 1) as usize);
                     }
+                    _ if lap.0.is_some() && matches!(opc, op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT | op::DRAW_INDEX_INDIRECT_MULTI | op::DRAW_INDIRECT_MULTI) => {
+                        let t = Instant::now();
+                        Self::apply_state(&mut st, opc, n, &|i: u64| f.rd(at + 4 * (1 + i)));
+                        PLAN_WALK[1].fetch_add(1, Ordering::Relaxed);
+                        PLAN_WALK[2].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    }
                     _ => Self::apply_state(&mut st, opc, n, &|i: u64| f.rd(at + 4 * (1 + i))),
+                }
+                if lap.0.is_some() {
+                    PLAN_WALK[0].fetch_add(1, Ordering::Relaxed);
                 }
                 if let Some(st2) = check.as_mut() {
                     Self::apply_state(st2, opc, n, &|i: u64| f.rd(at + 4 * (1 + i)));

@@ -16,9 +16,6 @@ enum Change {
     /// A host function called with the registers before the instructions
     /// `at` bytes into `from` (`patch::Patcher::hook`).
     Hook { at: usize, handler: extern "sysv64" fn(*const u64, u32) },
-    /// Bytes written over the ones `at` bytes into `from` (a branch turned
-    /// into another of the same length).
-    Bytes { at: usize, new: &'static [u8] },
 }
 
 struct Fix {
@@ -551,21 +548,6 @@ const FIXES: &[Fix] = &[
         why: "the port counts the engine's readbacks of GPU memory by caller and allocator (census)",
         only_with: Some("DS_RB_CENSUS"),
     },
-    // The scene's hand-off of a static mesh item to the GPU-driven batches (eboot+0xa21e10:
-    // `mov rax,[rbx+20h]; cmp dword ptr [rax+3D8h],4; jne` past the hand-off when the item's
-    // program is not of kind 4). Taken always (`jne` -> `nop; jmp`, the same target), every item
-    // stays on the title's CPU draw path: no per-item culls on the GPU (cs 0x1008994d00, ~1,050
-    // dispatches a flip at Castlewall), the CPU's frustum culling only. A/B only (the stand-in
-    // of 2026-10-10, when the batches drew nothing here; FINDINGS.md 2026-11-16).
-    Fix {
-        name: "static meshes on the CPU draw path",
-        offset: 0xa21e6c,
-        from: (17, 0x6f3a7ba8f3dd1eec),
-        change: Change::Bytes { at: 11, new: &[0x90, 0xe9] },
-        kind: "rendering path (A/B)",
-        why: "the title's static mesh items are drawn by its CPU draw path, not its GPU-driven batches",
-        only_with: Some("DS_CPU_DRAW_PATH"),
-    },
     // The end of the Agc library's command-buffer init (eboot+0x1d0a4fb,
     // `mov dword ptr [rax+30h],0`: rax the buffer object, rsi its begin, rdx
     // its end; a leaf function without branches).
@@ -626,11 +608,6 @@ pub fn apply(p: &mut crate::patch::Patcher, ranges: &[(u64, u64)]) {
         let done = match &f.change {
             Change::Insert { at, code } => p.insert((f.offset + at) as u64, ranges, &code(RUNS[i].as_ptr() as u64)).map(|_| ()),
             Change::Hook { at, handler } => p.hook((f.offset + at) as u64, ranges, *handler as usize as u64, i as u32).map(|_| ()),
-            Change::Bytes { at, new } => {
-                let o = f.offset + at;
-                p.image[o..o + new.len()].copy_from_slice(new);
-                Ok(())
-            }
         };
         match done {
             Ok(()) => {
