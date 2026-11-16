@@ -6403,6 +6403,35 @@ struct RangeLog {
     /// Lookups (`latest`): [all, nothing unfinished, no bucket overlapping,
     /// answered under the lock, of those with a batch found].
     stats: [AtomicU64; 5],
+    /// Per region of addresses (4 MiB blocks hashed into `NOTE_REGIONS`, a cache line each), the
+    /// notes touching it, counted as `notes` is: odd while one is in progress (`region_now`). A
+    /// clean-page memo entry stays valid while its region's count is unchanged (`tune lane`):
+    /// with `notes` alone every write any queue noted emptied every thread's memo, every ~12
+    /// syncs at Castlewall (2026-11-16 night).
+    regions: [PadU64; NOTE_REGIONS],
+}
+
+/// Regions of `RangeLog::regions`.
+const NOTE_REGIONS: usize = 256;
+
+/// An atomic counter on a cache line of its own.
+#[repr(align(64))]
+struct PadU64(AtomicU64);
+
+/// The regions [a, a + n) touches, as a bit mask (`RangeLog::regions`).
+fn region_mask(a: u64, n: u64, mask: &mut [u64; NOTE_REGIONS / 64]) {
+    if n == 0 {
+        return;
+    }
+    let (b0, b1) = (a >> 22, (a + n - 1) >> 22);
+    if b1 - b0 >= NOTE_REGIONS as u64 {
+        *mask = [u64::MAX; NOTE_REGIONS / 64];
+        return;
+    }
+    for blk in b0..=b1 {
+        let r = (blk as usize) & (NOTE_REGIONS - 1);
+        mask[r / 64] |= 1 << (r % 64);
+    }
 }
 
 const PAGE_BUCKETS: usize = 1 << 16;
@@ -6468,7 +6497,26 @@ impl RangeLog {
             big: [const { AtomicU64::new(0) }; COARSE_BUCKETS],
             span,
             stats: [const { AtomicU64::new(0) }; 5],
+            regions: [const { PadU64(AtomicU64::new(0)) }; NOTE_REGIONS],
         }
+    }
+
+    /// Counts a note's start or end in the regions of `mask` (`regions`).
+    fn bump_regions(&self, mask: &[u64; NOTE_REGIONS / 64]) {
+        for (k, &w) in mask.iter().enumerate() {
+            let mut v = w;
+            while v != 0 {
+                let r = 64 * k + v.trailing_zeros() as usize;
+                v &= v - 1;
+                self.regions[r].0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    /// The count of notes touching the region holding `addr` now (`regions`).
+    #[inline]
+    fn region_now(&self, addr: u64) -> u64 {
+        self.regions[((addr >> 22) as usize) & (NOTE_REGIONS - 1)].0.load(Ordering::Acquire)
     }
 
     /// Page `p`'s entry: exact inside the guest span, else its bucket.
@@ -6542,6 +6590,9 @@ impl RangeLog {
         // (Counted before the write shows and again after: odd while a note is in progress,
         // so a memo keyed on `notes` never takes in a check made in between, `notes_settled`.)
         self.notes.fetch_add(1, Ordering::AcqRel);
+        let mut mask = [0u64; NOTE_REGIONS / 64];
+        region_mask(w.0, w.1, &mut mask);
+        self.bump_regions(&mask);
         self.mark_pages(seq, w.0, w.1);
         self.latest_seq.fetch_max(seq, Ordering::SeqCst);
         let done = done_seq();
@@ -6549,6 +6600,7 @@ impl RangeLog {
         g.prune(done);
         g.insert(seq, w.0, w.1);
         drop(g);
+        self.bump_regions(&mask);
         self.notes.fetch_add(1, Ordering::AcqRel);
     }
 
@@ -6558,6 +6610,11 @@ impl RangeLog {
             return;
         }
         self.notes.fetch_add(1, Ordering::AcqRel);
+        let mut mask = [0u64; NOTE_REGIONS / 64];
+        for (a, n) in writes.iter() {
+            region_mask(a, n, &mut mask);
+        }
+        self.bump_regions(&mask);
         for (a, n) in writes.iter() {
             self.mark_pages(seq, a, n);
         }
@@ -6567,6 +6624,7 @@ impl RangeLog {
         g.prune(done);
         g.insert_all(seq, writes);
         drop(g);
+        self.bump_regions(&mask);
         self.notes.fetch_add(1, Ordering::AcqRel);
     }
 
@@ -9380,8 +9438,9 @@ fn sync_parts_call() {
     });
 }
 
-/// `DS_CLEAN_CHECK=1`: [memo answers checked in full, of them found written].
-pub static CLEAN_CHECKS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// `DS_CLEAN_CHECK=1`: [memo answers checked in full, of them found written, found written by
+/// a note that touched the page's region after the answer (`tune lane`: not a stale answer)].
+pub static CLEAN_CHECKS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 fn clean_check_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -9464,8 +9523,8 @@ fn place_memo_cycles_line() -> String {
         cl[4],
         cl[5]
     ) + &if clean_check_on() {
-        format!("    clean-page memo checked (`DS_CLEAN_CHECK`): {} answers, {} of them found written
-", CLEAN_CHECKS[0].load(Ordering::Relaxed), CLEAN_CHECKS[1].load(Ordering::Relaxed))
+        format!("    clean-page memo checked (`DS_CLEAN_CHECK`): {} answers, {} of them found written, {} more found written by a note made after the answer
+", CLEAN_CHECKS[0].load(Ordering::Relaxed), CLEAN_CHECKS[1].load(Ordering::Relaxed), CLEAN_CHECKS[2].load(Ordering::Relaxed))
     } else {
         String::new()
     };
@@ -10420,6 +10479,8 @@ pub struct Exec {
     /// overlapped when last checked (direct-mapped by page), valid while the
     /// write generations are `clean_tag` (`sync_for_reads`).
     clean_pages: Vec<u64>,
+    /// Each entry's region count when it was made (`RangeLog::regions`; `tune lane`).
+    clean_ctrs: Vec<u64>,
     clean_tag: [u64; 3],
     /// Texture ranges no pending or in-flight write overlapped when last
     /// checked, valid while the write generations are `tex_clean_tag`
@@ -11633,6 +11694,7 @@ impl Exec {
                 own_gen: 0,
                 ops: [0; OPS],
                 clean_pages: vec![u64::MAX; CLEAN_SLOTS],
+                clean_ctrs: vec![0; CLEAN_SLOTS],
                 clean_tag: [u64::MAX; 3],
                 tex_clean: super::fx::Set::default(),
                 tex_clean_tag: [u64::MAX; 2],
@@ -15320,7 +15382,8 @@ impl Exec {
         if !super::tune::lane() || !super::tune::clean_pages() || !self.run_writes.is_empty() || self.held_run_writes.is_some() || sync_hooks_on() || super::tune::get_trace_sync() {
             return false;
         }
-        let tag = [0, INFLIGHT.notes.load(Ordering::Acquire), super::homes::STALE_ADDED.load(Ordering::Acquire)];
+        // (By region: `tune lane` is on here.)
+        let tag = [0, 0, super::homes::STALE_ADDED.load(Ordering::Acquire)];
         if tag != self.clean_tag {
             return false;
         }
@@ -15329,7 +15392,8 @@ impl Exec {
                 continue;
             }
             for page in (a >> CLEAN_SHIFT)..=((a + n - 1) >> CLEAN_SHIFT) {
-                if self.clean_pages[(page as usize) & (CLEAN_SLOTS - 1)] != page {
+                let slot = (page as usize) & (CLEAN_SLOTS - 1);
+                if self.clean_pages[slot] != page || self.clean_ctrs[slot] != INFLIGHT.region_now(page << CLEAN_SHIFT) {
                     return false;
                 }
             }
@@ -15554,8 +15618,10 @@ impl Exec {
         dirty.clear();
         let reads: &[(u64, u64)] = if super::tune::clean_pages() {
             // (This executor's own writes drop their pages from the memo as they are noted,
-            // `clean_evict`; any queue's writes in flight and stale homes empty it.)
-            let tag = [0, INFLIGHT.notes.load(Ordering::Acquire), super::homes::STALE_ADDED.load(Ordering::Acquire)];
+            // `clean_evict`; stale homes empty it, and any queue's writes in flight do too, or
+            // with `tune lane` only the entries of the regions they touch, `RangeLog::regions`.)
+            let by_region = super::tune::lane();
+            let tag = [0, if by_region { 0 } else { INFLIGHT.notes.load(Ordering::Acquire) }, super::homes::STALE_ADDED.load(Ordering::Acquire)];
             let counted = laps();
             let check = clean_check_on();
             if tag != self.clean_tag {
@@ -15576,25 +15642,33 @@ impl Exec {
                 let mut clean = true;
                 for page in first..=last {
                     let slot = (page as usize) & (CLEAN_SLOTS - 1);
-                    if self.clean_pages[slot] == page {
+                    if self.clean_pages[slot] == page && (!by_region || self.clean_ctrs[slot] == INFLIGHT.region_now(page << CLEAN_SHIFT)) {
                         if counted {
                             clean_count(4);
                         }
                         // `DS_CLEAN_CHECK=1`: the page the memo answers checked in full too.
                         if check {
                             let whole = [(page << CLEAN_SHIFT, 1u64 << CLEAN_SHIFT)];
+                            let rc = INFLIGHT.region_now(page << CLEAN_SHIFT);
                             let stale = super::homes::any_stale(&whole);
                             let pending = self.overlaps_pending(&whole);
                             let inflight = INFLIGHT.latest(&whole);
                             CLEAN_CHECKS[0].fetch_add(1, Ordering::Relaxed);
-                            if (stale || pending || inflight.is_some()) && CLEAN_CHECKS[1].fetch_add(1, Ordering::Relaxed) < 20 {
-                                crate::info!(
-                                    "gpu[{}]: clean check: page {:#x} answered clean by the memo, found written in full: stale home {stale}, own pending {pending}, in flight {inflight:?} (completed {}, notes {})",
-                                    self.name,
-                                    page << CLEAN_SHIFT,
-                                    done_seq(),
-                                    INFLIGHT.notes.load(Ordering::Acquire)
-                                );
+                            // (A note touching the region between the answer and this check:
+                            // a write noted after the memo answered, not a stale answer.)
+                            let raced = by_region && INFLIGHT.region_now(page << CLEAN_SHIFT) != rc || by_region && rc != self.clean_ctrs[slot];
+                            if stale || pending || inflight.is_some() {
+                                if raced {
+                                    CLEAN_CHECKS[2].fetch_add(1, Ordering::Relaxed);
+                                } else if CLEAN_CHECKS[1].fetch_add(1, Ordering::Relaxed) < 20 {
+                                    crate::info!(
+                                        "gpu[{}]: clean check: page {:#x} answered clean by the memo, found written in full: stale home {stale}, own pending {pending}, in flight {inflight:?} (completed {}, notes {}, region count {rc})",
+                                        self.name,
+                                        page << CLEAN_SHIFT,
+                                        done_seq(),
+                                        INFLIGHT.notes.load(Ordering::Acquire)
+                                    );
+                                }
                             }
                         }
                         continue;
@@ -15603,11 +15677,19 @@ impl Exec {
                         clean_count(5);
                     }
                     let whole = [(page << CLEAN_SHIFT, 1u64 << CLEAN_SHIFT)];
+                    // (The region's count before the check: kept only when no note touching
+                    // the region was in progress then or began since.)
+                    let rc = if by_region { INFLIGHT.region_now(page << CLEAN_SHIFT) } else { 0 };
                     if super::homes::any_stale(&whole) || self.overlaps_pending(&whole) || INFLIGHT.latest(&whole).is_some() {
                         clean = false;
                         break;
                     }
-                    if INFLIGHT.notes_settled(tag[1]) {
+                    if by_region {
+                        if rc & 1 == 0 && INFLIGHT.region_now(page << CLEAN_SHIFT) == rc {
+                            self.clean_pages[slot] = page;
+                            self.clean_ctrs[slot] = rc;
+                        }
+                    } else if INFLIGHT.notes_settled(tag[1]) {
                         self.clean_pages[slot] = page;
                     }
                 }
