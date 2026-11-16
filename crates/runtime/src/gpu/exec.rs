@@ -10482,6 +10482,8 @@ pub struct Exec {
     clean_pages: Vec<u64>,
     /// Each entry's region count when it was made (`RangeLog::regions`; `tune lane`).
     clean_ctrs: Vec<u64>,
+    /// The last large own write whose pages left the memo, with its batch (`clean_evict`).
+    clean_big: (u64, u64, u64),
     clean_tag: [u64; 3],
     /// Texture ranges no pending or in-flight write overlapped when last
     /// checked, valid while the write generations are `tex_clean_tag`
@@ -11696,6 +11698,7 @@ impl Exec {
                 ops: [0; OPS],
                 clean_pages: vec![u64::MAX; CLEAN_SLOTS],
                 clean_ctrs: vec![0; CLEAN_SLOTS],
+                clean_big: (0, 0, 0),
                 clean_tag: [u64::MAX; 3],
                 tex_clean: super::fx::Set::default(),
                 tex_clean_tag: [u64::MAX; 2],
@@ -15345,8 +15348,25 @@ impl Exec {
             }
             let (first, last) = (a >> CLEAN_SHIFT, (a + n - 1) >> CLEAN_SHIFT);
             if last - first >= CLEAN_SLOTS as u64 {
-                self.clean_pages.fill(u64::MAX);
-                return;
+                // A large write: the entries inside it (with `tune lane`; before, the whole memo,
+                // and the title's per-item culls write their 112 MiB output in every dispatch,
+                // so a worker's memo was empty after each one, 2026-11-16 night). Once per batch:
+                // while its pending writes cover the range, no page inside it is found clean
+                // again (`sync_for_reads` checks them first).
+                if !super::tune::lane() {
+                    self.clean_pages.fill(u64::MAX);
+                    return;
+                }
+                if self.clean_big == (a, n, self.batch_count) {
+                    continue;
+                }
+                for p in self.clean_pages.iter_mut() {
+                    if *p >= first && *p <= last {
+                        *p = u64::MAX;
+                    }
+                }
+                self.clean_big = (a, n, self.batch_count);
+                continue;
             }
             for page in first..=last {
                 let slot = (page as usize) & (CLEAN_SLOTS - 1);
