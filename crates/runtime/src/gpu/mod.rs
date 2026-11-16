@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 178] = [
+    static ALL: [Tunable; 179] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -210,6 +210,7 @@ pub mod tune {
         Tunable { name: "async_gfx_inline", env: "DS_ASYNC_GFX_INLINE", default: 12, value: AtomicU64::new(UNSET) },
         Tunable { name: "zk", env: "DS_ZK", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "xq_pre_c", env: "DS_XQ_PRE_C", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "lean", env: "DS_LEAN", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1448,6 +1449,14 @@ pub mod tune {
     /// swamp x1.005, every cycle (FINDINGS.md 2026-11-16).
     pub fn xq_pre_c() -> bool {
         get(177) != 0
+    }
+
+    /// The lean lane (ROUTE60.md "2026-11-16 midday"): stage preparations through compiled
+    /// plans (`shaders::lean`), with the full path for what they leave; `DS_LEAN_CHECK=1`
+    /// prepares both ways and compares. Live (each preparation reads it).
+    #[inline]
+    pub fn lean() -> bool {
+        get(178) != 0
     }
 
     /// Whether translations get `rdna::translate::Spec::hw_bounds` (scalar

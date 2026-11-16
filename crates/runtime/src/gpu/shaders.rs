@@ -1292,6 +1292,70 @@ thread_local! {
     /// This thread's view of `FMT_SEEN` (a pair it saw two formats for, or
     /// one the shared map names so).
     static FMT_LOCAL: std::cell::RefCell<HashMap<(u64, usize), u32>> = std::cell::RefCell::new(HashMap::new());
+    /// Moves whenever this thread's `FMT_LOCAL` changes: the lean lane's per-resource
+    /// memos of `single_format` hold while it stands (`lean::prepare`).
+    static FMT_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[path = "shaders_lean.rs"]
+mod lean;
+
+/// `DS_PROFILE_REPEATS=1` with the profiler (the full path's repeat statistics).
+fn repeat_stats_on() -> bool {
+    static REPEAT_STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REPEAT_STATS.get_or_init(|| std::env::var("DS_PROFILE_REPEATS").ok().as_deref() == Some("1")) && super::exec::profiling_on()
+}
+
+/// A stage's preparation through the lean lane when it is on (`tune lean`, `lean::prepare`),
+/// else (or for what it leaves) through `prepare`; `DS_LEAN_CHECK=1` makes both and compares.
+#[allow(clippy::too_many_arguments)]
+fn prepare_stage(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: &[u32], spec: &mut Spec, tmpl: u64, tkey: u64) -> Result<Prepared, String> {
+    if tkey == 0 || !super::tune::lean() || repeat_stats_on() {
+        return prepare(addr, insts, code_hash, user, spec, tmpl);
+    }
+    if lean::check_on() {
+        let a = lean::prepare(addr, &insts, code_hash, user, spec.stage, spec.user_sgprs, spec.user_base, tkey);
+        let b = prepare(addr, insts.clone(), code_hash, user, spec, tmpl);
+        if let (Some(Ok(a)), Ok(b)) = (&a, &b) {
+            // (A difference in the words alone is checked against a second lean read: the
+            // title's data read twice a few microseconds apart.)
+            if !lean::compare(a, b, false) {
+                if let Some(Ok(a2)) = lean::prepare(addr, &insts, code_hash, user, spec.stage, spec.user_sgprs, spec.user_base, tkey) {
+                    lean::compare(&a2, b, true);
+                }
+            }
+        }
+        if let Ok(p) = &b {
+            lean::learn(p, spec, tkey);
+        }
+        return b;
+    }
+    let r = prepare(addr, insts, code_hash, user, spec, tmpl);
+    if let Ok(p) = &r {
+        lean::learn(p, spec, tkey);
+    }
+    r
+}
+
+/// Whether a template hit tries the lean lane first (`tune lean`, not in its check mode).
+fn lean_now() -> bool {
+    super::tune::lean() && !lean::check_on() && !repeat_stats_on()
+}
+
+/// A template's content key for the lean lane: its specialization without resources and
+/// program address, hashed (0, no lean preparations, in the diagnosis modes that key
+/// translations by address).
+fn tmpl_key(spec: &Spec) -> u64 {
+    static BY_ADDRESS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *BY_ADDRESS.get_or_init(|| std::env::var_os("DS_WAVEMASK").is_some() || std::env::var_os("DS_LOCKSTEP_OFF").is_some()) {
+        return 0;
+    }
+    let mut s = spec.clone();
+    s.resources = Vec::new();
+    s.code_base = 0;
+    let mut h = super::fx::FxHasher::default();
+    s.hash(&mut h);
+    h.finish() | 1
 }
 
 /// Seeds the formats a program's learned specs (`specs`, each a resource
@@ -1353,6 +1417,7 @@ fn single_format(code: u64, res: usize, format: u8, dst_sel: u16) -> bool {
                 None => *FMT_SEEN.write().get_or_insert_with(HashMap::new).entry(key).or_insert(want),
             };
             FMT_LOCAL.with(|l| l.borrow_mut().insert(key, v));
+            FMT_GEN.with(|g| g.set(g.get() + 1));
             v
         }
     };
@@ -1367,6 +1432,7 @@ fn single_format(code: u64, res: usize, format: u8, dst_sel: u16) -> bool {
             }
         }).or_insert(FMT_MULTI);
         FMT_LOCAL.with(|l| l.borrow_mut().insert(key, shared));
+        FMT_GEN.with(|g| g.set(g.get() + 1));
         return shared == want;
     }
     false
@@ -1683,7 +1749,7 @@ pub fn fmt_census_lines() -> String {
 
 pub fn prep_parts_line() -> String {
     let hz = super::threadcpu::tsc_hz();
-    let mut s = String::new();
+    let mut s = lean::status();
     for (k, name) in ["vertex", "pixel", "compute", "compute, indirect dispatches"].iter().enumerate() {
         let v: Vec<u64> = PREP_PARTS[k].iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).collect();
         let n = v[PREP_PARTS_N];
@@ -1798,6 +1864,8 @@ fn r2_check_spec(kind: &str, addr: u64, got: &Spec, fresh: Spec) {
 /// two 64-entry batchable scans and four program-list scans a stage).
 struct CsTmpl {
     id: u64,
+    /// The specialization's content key for the lean lane (`tmpl_key`).
+    tkey: u64,
     addr: u64,
     rsrc2: u32,
     local: [u32; 3],
@@ -1836,16 +1904,31 @@ fn prepare_compute_r2<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prepa
     let batch_gen = BATCH_GEN.load(Ordering::Acquire);
     let regs = crate::hle::libs::agc::shader_registrations();
     let slot = ((addr >> 8) ^ (addr >> 19)) as usize & (CS_TMPL_SLOTS - 1);
+    // The lean lane first, from the template without cloning its specialization.
+    if lean_now() {
+        let t = CS_TMPLS.with(|t| {
+            let t = t.borrow();
+            let e = t.get(slot)?;
+            let s = e.spec.as_ref()?;
+            (e.addr == addr && e.rsrc2 == rsrc2 && e.local == local && e.wave64 == wave64 && e.lod_measure == lod_measure && e.tune_gen == tune_gen && e.batch_gen == batch_gen && e.regs == regs && e.tkey != 0).then(|| (e.insts.clone(), e.code_hash, e.tkey, s.user_sgprs, s.user_base))
+        });
+        if let Some((Some(insts), code_hash, tkey, us, ub)) = t {
+            if let Some(r) = lean::prepare(addr, &insts, code_hash, &user, Stage::Compute, us, ub, tkey) {
+                prep_lap_end();
+                return r;
+            }
+        }
+    }
     let hit = CS_TMPLS.with(|t| {
         let t = t.borrow();
         let e = t.get(slot)?;
         if e.addr == addr && e.rsrc2 == rsrc2 && e.local == local && e.wave64 == wave64 && e.lod_measure == lod_measure && e.tune_gen == tune_gen && e.batch_gen == batch_gen && e.regs == regs {
-            Some((e.insts.clone()?, e.code_hash, e.spec.clone()?, e.id))
+            Some((e.insts.clone()?, e.code_hash, e.spec.clone()?, (e.id, e.tkey)))
         } else {
             None
         }
     });
-    let (insts, code_hash, mut spec, id) = match hit {
+    let (insts, code_hash, mut spec, (id, tkey)) = match hit {
         Some((insts, code_hash, mut spec, id)) => {
             prep_lap(1);
             if r2_check() {
@@ -1861,6 +1944,7 @@ fn prepare_compute_r2<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prepa
             prep_lap(1);
             let spec = cs_spec(addr, rsrc2, local, wave64, code_hash);
             let id = next_tmpl_id();
+            let tkey = if LOCAL_PROGRAMS.with(|c| c.borrow().contains_key(&addr)) { tmpl_key(&spec) } else { 0 };
             // (The template: the switches, batchable programs and shader
             // registrations as they were before the spec read them. Only for
             // a program from a shader object, which `program_local` keeps
@@ -1873,18 +1957,18 @@ fn prepare_compute_r2<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prepa
                 }
                 let mut t = t.borrow_mut();
                 if t.is_empty() {
-                    t.resize_with(CS_TMPL_SLOTS, || CsTmpl { id: 0, addr: 0, rsrc2: 0, local: [0; 3], wave64: false, lod_measure: false, tune_gen: 0, batch_gen: 0, regs: 0, insts: None, code_hash: 0, spec: None });
+                    t.resize_with(CS_TMPL_SLOTS, || CsTmpl { id: 0, tkey: 0, addr: 0, rsrc2: 0, local: [0; 3], wave64: false, lod_measure: false, tune_gen: 0, batch_gen: 0, regs: 0, insts: None, code_hash: 0, spec: None });
                 }
                 let mut tmpl = spec.clone();
                 tmpl.ps_inputs = Vec::new();
                 tmpl.resources = Vec::new();
-                t[slot] = CsTmpl { id, addr, rsrc2, local, wave64, lod_measure, tune_gen, batch_gen, regs, insts: Some(insts.clone()), code_hash, spec: Some(tmpl) };
+                t[slot] = CsTmpl { id, tkey, addr, rsrc2, local, wave64, lod_measure, tune_gen, batch_gen, regs, insts: Some(insts.clone()), code_hash, spec: Some(tmpl) };
             });
-            (insts, code_hash, spec, id)
+            (insts, code_hash, spec, (id, tkey))
         }
     };
     prep_lap(2);
-    let r = prepare(addr, insts, code_hash, &user, &mut spec, id);
+    let r = prepare_stage(addr, insts, code_hash, &user, &mut spec, id, tkey);
     spec_vecs_back(spec);
     r
 }
@@ -2354,6 +2438,8 @@ fn ps_key<R: RegRead + ?Sized>(cp: &R, k: &mut [u32; PS_KEY_MAX]) -> usize {
 /// full path).
 struct PsTmpl {
     id: u64,
+    /// The specialization's content key for the lean lane (`tmpl_key`).
+    tkey: u64,
     addr: u64,
     rsrc2: u32,
     n: u8,
@@ -2390,6 +2476,21 @@ fn prepare_ps_r2<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
     let tune_gen = super::tune::generation();
     let regs = crate::hle::libs::agc::shader_registrations();
     let slot = ((addr >> 8) ^ (addr >> 19)) as usize & (PS_TMPL_SLOTS - 1);
+    // The lean lane first, from the template without cloning its specialization.
+    if lean_now() {
+        let t = PS_TMPLS.with(|t| {
+            let t = t.borrow();
+            let e = t.get(slot)?;
+            let s = e.spec.as_ref()?;
+            (e.addr == addr && e.rsrc2 == rsrc2 && e.n as usize == n && e.batched == batched && e.lod_measure == lod_measure && e.tune_gen == tune_gen && e.regs == regs && e.key[..n] == key[..n] && e.tkey != 0).then(|| (e.insts.clone(), e.code_hash, e.tkey, s.user_sgprs, s.user_base))
+        });
+        if let Some((Some(insts), code_hash, tkey, us, ub)) = t {
+            if let Some(r) = lean::prepare(addr, &insts, code_hash, &user, Stage::Fragment, us, ub, tkey) {
+                prep_lap_end();
+                return r;
+            }
+        }
+    }
     let hit = PS_TMPLS.with(|t| {
         let t = t.borrow();
         let e = t.get(slot)?;
@@ -2400,12 +2501,12 @@ fn prepare_ps_r2<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
             ps_inputs.extend_from_slice(&e.inputs);
             spec.ps_inputs = ps_inputs;
             spec.resources = resources;
-            Some((e.insts.clone()?, e.code_hash, spec, e.id))
+            Some((e.insts.clone()?, e.code_hash, spec, (e.id, e.tkey)))
         } else {
             None
         }
     });
-    let (insts, code_hash, mut spec, id) = match hit {
+    let (insts, code_hash, mut spec, (id, tkey)) = match hit {
         Some(h) => {
             prep_lap(1);
             if r2_check() {
@@ -2419,23 +2520,24 @@ fn prepare_ps_r2<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
             let spec = ps_spec(addr, rsrc2, &|a: u32| cp.ctx(a));
             let id = next_tmpl_id();
             let registered = LOCAL_PROGRAMS.with(|c| c.borrow().contains_key(&addr));
+            let tkey = if registered { tmpl_key(&spec) } else { 0 };
             if registered {
                 PS_TMPLS.with(|t| {
                     let mut t = t.borrow_mut();
                     if t.is_empty() {
-                        t.resize_with(PS_TMPL_SLOTS, || PsTmpl { id: 0, addr: 0, rsrc2: 0, n: 0, batched: false, lod_measure: false, key: [0; PS_KEY_MAX], tune_gen: 0, regs: 0, insts: None, code_hash: 0, inputs: Vec::new(), spec: None });
+                        t.resize_with(PS_TMPL_SLOTS, || PsTmpl { id: 0, tkey: 0, addr: 0, rsrc2: 0, n: 0, batched: false, lod_measure: false, key: [0; PS_KEY_MAX], tune_gen: 0, regs: 0, insts: None, code_hash: 0, inputs: Vec::new(), spec: None });
                     }
                     let mut tmpl = spec.clone();
                     let inputs = std::mem::take(&mut tmpl.ps_inputs);
                     tmpl.resources = Vec::new();
-                    t[slot] = PsTmpl { id, addr, rsrc2, n: n as u8, batched, lod_measure, key, tune_gen, regs, insts: Some(insts.clone()), code_hash, inputs, spec: Some(tmpl) };
+                    t[slot] = PsTmpl { id, tkey, addr, rsrc2, n: n as u8, batched, lod_measure, key, tune_gen, regs, insts: Some(insts.clone()), code_hash, inputs, spec: Some(tmpl) };
                 });
             }
-            (insts, code_hash, spec, id)
+            (insts, code_hash, spec, (id, tkey))
         }
     };
     prep_lap(2);
-    let r = prepare(addr, insts, code_hash, &user, &mut spec, id);
+    let r = prepare_stage(addr, insts, code_hash, &user, &mut spec, id, tkey);
     spec_vecs_back(spec);
     r
 }
@@ -2667,6 +2769,8 @@ pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
 /// (GPU-resolved draws and vertex dumps take the full path).
 struct NggTmpl {
     id: u64,
+    /// The specialization's content key for the lean lane (`tmpl_key`).
+    tkey: u64,
     addr: u64,
     rsrc2: u32,
     wave: u32,
@@ -2700,6 +2804,21 @@ fn prepare_ngg_r2<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
     let tune_gen = super::tune::generation();
     let regs = crate::hle::libs::agc::shader_registrations();
     let slot = ((addr >> 8) ^ (addr >> 19)) as usize & (NGG_TMPL_SLOTS - 1);
+    // The lean lane first, from the template without cloning its specialization.
+    if lean_now() {
+        let t = NGG_TMPLS.with(|t| {
+            let t = t.borrow();
+            let e = t.get(slot)?;
+            let s = e.spec.as_ref()?;
+            (e.addr == addr && e.rsrc2 == rsrc2 && e.wave == wave && e.base_instance == base_instance && e.batched == batched && e.tune_gen == tune_gen && e.regs == regs && e.tkey != 0).then(|| (e.insts.clone(), e.code_hash, e.tkey, s.user_sgprs, s.user_base))
+        });
+        if let Some((Some(insts), code_hash, tkey, us, ub)) = t {
+            if let Some(r) = lean::prepare(addr, &insts, code_hash, &user, Stage::Vertex, us, ub, tkey) {
+                prep_lap_end();
+                return r;
+            }
+        }
+    }
     let hit = NGG_TMPLS.with(|t| {
         let t = t.borrow();
         let e = t.get(slot)?;
@@ -2708,12 +2827,12 @@ fn prepare_ngg_r2<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
             let (ps_inputs, resources) = spec_vecs();
             spec.ps_inputs = ps_inputs;
             spec.resources = resources;
-            Some((e.insts.clone()?, e.code_hash, spec, e.id))
+            Some((e.insts.clone()?, e.code_hash, spec, (e.id, e.tkey)))
         } else {
             None
         }
     });
-    let (insts, code_hash, mut spec, id) = match hit {
+    let (insts, code_hash, mut spec, (id, tkey)) = match hit {
         Some(h) => {
             prep_lap(1);
             if r2_check() {
@@ -2727,23 +2846,24 @@ fn prepare_ngg_r2<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
             let spec = ngg_spec(addr, rsrc2, stages, &insts);
             let id = next_tmpl_id();
             let registered = LOCAL_PROGRAMS.with(|c| c.borrow().contains_key(&addr));
+            let tkey = if registered { tmpl_key(&spec) } else { 0 };
             if registered {
                 NGG_TMPLS.with(|t| {
                     let mut t = t.borrow_mut();
                     if t.is_empty() {
-                        t.resize_with(NGG_TMPL_SLOTS, || NggTmpl { id: 0, addr: 0, rsrc2: 0, wave: 0, base_instance: None, batched: false, tune_gen: 0, regs: 0, insts: None, code_hash: 0, spec: None });
+                        t.resize_with(NGG_TMPL_SLOTS, || NggTmpl { id: 0, tkey: 0, addr: 0, rsrc2: 0, wave: 0, base_instance: None, batched: false, tune_gen: 0, regs: 0, insts: None, code_hash: 0, spec: None });
                     }
                     let mut tmpl = spec.clone();
                     tmpl.ps_inputs = Vec::new();
                     tmpl.resources = Vec::new();
-                    t[slot] = NggTmpl { id, addr, rsrc2, wave, base_instance, batched, tune_gen, regs, insts: Some(insts.clone()), code_hash, spec: Some(tmpl) };
+                    t[slot] = NggTmpl { id, tkey, addr, rsrc2, wave, base_instance, batched, tune_gen, regs, insts: Some(insts.clone()), code_hash, spec: Some(tmpl) };
                 });
             }
-            (insts, code_hash, spec, id)
+            (insts, code_hash, spec, (id, tkey))
         }
     };
     prep_lap(2);
-    let r = prepare(addr, insts, code_hash, &user, &mut spec, id);
+    let r = prepare_stage(addr, insts, code_hash, &user, &mut spec, id, tkey);
     spec_vecs_back(spec);
     r
 }
