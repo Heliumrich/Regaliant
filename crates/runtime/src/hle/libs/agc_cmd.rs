@@ -102,12 +102,21 @@ fn hdr(opcode: u32, payload: u32, compute: bool) -> u32 {
 }
 
 /// Writes `dw` at the command buffer's cursor; returns its address or 0.
-/// Packets the title wrote through `emit`, and the direct dispatches among them
-/// (`sceAgcCbDispatch`): for the status report (`emit_status`).
+/// `DS_EMIT_CENSUS=1` (diagnosis): packets the title wrote through `emit`, and the direct
+/// dispatches among them (`sceAgcCbDispatch`), for the status report (`emit_status`). Off by
+/// default: the counters are shared by every thread of the title that writes packets.
 static EMITS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+fn emit_census() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_EMIT_CENSUS").ok().as_deref() == Some("1"))
+}
 
 /// For the status report: how much of the title's stream is written through these functions.
 pub fn emit_status() -> String {
+    if !emit_census() {
+        return String::new();
+    }
     format!(
         "    agc: {} packets written by the title through the command functions' `emit`, {} of them direct dispatches (`sceAgcCbDispatch`)
 ",
@@ -117,7 +126,9 @@ pub fn emit_status() -> String {
 }
 
 fn emit(cb: u64, dw: &[u32]) -> u64 {
-    EMITS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if emit_census() {
+        EMITS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let p = alloc_dw(cb, dw.len() as u32);
     if p != 0 {
         unsafe { std::ptr::copy_nonoverlapping(dw.as_ptr(), p as *mut u32, dw.len()) };
@@ -615,7 +626,9 @@ sysv! {
 
     // ---- dispatches
     fn sceAgcCbDispatch(cb: u64, x: u32, y: u32, z: u32, modifier: u32) -> u64 {
-        EMITS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if emit_census() {
+            EMITS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         emit(cb, &[hdr(op::DISPATCH_DIRECT, 4, ACB), x, y, z, dispatch_initiator(modifier)])
     }
     fn sceAgcCbDispatchGetSize() -> u64 { 20 }
