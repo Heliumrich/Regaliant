@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 182] = [
+    static ALL: [Tunable; 183] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -214,6 +214,7 @@ pub mod tune {
         Tunable { name: "lane", env: "DS_LANE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "join", env: "DS_JOIN", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "copy_snap", env: "DS_COPY_SNAP", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "headless_present", env: "DS_HEADLESS_PRESENT", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1493,6 +1494,13 @@ pub mod tune {
     /// FINDINGS.md 2026-11-17 afternoon). 0: from the mirror like every other buffer.
     pub fn copy_snap() -> bool {
         get(181) != 0
+    }
+
+    /// Whether a run without a window presents a small image a flip to a swapchain that is
+    /// never shown (`vk::present::headless_present`): the driver's power management then
+    /// runs the GPU as it does for a run with a window. 0: nothing is presented.
+    pub fn headless_present() -> bool {
+        get(182) != 0
     }
 
     /// Whether translations get `rdna::translate::Spec::hw_bounds` (scalar
@@ -3674,6 +3682,11 @@ pub fn status_ex(with_stacks: bool) -> String {
                 s.push_str(&format!("        {st}\n"));
             }
         }
+    }
+    let hidden = vk::present::hidden_line();
+    if !hidden.is_empty() {
+        s.push_str(&format!("    {hidden}
+"));
     }
     s.push_str(&format!(
         "    gpu totals: {} submits, {} packets, {} draws ({} from {} multi-draw packets, {} of them with a GPU-written count; {} indexed indirect draws dropped, their arguments past the index buffer, {} drawn as they read later), {} dispatches, {} EOP interrupts, {} flips, {} label waits latched, {} passed on writes made after their submission, {} on counters past their value, {} passed on promises, {} CP reads waited for another queue{}\n",

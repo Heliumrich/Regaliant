@@ -5425,7 +5425,9 @@ impl Cp {
         // dynamic state and pipeline from the last one could.
         let progs = (super::shaders::ngg_addr(self), super::shaders::ps_addr(self), self.reg(Space::Uc, 0x242));
         DRAW_STATE[0].fetch_add(1, Ordering::Relaxed);
-        let same = !self.ctx_dirty && progs == self.last_draw_progs;
+        // (The context registers and the primitive type alone: `Exec::draw_same_ctx`.)
+        let same_ctx = !self.ctx_dirty && progs.2 == self.last_draw_progs.2;
+        let same = same_ctx && progs == self.last_draw_progs;
         if !self.ctx_dirty {
             DRAW_STATE[1].fetch_add(1, Ordering::Relaxed);
             if same {
@@ -5444,6 +5446,7 @@ impl Cp {
         super::xwait::note_command(&self.name);
         let mut e = self.exec.take().unwrap();
         e.draw_same = same;
+        e.draw_same_ctx = same_ctx;
         self.last_draw = e.draw(self, args);
         self.exec = Some(e);
         self.split_if_due();

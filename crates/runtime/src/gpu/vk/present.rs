@@ -451,6 +451,153 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
     Ok(())
 }
 
+/// Runs without a window (`--headless`: the drivers' measurement runs) present too: one
+/// 64x64 image a flip to a swapchain on a window that is never shown. A process that
+/// presents nothing is left at about a third of the GPU's clock rate by the driver's power
+/// management while the CPU side limits its frame, and every batch completes late: 48
+/// flips/s where a run with a window makes 62 (FINDINGS.md 2026-11-17 night). `tune
+/// headless_present 0` (`DS_HEADLESS_PRESENT=0`): none, as until then.
+struct Hidden {
+    swapchain: vk::SwapchainKHR,
+    cmds: Vec<vk::CommandBuffer>,
+    fences: Vec<vk::Fence>,
+    acquire: Vec<vk::Semaphore>,
+    done: Vec<vk::Semaphore>,
+    images: Vec<vk::Image>,
+    frame: usize,
+    presented: u64,
+    skipped: u64,
+}
+// (Vulkan handles; used under the lock.)
+unsafe impl Send for Hidden {}
+
+static HIDDEN: parking_lot::Mutex<Option<Hidden>> = parking_lot::Mutex::new(None);
+static HIDDEN_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+unsafe fn hidden_make() -> Result<Hidden, String> {
+    let c = ctx();
+    let (hwnd, hinstance) = window::create_hidden()?;
+    unsafe {
+        let sci = vk::Win32SurfaceCreateInfoKHR::default().hinstance(hinstance).hwnd(hwnd);
+        let surface = c.win32_i.create_win32_surface(&sci, None).map_err(|e| format!("create surface: {e}"))?;
+        if !c.surface_i.get_physical_device_surface_support(c.pdev, c.queue_family, surface).unwrap_or(false) {
+            return Err("queue family cannot present".into());
+        }
+        let caps = c.surface_i.get_physical_device_surface_capabilities(c.pdev, surface).map_err(|e| format!("surface caps: {e}"))?;
+        let formats = c.surface_i.get_physical_device_surface_formats(c.pdev, surface).map_err(|e| format!("surface formats: {e}"))?;
+        let fmt = formats.first().copied().ok_or("no surface format")?;
+        let modes = c.surface_i.get_physical_device_surface_present_modes(c.pdev, surface).unwrap_or_default();
+        // (Never held back by a display's refresh: the flips have their own clock.)
+        let mode = [vk::PresentModeKHR::IMMEDIATE, vk::PresentModeKHR::MAILBOX].into_iter().find(|m| modes.contains(m)).unwrap_or(vk::PresentModeKHR::FIFO);
+        let extent = if caps.current_extent.width == u32::MAX || caps.current_extent.width == 0 { vk::Extent2D { width: 64, height: 64 } } else { caps.current_extent };
+        let count = (caps.min_image_count + 1).min(if caps.max_image_count == 0 { u32::MAX } else { caps.max_image_count });
+        let sci = vk::SwapchainCreateInfoKHR::default()
+            .surface(surface)
+            .min_image_count(count)
+            .image_format(fmt.format)
+            .image_color_space(fmt.color_space)
+            .image_extent(extent)
+            .image_array_layers(1)
+            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .pre_transform(caps.current_transform)
+            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+            .present_mode(mode)
+            .clipped(true);
+        let swapchain = c.swapchain_d.create_swapchain(&sci, None).map_err(|e| format!("create swapchain: {e}"))?;
+        let images = c.swapchain_d.get_swapchain_images(swapchain).map_err(|e| format!("swapchain images: {e}"))?;
+        let pool = c
+            .device
+            .create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(c.queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None)
+            .map_err(|e| e.to_string())?;
+        let cmds = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(FRAMES as u32)).map_err(|e| e.to_string())?;
+        let sem = || c.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).map_err(|e| e.to_string());
+        let mut h = Hidden { swapchain, cmds, fences: Vec::new(), acquire: Vec::new(), done: Vec::new(), images, frame: 0, presented: 0, skipped: 0 };
+        for _ in 0..FRAMES {
+            h.fences.push(c.device.create_fence(&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None).map_err(|e| e.to_string())?);
+            h.acquire.push(sem()?);
+        }
+        // (A present's semaphore per image, as the window's presenter has them: an image
+        // comes back only after its present let go of the semaphore.)
+        for _ in 0..h.images.len() {
+            h.done.push(sem()?);
+        }
+        crate::info!("present: no window: one {}x{} image a flip presented to a swapchain that is never shown ({mode:?}, {} images; `tune headless_present`)", extent.width, extent.height, h.images.len());
+        Ok(h)
+    }
+}
+
+/// A flip of a run without a window (`Hidden`): skipped while the frame slot's last
+/// submission or a free image is not there yet (nothing here waits).
+fn headless_present() {
+    if !crate::gpu::tune::headless_present() || HIDDEN_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let c = ctx();
+    let mut g = HIDDEN.lock();
+    if g.is_none() {
+        match unsafe { hidden_make() } {
+            Ok(h) => *g = Some(h),
+            Err(e) => {
+                crate::warn!("present: no window and no hidden swapchain ({e})");
+                HIDDEN_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+    let h = g.as_mut().unwrap();
+    unsafe {
+        let f = h.frame % FRAMES;
+        if c.device.get_fence_status(h.fences[f]) != Ok(true) {
+            h.skipped += 1;
+            return;
+        }
+        let idx = match c.swapchain_d.acquire_next_image(h.swapchain, 0, h.acquire[f], vk::Fence::null()) {
+            Ok((i, _)) => i,
+            Err(_) => {
+                h.skipped += 1;
+                return;
+            }
+        };
+        h.frame += 1;
+        let cmd = h.cmds[f];
+        c.device.reset_fences(&[h.fences[f]]).ok();
+        c.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).ok();
+        c.device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
+        let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+        let to_present = vk::ImageMemoryBarrier::default()
+            .image(h.images[idx as usize])
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .subresource_range(range);
+        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT, vk::PipelineStageFlags::BOTTOM_OF_PIPE, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
+        c.device.end_command_buffer(cmd).ok();
+        let wait = [h.acquire[f]];
+        let stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+        let signal = [h.done[idx as usize]];
+        let cmds = [cmd];
+        let si = vk::SubmitInfo::default().wait_semaphores(&wait).wait_dst_stage_mask(&stages).command_buffers(&cmds).signal_semaphores(&signal);
+        let scs = [h.swapchain];
+        let idxs = [idx];
+        let pi = vk::PresentInfoKHR::default().wait_semaphores(&signal).swapchains(&scs).image_indices(&idxs);
+        let q = c.queue.lock();
+        if c.device.queue_submit(*q, &[si], h.fences[f]).is_ok() {
+            let _ = c.swapchain_d.queue_present(*q, &pi);
+            h.presented += 1;
+        }
+    }
+}
+
+/// Status part: the hidden swapchain's presents (`headless_present`).
+pub fn hidden_line() -> String {
+    match HIDDEN.lock().as_ref() {
+        Some(h) => format!("hidden swapchain: {} flips presented, {} skipped (no free image or the slot's submission still running)", h.presented, h.skipped),
+        None => String::new(),
+    }
+}
+
 pub fn init(title: &str) -> Result<(), String> {
     super::init()?;
     let w = window::create(title, 1280, 720)?;
@@ -524,9 +671,10 @@ pub fn present(src: Source) -> bool {
     let c = ctx();
     let mut g = PRESENTER.lock();
     let Some(p) = g.as_mut() else {
+        drop(g);
+        headless_present();
         // Without a window: the frame watch still sees each frame (`framewatch::headless`).
         if let Source::Image { image, layout, width, height, .. } = src {
-            drop(g);
             super::framewatch::init_from_env();
             super::framewatch::headless(image, layout, width, height);
         }

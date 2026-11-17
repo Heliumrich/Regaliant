@@ -909,6 +909,46 @@ pub fn create(title: &str, width: u32, height: u32) -> Result<&'static Window, S
     Ok(WINDOW.get().unwrap())
 }
 
+/// A window that is never shown, with a message loop of its own (`present::headless_present`:
+/// a swapchain needs a window). Its handle and the module's.
+pub fn create_hidden() -> Result<(isize, isize), String> {
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(isize, isize), String>>();
+    std::thread::Builder::new()
+        .name("hidden-window".into())
+        .spawn(move || unsafe {
+            crate::log::set_thread_name("hidden-window");
+            let hinst = GetModuleHandleW(std::ptr::null());
+            let class = wide("dsport_hidden");
+            let wc = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                style: 0,
+                lpfnWndProc: Some(DefWindowProcW),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: hinst,
+                hIcon: std::ptr::null_mut(),
+                hCursor: std::ptr::null_mut(),
+                hbrBackground: std::ptr::null_mut(),
+                lpszMenuName: std::ptr::null(),
+                lpszClassName: class.as_ptr(),
+                hIconSm: std::ptr::null_mut(),
+            };
+            RegisterClassExW(&wc);
+            let hwnd = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, class.as_ptr(), class.as_ptr(), WS_POPUP, 0, 0, 64, 64, std::ptr::null_mut(), std::ptr::null_mut(), hinst, std::ptr::null());
+            if hwnd.is_null() {
+                let _ = tx.send(Err("CreateWindowExW failed".into()));
+                return;
+            }
+            let _ = tx.send(Ok((hwnd as isize, hinst as isize)));
+            let mut msg: MSG = std::mem::zeroed();
+            while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+                DispatchMessageW(&msg);
+            }
+        })
+        .map_err(|e| format!("hidden window thread: {e}"))?;
+    rx.recv().map_err(|e| format!("hidden window thread died: {e}"))?
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

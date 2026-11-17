@@ -9269,6 +9269,88 @@ impl Exec {
     }
 }
 
+/// Draws by pass (with the program census): per (executor class, depth target, the targets'
+/// sizes and colour slots as `draw::pass_key` packs them, kind: 0 a draw that ended early,
+/// 1 a full draw, 2 a buffer-delta draw) the draws and their time; flushed and cleared with
+/// the program census.
+#[allow(clippy::type_complexity)]
+static PASS_CENSUS: Mutex<Option<HashMap<(u8, u64, u64, u8), [u64; 2]>>> = Mutex::new(None);
+
+thread_local! {
+    #[allow(clippy::type_complexity)]
+    static PASS_LOCAL: std::cell::RefCell<(u64, u32, HashMap<(u8, u64, u64, u8), [u64; 2]>)> = std::cell::RefCell::new((0, 0, HashMap::new()));
+}
+
+/// A draw of `class` into the pass (`depth`, `key`) of kind `kind` took `ns`.
+pub(super) fn pass_note(class: u8, depth: u64, key: u64, kind: u8, ns: u64) {
+    let epoch = PROG_GEN.load(Ordering::Relaxed);
+    PASS_LOCAL.with(|l| {
+        let mut l = l.borrow_mut();
+        if l.0 != epoch {
+            l.0 = epoch;
+            l.1 = 0;
+            l.2.clear();
+        }
+        let e = l.2.entry((class, depth, key, kind)).or_insert([0; 2]);
+        e[0] += 1;
+        e[1] += ns;
+        l.1 += 1;
+        if l.1 >= PROG_FLUSH {
+            l.1 = 0;
+            let mut g = PASS_CENSUS.lock();
+            let m = g.get_or_insert_with(HashMap::new);
+            for (k, v) in l.2.drain() {
+                let e = m.entry(k).or_insert([0; 2]);
+                e[0] += v[0];
+                e[1] += v[1];
+            }
+        }
+    });
+}
+
+/// The pass census's lines (`laps_report`): per class its passes by time, each with its
+/// full and buffer-delta draws.
+fn pass_census_lines() -> String {
+    let g = PASS_CENSUS.lock();
+    let Some(m) = g.as_ref() else { return String::new() };
+    let flips = super::FRAMES.load(Ordering::Relaxed).saturating_sub(PROG_FROM.load(Ordering::Relaxed)).max(1) as f64;
+    let mut out = String::new();
+    for (c, name) in ["graphics CP", "the graphics CP's workers"].iter().enumerate() {
+        // (pass) -> per kind [draws, ns]
+        let mut by: HashMap<(u64, u64), [[u64; 2]; 3]> = HashMap::new();
+        for ((class, depth, key, kind), x) in m.iter() {
+            if *class == c as u8 {
+                let e = &mut by.entry((*depth, *key)).or_default()[(*kind as usize).min(2)];
+                e[0] += x[0];
+                e[1] += x[1];
+            }
+        }
+        if by.is_empty() {
+            continue;
+        }
+        let mut v: Vec<(&(u64, u64), &[[u64; 2]; 3])> = by.iter().collect();
+        v.sort_by_key(|x| std::cmp::Reverse(x.1.iter().map(|k| k[1]).sum::<u64>()));
+        let all_n: u64 = v.iter().map(|x| x.1.iter().map(|k| k[0]).sum::<u64>()).sum();
+        let all_ns: u64 = v.iter().map(|x| x.1.iter().map(|k| k[1]).sum::<u64>()).sum();
+        let top: Vec<String> = v
+            .iter()
+            .take(10)
+            .map(|((depth, key), k)| {
+                let (dw, dh, cw, ch, n) = ((key >> 14) & 0x3FFF, key & 0x3FFF, (key >> 42) & 0x3FFF, (key >> 28) & 0x3FFF, key >> 56);
+                let target = match (*depth != 0, n) {
+                    (true, 0) => format!("depth {depth:#x} {dw}x{dh} alone"),
+                    (true, _) => format!("depth {depth:#x} with {n} colour ({cw}x{ch})"),
+                    (false, _) => format!("{n} colour ({cw}x{ch}), no depth"),
+                };
+                let part = |x: &[u64; 2]| format!("{:.0}/flip at {:.1} us ({:.2} ms)", x[0] as f64 / flips, x[1] as f64 / x[0].max(1) as f64 / 1e3, x[1] as f64 / flips / 1e6);
+                format!("{target}: buffer-delta {}, full {}, ended early {}", part(&k[2]), part(&k[1]), part(&k[0]))
+            })
+            .collect();
+        out.push_str(&format!("    draws by pass, {name}: {:.0} a flip, {:.2} ms a flip ({} passes): {}\n", all_n as f64 / flips, all_ns as f64 / flips / 1e6, v.len(), top.join("; ")));
+    }
+    out
+}
+
 /// A command of program key (a, b) by class `class` took `ns`.
 pub(super) fn prog_note(class: u8, a: u64, b: u64, ns: u64) {
     let epoch = PROG_GEN.load(Ordering::Relaxed);
@@ -10239,6 +10321,7 @@ pub fn reset_shader_profile() {
     }
     crate::mem::ww_reset();
     *PROG_CENSUS.lock() = None;
+    *PASS_CENSUS.lock() = None;
     *SLOW_PLACES.lock() = None;
     PROG_GEN.fetch_add(1, Ordering::Relaxed);
     PROG_FROM.store(super::FRAMES.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -10268,9 +10351,9 @@ pub fn laps_report() -> String {
     }
     if !laps() {
         // (`DS_PROG_CENSUS=1`: the census alone.)
-        return if prog_census() { prog_census_lines() } else { String::new() };
+        return if prog_census() { prog_census_lines() + &pass_census_lines() } else { String::new() };
     }
-    draw_steps_line() + &draw::delta_line() + &shaders::prep_parts_line() + &bind_steps_line() + &pre_steps_line() + &prog_census_lines() + &slow_place_lines() + &shaders::fmt_census_lines()
+    draw_steps_line() + &draw::delta_line() + &shaders::prep_parts_line() + &bind_steps_line() + &pre_steps_line() + &prog_census_lines() + &pass_census_lines() + &slow_place_lines() + &shaders::fmt_census_lines()
 }
 
 /// Shaders by total GPU time.
@@ -10775,6 +10858,10 @@ pub struct Exec {
     /// [batch, `cmd_uses`] right after the last full draw was recorded
     /// (profiling: `exec::draw::CONSEC_DIFFS`).
     pub(crate) draw_same: bool,
+    /// This draw has the context registers and primitive type of its command processor's
+    /// last draw, whatever its programs' addresses (`Cp::draw`): a buffer-delta draw goes
+    /// by its stages' translations (`delta_holds`).
+    pub(crate) draw_same_ctx: bool,
     last_draw_end: (u64, u64),
     /// The last draw's GPU-read arguments and index base (`DS_DRAW_STATS`).
     last_draw_where: (Option<u64>, Option<u64>),
@@ -10864,6 +10951,9 @@ pub struct Exec {
     /// last dispatch (the pair census, draw.rs).
     pair_ring: [(u64, u64); 8],
     pair_ring_n: u32,
+    /// The draw being recorded, for the pass census: 0 it ended early, 1 a full draw, 2 a
+    /// buffer-delta draw (`draw_inner`).
+    census_kind: u8,
     /// Mirror mode: the page runs its batch's bindings write (gathered at
     /// its end: `record_mirror_writeback`), bytes used in the slot's last
     /// extra staging buffer, and pages copied without a claim.
@@ -12366,6 +12456,7 @@ impl Exec {
                 tex_scratch: Vec::new(),
                 last_draw_sig: [0; 5],
                 draw_same: false,
+                draw_same_ctx: false,
                 last_draw_end: (u64::MAX, 0),
                 last_draw_where: (None, None),
                 draw_run: None,
@@ -12398,6 +12489,7 @@ impl Exec {
                 cs_run: None,
                 pair_ring: [(0, 0); 8],
                 pair_ring_n: 0,
+                census_kind: 0,
                 owned: Vec::new(),
                 mm_own: None,
                 extra_used: 0,

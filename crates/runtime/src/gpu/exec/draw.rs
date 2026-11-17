@@ -673,6 +673,25 @@ pub(crate) fn color_surface(cp: &Cp, n: u32) -> Result<Option<Surface>, String> 
     }))
 }
 
+/// A draw's pass for the pass census (`exec::pass_note`): its depth target's base (0: none)
+/// and, packed, the depth target's size (bits 0-27), the first bound colour slot's size (bits
+/// 28-55) and the colour slots bound (from bit 56; a slot counts by its format, as
+/// `color_surface` reads it).
+fn pass_key(cp: &Cp) -> (u64, u64) {
+    let (depth, d) = depth_surface(cp).map_or((0, 0), |s| (s.base, (s.width as u64) << 14 | s.height as u64));
+    let (mut n, mut c0) = (0u64, 0u64);
+    for i in 0..MAX_RT as u32 {
+        if (ctx_reg(cp, 0x28C60 + 0x3C * i + 0x10) >> 2) & 0x1F != 0 {
+            if n == 0 {
+                let a2 = ctx_reg(cp, 0x28EC0 + 4 * i);
+                c0 = (((a2 >> 14) & 0x3FFF) as u64 + 1) << 14 | ((a2 & 0x3FFF) as u64 + 1);
+            }
+            n += 1;
+        }
+    }
+    (depth, d | c0 << 28 | n << 56)
+}
+
 /// Depth/stencil surface from DB_* (None: none bound).
 pub(crate) fn depth_surface(cp: &Cp) -> Option<Surface> {
     let zinfo = ctx_reg(cp, 0x28040);
@@ -1331,6 +1350,7 @@ impl Exec {
             }
         }
         let t_prog = super::prog_census().then(std::time::Instant::now);
+        self.census_kind = 0;
         // Menu & HUD Size: the interface layer scaled before the title composites it.
         if super::super::uiscale::scale() < 1.0 {
             let ps = ((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8;
@@ -1343,7 +1363,10 @@ impl Exec {
         self.ui_job = None;
         if let Some(t) = t_prog {
             let ps = ((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8;
-            super::prog_note(self.prog_class(), shaders::ngg_addr(cp), ps.max(2), t.elapsed().as_nanos() as u64);
+            let ns = t.elapsed().as_nanos() as u64;
+            super::prog_note(self.prog_class(), shaders::ngg_addr(cp), ps.max(2), ns);
+            let (depth, key) = pass_key(cp);
+            super::pass_note(self.prog_class(), depth, key, self.census_kind, ns);
         }
         let outcome = match r {
             Ok(true) => {
@@ -1513,7 +1536,10 @@ impl Exec {
     /// draw, `DELTA`'s refusals from 1).
     fn delta_holds(&self, at: Option<(u64, u64)>, keys: [u64; 2], sig: &[(u32, [u32; 8])], indexed: bool) -> Result<Fixed, usize> {
         let d = &self.delta;
-        let Some(f) = d.fixed.filter(|_| self.draw_same && at == Some((self.batch_count, self.cmd_uses.get()))) else { return Err(0) };
+        // (Programs at other addresses with the same translations count as the same: the
+        // keys below are the translations'.)
+        let same = self.draw_same || self.draw_same_ctx;
+        let Some(f) = d.fixed.filter(|_| same && at == Some((self.batch_count, self.cmd_uses.get()))) else { return Err(0) };
         if !self.recording || sync_mode() || super::super::tune::race_checks() || TINY_ANY.load(Ordering::Relaxed) || !self.cpw_open.is_empty() {
             return Err(1);
         }
@@ -1904,6 +1930,7 @@ impl Exec {
         // A buffer-delta draw takes the last full draw's targets, pipeline
         // and hazard check (`delta_holds`).
         let was_delta = delta.is_some();
+        self.census_kind = 1 + was_delta as u8;
         let (fixed, t_pipe) = match delta {
             Some(f) => {
                 // (The targets' use stamps, as their lookups make.)
