@@ -7039,6 +7039,25 @@ fn journal_note_one(w: (u64, u64), who: &str) {
 /// Kinds of the CPU reads of held recording (`Exec::note_held_reads`).
 pub const HELD_READ_KINDS: [&str; 6] = ["shared copy", "texture", "binding", "CP label poll", "CP read", "register pairs"];
 
+thread_local! {
+    /// The compute batch the next closed batch this thread submits waits for (`commit_after`).
+    static COMMIT_AFTER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Closed batches made to wait so (`commit_after`).
+pub static COMMITS_AFTER: AtomicU64 = AtomicU64::new(0);
+
+/// A stretch past a label wait is about to submit what it holds (`Cp::past_wait_settle`):
+/// the first closed batch this thread submits waits for batch `seq`, the one that promised
+/// the stretch's label (0: none). The stretch's batches were recorded before that batch
+/// existed, so only the batch open at the settle got the wait (`Exec::depend_on`); the main
+/// queue runs its submissions in order, so the first one's wait holds the rest back too.
+/// (Since 2026-11-17: about half of Castlewall's committed stretches had a first batch with
+/// no such wait while the label's writer was not complete; in-run level, FINDINGS.md.)
+pub(super) fn commit_after(seq: u64) {
+    COMMIT_AFTER.with(|c| c.set(seq));
+}
+
 /// Whether GPU work not complete yet, or a deferred CP write, writes into [a, a + n) (any
 /// queue's; `Cp::past_wait_settle`'s label polls).
 pub(super) fn unfinished_write(a: u64, n: u64) -> bool {
@@ -17377,7 +17396,15 @@ impl Exec {
                 }
             }
             let pre_on_c = b.pre_on_c && pre.is_some();
-            let xq = xq_tracking().then_some(XqBatch { compute: self.xq_c, on_c, acb: acb_id(&self.name), writes: &b.writes, ups: &b.fe2_up, dep: b.xq.0, why: b.xq.1, images: b.xq.2, pre_on_c });
+            // (A committed stretch's first batch: after its label's writer, `commit_after`.)
+            let after = COMMIT_AFTER.with(|c| c.replace(0));
+            let (xdep, xwhy) = if after > b.xq.0 && after > done_seq() && xq_compute_batch(after) {
+                COMMITS_AFTER.fetch_add(1, Ordering::Relaxed);
+                (after, b.xq.1 | 1 << XR_PROMISE)
+            } else {
+                (b.xq.0, b.xq.1)
+            };
+            let xq = xq_tracking().then_some(XqBatch { compute: self.xq_c, on_c, acb: acb_id(&self.name), writes: &b.writes, ups: &b.fe2_up, dep: xdep, why: xwhy, images: b.xq.2, pre_on_c });
             let note_gate = super::fe2::c4_on().then(|| NOTE_GATE.read_recursive());
             let mut acts: Vec<Action> = b.eager_action.into_iter().collect();
             // (A prologue on the compute queue: its uploads count once it completed.)

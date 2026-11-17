@@ -858,6 +858,9 @@ pub fn past_wait_status() -> String {
         } else {
             format!("    label waits passed on memory kept at their stretch's settle: {} waits in {} stretches a batch submitted meanwhile would have dropped\n", k(0), k(1))
         }
+    } + &{
+        let n = super::exec::COMMITS_AFTER.load(Ordering::Relaxed);
+        if n == 0 { String::new() } else { format!("    committed stretches whose first batch waits for their label's writer: {n}\n") }
     } + &held_runs_line()
 }
 
@@ -4191,6 +4194,9 @@ impl Cp {
         let flow = self.wait(w.control, w.a, w.wide, w.reference, w.mask, w.at);
         self.settling = false;
         let waited = t.elapsed();
+        // The batch that promised the label, when it is not complete yet: the stretch's first
+        // submission waits for it (`exec::commit_after`).
+        let writer = promised(w.a, w.wide, w.control & 7, w.mask, w.reference).map_or(0, |p| p.0);
         // Front end 2: the stretch was checked before its label's writer
         // synchronized for the last time ahead of the label, and the CPU may
         // have written pages it bound in between (the title's per-frame
@@ -4349,11 +4355,13 @@ impl Cp {
         // (A held run being collected goes on: its remaining chunks are checked as they are
         // collected, `unheld_collect`; the stretch's uploaded pages are current for them.)
         let up = if self.par.as_ref().is_some_and(|p| p.held) { self.exec.as_ref().map(|e| e.past_up().clone()) } else { None };
+        super::exec::commit_after(writer);
         if w.segs.is_empty() && w.counts.iter().all(|&c| c == 0) {
             self.exec.as_mut().unwrap().past_commit();
         } else {
             self.held_commit(&w.segs, &w.counts);
         }
+        super::exec::commit_after(0);
         match (self.par.as_mut(), up) {
             (Some(pr), Some(up)) => {
                 pr.unheld = Some(Box::new(Unheld { writes, need: needs.map(|x| x.0), up }));
