@@ -814,6 +814,17 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 let rest = line.trim_start().strip_prefix("probe").unwrap_or("").trim();
                 gpu::shaders::set_probe(rest)
             }
+            "csdump" => {
+                // Diagnosis: `csdump <hex compute shader address>`: its next dispatch writes
+                // its buffer resources' guest memory to the run directory.
+                match parts.next().and_then(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok()) {
+                    Some(a) => {
+                        gpu::exec::request_cs_dump(a);
+                        Ok(())
+                    }
+                    None => Err("usage: csdump <hex address>".into()),
+                }
+            }
             "skipcs" => {
                 // Diagnosis: `skipcs <hex compute shader address>` toggles
                 // skipping its dispatches.

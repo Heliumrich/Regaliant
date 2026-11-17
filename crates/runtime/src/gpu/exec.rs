@@ -32,6 +32,40 @@ static SKIP_CS: parking_lot::Mutex<Option<std::collections::HashSet<u64>>> = par
 /// its lock to find it empty).
 static SKIP_CS_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// `csdump <hex cs>` (control, diagnosis): the compute program whose next dispatch writes the
+/// guest memory of its buffer resources to the run directory (0: none asked).
+static CS_DUMP: AtomicU64 = AtomicU64::new(0);
+
+/// Asks for the buffers of `addr`'s next dispatch (`csdump`).
+pub fn request_cs_dump(addr: u64) {
+    CS_DUMP.store(addr, Ordering::Release);
+}
+
+/// The asked dump (`csdump`): each buffer resource's guest bytes (its stride times its records,
+/// up to 64 MiB) as `cs-<program>-res<N>-<base>.bin`, with a log line naming them. Guest memory
+/// as it stands when the dispatch is recorded: GPU-written ranges hold what was written back
+/// so far.
+fn cs_dump(p: &Prepared) {
+    if CS_DUMP.load(Ordering::Relaxed) != p.addr || CS_DUMP.compare_exchange(p.addr, 0, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let Some(dir) = crate::run_dir() else { return };
+    let mut names = Vec::new();
+    for (i, r) in p.resources.iter().enumerate() {
+        let Resolved::Buffer(v) = r else { continue };
+        let len = (v.stride.max(4) as u64 * v.num_records as u64).min(64 << 20);
+        if len == 0 || !super::cp::guest_readable(v.base, len) {
+            continue;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(v.base as *const u8, len as usize) };
+        let name = format!("cs-{:x}-res{i}-{:x}.bin", p.addr, v.base);
+        if std::fs::write(dir.join(&name), bytes).is_ok() {
+            names.push(format!("{name} (stride {}, {} records, format {})", v.stride, v.num_records, v.format));
+        }
+    }
+    crate::info!("csdump: cs {:#x} for flip {}: {}", p.addr, crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1, names.join(", "));
+}
+
 /// Adds or removes a compute shader address; returns whether it is listed now.
 pub fn toggle_skip_cs(addr: u64) -> bool {
     let mut g = SKIP_CS.lock();
@@ -4734,7 +4768,7 @@ fn trace_cs_images(queue: &str, p: &Prepared, bound: &Bound) {
 fn trace_loads(queue: &str, p: &Prepared, groups: [u32; 3]) {
     static ADDRS: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     let addrs = ADDRS.get_or_init(|| {
-        std::env::var("DS_TRACE_CS").unwrap_or_default().split(',').filter_map(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()).collect()
+        std::env::var("DS_TRACE_CS").unwrap_or_default().split([',', ';']).filter_map(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()).collect()
     });
     if !addrs.contains(&p.addr) {
         return;
@@ -19389,6 +19423,7 @@ impl Exec {
         }
         trace_cs_images(&self.name, &p, &bound);
         self.tap_cs(&p, &bound);
+        cs_dump(&p);
         stamp(2);
         lap.mark(12);
         if !lazy_barriers() {

@@ -56,6 +56,12 @@ struct ViewMemo {
     used: UseStamp,
 }
 
+/// `DS_CMP_ALWAYS=1` (diagnosis): comparison samplers always pass (`ImageCache::sampler`).
+fn cmp_always() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_CMP_ALWAYS").ok().as_deref() == Some("1"))
+}
+
 impl ViewMemo {
     /// 0 when it holds for `t` in `frame`, else why not (`memo_note`'s kinds: 2 another frame,
     /// 3 the images changed, 4 its region changed).
@@ -6200,7 +6206,9 @@ impl Images {
             .anisotropy_enable((aniso > 0 && b(s[2], 22, 2) >= 2) || raise)
             .max_anisotropy(((1u32 << aniso.min(4)) as f32).max(if raise { aniso_pc as f32 } else { 1.0 }))
             .compare_enable(compare_use)
-            .compare_op(match compare {
+            // (`DS_CMP_ALWAYS=1`, diagnosis: every comparison passes, so depth-compare samples
+            // of depth views read 1: no shadow from any shadow map.)
+            .compare_op(match if cmp_always() { 7 } else { compare } {
                 1 => vk::CompareOp::LESS,
                 2 => vk::CompareOp::EQUAL,
                 3 => vk::CompareOp::LESS_OR_EQUAL,

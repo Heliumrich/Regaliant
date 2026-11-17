@@ -2129,14 +2129,14 @@ fn cs_spec(addr: u64, rsrc2: u32, local: [u32; 3], wave64: bool, code_hash: u64)
         gpu_res: 0,
         pt_linear: false,
     };
-    if super::tune::per_lane() != 0 && per_lane_program(code_hash) {
+    if super::tune::per_lane() != 0 && per_lane_program(code_hash) && !plain_modes() {
         let votes = lane_votes_program(code_hash);
         spec.per_lane = super::tune::per_lane() == 1 || !votes;
         spec.lane_votes = spec.per_lane && votes;
     }
-    spec.lockstep_off = no_lockstep_program(code_hash);
-    spec.sg_waves = sg_wave_program(code_hash);
-    spec.sg_appends = append_program(code_hash);
+    spec.lockstep_off = no_lockstep_program(code_hash) && !plain_modes();
+    spec.sg_waves = sg_wave_program(code_hash) && !plain_modes();
+    spec.sg_appends = append_program(code_hash) && !plain_modes();
     // LOD statistics in rotation (`tune lod_cs` >= 2): a dispatch measures
     // only when prepared within `with_lod_stats` (`lodstats::rotate`);
     // batched dispatches keep them (their textures are not all known to the
@@ -2228,6 +2228,16 @@ const SG_WAVE_PROGRAMS: &[(u64, &str)] = &[
     // read from lane 0, v_mbcnt ranks), per-lane atomic ands.
     (0x7f89_1d6a_4856_4598, "GI reinsert cs 0x10089f4d00"),
 ];
+
+/// `DS_PLAIN_MODES=1` (diagnosis): no program is translated per lane, without lockstep, as
+/// subgroup waves or with per-subgroup appends (the lists above and `append_program`): every
+/// compute program runs in the mode the translator picks from its code alone. An A/B of what
+/// those modes give against the plain translation (their programs then compile at their first
+/// dispatch: the stored specs are keyed with the modes).
+fn plain_modes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_PLAIN_MODES").ok().as_deref() == Some("1"))
+}
 
 /// Program hashes found in SG_WAVE_PROGRAMS.
 static SG_WAVE_HASHES: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
@@ -4219,14 +4229,14 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         gpu_res: 0,
         pt_linear: false,
     };
-    if super::tune::per_lane() != 0 && per_lane_program(code_hash) {
+    if super::tune::per_lane() != 0 && per_lane_program(code_hash) && !plain_modes() {
         let votes = lane_votes_program(code_hash);
         spec.per_lane = super::tune::per_lane() == 1 || !votes;
         spec.lane_votes = spec.per_lane && votes;
     }
-    spec.lockstep_off = no_lockstep_program(code_hash);
-    spec.sg_waves = sg_wave_program(code_hash);
-    spec.sg_appends = append_program(code_hash);
+    spec.lockstep_off = no_lockstep_program(code_hash) && !plain_modes();
+    spec.sg_waves = sg_wave_program(code_hash) && !plain_modes();
+    spec.sg_appends = append_program(code_hash) && !plain_modes();
     spec
 }
 /// R2 (`tune r2`): what `prepare` looks up per plan (its analysis, the
