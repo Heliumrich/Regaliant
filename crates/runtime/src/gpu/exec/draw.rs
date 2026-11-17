@@ -33,6 +33,9 @@ pub static DELTA_VERIFY: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 /// looking them up (their memos' generations or the frame moved, or the
 /// last draw's came from the image cache)].
 pub static DELTA_BIND: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// DS_STEP_LAPS: draws step time in all by kind (DRAW_KINDS), other / buffer-delta:
+/// [ns, draws] (a batch first draws apart).
+static DELTA_COST: [[[AtomicU64; 2]; 2]; 3] = [const { [const { [const { AtomicU64::new(0) }; 2] }; 2] }; 3];
 
 /// What a full draw's targets, pipeline and hazard check gave, that a
 /// buffer-delta draw right after it takes over (`DrawDelta`).
@@ -201,8 +204,19 @@ pub(super) fn delta_line() -> String {
     } else {
         String::new()
     };
+    let costs = if super::laps() {
+        let us = |k: usize, d: usize| DELTA_COST[k][d][0].load(Ordering::Relaxed) as f64 / DELTA_COST[k][d][1].load(Ordering::Relaxed).max(1) as f64 / 1e3;
+        let n = |k: usize, d: usize| DELTA_COST[k][d][1].load(Ordering::Relaxed);
+        format!(
+            "
+    a draw's steps in all (`DS_STEP_LAPS`, not a batch's first; buffer-delta / other): graphics serial {:.2} us ({}) / {:.2} ({}), own chunks {:.2} ({}) / {:.2} ({}), workers {:.2} ({}) / {:.2} ({})",
+            us(0, 1), n(0, 1), us(0, 0), n(0, 0), us(1, 1), n(1, 1), us(1, 0), n(1, 0), us(2, 1), n(2, 1), us(2, 0), n(2, 0)
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "    buffer-delta draws: {} of {} candidates (refused: modes {}, translations or indices {}, images or samplers {}, image lookups {}, clears or reloads pending {}, textures {}, rendering instance {}); stages binding the draw before's images and samplers {}, looking them up {}{verified}\n",
+        "    buffer-delta draws: {} of {} candidates (refused: modes {}, translations or indices {}, images or samplers {}, image lookups {}, clears or reloads pending {}, textures {}, rendering instance {}); stages binding the draw before's images and samplers {}, looking them up {}{verified}{costs}\n",
         d[1], d[0], d[2], d[3], d[4], d[5], d[6], d[7], d[8], b[0], b[1]
     )
 }
@@ -1876,6 +1890,7 @@ impl Exec {
         lap.mark(4);
         // A buffer-delta draw takes the last full draw's targets, pipeline
         // and hazard check (`delta_holds`).
+        let was_delta = delta.is_some();
         let (fixed, t_pipe) = match delta {
             Some(f) => {
                 // (The targets' use stamps, as their lookups make.)
@@ -2784,6 +2799,11 @@ impl Exec {
             r.fresh = false;
         }
         lap.mark(17);
+        if super::laps() && !first {
+            let c = &DELTA_COST[kind][was_delta as usize];
+            c[0].fetch_add(lap.local.iter().sum::<u64>(), Ordering::Relaxed);
+            c[1].fetch_add(1, Ordering::Relaxed);
+        }
         if super::profiling() {
             super::note_phases(&super::DRAW_PHASES, [t_prep, t_pipe, t_bind, since(t0)]);
             super::note_place(self.deferred, self.batch_shaders.len().saturating_sub(1), [t_prep, t_pipe, t_bind, since(t0)]);
