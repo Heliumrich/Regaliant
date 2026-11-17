@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 183] = [
+    static ALL: [Tunable; 187] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -215,6 +215,10 @@ pub mod tune {
         Tunable { name: "join", env: "DS_JOIN", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "copy_snap", env: "DS_COPY_SNAP", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "headless_present", env: "DS_HEADLESS_PRESENT", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "pace_step", env: "DS_PACE_STEP", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "pace_smooth", env: "DS_PACE_SMOOTH", default: 8, value: AtomicU64::new(UNSET) },
+        Tunable { name: "pace_phys", env: "DS_PACE_PHYS", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "vrr", env: "DS_VRR", default: 2, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1501,6 +1505,35 @@ pub mod tune {
     /// runs the GPU as it does for a run with a window. 0: nothing is presented.
     pub fn headless_present() -> bool {
         get(182) != 0
+    }
+
+    /// The game's step per frame (`gamestep`): 1 the port sets it from the frames shown (the
+    /// time between the flips, smoothed over `pace_smooth` frames: the same game speed at
+    /// every frame rate, the step exact while every frame is shown as long as the last); 0
+    /// the title's own (1/59.94 s at least and in halves of it: fast above 60 frames a
+    /// second).
+    pub fn pace_step() -> bool {
+        get(183) != 0
+    }
+
+    /// Over how many frames the game's step is the mean of the times between flips (1 to 32;
+    /// 1: each frame steps by the time the frame before it was shown).
+    pub fn pace_smooth() -> u64 {
+        get(184).clamp(1, 32)
+    }
+
+    /// The physics' fixed step while the port sets the game's step: 0 the title's (1/59.94
+    /// s), 1 the frame limit's time a frame (one physics step a frame while the limit is
+    /// held; uncapped: the game's step, at most 1/30 s), 2 the game's step every frame (at
+    /// most 1/30 s).
+    pub fn pace_phys() -> u64 {
+        get(185)
+    }
+
+    /// Whether the window's display is taken as a variable-refresh one (G-Sync, FreeSync):
+    /// 2 as the driver or the display clock says (`vrr`), 1 always, 0 never.
+    pub fn vrr() -> u64 {
+        get(186)
     }
 
     /// Whether translations get `rdna::translate::Spec::hw_bounds` (scalar

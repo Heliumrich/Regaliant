@@ -1,9 +1,10 @@
 //! libSceVideoOut (PS5 API): display buffer sets, flip queue, vblank pacing,
 //! output status and color settings.
 //!
-//! A vblank thread executes queued flips at 59.94 Hz (scaled by the flip rate);
-//! with `tune flip_grid` 0 it shows a ready flip as soon as the flip rate
-//! allows, between the vblanks the title sees.
+//! A vblank thread executes queued flips: at each of the display's own vblanks where a
+//! window is on a fixed-refresh screen (the frame limit a whole number of them), as soon as
+//! the limit allows on a variable-refresh one, at 59.94 Hz on its own timer otherwise
+//! (`vblank_thread`, PACING.md).
 //! Until the GPU renders into display buffers, presentation shows black: the
 //! guest display memory is not produced by the title's GPU work yet, so
 //! nothing else would be truthful. Color settings are recorded, not applied.
@@ -124,6 +125,32 @@ pub struct Port {
 }
 
 static PORT: Mutex<Option<Port>> = Mutex::new(None);
+
+/// The flips shown lately, for the game's step (`gamestep`): each one's number and the
+/// instant of the vblank it was shown at (the tick's own time on a grid: the display's
+/// vblank or the timer's; the moment itself off the grid).
+static FLIP_TIMES: Mutex<VecDeque<(u64, Instant)>> = Mutex::new(VecDeque::new());
+/// Wakes the vblank thread when a flip is queued ready or becomes ready (off the grid it
+/// shows a ready frame without waiting for a tick).
+static FLIP_READY: std::sync::LazyLock<crate::thread::Waker> = std::sync::LazyLock::new(crate::thread::Waker::new);
+/// The time between flips the frame limit asks for now (ns; 0: none, the frame rate uncapped).
+pub static PACE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The last flip shown: its number and instant, and the time since the flip before it.
+pub fn latest_flip() -> Option<(u64, Instant, Duration)> {
+    let g = FLIP_TIMES.lock();
+    let &(n, at) = g.back()?;
+    let before = g.iter().rev().nth(1).map_or(Duration::ZERO, |&(_, b)| at.saturating_duration_since(b));
+    Some((n, at, before))
+}
+
+/// When flip `n` was shown (the last 256 flips are kept).
+pub fn flip_time(n: u64) -> Option<Instant> {
+    let g = FLIP_TIMES.lock();
+    let &(last, _) = g.back()?;
+    let back = last.checked_sub(n)? as usize;
+    g.iter().rev().nth(back).filter(|e| e.0 == n).map(|e| e.1)
+}
 static FLIP_CV: Condvar = Condvar::new();
 static VBLANK_CV: Condvar = Condvar::new();
 
@@ -141,100 +168,135 @@ fn vblank_thread() {
         }
         None => Duration::from_nanos(16_683_333), // 59.94 Hz
     };
-    // The uncapped frame rate (`tune uncapped`): vblanks at UNCAPPED_HZ while it is on (an
-    // explicit DS_VBLANK_HZ stays the rate).
+    // The uncapped frame rate (`tune uncapped`): on the thread's own timer the vblanks come at
+    // UNCAPPED_HZ while it is on (an explicit DS_VBLANK_HZ stays the rate).
     let uncapped_period = Duration::from_nanos((1e9 / UNCAPPED_HZ) as u64);
     let period_now = || if hz.is_none() && crate::gpu::tune::uncapped() { uncapped_period } else { base };
     let mut period = period_now();
     if period != base {
         crate::info!("vblank at {:.2} Hz (the frame rate uncapped)", 1.0 / period.as_secs_f64());
     }
-    // Flips off the vblank grid (`tune flip_grid` 0): the thread also wakes
-    // every FLIP_TICK to show a ready flip as soon as the title's flip rate
-    // allows (time since the last flip), while the title's vblanks (count,
-    // events, waits) stay at the emulated rate.
-    const FLIP_TICK: Duration = Duration::from_millis(1);
-    let mut next = Instant::now() + period;
-    let mut last_flip = Instant::now();
-    let mut last_cap = 0;
-    // Locked to the display (`displayclock::lock`): the title's vblank just after every `step`
-    // of the display's (the frame flipped then is presented at once and shown at the next
-    // refresh), the display's vblank it ticks at next, and the lock (n, step; n 0: the thread's
-    // own timer). On the fine grid (step 1) flips stay at least n of them apart (60 fps), so a
-    // frame done late shows at the next refresh after its due one, not a whole 60 Hz frame
-    // later. Not while uncapped or at a diagnosis rate.
+    // How the flips are paced (PACING.md):
+    // - On the display's grid (a window on a fixed-refresh screen, `displayclock::lock`): the
+    //   title's vblank ticks just after each of the display's (the frame flipped then is
+    //   presented at once and shown at the next refresh), and flips stay a whole number of
+    //   them apart (`displayclock::refreshes_for` the frame limit; uncapped: one). A frame
+    //   done late shows at the next refresh after its due one.
+    // - Off the grid (variable refresh, `vrr::active`; or `tune flip_grid` 0): a ready flip is
+    //   shown as soon as the frame limit's time has passed since the last one, on a line of
+    //   exact multiples of it while frames are on time; the title's vblanks keep the thread's
+    //   own timer.
+    // - On the thread's own timer (no window, or no steady second of the display's vblanks
+    //   yet; a diagnosis rate): at its ticks, as the title's flip rate and `tune frame_cap` ask.
     const LOCK_DELAY: Duration = Duration::from_micros(300);
+    let mut next = Instant::now() + period;
+    // The last flip's own time: its tick's on a grid, its place on the limit's line off it.
+    let mut last_flip = Instant::now();
+    let mut last_cap = u64::MAX;
+    // On the display's grid: the display's vblank the thread ticks at next (0: at the start)
+    // and the display's period as last measured (None: not on that grid).
     let mut lock_target: u64 = 0;
-    let mut locked_n: u32 = 0;
-    let mut locked_step: u32 = 0;
-    // (The vblank's period while locked: the display's times the step.)
-    let mut lock_period = Duration::ZERO;
+    let mut locked: Option<Duration> = None;
+    // The pacing as last logged: (kind, refreshes or 0, the limit's time in microseconds).
+    let mut logged: (u8, u32, u64) = (0, 0, 0);
+    let mut ticked = true;
     crate::displayclock::start();
+    crate::vrr::start();
     loop {
-        // The PC settings' console variables (changed values, objects the title builds later).
-        crate::input::motion_tick();
-        crate::pcsettings::mouse_blur_tick();
-        crate::pcsettings::convar::tick();
-        crate::pcsettings::popup::tick();
-        crate::pcsettings::pointer::tick();
-        crate::dispmode::tick();
-        let grid = crate::gpu::tune::flip_grid();
+        // Once a vblank: the PC settings' console variables (changed values, objects the title
+        // builds later) and the other per-vblank work.
+        if std::mem::take(&mut ticked) {
+            crate::input::motion_tick();
+            crate::pcsettings::mouse_blur_tick();
+            crate::pcsettings::convar::tick();
+            crate::pcsettings::popup::tick();
+            crate::pcsettings::pointer::tick();
+            crate::dispmode::tick();
+        }
         // The rate changed (`tune uncapped`): the next vblank one new period from now.
         let p_now = period_now();
         if p_now != period {
             period = p_now;
             next = Instant::now() + period;
-            crate::info!("vblank at {:.2} Hz ({})", 1.0 / period.as_secs_f64(), if period == uncapped_period { "the frame rate uncapped" } else { "the frame rate capped at the vblanks" });
+            crate::info!("vblank timer at {:.2} Hz ({})", 1.0 / period.as_secs_f64(), if period == uncapped_period { "the frame rate uncapped" } else { "the frame rate limited" });
         }
-        let lock = if hz.is_none() && period != uncapped_period { crate::displayclock::lock() } else { None };
+        let uncapped = period == uncapped_period;
+        let vrr = hz.is_none() && crate::vrr::active();
+        let lock = if hz.is_none() && !vrr { crate::displayclock::lock() } else { None };
         match lock {
-            Some((n, step, s)) => {
-                if locked_n != n || locked_step != step {
-                    let hz = 1.0 / s.period.as_secs_f64();
-                    if step < n {
-                        crate::info!("vblank locked to the display: at each of its vblanks ({hz:.3} Hz measured), flips at least {n} apart");
-                    } else {
-                        crate::info!("vblank locked to the display: at every {n} of its vblanks ({hz:.3} Hz measured)");
-                    }
+            Some(s) => {
+                if locked.is_none() {
                     crate::displayclock::LOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    locked_n = n;
-                    locked_step = step.max(1);
                     lock_target = 0;
                 }
-                lock_period = s.period * locked_step;
-                // (At the start, or behind by two steps or more: the display's next vblank.)
-                if lock_target == 0 || lock_target + 2 * locked_step as u64 <= s.count {
+                locked = Some(s.period);
+                // (At the start, or behind by two or more: the display's next vblank.)
+                if lock_target == 0 || lock_target + 2 <= s.count {
                     lock_target = s.count + 1;
                 }
                 next = s.last + s.period * lock_target.saturating_sub(s.count) as u32 + LOCK_DELAY;
             }
-            None if locked_n != 0 => {
-                crate::info!("vblank on its own timer again ({:.2} Hz)", 1.0 / period.as_secs_f64());
-                locked_n = 0;
-                locked_step = 0;
+            None if locked.is_some() => {
+                locked = None;
                 next = Instant::now() + period;
             }
             None => {}
         }
+        let grid = crate::gpu::tune::flip_grid() && !vrr;
+        // The frame limit off the grid: the least time between flips (the title's flip rate
+        // and `tune frame_cap` count there as on the timer's grid).
+        let limit_gap = |flip_rate: u32| -> Duration {
+            if uncapped {
+                return Duration::ZERO;
+            }
+            let cap = crate::gpu::tune::frame_cap();
+            let own = base * (flip_rate + 1);
+            if cap > 0 { own.max(Duration::from_secs_f64(1.0 / cap as f64)) } else { own }
+        };
         let now = Instant::now();
-        let wake = if grid { next } else { next.min(now + FLIP_TICK) };
-        if wake > now {
-            crate::thread::short_sleep(wake - now);
+        if grid {
+            if next > now {
+                crate::thread::short_sleep(next - now);
+            }
+        } else {
+            // Off the grid: a flip that waits ready is shown at its place on the limit's line
+            // (now, when that has passed); with none ready the thread sleeps to its next
+            // vblank or until one becomes ready (`FLIP_READY`).
+            let (ready, gap) = PORT.lock().as_ref().map_or((false, Duration::ZERO), |p| (p.pending.front().is_some_and(|f| f.ready), limit_gap(p.flip_rate)));
+            let line = last_flip + gap;
+            if ready {
+                let wake = next.min(line);
+                if wake > now {
+                    crate::thread::short_sleep(wake - now);
+                }
+            } else if next > now {
+                crate::thread::sleep_or_wake(next - now, &FLIP_READY);
+            }
         }
         let now = Instant::now();
         let tick = now >= next;
+        // The tick's own time: the flip shown at it counts from there, not from this wake. A
+        // thread woken a grid step or more late (held up by the presenter) is at a later
+        // tick's time: on the display's grid the one whose next vblank shows what is
+        // presented now.
+        let tick_at = {
+            let step = locked.unwrap_or(period);
+            let late = now.saturating_duration_since(next) + if locked.is_some() { LOCK_DELAY } else { Duration::ZERO };
+            next + step * (late.as_secs_f64() / step.as_secs_f64()) as u32
+        };
         if tick {
-            if locked_n != 0 {
-                lock_target += locked_step as u64;
+            ticked = true;
+            if locked.is_some() {
+                lock_target += 1;
                 // (Recomputed from the display's vblanks at the next pass.)
                 next = now + period;
             } else {
                 next += period;
-            }
-            // Uncapped, a vblank thread held up (the presenter waiting for the display) skips
-            // the vblanks it missed instead of ticking them in a burst.
-            if period == uncapped_period && next < now {
-                next = now + period;
+                // Uncapped, a thread held up (the presenter waiting for the display) skips
+                // the vblanks it missed instead of ticking them in a burst.
+                if uncapped && next < now {
+                    next = now + period;
+                }
             }
         }
         let mut show: Option<DisplayBuffer> = None;
@@ -247,25 +309,50 @@ fn vblank_thread() {
                 p.vblank_time = crate::hle::kernel::time::process_time_us();
                 p.vblank_tsc = unsafe { core::arch::x86_64::_rdtsc() };
             }
-            // (On the display's fine grid the title's flip rate counts 60 Hz vblanks: n of its.)
-            let (vperiod, per_vblank) = if locked_n != 0 { (lock_period, (locked_n / locked_step).max(1) as u64) } else { (period, 1) };
-            let mut interval = (p.flip_rate as u64 + 1) * per_vblank;
-            // A frame cap (`tune frame_cap`): at least 1/cap between flips,
-            // on the grid the whole number of vblanks that keeps under it.
             let cap = crate::gpu::tune::frame_cap();
-            let min_gap = if cap > 0 { Duration::from_secs_f64(1.0 / cap as f64) } else { Duration::ZERO };
-            if cap > 0 {
-                interval = interval.max((min_gap.as_secs_f64() / vperiod.as_secs_f64() - 0.01).ceil().max(1.0) as u64);
-            }
-            if cap != last_cap {
+            // The frame limit in frames a second (None: uncapped): the title's own flip rate
+            // (every vblank of its 59.94 Hz, or every second or third), `tune frame_cap` under it.
+            let limit_fps: Option<f64> = (!uncapped).then(|| {
+                let own = 1.0 / (base * (p.flip_rate + 1)).as_secs_f64();
+                if cap > 0 { own.min(cap as f64) } else { own }
+            });
+            // Flips apart in ticks on a grid, and the time between flips the limit asks for.
+            let (interval, pace): (u64, Duration) = match locked {
+                Some(display) if grid => {
+                    let n = crate::displayclock::forced_refreshes().unwrap_or_else(|| limit_fps.map_or(1, |f| crate::displayclock::refreshes_for(1.0 / display.as_secs_f64(), f))) as u64;
+                    (n, display * n as u32)
+                }
+                _ if !grid => (1, limit_gap(p.flip_rate)),
+                _ => {
+                    // The thread's own timer: the title's flip rate in its vblanks, and under
+                    // a frame cap the whole number of them that keeps under it.
+                    let mut interval = p.flip_rate as u64 + 1;
+                    let min_gap = if cap > 0 { Duration::from_secs_f64(1.0 / cap as f64) } else { Duration::ZERO };
+                    if cap > 0 {
+                        interval = interval.max((min_gap.as_secs_f64() / period.as_secs_f64() - 0.01).ceil().max(1.0) as u64);
+                    }
+                    (interval, if uncapped || hz.is_some() { Duration::ZERO } else { period * interval as u32 })
+                }
+            };
+            // (The limit's time to the tenth of a millisecond: a display's measured period wanders.)
+            let kind = (if !grid { 3 } else if locked.is_some() { 2 } else { 1 }, if locked.is_some() && grid { interval as u32 } else { 0 }, (pace.as_micros() as u64 + 50) / 100);
+            if kind != logged || cap != last_cap {
+                logged = kind;
                 last_cap = cap;
-                crate::info!("frame cap {} (`tune frame_cap`): flips at least {interval} vblank(s) apart", if cap > 0 { format!("{cap} fps") } else { "off".into() });
+                crate::displayclock::FLIPS_APART.store(kind.1, std::sync::atomic::Ordering::Relaxed);
+                let limit = limit_fps.map_or("uncapped".to_string(), |f| format!("a limit of {f:.2} frames a second"));
+                match (kind.0, locked) {
+                    (2, Some(display)) => {
+                        let rhz = 1.0 / display.as_secs_f64();
+                        crate::info!("pacing: the display's grid ({rhz:.3} Hz measured): the title's vblank at each of its vblanks, flips at least {interval} apart ({:.2} frames a second at most; {limit})", rhz / interval as f64);
+                    }
+                    (3, _) => crate::info!("pacing: off the grid ({}): a ready frame is shown {}; the title's vblank on its own {:.2} Hz timer", if vrr { "variable refresh" } else { "`tune flip_grid` 0" }, if pace.is_zero() { "at once".to_string() } else { format!("{:.3} ms after the last at the earliest ({limit})", pace.as_secs_f64() * 1e3) }, 1.0 / period.as_secs_f64()),
+                    _ => crate::info!("pacing: the vblank thread's own {:.2} Hz timer: flips at least {interval} vblank(s) apart ({limit}{})", 1.0 / period.as_secs_f64(), if cap > 0 { format!(", `tune frame_cap` {cap}") } else { String::new() }),
+                }
             }
-            // On the grid: at a vblank, `interval` vblanks after the last
-            // flip. Off it: once `interval` vblank periods (and 1/cap) have
-            // passed since the last flip (half a millisecond early is close
-            // enough).
-            let due = if grid { tick && p.vblanks - p.last_flip_vblank >= interval } else { now.duration_since(last_flip) + Duration::from_micros(500) >= (vperiod * interval as u32).max(min_gap) };
+            // On a grid: at a tick, `interval` ticks after the last flip. Off it: once the
+            // limit's time has passed since the last flip's place on the line.
+            let due = if grid { tick && p.vblanks - p.last_flip_vblank >= interval } else { now + Duration::from_micros(50) >= last_flip + pace };
             if p.pending.front().is_some_and(|f| f.ready) && due {
                 let f = p.pending.pop_front().unwrap();
                 p.current = f.index;
@@ -280,7 +367,23 @@ fn vblank_thread() {
                     p.tsc = unsafe { core::arch::x86_64::_rdtsc() };
                 }
                 p.last_flip_vblank = p.vblanks;
-                last_flip = now;
+                // The flip's own time: the tick's on a grid; off it the next place on the
+                // limit's line while the frame is on time (within a millisecond), else now.
+                last_flip = if grid {
+                    tick_at
+                } else if !pace.is_zero() && now.saturating_duration_since(last_flip + pace) < Duration::from_millis(1) {
+                    last_flip + pace
+                } else {
+                    now
+                };
+                {
+                    let mut t = FLIP_TIMES.lock();
+                    t.push_back((p.count, last_flip));
+                    while t.len() > 256 {
+                        t.pop_front();
+                    }
+                }
+                PACE_NS.store(pace.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 if p.count <= 3 || p.count % 600 == 0 {
                     crate::info!("flip #{} -> buffer {} (arg {:#x})", p.count, f.index, f.arg);
                 }
@@ -339,6 +442,7 @@ pub fn submit_flip(handle: i32, index: i32, arg: i64) -> i32 {
         }
         p.pending.push_back(Flip { index, arg, submit_tsc: unsafe { core::arch::x86_64::_rdtsc() }, ready: true, ticket: 0 });
         QUEUED_FLIP.store(p.count as u64 + p.pending.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        FLIP_READY.wake();
         0
     })
     .unwrap_or_else(|e| e)
@@ -371,6 +475,7 @@ pub fn commit_flip(ticket: u64) {
     if let Some(p) = g.as_mut() {
         if let Some(f) = p.pending.iter_mut().find(|f| f.ticket == ticket) {
             f.ready = true;
+            FLIP_READY.wake();
         }
     }
 }

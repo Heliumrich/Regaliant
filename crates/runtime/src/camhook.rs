@@ -77,6 +77,8 @@ const AIM_PITCH_MAX: u64 = 0xD0;
 const AIM_PITCH_MIN: u64 = 0xD4;
 /// The aim's pitch rises for downward motion, as the free camera's.
 const AIM_PITCH_SIGN: f32 = 1.0;
+/// The gameplay camera's controller at its last update with free stick input.
+static LAST_CTL: AtomicU64 = AtomicU64::new(0);
 /// The controllers seen (the first few logged).
 static SEEN: parking_lot::Mutex<Vec<u64>> = parking_lot::Mutex::new(Vec::new());
 
@@ -96,6 +98,28 @@ pub fn live() -> bool {
     let t = LAST_MS.load(Ordering::Relaxed);
     let aim = AIM_MS.load(Ordering::Relaxed);
     READY.load(Ordering::Acquire) && ((FREE.load(Ordering::Relaxed) && t != 0 && now_ms().saturating_sub(t) < 250) || (aim != 0 && now_ms().saturating_sub(aim) < 250))
+}
+
+/// The player's position as the gameplay camera's controller keeps it (+0x90..+0x98; its
+/// last update with free stick input within 250 ms): for speed checks (`gamestep::walktest`).
+pub fn player_pos() -> Option<[f32; 3]> {
+    let ctl = LAST_CTL.load(Ordering::Relaxed);
+    let t = LAST_MS.load(Ordering::Relaxed);
+    if ctl == 0 || t == 0 || now_ms().saturating_sub(t) > 250 || !FREE.load(Ordering::Relaxed) {
+        return None;
+    }
+    Some([rdf(ctl + 0x90), rdf(ctl + 0x94), rdf(ctl + 0x98)])
+}
+
+/// The gameplay camera's yaw (radians; its last update with free stick input within 250 ms):
+/// for speed checks (`gamestep::turntest`).
+pub fn camera_yaw() -> Option<f32> {
+    let ctl = LAST_CTL.load(Ordering::Relaxed);
+    let t = LAST_MS.load(Ordering::Relaxed);
+    if ctl == 0 || t == 0 || now_ms().saturating_sub(t) > 250 || !FREE.load(Ordering::Relaxed) {
+        return None;
+    }
+    Some(rdf(ctl + YAW))
 }
 
 fn rd32(a: u64) -> u32 {
@@ -120,6 +144,7 @@ pub extern "sysv64" fn stick_hook(regs: *const u64, _arg: u32) {
         return;
     }
     STATS[1].fetch_add(1, Ordering::Relaxed);
+    LAST_CTL.store(ctl, Ordering::Relaxed);
     {
         let mut g = SEEN.lock();
         if !g.contains(&ctl) && g.len() < 16 {

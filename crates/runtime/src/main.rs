@@ -30,6 +30,7 @@ mod patch;
 mod pcsettings;
 mod jobidle;
 mod camhook;
+mod gamestep;
 mod dispmode;
 mod display;
 mod displayclock;
@@ -43,6 +44,7 @@ mod cpudraw;
 mod titlemem;
 mod textbox;
 mod uistate;
+mod vrr;
 mod tls;
 
 use std::path::{Path, PathBuf};
@@ -401,6 +403,42 @@ fn poll_control(path: &Path, offset: &mut u64) {
                         _ => Err(format!("bad hold '{h}'")),
                     },
                     h => input::press_now(names, h.and_then(|h| h.parse().ok()).unwrap_or(6)),
+                }
+            }
+            "gamestep" => {
+                // `gamestep`: the title's frame steps since the last report (game time against
+                // real time); `gamestep log <n>`: the last n, one a line.
+                match (parts.next(), parts.next().and_then(|v| v.parse::<usize>().ok())) {
+                    (Some("log"), n) => info!("gamestep log:\n{}", gamestep::log(n.unwrap_or(120))),
+                    _ => info!("{}", gamestep::report()),
+                }
+                Ok(())
+            }
+            "walktest" => {
+                // `walktest <x> <y> <ms> [name]`: the left stick held at a tilt, the player's
+                // speed over the hold's steady part logged (`gamestep::walktest`).
+                let x = parts.next().and_then(|v| v.parse::<i32>().ok());
+                let y = parts.next().and_then(|v| v.parse::<i32>().ok());
+                let ms = parts.next().and_then(|v| v.parse::<u64>().ok());
+                match (x, y, ms) {
+                    (Some(x), Some(y), Some(ms)) if (1000..=60_000).contains(&ms) => {
+                        gamestep::walktest(x, y, ms, parts.next().unwrap_or("-").to_string());
+                        Ok(())
+                    }
+                    _ => Err("usage: walktest <x> <y> <ms 1000..60000> [name]".into()),
+                }
+            }
+            "turntest" => {
+                // `turntest <x> <ms> [name]`: the right stick held sideways, the camera's turn
+                // over the hold's steady part logged (`gamestep::turntest`).
+                let x = parts.next().and_then(|v| v.parse::<i32>().ok());
+                let ms = parts.next().and_then(|v| v.parse::<u64>().ok());
+                match (x, ms) {
+                    (Some(x), Some(ms)) if (2000..=60_000).contains(&ms) => {
+                        gamestep::turntest(x, ms, parts.next().unwrap_or("-").to_string());
+                        Ok(())
+                    }
+                    _ => Err("usage: turntest <x> <ms 2000..60000> [name]".into()),
                 }
             }
             "pcset" => {

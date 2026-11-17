@@ -356,6 +356,65 @@ pub fn short_sleep(d: std::time::Duration) {
     }
 }
 
+/// An event a waiting thread can be woken with before its time (`sleep_or_wake`): auto-reset,
+/// kept for the process's life.
+pub struct Waker(isize);
+
+impl Waker {
+    pub fn new() -> Waker {
+        use windows_sys::Win32::System::Threading::CreateEventW;
+        Waker(unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) } as isize)
+    }
+
+    /// Ends the waiting thread's sleep (or its next one).
+    pub fn wake(&self) {
+        if self.0 != 0 {
+            unsafe { windows_sys::Win32::System::Threading::SetEvent(self.0 as _) };
+        }
+    }
+}
+
+/// Sleeps about `d` on the calling thread's high-resolution timer as `short_sleep` does, or
+/// until `waker` is woken; true when woken. (Without the timer or the event: `short_sleep`.)
+pub fn sleep_or_wake(d: std::time::Duration, waker: &Waker) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::Threading::{CancelWaitableTimer, CreateWaitableTimerExW, SetWaitableTimer, WaitForMultipleObjects, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE, TIMER_ALL_ACCESS};
+    struct Timer(HANDLE);
+    impl Drop for Timer {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
+    thread_local! {
+        static TIMER: Timer = Timer(unsafe { CreateWaitableTimerExW(std::ptr::null(), std::ptr::null(), CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS) });
+    }
+    if waker.0 == 0 || d.is_zero() {
+        short_sleep(d);
+        return false;
+    }
+    let due = -((d.as_nanos() / 100).clamp(1, i64::MAX as u128) as i64);
+    let r = TIMER.try_with(|t| {
+        if t.0.is_null() || unsafe { SetWaitableTimer(t.0, &due, 0, None, std::ptr::null(), 0) } == 0 {
+            return None;
+        }
+        let handles = [waker.0 as HANDLE, t.0];
+        let r = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
+        if r == 0 {
+            unsafe { CancelWaitableTimer(t.0) };
+        }
+        Some(r == 0)
+    });
+    match r {
+        Ok(Some(woken)) => woken,
+        _ => {
+            short_sleep(d);
+            false
+        }
+    }
+}
+
 pub fn spawn_host(name: &str, stack_size: usize, f: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
     use windows_sys::Win32::System::Threading::{CreateThread, SetThreadDescription};
     unsafe extern "system" fn proc_(param: *mut std::ffi::c_void) -> u32 {

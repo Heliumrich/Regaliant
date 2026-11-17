@@ -626,6 +626,31 @@ const FIXES: &[Fix] = &[
         why: "the port lists the models the CPU draw path takes whole",
         only_with: Some("DS_CPUDRAW_CENSUS"),
     },
+    // A per-frame simulation stepped by 1/the display's refresh rate whatever the frame took
+    // (eboot+0xe6f180: `vdivss xmm0,xmm0,[rax+28h]` at +0xe6f1f4, then `mov rax,[rbx+0F8h]`):
+    // its step from the port (`gamestep::fixed_step_code`: the game's step, at most the
+    // title's 1/59.94 s), so that it keeps its speed above 60 frames a second.
+    Fix {
+        name: "a per-frame simulation keeps its speed above 60 fps",
+        offset: 0xe6f1f9,
+        from: (7, 0x108842cc7285899d),
+        change: Change::Insert { at: 0, code: crate::gamestep::fixed_step_code },
+        kind: "PC frame rates, `tune pace_step`",
+        why: "it steps by 1/59.94 s every frame, so twice as fast at 120 frames a second",
+        only_with: None,
+    },
+    // The frame step (`gamestep`): after the application's per-frame call of it returned
+    // (eboot+0xb27f77 calls eboot+0xb280e0; `mov rax,[rbx+28E8h]`, rbx the application
+    // object, its timer at +0x28F0).
+    Fix {
+        name: "the frame step follows the frames shown",
+        offset: 0xb27f7c,
+        from: (7, 0x6aae3b529a211d65),
+        change: Change::Hook { at: 0, handler: crate::gamestep::after_step },
+        kind: "PC frame rates, `tune pace`",
+        why: "the title steps the game by 1/59.94 s at least and in halves of it, whatever the frames' real spacing",
+        only_with: None,
+    },
 ];
 
 /// Whether the fix of this name was applied.
@@ -659,6 +684,7 @@ pub fn apply(p: &mut crate::patch::Patcher, ranges: &[(u64, u64)]) {
     }
     crate::dispmode::init();
     crate::pcsettings::convar::init(p.base, p.image);
+    crate::gamestep::init(p.base);
     for (i, f) in FIXES.iter().enumerate() {
         let unmet = |n: &str| match n.strip_prefix('!') {
             Some(x) => std::env::var_os(x).is_some(),
@@ -703,5 +729,5 @@ pub fn status() -> String {
         .map(|(i, f)| format!("'{}' ran {} times", f.name, RUNS[i].load(Ordering::Relaxed)))
         .collect();
     let fixes = if runs.is_empty() { String::new() } else { format!("    title fixes: {}\n", runs.join(", ")) };
-    fixes + &crate::cullread::status() + &crate::cpudraw::status() + &crate::jobidle::status() + &crate::camhook::status() + &crate::dispmode::status() + &crate::pcsettings::store::status()
+    fixes + &crate::cullread::status() + &crate::cpudraw::status() + &crate::jobidle::status() + &crate::gamestep::status() + &crate::camhook::status() + &crate::dispmode::status() + &crate::pcsettings::store::status()
 }

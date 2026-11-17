@@ -62,9 +62,11 @@ pub fn wanted_mode(device: &str) -> Option<Mode> {
     }
     let rate = if hz != 0 {
         at.iter().min_by_key(|m| (m.hz as i64 - hz as i64).abs()).map(|m| m.hz)
-    } else if let Some(r) = paced_rate(&at) {
-        // (Automatic with the frame rate limited (60 or 30): a rate that shows each frame for
-        // the same number of refreshes, which the vblank then follows (`displayclock`).)
+    } else if let Some(r) = paced_rate(&at).filter(|_| crate::vrr::possible_on(device) != Some(true)) {
+        // (Automatic with the frame rate limited (60 or 30) on a fixed-refresh screen: a rate
+        // that makes the limit a whole number of refreshes, which the vblank then follows
+        // (`displayclock`). A variable-refresh screen keeps its own rate: it shows each frame
+        // as it comes at any rate.)
         Some(r)
     } else if (w, h) == (desk.w, desk.h) {
         Some(desk.hz)
@@ -77,9 +79,10 @@ pub fn wanted_mode(device: &str) -> Option<Mode> {
 
 /// Automatic refresh with the frame rate limited (the PC tab's 60 or 30 FPS, not Uncapped): the
 /// highest of the rates `at` that is a whole multiple of 60 Hz (59, 60, 119, 120, 239, 240:
-/// within 2%), so every frame is shown the same number of refreshes; None when there is none
-/// (or uncapped: the highest rate serves). On a 165 Hz screen 60 fps frames alternate 2 and 3
-/// refreshes (the user, 2026-11-15: "near 60 it didn't feel all that smooth"); at 120 each is 2.
+/// within 2%), so the limit is a whole number of refreshes and the game runs at a true 60;
+/// None when there is none (or uncapped: the highest rate serves). At a rate that is no
+/// multiple (165 Hz) the limit's frames are three refreshes each: an even 55 a second
+/// (`displayclock::refreshes_for`).
 fn paced_rate(at: &[Mode]) -> Option<u32> {
     if crate::gpu::tune::uncapped() {
         return None;

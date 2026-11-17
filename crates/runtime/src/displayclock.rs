@@ -6,13 +6,16 @@
 //! The title flips at every emulated vblank. A timer at 59.94 Hz cannot be even on a 165 Hz
 //! screen (its frames are shown alternately 2 and 3 refreshes: 12 and 18 ms, a judder at a
 //! steady 60 fps; the user, 2026-11-15: "near 60 it didn't feel all that smooth"), and against
-//! a 120 Hz screen it drifts (a frame shown three refreshes every ~9 s). Ticked at every Nth
-//! real vblank where the refresh is N times ~60 Hz (`lock`), each frame stays N refreshes.
+//! a 120 Hz screen it drifts (a frame shown three refreshes every ~9 s). So at every refresh
+//! rate the title's vblank ticks at each of the display's own (`lock`), and the frame limit
+//! is a whole number of them between flips (`refreshes_for`): every frame at the limit stays
+//! that many refreshes, and a frame done late is shown one refresh later, not a whole frame.
 //!
 //! On a variable-refresh screen (G-Sync, FreeSync) the vblanks follow the frames presented, so
-//! a lock would feed back on itself: refresh intervals well above the mode's period mark it
-//! (`vrr`), and the vblank keeps its own timer there (the screen then shows each frame as it
-//! comes, which is even by itself).
+//! a lock would feed back on itself: `vrr::active` (the driver's word where there is one, else
+//! refresh intervals well above the mode's period here, `vrr_seen`) keeps the lock off, and
+//! the frame limit is the vblank thread's own timer there (the screen shows each frame as it
+//! comes).
 
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
@@ -89,50 +92,98 @@ pub fn snapshot() -> Option<Snap> {
     STATE.lock().as_ref().and_then(|s| s.snap)
 }
 
-/// The lock: the display's vblanks a 60 Hz frame spans (`n`, the flips' least distance) and how
-/// many of them the title's vblank ticks at (`step`), with the clock's state. Where the refresh
-/// is a whole multiple of ~60 Hz (within 1%: 59.94 to 60.5 Hz a step) the vblank ticks at each
-/// of the display's (`step` 1, the fine grid): at 120 Hz a frame done late shows after 25 ms
-/// instead of 33 (2 and 3 refreshes rather than 2 and 4), one of 17-25 ms keeps 40 fps instead
-/// of 30. None where the refresh is no such multiple, the clock has no second of vblanks yet, or
-/// variable refresh is suspected. Diagnosis: `DS_VBLANK_LOCK=<n>` ticks at every nth vblank
-/// whatever the rate (3 on a 165 Hz screen: 55 Hz), `=f<n>` at each with flips n apart (`f3` at
-/// 165 Hz: 55 fps on its finer grid), `=0` never; `DS_VBLANK_FINE=0` ticks every nth (the coarse
-/// lock) where the fine one would.
-pub fn lock() -> Option<(u32, u32, Snap)> {
-    // (Forced: Some((n, fine)); n 0: never.)
-    static FORCED: std::sync::OnceLock<Option<(u32, bool)>> = std::sync::OnceLock::new();
-    let forced = *FORCED.get_or_init(|| {
-        let v = std::env::var("DS_VBLANK_LOCK").ok()?;
-        match v.strip_prefix('f') {
-            Some(n) => n.parse::<u32>().ok().map(|n| (n, true)),
-            None => v.parse::<u32>().ok().map(|n| (n, false)),
-        }
-    });
-    if forced.is_some_and(|f| f.0 == 0) {
+/// The lock: the display's vblanks as last seen, for the title's vblank to tick at each of
+/// them, when the clock has a second of them at the mode's own period (a gap or a stretched
+/// refresh is not a lock's) and variable refresh has not been seen here. Diagnosis:
+/// `DS_VBLANK_LOCK=0` never locks; `=<n>` forces flips n refreshes apart whatever the limit
+/// (`forced_refreshes`).
+pub fn lock() -> Option<Snap> {
+    if forced().is_some_and(|n| n == 0) {
         return None;
     }
     let s = snapshot()?;
-    if VRR_UNTIL.lock().is_some_and(|t| Instant::now() < t) {
+    if vrr_seen() {
         return None;
     }
     let hz = 1.0 / s.period.as_secs_f64();
-    // (The measured period must be the mode's: a gap or a stretched refresh is not a lock's.)
     if s.mode_hz > 0 && (hz / s.mode_hz as f64 - 1.0).abs() > 0.02 {
         return None;
     }
-    if let Some((n, fine)) = forced {
-        return Some((n, if fine { 1 } else { n }, s));
-    }
-    static FINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let fine = *FINE.get_or_init(|| std::env::var("DS_VBLANK_FINE").ok().as_deref() != Some("0"));
-    let n = (hz / 59.94).round();
-    let per = hz / n;
-    (n >= 1.0 && n <= 8.0 && (59.94 * 0.999..=60.5).contains(&per)).then_some((n as u32, if fine { 1 } else { n as u32 }, s))
+    Some(s)
 }
 
+fn forced() -> Option<u32> {
+    static FORCED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *FORCED.get_or_init(|| std::env::var("DS_VBLANK_LOCK").ok().and_then(|v| v.trim_start_matches('f').parse::<u32>().ok()))
+}
+
+/// `DS_VBLANK_LOCK=<n>` (diagnosis): flips this many refreshes apart on the display's grid.
+pub fn forced_refreshes() -> Option<u32> {
+    forced().filter(|&n| n > 0)
+}
+
+/// Whether refreshes that follow the presents were seen lately (`note`): variable refresh, by
+/// the display's own evidence (`vrr::active` asks the driver first).
+pub fn vrr_seen() -> bool {
+    VRR_UNTIL.lock().is_some_and(|t| Instant::now() < t)
+}
+
+/// How many of a display's refreshes a frame is shown for under a frame limit: the fewest
+/// that keep the rate at or under the limit (5% over counts as at it: 60 fps on a 60.0 or a
+/// 62 Hz screen is every refresh). 60 fps: 1 at 60 Hz, 2 at 120, 3 at 144 (48 fps) and 165
+/// (55 fps), 4 at 240; no whole number of refreshes makes 60 where the rate is no multiple of
+/// it, and an uneven mix of them is what the limit is there to avoid.
+pub fn refreshes_for(display_hz: f64, limit_fps: f64) -> u32 {
+    if !(display_hz > 0.0 && limit_fps > 0.0) {
+        return 1;
+    }
+    let n = ((display_hz / limit_fps * 0.95).ceil() as u32).clamp(1, 16);
+    // (Where that loses more than three frames in ten, 60 on a 72 or 75 Hz screen: every
+    // refresh instead.)
+    if n > 1 && display_hz / (n as f64) < limit_fps * 0.7 { n - 1 } else { n }
+}
+
+/// The refreshes between flips the vblank thread keeps now (0: its own timer), for the status.
+pub static FLIPS_APART: AtomicU32 = AtomicU32::new(0);
+
 fn monitor_hz(device: &str) -> u32 {
+    if device == SIM_DEVICE {
+        return sim_hz().map_or(0, |h| h.round() as u32);
+    }
     crate::display::current_mode(device).map_or(0, |m| m.hz)
+}
+
+/// `DS_DISPLAY_SIM=<hz>` (tests, 24 to 500): the display's vblanks come from a timer at this
+/// rate instead of a monitor's, also in runs without a window, so that the pacing on a
+/// display's grid (the lock, the refreshes per frame, the game's step) runs at any refresh
+/// rate where no such screen is at hand or the screen is off. What a real screen adds (the
+/// swapchain's and the compositor's timing) is not in it.
+pub fn sim_hz() -> Option<f64> {
+    static SIM: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    *SIM.get_or_init(|| std::env::var("DS_DISPLAY_SIM").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|h| (24.0..=500.0).contains(h)))
+}
+
+const SIM_DEVICE: &str = "simulated display";
+
+/// The simulated display's vblanks: each at its own time on the timer's line.
+fn run_sim(hz: f64) {
+    crate::info!("display clock: a simulated {hz} Hz display (DS_DISPLAY_SIM): its vblanks from a timer");
+    *STATE.lock() = Some(State { device: SIM_DEVICE.into(), snap: None, times: Default::default(), count: 0 });
+    let period = Duration::from_secs_f64(1.0 / hz);
+    let start = Instant::now();
+    let mut k: u32 = 1;
+    loop {
+        let at = start + period * k;
+        let now = Instant::now();
+        if at > now {
+            crate::thread::short_sleep(at - now);
+        }
+        // (Woken late by a period or more: the moment itself, and `note` counts the vblanks
+        // missed.)
+        let woke = Instant::now();
+        note(SIM_DEVICE, if woke.saturating_duration_since(at) < period { at } else { woke });
+        k = ((woke.saturating_duration_since(start).as_secs_f64() * hz) as u32 + 1).max(k + 1);
+    }
 }
 
 fn run() {
@@ -142,8 +193,14 @@ fn run() {
         use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL};
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     }
+    if let Some(hz) = sim_hz() {
+        run_sim(hz);
+    }
     let mut opened: Option<(String, u32, u32)> = None; // device, adapter, source
     let mut failures = 0u32;
+    // Waits that failed in a row (a screen that is off or taken by another program's exclusive
+    // fullscreen has no vblanks to wait for: tried again every two seconds, said once).
+    let mut wait_failures = 0u32;
     loop {
         let want = crate::gpu::vk::window::current_monitor().map(|(_, d)| d);
         let Some(device) = want else {
@@ -175,7 +232,9 @@ fn run() {
                 std::thread::sleep(Duration::from_secs(2));
                 continue;
             }
-            crate::info!("display clock: following {device}'s vblanks ({} Hz mode)", monitor_hz(&device));
+            if wait_failures == 0 {
+                crate::info!("display clock: following {device}'s vblanks ({} Hz mode)", monitor_hz(&device));
+            }
             opened = Some((device.clone(), oa.h_adapter, oa.vidpn_source_id));
             *STATE.lock() = Some(State { device: device.clone(), snap: None, times: Default::default(), count: 0 });
         }
@@ -184,13 +243,24 @@ fn run() {
         let r = unsafe { D3DKMTWaitForVerticalBlankEvent(&w) };
         let now = Instant::now();
         if r != 0 {
-            // (The adapter changed or was lost: opened again.)
+            // The adapter changed or was lost, or the screen shows nothing of the desktop's
+            // (0xC01E0006, "present occluded": the monitor is off, or another program holds it
+            // in exclusive fullscreen): opened again, at once the first time, then every two
+            // seconds. The title's vblank keeps its own timer meanwhile.
+            wait_failures += 1;
+            if wait_failures == 2 {
+                crate::info!("display clock: {device}'s vblanks cannot be waited for (status {r:#x}{}): the title's vblank keeps its own timer; tried again every two seconds", if r as u32 == 0xC01E_0006 { ", the screen is off or held by another program" } else { "" });
+            }
             unsafe { D3DKMTCloseAdapter(&CloseAdapter { h_adapter: adapter }) };
             opened = None;
             *STATE.lock() = None;
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(Duration::from_millis(if wait_failures > 1 { 2000 } else { 200 }));
             continue;
         }
+        if wait_failures > 1 {
+            crate::info!("display clock: following {device}'s vblanks again");
+        }
+        wait_failures = 0;
         note(&device, now);
     }
 }
@@ -286,17 +356,16 @@ pub fn window_clause() -> String {
     let total: u64 = c.iter().sum();
     let Some(s) = snapshot().filter(|_| total > 0) else { return String::new() };
     let parts: Vec<String> = c.iter().enumerate().filter(|(_, n)| **n > 0).map(|(i, n)| format!("{}{}:{n}", i, if i == 8 { "+" } else { "" })).collect();
-    format!("; display refreshes between presents ({:.0} Hz, {}): {}", 1.0 / s.period.as_secs_f64(), match lock() {
-        Some((n, step, _)) if step < n => format!("locked each, flips {n} apart"),
-        Some((n, _, _)) => format!("locked every {n}"),
-        None => "timer".into(),
+    format!("; display refreshes between presents ({:.0} Hz, {}): {}", 1.0 / s.period.as_secs_f64(), match FLIPS_APART.load(Relaxed) {
+        0 => "timer".into(),
+        n => format!("locked each, flips {n} apart"),
     }, parts.join(" "))
 }
 
 /// Status: the clock's display and rate, the lock's state, the presents' cadence.
 pub fn status_line() -> String {
-    let Some(s) = snapshot() else { return String::new() };
-    let lock = lock();
+    let Some(s) = snapshot() else { return crate::vrr::status_line() };
+    let apart = FLIPS_APART.load(Relaxed);
     let cadence = {
         let c = CADENCE.lock();
         let total: u64 = c.0.iter().sum();
@@ -312,13 +381,30 @@ pub fn status_line() -> String {
         1.0 / s.period.as_secs_f64(),
         s.mode_hz,
         s.count,
-        match lock {
-            Some((n, step, _)) if step < n => format!("ticks at each of them, flips at least {n} apart"),
-            Some((n, _, _)) => format!("ticks at every {n} of them"),
-            None if std::env::var("DS_VBLANK_LOCK").ok().as_deref() == Some("0") => "keeps its own timer (DS_VBLANK_LOCK=0)".into(),
-            None => "keeps its own timer (the refresh is no whole multiple of ~60 Hz, or varies)".into(),
+        match apart {
+            0 if std::env::var("DS_VBLANK_LOCK").ok().as_deref() == Some("0") => "keeps its own timer (DS_VBLANK_LOCK=0)".into(),
+            0 => "keeps its own timer (variable refresh, a diagnosis rate, or no steady second of vblanks yet)".into(),
+            n => format!("ticks at each of them, flips at least {n} apart ({:.2} frames a second at most)", 1.0 / s.period.as_secs_f64() / n as f64),
         },
         if VRR_LOGGED.load(Relaxed) { "; variable refresh or stalls seen" } else { "" },
         cadence
-    )
+    ) + &crate::vrr::status_line()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::refreshes_for;
+
+    #[test]
+    fn a_frame_limit_is_a_whole_number_of_refreshes() {
+        let n60 = |hz: f64| refreshes_for(hz, 59.94);
+        // (Multiples of 60, as Windows' modes measure: 59.94 to 60.5 a step.)
+        assert_eq!([n60(59.94), n60(60.0), n60(60.5), n60(119.88), n60(120.0), n60(239.76), n60(240.0), n60(360.0)], [1, 1, 1, 2, 2, 4, 4, 6]);
+        // No multiple: the fewest refreshes at or under the limit (48, 55 and 50 fps).
+        assert_eq!([n60(144.0), n60(165.0), n60(100.0)], [3, 3, 2]);
+        // 72 and 75 Hz: every refresh rather than 36 or 37.5 fps.
+        assert_eq!([n60(72.0), n60(75.0), n60(50.0)], [1, 1, 1]);
+        let n30 = |hz: f64| refreshes_for(hz, 29.97);
+        assert_eq!([n30(60.0), n30(120.0), n30(144.0), n30(165.0), n30(240.0)], [2, 4, 5, 6, 8]);
+    }
 }
