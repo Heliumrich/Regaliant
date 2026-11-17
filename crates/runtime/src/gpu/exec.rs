@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod draw;
-pub(crate) use draw::{color_surface, depth_surface, set_equal_bias, toggle_skip_vs};
+pub(crate) use draw::{color_surface, depth_surface, pass_key, set_equal_bias, toggle_skip_vs};
 
 /// Dispatches of compute shaders on this list are skipped (`skipcs` control
 /// command; diagnosis).
@@ -9250,7 +9250,7 @@ thread_local! {
 
 impl Exec {
     /// This executor's census class.
-    fn prog_class(&self) -> u8 {
+    pub(super) fn prog_class(&self) -> u8 {
         if self.deferred {
             if self.name.starts_with("gpu-gfx") {
                 1
@@ -9271,8 +9271,8 @@ impl Exec {
 
 /// Draws by pass (with the program census): per (executor class, depth target, the targets'
 /// sizes and colour slots as `draw::pass_key` packs them, kind: 0 a draw that ended early,
-/// 1 a full draw, 2 a buffer-delta draw) the draws and their time; flushed and cleared with
-/// the program census.
+/// 1 a full draw, 2 a buffer-delta draw, 3 a repeat of the draw before, `Cp::draw_cpu_args_base`)
+/// the draws and their time; flushed and cleared with the program census.
 #[allow(clippy::type_complexity)]
 static PASS_CENSUS: Mutex<Option<HashMap<(u8, u64, u64, u8), [u64; 2]>>> = Mutex::new(None);
 
@@ -9317,10 +9317,10 @@ fn pass_census_lines() -> String {
     let mut out = String::new();
     for (c, name) in ["graphics CP", "the graphics CP's workers"].iter().enumerate() {
         // (pass) -> per kind [draws, ns]
-        let mut by: HashMap<(u64, u64), [[u64; 2]; 3]> = HashMap::new();
+        let mut by: HashMap<(u64, u64), [[u64; 2]; 4]> = HashMap::new();
         for ((class, depth, key, kind), x) in m.iter() {
             if *class == c as u8 {
-                let e = &mut by.entry((*depth, *key)).or_default()[(*kind as usize).min(2)];
+                let e = &mut by.entry((*depth, *key)).or_default()[(*kind as usize).min(3)];
                 e[0] += x[0];
                 e[1] += x[1];
             }
@@ -9328,7 +9328,7 @@ fn pass_census_lines() -> String {
         if by.is_empty() {
             continue;
         }
-        let mut v: Vec<(&(u64, u64), &[[u64; 2]; 3])> = by.iter().collect();
+        let mut v: Vec<(&(u64, u64), &[[u64; 2]; 4])> = by.iter().collect();
         v.sort_by_key(|x| std::cmp::Reverse(x.1.iter().map(|k| k[1]).sum::<u64>()));
         let all_n: u64 = v.iter().map(|x| x.1.iter().map(|k| k[0]).sum::<u64>()).sum();
         let all_ns: u64 = v.iter().map(|x| x.1.iter().map(|k| k[1]).sum::<u64>()).sum();
@@ -9343,7 +9343,7 @@ fn pass_census_lines() -> String {
                     (false, _) => format!("{n} colour ({cw}x{ch}), no depth"),
                 };
                 let part = |x: &[u64; 2]| format!("{:.0}/flip at {:.1} us ({:.2} ms)", x[0] as f64 / flips, x[1] as f64 / x[0].max(1) as f64 / 1e3, x[1] as f64 / flips / 1e6);
-                format!("{target}: buffer-delta {}, full {}, ended early {}", part(&k[2]), part(&k[1]), part(&k[0]))
+                format!("{target}: repeats {}, buffer-delta {}, full {}, ended early {}", part(&k[3]), part(&k[2]), part(&k[1]), part(&k[0]))
             })
             .collect();
         out.push_str(&format!("    draws by pass, {name}: {:.0} a flip, {:.2} ms a flip ({} passes): {}\n", all_n as f64 / flips, all_ns as f64 / flips / 1e6, v.len(), top.join("; ")));

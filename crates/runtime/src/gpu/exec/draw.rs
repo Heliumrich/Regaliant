@@ -677,7 +677,7 @@ pub(crate) fn color_surface(cp: &Cp, n: u32) -> Result<Option<Surface>, String> 
 /// and, packed, the depth target's size (bits 0-27), the first bound colour slot's size (bits
 /// 28-55) and the colour slots bound (from bit 56; a slot counts by its format, as
 /// `color_surface` reads it).
-fn pass_key(cp: &Cp) -> (u64, u64) {
+pub(crate) fn pass_key(cp: &Cp) -> (u64, u64) {
     let (depth, d) = depth_surface(cp).map_or((0, 0), |s| (s.base, (s.width as u64) << 14 | s.height as u64));
     let (mut n, mut c0) = (0u64, 0u64);
     for i in 0..MAX_RT as u32 {

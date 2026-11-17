@@ -5511,8 +5511,13 @@ impl Cp {
         let index = (self.index_base + w[2] as u64 * sz as u64, sz);
         let laps = (!self.compute && super::tune::cp_classes()).then(Instant::now);
         if std::mem::take(&mut self.repeat_ok) && super::tune::draw_repeat() {
+            // (The pass census: a repeat's time by its pass, `exec::pass_note` kind 3.)
+            let census = super::exec::prog_census().then(|| (super::exec::pass_key(self), Instant::now()));
             if let Some(e) = self.exec.as_mut() {
                 if e.draw_repeat_cpu(index, w[0], w[1], w[3] as i32, w[4]) {
+                    if let Some(((depth, key), t)) = census {
+                        super::exec::pass_note(e.prog_class(), depth, key, 3, t.elapsed().as_nanos() as u64);
+                    }
                     // (Stage preparations made ahead for it are not used.)
                     let _ = self.take_ahead();
                     self.repeat_ok = true;
