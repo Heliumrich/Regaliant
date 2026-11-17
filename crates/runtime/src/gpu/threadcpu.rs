@@ -108,6 +108,99 @@ struct Window {
     splits: u64,
     /// The title's threads: host thread id -> (name, cycles) at the start.
     title: HashMap<u32, (String, u64)>,
+    /// Every thread's kernel time, user time and context switches at the
+    /// start (`thread_times`).
+    times: HashMap<u32, (u64, u64, u64)>,
+}
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtQuerySystemInformation(class: u32, buf: *mut core::ffi::c_void, len: u32, ret: *mut u32) -> i32;
+}
+
+/// Kernel time and user time (100 ns units; charged by the clock's ticks,
+/// so only sums over a window of seconds mean something) and context
+/// switches of this process's threads by host thread id, from the system's
+/// process list (SystemProcessInformation: x64 layouts, the process record's
+/// threads from +0x100, 0x50 bytes each). One call of a few ms: for the
+/// profile window's ends only.
+fn thread_times() -> HashMap<u32, (u64, u64, u64)> {
+    let mut out = HashMap::new();
+    let pid = std::process::id() as u64;
+    let mut buf: Vec<u64> = vec![0; 1 << 17];
+    for _ in 0..4 {
+        let mut need = 0u32;
+        let st = unsafe { NtQuerySystemInformation(5, buf.as_mut_ptr() as *mut _, (buf.len() * 8) as u32, &mut need) };
+        if st == 0 {
+            break;
+        }
+        // STATUS_INFO_LENGTH_MISMATCH: a larger buffer.
+        if st as u32 != 0xC000_0004 {
+            return out;
+        }
+        buf = vec![0; (need as usize / 8 + 1) * 2];
+    }
+    let base = buf.as_ptr() as *const u8;
+    let len = buf.len() * 8;
+    let rd32 = |o: usize| unsafe { (base.add(o) as *const u32).read_unaligned() };
+    let rd64 = |o: usize| unsafe { (base.add(o) as *const u64).read_unaligned() };
+    let mut at = 0usize;
+    loop {
+        if at + 0x100 > len {
+            break;
+        }
+        let (next, threads) = (rd32(at) as usize, rd32(at + 4) as usize);
+        if rd64(at + 0x50) == pid {
+            for k in 0..threads {
+                let t = at + 0x100 + k * 0x50;
+                if t + 0x50 > len {
+                    break;
+                }
+                out.insert(rd64(t + 0x30) as u32, (rd64(t), rd64(t + 8), rd32(t + 0x40) as u64));
+            }
+            break;
+        }
+        if next == 0 {
+            break;
+        }
+        at += next;
+    }
+    out
+}
+
+/// The window's kernel share and context switches by thread kind (`profile
+/// report`): tick-charged thread times, so shares, not exact ms.
+fn times_line(w: &Window, flips: u64) -> String {
+    let now = thread_times();
+    if now.is_empty() || w.times.is_empty() {
+        return String::new();
+    }
+    let delta = |tid: u32| {
+        let (a, b) = (now.get(&tid).copied().unwrap_or_default(), w.times.get(&tid).copied().unwrap_or_default());
+        (a.0.saturating_sub(b.0), a.1.saturating_sub(b.1), a.2.wrapping_sub(b.2) & 0xFFFF_FFFF)
+    };
+    let mut kinds: Vec<(String, [u64; 3])> = Vec::new();
+    let mut add = |name: &str, d: (u64, u64, u64)| match kinds.iter_mut().find(|x| x.0 == name) {
+        Some(x) => {
+            x.1[0] += d.0;
+            x.1[1] += d.1;
+            x.1[2] += d.2;
+        }
+        None => kinds.push((name.to_string(), [d.0, d.1, d.2])),
+    };
+    for (kind, tid) in super::cpu_threads() {
+        add(kind, delta(tid));
+    }
+    for (tid, (name, _)) in title_snapshot() {
+        let kind = if name.starts_with("BPE JobWorkerThread") { "title jobs" } else { "title others" };
+        add(kind, delta(tid));
+    }
+    let parts: Vec<String> = kinds
+        .iter()
+        .filter(|x| x.1[0] + x.1[1] > 0)
+        .map(|(k, d)| format!("{k} {:.1} of {:.1} ({:.0} switches)", d[0] as f64 / 1e4 / flips as f64, (d[0] + d[1]) as f64 / 1e4 / flips as f64, d[2] as f64 / flips as f64))
+        .collect();
+    format!("    kernel time of thread time and context switches in the window, per flip (times charged by clock ticks: shares, not exact ms): {}\n", parts.join(", "))
 }
 
 /// The title's live threads' cycles so far, by host thread id.
@@ -175,7 +268,7 @@ pub fn frames_detail_clause(flips: u64) -> String {
 
 /// Starts a profile window (`profile reset`).
 pub fn reset_window() {
-    let w = Window { at: Instant::now(), cycles: snapshot(), flips: super::FRAMES.load(Ordering::Relaxed), commands: commands(), splits: super::cp::SPLITS.load(Ordering::Relaxed), title: title_snapshot() };
+    let w = Window { at: Instant::now(), cycles: snapshot(), flips: super::FRAMES.load(Ordering::Relaxed), commands: commands(), splits: super::cp::SPLITS.load(Ordering::Relaxed), title: title_snapshot(), times: thread_times() };
     *WINDOW.lock() = Some(w);
 }
 
@@ -215,5 +308,5 @@ pub fn window_line() -> String {
         jobs.iter().sum::<f64>(),
         jobs.first().copied().unwrap_or(0.0),
         others.join(", ")
-    )
+    ) + &times_line(w, flips)
 }
