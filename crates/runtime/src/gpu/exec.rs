@@ -10888,7 +10888,8 @@ struct CsRun {
     /// `DS_JOIN_CENSUS=1`: the run's first command's preparation (what later commands'
     /// resources are compared with).
     first: Option<std::sync::Arc<shaders::Found>>,
-    /// `DS_JOIN_CENSUS=1`: the first command's user data (its roots' values).
+    /// `DS_JOIN_CENSUS=1`: the first command's SGPR data (its user data: the roots' values;
+    /// then its scalar loads' words).
     first_user: Vec<u32>,
 }
 
@@ -10906,13 +10907,31 @@ fn join_census_on() -> bool {
 /// pointers their descriptors come from) against the run's first command: roots equal and
 /// resolved the same, roots equal but resolved differently (what a run handled as data
 /// would get wrong), a root differing and resolved the same, a root differing and resolved
-/// differently, roots the analysis does not follow].
-static JOIN_CENSUS: Mutex<Option<HashMap<u64, [u64; 11]>>> = Mutex::new(None);
+/// differently, roots the analysis does not follow; then the scalar loads the same way by
+/// their words in the SGPR data: root equal and words the same, root equal but words
+/// differing, root differing and the same, root differing and differing, no root (the
+/// program's own data)].
+static JOIN_CENSUS: Mutex<Option<HashMap<u64, [u64; 16]>>> = Mutex::new(None);
 
-fn join_census(first: &shaders::Found, first_user: &[u32], p: &Prepared) {
-    let mut d = [1u64, 0, 0, 0, p.resources.len() as u64, 0, 0, 0, 0, 0, 0];
+fn join_census(first: &shaders::Found, first_sgpr: &[u32], p: &Prepared) {
+    let mut d = [1u64, 0, 0, 0, p.resources.len() as u64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     let users = (p.tr.spec.user_sgprs as usize).min(p.sgpr_data.len());
     let user = &p.sgpr_data[..users];
+    let first_user = &first_sgpr[..users.min(first_sgpr.len())];
+    for (l, o) in p.tr.plan.loads.iter().zip(rdna::translate::load_offsets(&p.tr.plan)) {
+        let (o, n) = (o as usize, l.dwords as usize);
+        let same = p.sgpr_data.get(o..o + n).is_some_and(|w| first_sgpr.get(o..o + n) == Some(w));
+        let slot = match super::gpures::root_of_ptr(&l.ptr) {
+            None => 15,
+            Some(r) => match (super::gpures::root_value(r, first_user) == super::gpures::root_value(r, user), same) {
+                (true, true) => 11,
+                (true, false) => 12,
+                (false, true) => 13,
+                (false, false) => 14,
+            },
+        };
+        d[slot] += 1;
+    }
     for (i, (a, b)) in first.resources.iter().zip(p.resources.iter()).enumerate() {
         let same = a == b;
         let roots = p.tr.plan.resources.get(i).and_then(super::gpures::res_roots);
@@ -10948,8 +10967,8 @@ fn join_census(first: &shaders::Found, first_user: &[u32], p: &Prepared) {
     }
     d[5] = plain as u64;
     let mut g = JOIN_CENSUS.lock();
-    let e = g.get_or_insert_with(HashMap::new).entry(p.addr).or_insert([0; 11]);
-    for k in 0..11 {
+    let e = g.get_or_insert_with(HashMap::new).entry(p.addr).or_insert([0; 16]);
+    for k in 0..16 {
         e[k] += d[k];
     }
 }
@@ -10957,7 +10976,7 @@ fn join_census(first: &shaders::Found, first_user: &[u32], p: &Prepared) {
 fn join_census_line() -> String {
     let g = JOIN_CENSUS.lock();
     let Some(m) = g.as_ref() else { return String::new() };
-    let mut v: Vec<(&u64, &[u64; 11])> = m.iter().collect();
+    let mut v: Vec<(&u64, &[u64; 16])> = m.iter().collect();
     v.sort_by(|a, b| b.1[0].cmp(&a.1[0]));
     let all: u64 = v.iter().map(|x| x.1[0]).sum();
     let plain: u64 = v.iter().map(|x| x.1[5]).sum();
@@ -10967,7 +10986,7 @@ fn join_census_line() -> String {
         .map(|(a, d)| {
             let n = d[0].max(1) as f64;
             format!(
-                "cs {a:#x} {} ({:.1} of {:.1} resources differ; written {:.2}, images or samplers {:.2}; only read-only buffers in {:.0}%; resources by roots: equal {} ({} of them resolved differently), a root differing {} ({} of them resolved the same), not followed {})",
+                "cs {a:#x} {} ({:.1} of {:.1} resources differ; written {:.2}, images or samplers {:.2}; only read-only buffers in {:.0}%; resources by roots: equal {} ({} of them resolved differently), a root differing {} ({} of them resolved the same), not followed {}; scalar loads by root: equal {} ({} of them with other words), differing {} ({} of them with the same words), without one {})",
                 d[0],
                 d[1] as f64 / n,
                 d[4] as f64 / n,
@@ -10978,7 +10997,12 @@ fn join_census_line() -> String {
                 d[7],
                 d[8] + d[9],
                 d[8],
-                d[10]
+                d[10],
+                d[11] + d[12],
+                d[12],
+                d[13] + d[14],
+                d[13],
+                d[15]
             )
         })
         .collect();
@@ -19471,7 +19495,7 @@ impl Exec {
                             None
                         };
                         let first = join_census_on().then(|| p.found.clone());
-                        let first_user = if join_census_on() { p.sgpr_data[..(p.tr.spec.user_sgprs as usize).min(p.sgpr_data.len())].to_vec() } else { Vec::new() };
+                        let first_user = if join_census_on() { p.sgpr_data.to_vec() } else { Vec::new() };
                         self.cs_run = Some(CsRun { batch: self.batch_count, uses: self.cmd_uses.get(), pipeline, descs: desc_signature(&bound), args, table, groups: groups[0], ring, window: wbase, gpu, first, first_user });
                         BATCHED[1].fetch_add(1, Ordering::Relaxed);
                     }
