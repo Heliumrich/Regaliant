@@ -525,10 +525,12 @@ sysv! {
         submit_flip(h, index, arg)
     }
     fn sceVideoOutIsFlipPending(h: i32) -> i32 {
+        let _c = crate::hle::waitcensus::scope(|| "flip pending poll".into(), 0);
         port(h, |p| p.pending.len() as i32).unwrap_or_else(|e| e)
     }
     fn sceVideoOutWaitVblank(h: i32) -> i32 {
         if h != 1 { return ERR_INVALID_HANDLE; }
+        let _c = crate::hle::waitcensus::scope(|| "wait vblank".into(), 0);
         let mut g = PORT.lock();
         let Some(start) = g.as_ref().map(|p| p.vblanks) else { return ERR_INVALID_HANDLE };
         while g.as_ref().is_some_and(|p| p.vblanks == start) {
@@ -538,6 +540,7 @@ sysv! {
     }
     fn sceVideoOutGetFlipStatus(h: i32, st: *mut u8) -> i32 {
         if st.is_null() { return ERR_INVALID_ADDRESS; }
+        let _c = crate::hle::waitcensus::scope(|| "flip status poll".into(), 0);
         port(h, |p| {
             std::ptr::write_bytes(st, 0, 0x88);
             *(st as *mut u64) = p.count;

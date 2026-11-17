@@ -935,6 +935,11 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 info!("status at flip {flip}:\n{}", thread_summary());
                 Ok(())
             }
+            "waits" => {
+                // `DS_WAIT_CENSUS=1`: the title's waits since the last report.
+                info!("waits at flip {flip}:\n{}", hle::waitcensus::report());
+                Ok(())
+            }
             "iostat" => {
                 info!("file traffic at flip {flip}:\n{}", hle::iostat::status());
                 Ok(())

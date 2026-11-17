@@ -77,6 +77,7 @@ impl Equeue {
         self.events.lock().iter().any(|x| x.ev.ident == ident && x.ev.filter == filter)
     }
     fn wait(&self, out: &mut [Kevent], deadline: Option<Instant>) -> usize {
+        let _c = crate::hle::waitcensus::scope(|| format!("equeue '{}'", self.name), deadline.map_or(0, |d| d.saturating_duration_since(Instant::now()).as_micros() as u64));
         let mut e = self.events.lock();
         let mut _w = None;
         loop {

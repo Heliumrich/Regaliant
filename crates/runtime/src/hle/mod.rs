@@ -6,6 +6,7 @@
 //! missing behavior is never hidden.
 
 pub mod iostat;
+pub mod waitcensus;
 pub mod kernel;
 pub mod libs;
 

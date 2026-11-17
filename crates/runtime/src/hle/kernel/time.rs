@@ -79,6 +79,7 @@ unsafe fn write_ts(ts: *mut i64, d: Duration) {
 }
 
 pub fn sleep_us(us: u64) {
+    let _c = crate::hle::waitcensus::scope(|| "usleep".into(), us);
     if us == 0 {
         std::thread::yield_now();
     } else {
@@ -160,6 +161,7 @@ sysv! {
     fn sceKernelSleep(s: u32) -> i32 { std::thread::sleep(Duration::from_secs(s as u64)); 0 }
     fn sceKernelNanosleep(req: *const i64, rem: *mut i64) -> i32 {
         if req.is_null() { return sce(EINVAL); }
+        let _c = crate::hle::waitcensus::scope(|| "nanosleep".into(), (*req).max(0) as u64 * 1_000_000 + (*req.add(1)).clamp(0, 999_999_999) as u64 / 1000);
         crate::thread::short_sleep(Duration::new((*req).max(0) as u64, (*req.add(1)).clamp(0, 999_999_999) as u32));
         if !rem.is_null() { *rem = 0; *rem.add(1) = 0; }
         0
@@ -202,6 +204,7 @@ sysv! {
     }
     fn nanosleep(req: *const i64, rem: *mut i64) -> i32 {
         if req.is_null() { super::set_errno(EINVAL); return -1; }
+        let _c = crate::hle::waitcensus::scope(|| "nanosleep".into(), (*req).max(0) as u64 * 1_000_000 + (*req.add(1)).clamp(0, 999_999_999) as u64 / 1000);
         crate::thread::short_sleep(Duration::new((*req).max(0) as u64, (*req.add(1)).clamp(0, 999_999_999) as u32));
         if !rem.is_null() { *rem = 0; *rem.add(1) = 0; }
         0

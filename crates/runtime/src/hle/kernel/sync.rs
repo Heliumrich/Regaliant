@@ -254,6 +254,7 @@ unsafe fn cond_from(slot: *mut u64) -> Result<&'static GCond, i32> {
 
 impl GCond {
     fn wait(&self, m: &GMutex, deadline: Option<Instant>) -> i32 {
+        let _c = crate::hle::waitcensus::scope(|| "cond".into(), deadline.map_or(0, |d| d.saturating_duration_since(Instant::now()).as_micros() as u64));
         let mut g = self.seq.lock();
         let start = *g;
         let count = match m.release_all() {
@@ -598,6 +599,7 @@ sysv! {
     fn sceKernelWaitSema(h: u64, need: i32, timeout: *mut u32) -> i32 {
         let Some(s) = sema_from(h) else { return sce(ESRCH) };
         if need < 1 || need > s.max { return sce(EINVAL); }
+        let _c = crate::hle::waitcensus::scope(|| "sema".into(), if timeout.is_null() { 0 } else { *timeout as u64 });
         let start = Instant::now();
         let deadline = if timeout.is_null() { None } else { Some(deadline_us(*timeout as u64)) };
         let mut c = s.count.lock();
@@ -674,6 +676,7 @@ sysv! {
     fn sceKernelWaitEventFlag(h: u64, pat: u64, mode: u32, result: *mut u64, timeout: *mut u32) -> i32 {
         let Some(e) = ef_from(h) else { return sce(ESRCH) };
         if mode & (EVF_WAITMODE_AND | EVF_WAITMODE_OR) == 0 { return sce(EINVAL); }
+        let _c = crate::hle::waitcensus::scope(|| "event flag".into(), if timeout.is_null() { 0 } else { *timeout as u64 });
         let deadline = if timeout.is_null() { None } else { Some(deadline_us(*timeout as u64)) };
         let mut b = e.bits.lock();
         let _w = if !ef_satisfied(*b, pat, mode) { Some(crate::thread::waiting("event flag", h, Some(ef_detail))) } else { None };
