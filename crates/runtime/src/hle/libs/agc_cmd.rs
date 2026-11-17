@@ -102,7 +102,22 @@ fn hdr(opcode: u32, payload: u32, compute: bool) -> u32 {
 }
 
 /// Writes `dw` at the command buffer's cursor; returns its address or 0.
+/// Packets the title wrote through `emit`, and the direct dispatches among them
+/// (`sceAgcCbDispatch`): for the status report (`emit_status`).
+static EMITS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// For the status report: how much of the title's stream is written through these functions.
+pub fn emit_status() -> String {
+    format!(
+        "    agc: {} packets written by the title through the command functions' `emit`, {} of them direct dispatches (`sceAgcCbDispatch`)
+",
+        EMITS[0].load(std::sync::atomic::Ordering::Relaxed),
+        EMITS[1].load(std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
 fn emit(cb: u64, dw: &[u32]) -> u64 {
+    EMITS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let p = alloc_dw(cb, dw.len() as u32);
     if p != 0 {
         unsafe { std::ptr::copy_nonoverlapping(dw.as_ptr(), p as *mut u32, dw.len()) };
@@ -600,6 +615,7 @@ sysv! {
 
     // ---- dispatches
     fn sceAgcCbDispatch(cb: u64, x: u32, y: u32, z: u32, modifier: u32) -> u64 {
+        EMITS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         emit(cb, &[hdr(op::DISPATCH_DIRECT, 4, ACB), x, y, z, dispatch_initiator(modifier)])
     }
     fn sceAgcCbDispatchGetSize() -> u64 { 20 }

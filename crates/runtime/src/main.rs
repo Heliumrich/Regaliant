@@ -932,7 +932,7 @@ fn poll_control(path: &Path, offset: &mut u64) {
             "status" => {
                 // The status report without stacks (GPU, image cache with its
                 // upload breakdown, audio, file traffic).
-                info!("status at flip {flip}:\n{}", thread_summary());
+                info!("status at flip {flip}:\n{}{}", thread_summary(), hle::libs::agc_cmd::emit_status());
                 Ok(())
             }
             "waits" => {
