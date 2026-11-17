@@ -1478,7 +1478,10 @@ pub mod tune {
     /// command of an open batched run whose resources are the run's but for read-only buffers
     /// binds those alone and takes the rest of its SGPR data from the run's first command
     /// (`Exec::join_try`). 1: on; 2: the check (the full path records every command, and the
-    /// block the join would have written is compared with its own); 0: off.
+    /// block the join would have written is compared with its own); 3: the form without the
+    /// full preparation checked against the one after it; 4: only the form after it; 5: the
+    /// lean binding of a joined command's buffers (`Exec::join_bind_lean`) checked against
+    /// `bind_stage`'s general arm, whose result is used; 6: the general arm alone; 0: off.
     pub fn join() -> u64 {
         get(180)
     }

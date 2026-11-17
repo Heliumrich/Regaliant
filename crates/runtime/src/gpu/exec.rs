@@ -5265,16 +5265,30 @@ fn scratch_buffer() -> Option<vk::Buffer> {
 /// `DS_TRACE_BINDS=<hex address>[-<hex end>]`: each buffer binding over the
 /// range, once per (shader, written, unbounded, placement): who reads and
 /// writes a buffer, and where it was placed.
-fn trace_bind(queue: &str, shader: u64, base: u64, size: u64, written: bool, unbounded: bool, placement: Placement) {
+/// `DS_TRACE_BINDS=<hex address>[-<hex end>]`: the range whose bindings are traced ((0, 0): none).
+fn trace_binds() -> (u64, u64) {
     static AT: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
-    let (at, end) = *AT.get_or_init(|| {
+    *AT.get_or_init(|| {
         let v = std::env::var("DS_TRACE_BINDS").unwrap_or_default();
         let num = |x: &str| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok();
         match v.split_once('-') {
             Some((lo, hi)) => (num(lo).unwrap_or(0), num(hi).unwrap_or(0)),
             None => num(&v).map_or((0, 0), |x| (x, x + 1)),
         }
-    });
+    })
+}
+
+/// `DS_TRACE_PLACE=<hex shader>` and `DS_TRACE_PLACE_FROM=<flip>` ((0, 0): none).
+fn trace_place() -> (u64, u64) {
+    static TRACE_PLACE: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    *TRACE_PLACE.get_or_init(|| {
+        let a = std::env::var("DS_TRACE_PLACE").ok().and_then(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()).unwrap_or(0);
+        (a, std::env::var("DS_TRACE_PLACE_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+    })
+}
+
+fn trace_bind(queue: &str, shader: u64, base: u64, size: u64, written: bool, unbounded: bool, placement: Placement) {
+    let (at, end) = trace_binds();
     if at == 0 || base >= end || base.saturating_add(size) <= at {
         return;
     }
@@ -10622,6 +10636,10 @@ pub struct Exec {
     /// preparation read.
     bind_items: Vec<(usize, Resolved)>,
     join_reads: Vec<(u64, u64)>,
+    /// `tune join`: what the buffers bound for the command being joined read.
+    join_breads: Vec<(u64, u64)>,
+    /// The device address of the buffer last asked for in this batch (`buffer_va`).
+    va_memo: (u64, vk::Buffer, u64),
     bind_note: Option<([u64; 3], bool)>,
     /// The reads `sync_for_reads` still checks (the vector reused).
     dirty_reads: Vec<(u64, u64)>,
@@ -10925,10 +10943,54 @@ struct CsRun {
     first_user: Vec<u32>,
 }
 
+/// What `Exec::join_bind_lean` needs of a joined run's translation: where the info blocks
+/// and the address block start in its SGPR data, whether it has write marks and
+/// `Spec::hw_bounds`, its resources whose loads go unchecked, those it binds by address
+/// alone and those it binds by a descriptor, and whether the lean binding may run at all
+/// (no diagnosis that wants every binding).
+#[derive(Clone, Copy)]
+struct JoinLay {
+    res_info: usize,
+    addr_at: usize,
+    has_marks: bool,
+    hw_bounds: bool,
+    unchecked: u64,
+    addr_bound: u64,
+    desc_bound: u64,
+    lean: bool,
+}
+
+impl JoinLay {
+    fn of(found: &shaders::Found) -> JoinLay {
+        let (mut addr, mut desc, mut marks) = (0u64, 0u64, false);
+        for b in &found.tr.out.bindings {
+            match b.kind {
+                BindingKind::Address(i) if i < 64 => addr |= 1 << i,
+                BindingKind::Buffer(i) if i < 64 => desc |= 1 << i,
+                // (A resource past 63: the general arm.)
+                BindingKind::Address(_) | BindingKind::Buffer(_) => desc = u64::MAX,
+                BindingKind::Marks => marks = true,
+                _ => {}
+            }
+        }
+        JoinLay {
+            res_info: rdna::translate::res_info_offset(&found.tr.plan) as usize,
+            addr_at: rdna::translate::addr_info_offset(&found.tr.plan) as usize,
+            has_marks: marks,
+            hw_bounds: found.tr.spec.hw_bounds,
+            unchecked: found.tr.out.unchecked_res,
+            addr_bound: addr & !desc,
+            desc_bound: desc,
+            lean: found.tr.spec.gpu_res == 0 && !super::slotcensus::on() && !super::census::on() && !super::smalltrack::on() && trace_binds().0 == 0 && trace_place().0 == 0 && !super::resident::mirror_mode(),
+        }
+    }
+}
+
 /// A batched run's first command as later ones are joined to it (`tune join`): what it
 /// resolved, its SGPR data as bound, its ring, front end 2's view its bindings were checked
 /// for, and what it writes.
 struct JoinRun {
+    lay: JoinLay,
     found: std::sync::Arc<shaders::Found>,
     template: Vec<u32>,
     which: usize,
@@ -10962,8 +11024,10 @@ struct JoinRun {
 /// commands it took, refusals for a changed setting, for its partial preparation, for a wait
 /// at its reads; and its check (`tune join` 3): compared, differing, taken by one form
 /// only; then runs left without a join because their program's commands never joined
-/// (`Exec::join_dead`), and runs given one].
-static JOIN_STATS: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
+/// (`Exec::join_dead`), and runs given one; then the lean binding (`join_bind_lean`):
+/// commands it bound, commands it left to the general arm, its check (`tune join` 5):
+/// compared, differing].
+static JOIN_STATS: [AtomicU64; 36] = [const { AtomicU64::new(0) }; 36];
 
 
 /// `DS_JOIN_KEYS=1` (a census): the commands joined without their full preparation by what is
@@ -11128,7 +11192,7 @@ fn join_line() -> String {
             "    of them without the full preparation: {}; it refused for a changed setting {}, its partial preparation {}, a wait at its reads {}; its check: {} compared, {} differing, {} taken only with the full preparation, {} only without it\n",
             v[22], v[23], v[24], v[25], v[26], v[27], v[28], v[29]
         )
-        + &format!("    runs given a join {}, left without one for a program whose commands never joined {}\n", v[31], v[30])
+        + &format!("    runs given a join {}, left without one for a program whose commands never joined {}; the lean binding: {} commands, {} left to the general arm, its check: {} compared, {} differing\n", v[31], v[30], v[32], v[33], v[34], v[35])
         + &join_fine_lines()
         + &join_keys_line()
 }
@@ -12247,6 +12311,8 @@ impl Exec {
                 join_acc: [0; 11],
                 bind_items: Vec::new(),
                 join_reads: Vec::new(),
+                join_breads: Vec::new(),
+                va_memo: (u64::MAX, vk::Buffer::null(), 0),
                 bind_note: None,
                 dirty_reads: Vec::new(),
                 sync_t: 0,
@@ -18458,11 +18524,7 @@ impl Exec {
                         // DS_TRACE_PLACE=<hex shader>: its bindings' placements, the
                         // first 64 from flip DS_TRACE_PLACE_FROM on (diagnosis: what a
                         // program reads across PCIe).
-                        static TRACE_PLACE: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
-                        let (tp, tp_from) = *TRACE_PLACE.get_or_init(|| {
-                            let a = std::env::var("DS_TRACE_PLACE").ok().and_then(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()).unwrap_or(0);
-                            (a, std::env::var("DS_TRACE_PLACE_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
-                        });
+                        let (tp, tp_from) = trace_place();
                         if tp != 0 && tp == p.addr && super::FRAMES.load(Ordering::Relaxed) >= tp_from {
                             static N: AtomicU64 = AtomicU64::new(0);
                             if N.fetch_add(1, Ordering::Relaxed) < 64 {
@@ -19005,6 +19067,85 @@ impl Exec {
         }
     }
 
+    /// A buffer's device address (the driver's call once per buffer in a row and batch).
+    #[inline]
+    fn buffer_va(&mut self, b: vk::Buffer) -> u64 {
+        if self.va_memo.0 != self.batch_count || self.va_memo.1 != b {
+            self.va_memo = (self.batch_count, b, ctx().buffer_address(b));
+        }
+        self.va_memo.2
+    }
+
+    /// The buffers of the command being joined (`items`: its resources
+    /// under differing pointers) bound as `bind_stage`'s buffer arm binds a sized read-only
+    /// range that front end 2's mirror serves and the translation reads by address: placed,
+    /// its info block and address entry written into `block`, its range added to
+    /// `join_breads`. False: something the general arm must do (a descriptor binding, an
+    /// unsized or empty range, a range outside the mirror's span or not placed): it binds
+    /// them all again.
+    fn join_bind_lean(&mut self, lay: &JoinLay, block: &mut [u32], items: &[(usize, Resolved)]) -> Result<bool, String> {
+        use rdna::translate::{ADDR_HEADER_DWORDS, ADDR_INFO_DWORDS};
+        let mut n = 0u64;
+        for (i, res) in items {
+            let i = *i;
+            if i >= 64 || lay.desc_bound & (1 << i) != 0 {
+                return Ok(false);
+            }
+            // (Not bound by the translation: nothing to do, as in the general arm.)
+            if lay.addr_bound & (1 << i) == 0 {
+                continue;
+            }
+            let (base, size, stride, limit) = match res {
+                Resolved::Buffer(v) => match v.byte_size() {
+                    Some(s) => (v.base, s, v.stride, v.index_limit()),
+                    None => return Ok(false),
+                },
+                Resolved::Global(a, Some(s)) => (*a, *s, 0, u32::MAX),
+                _ => return Ok(false),
+            };
+            if size == 0 || size >= 16 << 20 || !super::fe2::in_span(base, size) {
+                return Ok(false);
+            }
+            self.join_breads.push((base, size));
+            self.fe2_unsized = false;
+            let placed = self.fe2_place(base, size, false);
+            if self.stopped {
+                return Err(STOPPED.into());
+            }
+            let Some((hbuf, hoff, avail)) = placed else { return Ok(false) };
+            // (As the general arm's mirror placement: from a mark word's boundary.)
+            let off = hoff & !127;
+            let bias = hoff - off;
+            let mut range = (bias + size).next_multiple_of(4).min(bias + avail);
+            if lay.hw_bounds && lay.unchecked & (1 << i) != 0 {
+                let exact = (bias & !3) + size.next_multiple_of(4);
+                if exact < range {
+                    HW_BOUNDS_NARROWED.fetch_add(1, Ordering::Relaxed);
+                    range = exact;
+                }
+            }
+            let ri = lay.res_info + RES_INFO_DWORDS as usize * i;
+            let ai = lay.addr_at + (ADDR_HEADER_DWORDS + ADDR_INFO_DWORDS * i as u32) as usize;
+            if ri + 4 > block.len() || ai + 4 > block.len() {
+                return Ok(false);
+            }
+            block[ri] = bias as u32;
+            block[ri + 1] = stride;
+            block[ri + 2] = size.min(u32::MAX as u64) as u32;
+            block[ri + 3] = limit;
+            if lay.has_marks {
+                block[ai + 3] = u32::MAX;
+            }
+            let va = self.buffer_va(hbuf) + off;
+            block[ai] = va as u32;
+            block[ai + 1] = (va >> 32) as u32;
+            block[ai + 2] = range.min(u32::MAX as u64) as u32;
+            n += 1;
+        }
+        ADDRESSED.fetch_add(n, Ordering::Relaxed);
+        Ok(true)
+    }
+
     /// `tune join`: a command of program `addr` was joined (`ok`) or refused for what
     /// differs between the program's commands (`join_dead`).
     #[inline]
@@ -19100,18 +19241,46 @@ impl Exec {
             return refuse(25);
         }
         let t1 = tsc();
-        let bound = if mask != 0 {
+        self.join_breads.clear();
+        let mode = super::tune::join();
+        let mut lean = false;
+        if mask != 0 && j.lay.lean && mode != 6 {
+            let lay = j.lay;
+            let items = std::mem::take(&mut self.bind_items);
+            let r = self.join_bind_lean(&lay, &mut j.proto.sgpr_data, &items);
+            self.bind_items = items;
+            lean = r?;
+            JOIN_STATS[32 + !lean as usize].fetch_add(1, Ordering::Relaxed);
+        }
+        // (`tune join` 5: the general arm binds them as well, and what it wrote is compared.)
+        let lean_block = (lean && mode == 5).then(|| j.proto.sgpr_data.clone());
+        let bound = if mask != 0 && (!lean || mode == 5) {
             self.bind_only = Some(mask);
             self.bind_stage(&mut j.proto, true)?
         } else {
             self.bound_pool.pop().unwrap_or_default()
         };
+        if let Some(lb) = lean_block {
+            let mut a = self.join_breads.clone();
+            let mut b = bound.reads.clone();
+            a.sort_unstable();
+            b.sort_unstable();
+            JOIN_STATS[34].fetch_add(1, Ordering::Relaxed);
+            if (lb != j.proto.sgpr_data || a != b) && JOIN_STATS[35].fetch_add(1, Ordering::Relaxed) < 16 {
+                let at = lb.iter().zip(j.proto.sgpr_data.iter()).position(|(x, y)| x != y);
+                crate::warn!("gpu[{}]: join check: cs {:#x}: the lean binding differs from the general arm's (first differing dword {at:?} of {}: {:#x?} against {:#x?}; reads {a:x?} against {b:x?})", self.name, j.proto.addr, lb.len(), at.map(|k| lb[k]), at.map(|k| j.proto.sgpr_data[k]));
+            }
+        }
+        if !lean || mode == 5 {
+            self.join_breads.clear();
+            self.join_breads.extend_from_slice(&bound.reads);
+        }
         let t2 = tsc();
         if uses != self.cmd_uses.get() {
             self.recycle(bound);
             return refuse(5);
         }
-        if !self.cpw_open.is_empty() && self.cpw_hazard(j.reads.iter().chain(j.writes.iter()).chain(bound.reads.iter())) {
+        if !self.cpw_open.is_empty() && self.cpw_hazard(j.reads.iter().chain(j.writes.iter()).chain(self.join_breads.iter())) {
             self.recycle(bound);
             JOIN_STATS[12].fetch_add(1, Ordering::Relaxed);
             return refuse(2);
@@ -19541,12 +19710,12 @@ impl Exec {
         // preparation below).
         let join_mode = super::tune::join();
         let mut fast_pred: Option<Vec<u32>> = None;
-        if matches!(join_mode, 1 | 3) && indirect.is_none() && pre.is_none() {
+        if matches!(join_mode, 1 | 3 | 5 | 6) && indirect.is_none() && pre.is_none() {
             if let Some(mut run) = self.cs_run.take() {
                 match self.join_fast(&mut run, cp, groups, initiator) {
                     Ok(Some(bound)) => {
                         self.recycle(bound);
-                        if join_mode == 1 {
+                        if join_mode != 3 {
                             if self.join_commit(&mut run, cs_addr(cp), groups) {
                                 self.join_cnt[1] += 1;
                                 self.join_fast_done = true;
@@ -20339,6 +20508,7 @@ impl Exec {
                             && !super::forward::is_copy_kernel(&p))
                         .then(|| {
                             Box::new(JoinRun {
+                                lay: JoinLay::of(&p.found),
                                 found: p.found.clone(),
                                 template: p.sgpr_data.clone(),
                                 which,
