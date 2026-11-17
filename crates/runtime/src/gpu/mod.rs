@@ -3570,8 +3570,10 @@ fn profile_summary() -> String {
             let busy: u64 = v.iter().map(|x| *x.1).sum();
             v.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
             s.push_str(&format!("    gpu profile {kind} busy (not waiting): {busy} samples, by innermost function of ours:\n"));
-            for (f, n) in v.iter().take(30) {
-                s.push_str(&format!("      {:5.1}%  {f}\n", **n as f64 * 100.0 / busy.max(1) as f64));
+            // (`DS_PROFILE_BUSY_TOP`: how many functions, default 30.)
+            let busy_top = std::env::var("DS_PROFILE_BUSY_TOP").ok().and_then(|x| x.parse().ok()).unwrap_or(30);
+            for (f, n) in v.iter().take(busy_top) {
+                s.push_str(&format!("      {:6.2}%  {f}\n", **n as f64 * 100.0 / busy.max(1) as f64));
             }
         }
     }
