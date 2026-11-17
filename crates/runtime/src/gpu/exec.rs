@@ -3874,6 +3874,7 @@ pub(super) fn push_line() -> String {
         BATCHED[0].load(Ordering::Relaxed),
         BATCHED[2].load(Ordering::Relaxed)
     ) + &batch_miss_line()
+        + &join_census_line()
         + &place_memo_cycles_line()
         + &super::fe2::work_parts_line()
         + &super::fe2::big_runs_line()
@@ -10880,6 +10881,66 @@ struct CsRun {
     /// A GPU-resolved program's run (`gpures`): later commands are appended
     /// with their user data alone (`gpu_append`).
     gpu: Option<Box<GpuRun>>,
+    /// `DS_JOIN_CENSUS=1`: the run's first command's preparation (what later commands'
+    /// resources are compared with).
+    first: Option<std::sync::Arc<shaders::Found>>,
+}
+
+/// `DS_JOIN_CENSUS=1` (diagnosis): for every command appended to an open batched dispatch,
+/// how many of its resources differ from the run's first command's (the others are the
+/// run's: what a joined-dispatch path could leave to the run), by program.
+fn join_census_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_JOIN_CENSUS").ok().as_deref() == Some("1"))
+}
+
+/// By program: [commands appended, differing resources in all, differing written ones,
+/// differing images or samplers, resources in all, commands whose every difference is a
+/// read-only buffer].
+static JOIN_CENSUS: Mutex<Option<HashMap<u64, [u64; 6]>>> = Mutex::new(None);
+
+fn join_census(first: &shaders::Found, p: &Prepared) {
+    let mut d = [1u64, 0, 0, 0, p.resources.len() as u64, 0];
+    let mut plain = first.resources.len() == p.resources.len();
+    for (i, (a, b)) in first.resources.iter().zip(p.resources.iter()).enumerate() {
+        if a == b {
+            continue;
+        }
+        d[1] += 1;
+        let written = p.tr.plan.resources.get(i).is_some_and(|r| r.written);
+        if written {
+            d[2] += 1;
+        }
+        let buffer = matches!(b, Resolved::Buffer(_) | Resolved::Global(..));
+        if !buffer {
+            d[3] += 1;
+        }
+        plain &= buffer && !written;
+    }
+    d[5] = plain as u64;
+    let mut g = JOIN_CENSUS.lock();
+    let e = g.get_or_insert_with(HashMap::new).entry(p.addr).or_default();
+    for k in 0..6 {
+        e[k] += d[k];
+    }
+}
+
+fn join_census_line() -> String {
+    let g = JOIN_CENSUS.lock();
+    let Some(m) = g.as_ref() else { return String::new() };
+    let mut v: Vec<(&u64, &[u64; 6])> = m.iter().collect();
+    v.sort_by(|a, b| b.1[0].cmp(&a.1[0]));
+    let all: u64 = v.iter().map(|x| x.1[0]).sum();
+    let plain: u64 = v.iter().map(|x| x.1[5]).sum();
+    let parts: Vec<String> = v
+        .iter()
+        .take(10)
+        .map(|(a, d)| {
+            let n = d[0].max(1) as f64;
+            format!("cs {a:#x} {} ({:.1} of {:.1} resources differ; written {:.2}, images or samplers {:.2}; only read-only buffers in {:.0}%)", d[0], d[1] as f64 / n, d[4] as f64 / n, d[2] as f64 / n, d[3] as f64 / n, 100.0 * d[5] as f64 / n)
+        })
+        .collect();
+    format!("    commands appended to open batched dispatches against their run's first command (`DS_JOIN_CENSUS`): {all}, {plain} differing in read-only buffers alone; by program: {}\n", parts.join("; "))
 }
 
 /// A GPU-resolved run (`CsRun::gpu`): the program, its run roots with the
@@ -19277,6 +19338,9 @@ impl Exec {
             };
         if appended {
             BATCHED[0].fetch_add(1, Ordering::Relaxed);
+            if let Some(f) = self.cs_run.as_ref().and_then(|r| r.first.as_ref()) {
+                join_census(f, &p);
+            }
         } else if batched {
             let miss = if indirect.is_some() {
                 0
@@ -19359,7 +19423,8 @@ impl Exec {
                         } else {
                             None
                         };
-                        self.cs_run = Some(CsRun { batch: self.batch_count, uses: self.cmd_uses.get(), pipeline, descs: desc_signature(&bound), args, table, groups: groups[0], ring, window: wbase, gpu });
+                        let first = join_census_on().then(|| p.found.clone());
+                        self.cs_run = Some(CsRun { batch: self.batch_count, uses: self.cmd_uses.get(), pipeline, descs: desc_signature(&bound), args, table, groups: groups[0], ring, window: wbase, gpu, first });
                         BATCHED[1].fetch_add(1, Ordering::Relaxed);
                     }
                     _ => {
