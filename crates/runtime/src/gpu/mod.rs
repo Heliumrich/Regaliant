@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 180] = [
+    static ALL: [Tunable; 181] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -212,6 +212,7 @@ pub mod tune {
         Tunable { name: "xq_pre_c", env: "DS_XQ_PRE_C", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lean", env: "DS_LEAN", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lane", env: "DS_LANE", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "join", env: "DS_JOIN", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1470,6 +1471,15 @@ pub mod tune {
     /// and lean-check answer again in full and compares.
     pub fn lane() -> bool {
         get(179) != 0
+    }
+
+    /// Runs of a batched program as data (2026-11-17; ROUTE60.md's first section): a later
+    /// command of an open batched run whose resources are the run's but for read-only buffers
+    /// binds those alone and takes the rest of its SGPR data from the run's first command
+    /// (`Exec::join_try`). 1: on; 2: the check (the full path records every command, and the
+    /// block the join would have written is compared with its own); 0: off.
+    pub fn join() -> u64 {
+        get(180)
     }
 
     /// Whether translations get `rdna::translate::Spec::hw_bounds` (scalar

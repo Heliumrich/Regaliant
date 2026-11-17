@@ -669,6 +669,233 @@ fn prepare_with(addr: u64, insts: &Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, 
     }))
 }
 
+/// A joined run's first command as `join_items` compares later ones with it (`tune join`,
+/// `Exec::join_fast`): its user data and, from the first later command on, what its plan's
+/// pointer chains held.
+pub(in crate::gpu) struct JoinFirst {
+    pub user: [u32; 16],
+    vals: [u64; MAX_NODES],
+    have: u64,
+    ready: bool,
+}
+
+impl JoinFirst {
+    pub fn new(user: [u32; 16]) -> JoinFirst {
+        JoinFirst { user, vals: [0; MAX_NODES], have: 0, ready: false }
+    }
+}
+
+/// This command's chain values beside the first command's (`join_items`): a node whose
+/// pointer is the first's holds the first's value without a read.
+struct JNodes<'a> {
+    vals: [u64; MAX_NODES],
+    have: u64,
+    same: u64,
+    user: &'a [u32; 16],
+    first: &'a JoinFirst,
+}
+
+fn jnode(i: usize, nodes: &[(Ptr, Node)], s: &mut JNodes, rd: &mut Reader, code_base: u64) -> Option<bool> {
+    if s.have & (1 << i) != 0 {
+        return Some(s.same & (1 << i) != 0);
+    }
+    let n = nodes[i].1;
+    let (base, parent_same) = jroot(n.from, nodes, s, rd, code_base)?;
+    let first_has = s.first.have & (1 << i) != 0;
+    if parent_same {
+        if !first_has {
+            return None;
+        }
+        s.vals[i] = s.first.vals[i];
+        s.have |= 1 << i;
+        s.same |= 1 << i;
+        return Some(true);
+    }
+    let a = base + n.off as u64;
+    let mut w = [0u32; 2];
+    if a % 4 != 0 || !rd.read_into(a, &mut w) {
+        return None;
+    }
+    let v = w[0] as u64 | (w[1] as u64) << 32;
+    s.vals[i] = v;
+    s.have |= 1 << i;
+    let eq = first_has && v == s.first.vals[i];
+    if eq {
+        s.same |= 1 << i;
+    }
+    Some(eq)
+}
+
+/// A root's value and whether it is the first command's.
+fn jroot(r: Root, nodes: &[(Ptr, Node)], s: &mut JNodes, rd: &mut Reader, code_base: u64) -> Option<(u64, bool)> {
+    match r {
+        Root::User(k) => {
+            let k = k as usize;
+            let (lo, hi) = (*s.user.get(k)?, *s.user.get(k + 1)?);
+            let eq = s.first.user[k] == lo && s.first.user[k + 1] == hi;
+            Some(((lo as u64) | ((hi as u64) << 32), eq))
+        }
+        Root::Pc(o) => Some((code_base + o, true)),
+        Root::Node(i) => {
+            let same = jnode(i as usize, nodes, s, rd, code_base)?;
+            Some((s.vals[i as usize], same))
+        }
+    }
+}
+
+fn jword(w: Word, nodes: &[(Ptr, Node)], s: &mut JNodes, rd: &mut Reader, code_base: u64) -> Option<u32> {
+    match w {
+        Word::User(k) => s.user.get(k as usize).copied(),
+        Word::Const(c) => Some(c),
+        Word::Mem(r, off) => {
+            let (b, _) = jroot(r, nodes, s, rd, code_base)?;
+            rd.u32(b + off as u64)
+        }
+        Word::PtrLo(r, b) => Some((jroot(r, nodes, s, rd, code_base)?.0 + b as u64) as u32),
+        Word::PtrHi(r, b) => Some(((jroot(r, nodes, s, rd, code_base)?.0 + b as u64) >> 32) as u32),
+        Word::Bad => None,
+    }
+}
+
+/// `tune join` (`Exec::join_fast`): the part of a compute stage's preparation that differs
+/// from its run's first command (`first`, its translation and resources; `jf`). A pointer
+/// that is the first command's is taken to hold what it held then (checked on the title's
+/// commands: equal roots gave equal resources and loads in every case, FINDINGS.md
+/// 2026-11-17 midday), so only the chains under differing pointers are read. `block`: the
+/// first command's SGPR data, into which this command's user words and the loads under
+/// differing pointers are written. `items`: the resources resolved here (read-only buffers
+/// of the first's format where the translation depends on it). `reads`: what was read.
+/// The mask of those resources; None: not on this path (no compiled plan or translation on
+/// this thread, something unreadable, a differing resource that is written or no buffer,
+/// another format): the full preparation runs.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::gpu) fn join_items(addr: u64, code_hash: u64, user: &[u32; 16], user_sgprs: u16, user_base: u16, first: &Found, jf: &mut JoinFirst, block: &mut [u32], items: &mut Vec<(usize, Resolved)>, reads: &mut Vec<(u64, u64)>) -> Option<u64> {
+    let plan_key = code_hash ^ (user_sgprs as u64) << 48 ^ (user_base as u64) << 56;
+    let lp = plan_for(plan_key, &first.insts, Stage::Compute)?;
+    if !lp.ok {
+        return None;
+    }
+    let trs = lp.trs.borrow();
+    let te = trs.iter().find(|e| Arc::ptr_eq(&e.tr, &first.tr))?;
+    let nodes_ref = lp.nodes.borrow();
+    let nodes: &[(Ptr, Node)] = &nodes_ref;
+    if te.sgpr_dwords != block.len() || nodes.len() > MAX_NODES || lp.res.len() != first.resources.len() {
+        return None;
+    }
+    let put = |rd: Reader| -> (Vec<(u64, u64)>, bool) {
+        let Reader { reads, words, unread, chain_vals, .. } = rd;
+        let ok = unread.is_empty();
+        pool::put_words(words);
+        pool::put_pairs(unread);
+        pool::put_addrs(chain_vals);
+        (reads, ok)
+    };
+    // The first command's chain values, once a run.
+    if !jf.ready {
+        let mut v = Vals { v: [std::mem::MaybeUninit::uninit(); MAX_NODES], have: 0 };
+        let mut rd0 = Reader::lean(addr, [0; 3]);
+        rd0.load_spans();
+        for i in 0..nodes.len() {
+            if let Some(x) = node_val(i, &lp, nodes, &mut v, &mut rd0, &jf.user, addr) {
+                jf.vals[i] = x;
+            }
+        }
+        jf.have = v.have;
+        jf.ready = true;
+        pool::put_pairs(put(rd0).0);
+    }
+    let mut rd = Reader::lean(addr, lp.hints.get());
+    rd.load_spans();
+    let mut s = JNodes { vals: [0; MAX_NODES], have: 0, same: 0, user, first: jf };
+    let out = join_items_in(addr, &lp, nodes, te, first, &mut s, &mut rd, block, items);
+    rd.save_spans();
+    let (r, ok) = put(rd);
+    reads.clear();
+    reads.extend_from_slice(&r);
+    pool::put_pairs(r);
+    if ok {
+        out
+    } else {
+        None
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn join_items_in(addr: u64, lp: &LeanPlan, nodes: &[(Ptr, Node)], te: &TrEntry, first: &Found, s: &mut JNodes, rd: &mut Reader, block: &mut [u32], items: &mut Vec<(usize, Resolved)>) -> Option<u64> {
+    let mut mask = 0u64;
+    items.clear();
+    for (i, r) in lp.res.iter().enumerate() {
+        let n = r.n as usize;
+        // The first command's when every pointer and user word of its descriptor is.
+        let mut same = true;
+        let src = match r.first {
+            Some((root, off)) => {
+                let (b, sm) = jroot(root, nodes, s, rd, addr)?;
+                same &= sm;
+                Some(b + off as u64)
+            }
+            None => None,
+        };
+        for k in 0..n {
+            match r.words[k] {
+                Word::User(u) => same &= s.user.get(u as usize) == s.first.user.get(u as usize),
+                Word::Const(_) => {}
+                Word::Mem(rt, _) | Word::PtrLo(rt, _) | Word::PtrHi(rt, _) => same &= jroot(rt, nodes, s, rd, addr)?.1,
+                Word::Bad => return None,
+            }
+        }
+        if same {
+            continue;
+        }
+        if i >= 64 || r.written || !matches!(r.kind, ResKind::Buffer | ResKind::Global) {
+            return None;
+        }
+        let mut w = [0u32; 8];
+        let block_read = r.block && src.is_some_and(|b| rd.read_into(b, &mut w[..n]));
+        if !block_read {
+            for k in 0..n {
+                w[k] = jword(r.words[k], nodes, s, rd, addr)?;
+            }
+        }
+        if r.kind == ResKind::Buffer {
+            let v = Vsharp::decode(&w);
+            if lp.fmt_mask & (1 << i) != 0 {
+                match first.resources.get(i) {
+                    Some(Resolved::Buffer(f)) if f.format == v.format && f.dst_sel == v.dst_sel => {}
+                    _ => return None,
+                }
+            }
+            items.push((i, Resolved::Buffer(v)));
+        } else {
+            items.push((i, Resolved::Global(w[0] as u64 | ((w[1] as u64) << 32), r.extent)));
+        }
+        mask |= 1 << i;
+    }
+    // This command's user words, and the loads under differing pointers.
+    if block.len() < translate::SGPR_DATA_USER as usize {
+        return None;
+    }
+    block[..16].copy_from_slice(&s.user[..]);
+    let mut at = translate::SGPR_DATA_USER as usize;
+    for l in &te.loads {
+        let n = l.dwords as usize;
+        let (b, sm) = jroot(l.from, nodes, s, rd, addr)?;
+        if at + n > block.len() {
+            return None;
+        }
+        if !sm {
+            let a = b + l.off as u64;
+            if !rd.read_into(a, &mut block[at..at + n]) {
+                for k in 0..n {
+                    block[at + k] = rd.u32(a + 4 * k as u64).unwrap_or(0);
+                }
+            }
+        }
+        at += n;
+    }
+    Some(mask)
+}
+
 /// After the full path prepared a stage that this path left to it: its translation recorded
 /// for the template and resource specializations, when the translation is the one the full
 /// path finds for that specialization (not a run-time variant standing in for one).

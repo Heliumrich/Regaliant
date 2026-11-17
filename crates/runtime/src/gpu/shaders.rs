@@ -1316,6 +1316,15 @@ thread_local! {
 
 #[path = "shaders_lean.rs"]
 mod lean;
+pub(super) use lean::{join_items, JoinFirst};
+
+/// What a compute stage's template is checked against besides its registers (`tune join`:
+/// a joined run's later commands are prepared from its first while these stand): the
+/// switches' generation, the batching generation and the title's shader registrations; and
+/// whether the lean preparation runs now.
+pub(super) fn join_gens() -> Option<[u64; 3]> {
+    lean_now().then(|| [super::tune::generation(), BATCH_GEN.load(std::sync::atomic::Ordering::Acquire), crate::hle::libs::agc::shader_registrations()])
+}
 
 /// Template lookups by stage [vertex, pixel, compute] and outcome [hit, empty slot, another
 /// program in the slot, its shader registrations changed, other keys changed] (`DS_STEP_LAPS`).

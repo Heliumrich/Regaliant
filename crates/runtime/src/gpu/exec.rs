@@ -3874,6 +3874,7 @@ pub(super) fn push_line() -> String {
         BATCHED[0].load(Ordering::Relaxed),
         BATCHED[2].load(Ordering::Relaxed)
     ) + &batch_miss_line()
+        + &join_line()
         + &join_census_line()
         + &place_memo_cycles_line()
         + &super::fe2::work_parts_line()
@@ -10592,6 +10593,18 @@ pub struct Exec {
     /// its image part found: the generations it looked up with and whether
     /// every one came from the binding memos.
     bind_reuse: Option<usize>,
+    /// `tune join`: the next `bind_stage` binds only the buffer resources of this mask
+    /// (their placements, info blocks and address entries) and nothing else.
+    bind_only: Option<u64>,
+    /// `tune join`: the block of the command being joined (`join_try`).
+    join_block: Vec<u32>,
+    /// `tune join`: `join_try`'s cycles by part for the command being joined.
+    join_tsc: [u64; 3],
+    /// `tune join`: resources the next `bind_stage` binds in place of its stage's own
+    /// (`bind_only`; `join_fast`: the later command's buffers), and what its partial
+    /// preparation read.
+    bind_items: Vec<(usize, Resolved)>,
+    join_reads: Vec<(u64, u64)>,
     bind_note: Option<([u64; 3], bool)>,
     /// The reads `sync_for_reads` still checks (the vector reused).
     dirty_reads: Vec<(u64, u64)>,
@@ -10885,12 +10898,113 @@ struct CsRun {
     /// A GPU-resolved program's run (`gpures`): later commands are appended
     /// with their user data alone (`gpu_append`).
     gpu: Option<Box<GpuRun>>,
+    /// `tune join`: what later commands of the run are joined to (`Exec::join_try`).
+    join: Option<Box<JoinRun>>,
     /// `DS_JOIN_CENSUS=1`: the run's first command's preparation (what later commands'
     /// resources are compared with).
     first: Option<std::sync::Arc<shaders::Found>>,
     /// `DS_JOIN_CENSUS=1`: the first command's SGPR data (its user data: the roots' values;
     /// then its scalar loads' words).
     first_user: Vec<u32>,
+}
+
+/// A batched run's first command as later ones are joined to it (`tune join`): what it
+/// resolved, its SGPR data as bound, its ring, front end 2's view its bindings were checked
+/// for, and what it writes.
+struct JoinRun {
+    found: std::sync::Arc<shaders::Found>,
+    template: Vec<u32>,
+    which: usize,
+    fe2_want: u32,
+    writes: Vec<(u64, u64)>,
+    sized: Vec<(u64, u64)>,
+    /// What its buffer bindings read (with its writes: what open CP writes are checked
+    /// against for a joined command, beside that command's own buffers).
+    reads: Vec<(u64, u64)>,
+    /// For `join_fast` (a later command without its full preparation): the first command's
+    /// registers and wave size, what its template was checked against (`shaders::
+    /// join_gens`; None: no lean preparation), its preparation as bound (the later
+    /// commands' buffers are bound into it) and its pointers.
+    regs: [u32; 6],
+    wave64: bool,
+    gens: Option<[u64; 3]>,
+    proto: Prepared,
+    first: shaders::JoinFirst,
+}
+
+/// `tune join`: [commands joined; refused for the run's state or the command's shape, the
+/// executor's state (open CP writes, a barrier wanted, checks or profiles on), front end 2's
+/// view moved since the run's first command, a differing resource that is not a read-only
+/// buffer, something recorded while its buffers were bound, a binding unlike the run's (or
+/// a shadow), the block's size, the ring or its window; then the check (`tune join` 2):
+/// commands compared, blocks or notes that differed, commands the full path did not append;
+/// then the executor's state by kind: open CP writes, a barrier wanted, resident shadows,
+/// checks or profiles on or front end 2 off; then the commands not appended by why (another
+/// batch, something recorded since, the pipeline, the groups, the descriptors, of those the
+/// run's ring window left); then the join without the full preparation (`join_fast`):
+/// commands it took, refusals for a changed setting, for its partial preparation, for a wait
+/// at its reads; and its check (`tune join` 3): compared, differing, taken by one form
+/// only].
+static JOIN_STATS: [AtomicU64; 30] = [const { AtomicU64::new(0) }; 30];
+
+/// `tune join`: cycles of joined commands by part: [the checks before binding, the buffers'
+/// binding, the block, the ring and table, the notes; the preparation and the shader-read
+/// sync before it (every command that reached the join's attempt)], and that last count.
+static JOIN_TSC: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+#[inline]
+fn tsc() -> u64 {
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+fn join_line() -> String {
+    let v: Vec<u64> = JOIN_STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    if v.iter().all(|&x| x == 0) {
+        return String::new();
+    }
+    let t: Vec<u64> = JOIN_TSC.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let hz = crate::hle::kernel::time::tsc_hz().max(1) as f64;
+    let ns = |c: u64, n: u64| c as f64 / hz * 1e9 / n.max(1) as f64;
+    let parts = format!(
+        "    a joined command by part, ns: checks {:.0}, binding its buffers {:.0}, the block {:.0}, ring and table {:.0}, notes {:.0}; before the attempt (every command that came to it, {}): preparation and sync {:.0}\n",
+        ns(t[0], v[0]),
+        ns(t[1], v[0]),
+        ns(t[2], v[0]),
+        ns(t[3], v[0]),
+        ns(t[4], v[0]),
+        t[6],
+        ns(t[5], t[6])
+    );
+    format!(
+        "    runs as data (`tune join` {}): {} commands joined; refused: the run or the command's shape {}, the executor's state {}, the view moved {}, a differing resource not a read-only buffer {}, a recording while binding {}, a binding unlike the run's {}, the block's size {}, the ring or its window {}; checked {}: {} differed, {} not appended by the full path (another batch {}, something recorded since {}, the pipeline {}, the groups {}, the descriptors {} and the run's window left {}); the executor's state by kind: an open CP write met {}, a barrier wanted {}, resident shadows {}, modes {}\n",
+        super::tune::join(),
+        v[0],
+        v[1],
+        v[2],
+        v[3],
+        v[4],
+        v[5],
+        v[6],
+        v[7],
+        v[8],
+        v[9],
+        v[10],
+        v[11],
+        v[16],
+        v[17],
+        v[18],
+        v[19],
+        v[20],
+        v[21],
+        v[12],
+        v[13],
+        v[14],
+        v[15]
+    ) + &parts
+        + &format!(
+            "    of them without the full preparation: {}; it refused for a changed setting {}, its partial preparation {}, a wait at its reads {}; its check: {} compared, {} differing, {} taken only with the full preparation, {} only without it\n",
+            v[22], v[23], v[24], v[25], v[26], v[27], v[28], v[29]
+        )
 }
 
 /// `DS_JOIN_CENSUS=1` (diagnosis): for every command appended to an open batched dispatch,
@@ -11997,6 +12111,11 @@ impl Exec {
                 delta: Default::default(),
                 delta_sig: Vec::new(),
                 bind_reuse: None,
+                bind_only: None,
+                join_block: Vec::new(),
+                join_tsc: [0; 3],
+                bind_items: Vec::new(),
+                join_reads: Vec::new(),
                 bind_note: None,
                 dirty_reads: Vec::new(),
                 sync_t: 0,
@@ -17791,6 +17910,8 @@ impl Exec {
         let _source = super::fe2::StageSource::set(p.ahead);
         self.bind_note = None;
         let reuse = self.bind_reuse.take();
+        let only = self.bind_only.take();
+        let items = if only.is_some() { std::mem::take(&mut self.bind_items) } else { Vec::new() };
         // What the preparation found (its own block, shared with its cache
         // entry), apart from the SGPR data written below.
         let found = p.found.clone();
@@ -17829,6 +17950,12 @@ impl Exec {
             }
 
             for b in &found.tr.out.bindings {
+                if let Some(m) = only {
+                    match b.kind {
+                        BindingKind::Buffer(i) | BindingKind::Address(i) if i < 64 && m & (1u64 << i) != 0 => {}
+                        _ => continue,
+                    }
+                }
                 match b.kind {
                     // Resolved by the shader through the page table (front end
                     // 2: in the mirror at guest offsets, its device address in
@@ -17842,7 +17969,8 @@ impl Exec {
                         }
                     }
                     BindingKind::Buffer(i) | BindingKind::Address(i) => {
-                        let (base, size, stride, limit) = match &found.resources[i] {
+                        let res_i: &Resolved = items.iter().find(|x| x.0 == i).map_or(&found.resources[i], |x| &x.1);
+                        let (base, size, stride, limit) = match res_i {
                             Resolved::Buffer(v) => (v.base, v.byte_size(), v.stride, v.index_limit()),
                             Resolved::Global(a, n) => (*a, *n, 0, u32::MAX),
                             _ => return Err("binding/resource mismatch".into()),
@@ -17886,7 +18014,7 @@ impl Exec {
                         let mut placement = Placement::None;
                         // Sized: buffers, and bases whose loads all read known
                         // bytes (data loads read by the shader).
-                        let sized = matches!(found.resources[i], Resolved::Buffer(_) | Resolved::Global(_, Some(_)));
+                        let sized = matches!(*res_i, Resolved::Buffer(_) | Resolved::Global(_, Some(_)));
                         let read_only = size > 0 && !found.tr.plan.resources[i].written && sized;
                         if size > 0 && super::census::on() {
                             use super::census::{RO, RO_UNSIZED, WRITTEN};
@@ -17896,7 +18024,7 @@ impl Exec {
                         // a video-memory home holding the range (see `homes`).
                         // Front end 2: a tiny read-only buffer no GPU work writes,
                         // as guest memory holds it now (`TINY_SNAP_BYTES`).
-                        let tiny = if read_only && super::fe2::on() && size <= TINY_SNAP_BYTES && matches!(found.resources[i], Resolved::Buffer(_)) && !super::resident::mirror_mode() {
+                        let tiny = if read_only && super::fe2::on() && size <= TINY_SNAP_BYTES && matches!(*res_i, Resolved::Buffer(_)) && !super::resident::mirror_mode() {
                             self.snapshot_as(base, size, 4096, false)
                         } else {
                             None
@@ -17904,14 +18032,14 @@ impl Exec {
                         let from_mirror = if tiny.is_some() {
                             None
                         } else if super::resident::mirror_mode() {
-                            self.mm_unsized = matches!(found.resources[i], Resolved::Global(_, None));
+                            self.mm_unsized = matches!(*res_i, Resolved::Global(_, None));
                             // Diagnostics: large written bindings, the first of each shader.
                             if found.tr.plan.resources[i].written && size >= 16 << 20 {
                                 static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
                                 let mut g = SEEN.lock();
                                 let seen = g.get_or_insert_with(HashSet::new);
                                 if seen.len() < 40 && seen.insert(p.addr) {
-                                    let what = match &found.resources[i] {
+                                    let what = match res_i {
                                         Resolved::Buffer(v) => format!("V# stride {} records {} (index limit {})", v.stride, v.num_records, v.index_limit()),
                                         Resolved::Global(_, n) => format!("pointer ({n:?} bytes)"),
                                         _ => String::new(),
@@ -17936,7 +18064,7 @@ impl Exec {
                                     SEEN_FULL.store(true, Ordering::Relaxed);
                                 }
                                 if seen.len() < 40 && seen.insert(p.addr) {
-                                    let what = match &found.resources[i] {
+                                    let what = match res_i {
                                         Resolved::Buffer(v) => format!("V# stride {} records {}", v.stride, v.num_records),
                                         Resolved::Global(_, n) => format!("pointer ({n:?} bytes)"),
                                         _ => String::new(),
@@ -17944,7 +18072,7 @@ impl Exec {
                                     crate::info!("gpu[{}]: front end 2: {:?} shader {:#x} writes {base:#x}+{size:#x}: {what}; atomic {}", self.name, p.stage, p.addr, found.tr.plan.resources[i].atomic);
                                 }
                             }
-                            self.fe2_unsized = matches!(found.resources[i], Resolved::Global(_, None));
+                            self.fe2_unsized = matches!(*res_i, Resolved::Global(_, None));
                             let r = self.fe2_place(base, size, found.tr.plan.resources[i].written);
                             self.fe2_unsized = false;
                             r
@@ -17974,7 +18102,7 @@ impl Exec {
                         // it when the batch executes, after CP and title writes
                         // that came later: `tune race_checks`, FINDINGS.md
                         // 2026-10-14); data GPU work writes is read where it is.
-                        let data_load = read_only && matches!(found.resources[i], Resolved::Global(_, Some(_)));
+                        let data_load = read_only && matches!(*res_i, Resolved::Global(_, Some(_)));
                         let snap = if tiny.is_some() {
                             tiny
                         } else if read_only && resident.is_none() && home.is_none() && data_load && super::tune::data_snapshots() {
@@ -18024,7 +18152,7 @@ impl Exec {
                         }
                         BindClock::mark(&mut clk, 6);
                         if super::tune::race_checks() && size > 0 && snap.is_none() && mirrored.is_none() && (home.is_some() || span.is_some()) {
-                            let unbounded = matches!(found.resources[i], Resolved::Global(_, None));
+                            let unbounded = matches!(*res_i, Resolved::Global(_, None));
                             let kind = if found.tr.plan.resources[i].written { 1 } else { 0 } | if data_load { 2 } else { 0 } | if unbounded { 4 } else { 0 };
                             bound.in_place.push((base, size, kind));
                         }
@@ -18046,7 +18174,7 @@ impl Exec {
                                 if super::xwait::on() {
                                     super::xwait::note_write(&self.name, base, size);
                                 }
-                                if matches!(found.resources[i], Resolved::Buffer(_)) {
+                                if matches!(*res_i, Resolved::Buffer(_)) {
                                     bound.sized_writes.push((base, size));
                                 }
                             }
@@ -18073,7 +18201,7 @@ impl Exec {
                                 Some((buffer, start, end)) => {
                                     placement = Placement::Host;
                                     if super::resident::enabled() {
-                                        note_in_place(found.tr.plan.resources[i].written, matches!(found.resources[i], Resolved::Global(_, None)), size, p.addr);
+                                        note_in_place(found.tr.plan.resources[i].written, matches!(*res_i, Resolved::Global(_, None)), size, p.addr);
                                     }
                                     let rel = base - start;
                                     let align = ctx().limits.min_storage_buffer_offset_alignment.max(4);
@@ -18096,7 +18224,7 @@ impl Exec {
                                         if super::xwait::on() {
                                             super::xwait::note_write(&self.name, base, size);
                                         }
-                                        if matches!(found.resources[i], Resolved::Buffer(_)) {
+                                        if matches!(*res_i, Resolved::Buffer(_)) {
                                             bound.sized_writes.push((base, size));
                                         }
                                     }
@@ -18138,7 +18266,7 @@ impl Exec {
                                         if *TRACE.get_or_init(|| std::env::var("DS_TRACE_SHADOW").ok().as_deref() == Some("1")) {
                                             static SEEN: std::sync::Mutex<Option<HashSet<(u64, u64)>>> = std::sync::Mutex::new(None);
                                             if SEEN.lock().unwrap().get_or_insert_with(HashSet::new).insert((p.addr, base)) {
-                                                let global = matches!(found.resources[i], Resolved::Global(..));
+                                                let global = matches!(*res_i, Resolved::Global(..));
                                                 crate::info!("shadow: {:?} shader {:#x} writes {base:#x}+{size:#x} (bound {range:#x}{})", p.stage, p.addr, if global { ", global pointer" } else { "" });
                                             }
                                         }
@@ -18180,10 +18308,10 @@ impl Exec {
                         if profiling() {
                             bound.placements.push((placement, bound_size, found.tr.plan.resources[i].written));
                         }
-                        trace_bind(&self.name, p.addr, base, size, found.tr.plan.resources[i].written, matches!(found.resources[i], Resolved::Global(_, None)), placement);
+                        trace_bind(&self.name, p.addr, base, size, found.tr.plan.resources[i].written, matches!(*res_i, Resolved::Global(_, None)), placement);
                         if super::smalltrack::on() {
                             let k = PLACEMENTS.iter().position(|&x| x == placement).unwrap_or(7);
-                            super::smalltrack::bound(base, size, found.tr.plan.resources[i].written, k, &self.name, p.addr, matches!(found.resources[i], Resolved::Global(_, None)));
+                            super::smalltrack::bound(base, size, found.tr.plan.resources[i].written, k, &self.name, p.addr, matches!(*res_i, Resolved::Global(_, None)));
                         }
                         // DS_TRACE_PLACE=<hex shader>: its bindings' placements, the
                         // first 64 from flip DS_TRACE_PLACE_FROM on (diagnosis: what a
@@ -18196,7 +18324,7 @@ impl Exec {
                         if tp != 0 && tp == p.addr && super::FRAMES.load(Ordering::Relaxed) >= tp_from {
                             static N: AtomicU64 = AtomicU64::new(0);
                             if N.fetch_add(1, Ordering::Relaxed) < 64 {
-                                let what = match &found.resources[i] {
+                                let what = match res_i {
                                     Resolved::Buffer(v) => format!("V# stride {} records {}", v.stride, v.num_records),
                                     Resolved::Global(_, n) => format!("pointer ({n:?} bytes)"),
                                     _ => String::new(),
@@ -18264,6 +18392,10 @@ impl Exec {
                     _ => {}
                 }
             }
+        }
+        if only.is_some() {
+            self.bind_items = items;
+            return Ok(bound);
         }
         let frame = super::FRAMES.load(Ordering::Relaxed);
         // A buffer-delta draw's: the last draw's (`draw::DrawDelta`).
@@ -18695,6 +18827,285 @@ impl Exec {
         }
     }
 
+    /// `tune join`: a later command of the open batched run `r` taken without its full
+    /// preparation. Its registers are the first command's but for the user data; its
+    /// per-item pointers are resolved by the lean plan (`shaders::join_items`: the first
+    /// command's block with this command's user words and per-item loads, and its per-item
+    /// buffers), their reads synced as a preparation's, and the buffers bound into the first
+    /// command's preparation (`JoinRun::proto`), whose SGPR data then is this command's
+    /// block (left in `join_block`). None: `dispatch_inner` prepares the command in full.
+    fn join_fast(&mut self, r: &mut CsRun, cp: &Cp, groups: [u32; 3], initiator: u32) -> Result<Option<Bound>, String> {
+        let (batch, uses, run_groups) = (r.batch, r.uses, r.groups);
+        let Some(j) = r.join.as_mut() else { return Ok(None) };
+        if gpu_run_regs(cp) != j.regs || (initiator & (1 << 15) == 0) != j.wave64 {
+            return Ok(None);
+        }
+        let refuse = |k: usize| {
+            JOIN_STATS[k].fetch_add(1, Ordering::Relaxed);
+            Ok(None)
+        };
+        if batch != self.batch_count || uses != self.cmd_uses.get() || !self.recording || self.held || initiator & (1 << 5) != 0 || groups[1] != 1 || groups[2] != 1 || groups[0] == 0 || run_groups + groups[0] > BATCH_MAX_GROUPS || (0x204..0x207).any(|x| cp.reg(Space::Sh, x) != 0) {
+            return refuse(1);
+        }
+        if (!self.cpw_open.is_empty() && !cpw_lazy_here()) || self.barrier_wanted || !self.resident.is_empty() || super::tune::race_checks() || verify::enabled() || profiling() || !super::fe2::on() {
+            return refuse(2);
+        }
+        if self.fe2_want(super::precache::epoch() as u32) > j.fe2_want {
+            return refuse(3);
+        }
+        if j.gens.is_none() || shaders::join_gens() != j.gens {
+            return refuse(23);
+        }
+        let t0 = tsc();
+        let user: [u32; 16] = std::array::from_fn(|i| cp.reg(Space::Sh, 0x240 + i as u32));
+        j.proto.sgpr_data.clear();
+        j.proto.sgpr_data.extend_from_slice(&j.template);
+        let mut items = std::mem::take(&mut self.bind_items);
+        let mut reads = std::mem::take(&mut self.join_reads);
+        let (us, ub) = (j.proto.tr.spec.user_sgprs, j.proto.tr.spec.user_base);
+        let mask = shaders::join_items(j.proto.addr, j.proto.code_hash, &user, us, ub, &j.found, &mut j.first, &mut j.proto.sgpr_data, &mut items, &mut reads);
+        self.bind_items = items;
+        let Some(mask) = mask else {
+            self.join_reads = reads;
+            return refuse(24);
+        };
+        // What the partial preparation read, synced as a preparation's reads.
+        self.sync_readers = [j.proto.addr, 0];
+        let waited = !reads.is_empty() && self.sync_for_stage(&reads, SYNC_CS_READS);
+        self.join_reads = reads;
+        if self.stopped {
+            return Err(STOPPED.into());
+        }
+        if waited {
+            return refuse(25);
+        }
+        let t1 = tsc();
+        let bound = if mask != 0 {
+            self.bind_only = Some(mask);
+            self.bind_stage(&mut j.proto, true)?
+        } else {
+            self.bound_pool.pop().unwrap_or_default()
+        };
+        let t2 = tsc();
+        if uses != self.cmd_uses.get() {
+            self.recycle(bound);
+            return refuse(5);
+        }
+        if !self.cpw_open.is_empty() && self.cpw_hazard(j.reads.iter().chain(j.writes.iter()).chain(bound.reads.iter())) {
+            self.recycle(bound);
+            JOIN_STATS[12].fetch_add(1, Ordering::Relaxed);
+            return refuse(2);
+        }
+        let like = bound.shadows.is_empty()
+            && bound.writes.is_empty()
+            && bound.imgs.is_empty()
+            && bound.img_arrays.is_empty()
+            && bound.bufs.iter().all(|(bn, info)| {
+                use ash::vk::Handle;
+                let want = [*bn as u64, info.buffer.as_raw(), info.offset, info.range];
+                r.descs.chunks_exact(4).any(|c| c == want)
+            });
+        if !like {
+            self.recycle(bound);
+            return refuse(6);
+        }
+        let j = r.join.as_ref().expect("checked above");
+        self.join_block.clear();
+        self.join_block.extend_from_slice(&j.proto.sgpr_data);
+        self.join_tsc = [t1.wrapping_sub(t0), t2.wrapping_sub(t1), tsc().wrapping_sub(t2)];
+        Ok(Some(bound))
+    }
+
+    /// `tune join`: whether the prepared command `p`, a direct dispatch, can be joined to
+    /// the open batched run `r`: the same translation, nothing recorded since the run's
+    /// dispatch, front end 2's view as the run's first command had it, and resources that
+    /// are the first command's but for read-only buffers. Those are bound here (their
+    /// placements, info blocks and address entries: `bind_only`), and the command's SGPR
+    /// data is left in `join_block`: the run's first block with this command's user words
+    /// and loads and those resources' entries. None: the full path records it.
+    fn join_try(&mut self, r: &CsRun, p: &mut Prepared, groups: [u32; 3], initiator: u32, start_zero: bool) -> Result<Option<Bound>, String> {
+        let Some(j) = r.join.as_ref() else { return Ok(None) };
+        if !std::sync::Arc::ptr_eq(&p.found.tr, &j.found.tr) {
+            return Ok(None);
+        }
+        let t0 = tsc();
+        let refuse = |k: usize| {
+            JOIN_STATS[k].fetch_add(1, Ordering::Relaxed);
+            Ok(None)
+        };
+        if r.batch != self.batch_count || r.uses != self.cmd_uses.get() || !self.recording || self.held || initiator & (1 << 5) != 0 || groups[1] != 1 || groups[2] != 1 || groups[0] == 0 || r.groups + groups[0] > BATCH_MAX_GROUPS || !start_zero {
+            return refuse(1);
+        }
+        if (!self.cpw_open.is_empty() && !cpw_lazy_here()) || self.barrier_wanted || !self.resident.is_empty() || super::tune::race_checks() || verify::enabled() || profiling() || !super::fe2::on() {
+            let kind = if !self.cpw_open.is_empty() && !cpw_lazy_here() {
+                12
+            } else if self.barrier_wanted {
+                13
+            } else if !self.resident.is_empty() {
+                14
+            } else {
+                15
+            };
+            JOIN_STATS[kind].fetch_add(1, Ordering::Relaxed);
+            return refuse(2);
+        }
+        if self.fe2_want(super::precache::epoch() as u32) > j.fe2_want {
+            return refuse(3);
+        }
+        if j.found.resources.len() != p.found.resources.len() {
+            return refuse(4);
+        }
+        let mut mask = 0u64;
+        for (i, (a, b)) in j.found.resources.iter().zip(p.found.resources.iter()).enumerate() {
+            if a == b {
+                continue;
+            }
+            let plain = i < 64 && matches!(b, Resolved::Buffer(_) | Resolved::Global(..)) && !p.found.tr.plan.resources.get(i).is_some_and(|x| x.written);
+            if !plain {
+                return refuse(4);
+            }
+            mask |= 1u64 << i;
+        }
+        let plan = &j.found.tr.plan;
+        let res_info = rdna::translate::res_info_offset(plan) as usize;
+        let addr_at = rdna::translate::addr_info_offset(plan) as usize;
+        let per = RES_INFO_DWORDS as usize;
+        if j.template.len() != p.sgpr_data.len() || res_info + per * p.found.resources.len() > j.template.len() {
+            return refuse(7);
+        }
+        let t1 = tsc();
+        let bound = if mask != 0 {
+            self.bind_only = Some(mask);
+            self.bind_items.clear();
+            self.bind_stage(p, true)?
+        } else {
+            self.bound_pool.pop().unwrap_or_default()
+        };
+        let t2 = tsc();
+        if r.uses != self.cmd_uses.get() {
+            self.recycle(bound);
+            return refuse(5);
+        }
+        // Open CP writes (`cpw_lazy`): the full path wants a barrier where the command's
+        // buffers meet one; here against the run's first command's ranges and this
+        // command's own buffers (more than the command reads: a hit sends it to the full
+        // path).
+        if !self.cpw_open.is_empty() && self.cpw_hazard(j.reads.iter().chain(j.writes.iter()).chain(bound.reads.iter())) {
+            self.recycle(bound);
+            JOIN_STATS[12].fetch_add(1, Ordering::Relaxed);
+            return refuse(2);
+        }
+        // What was bound: read-only buffers in place, their descriptors (where they have
+        // one) the run's.
+        let like = bound.shadows.is_empty()
+            && bound.writes.is_empty()
+            && bound.imgs.is_empty()
+            && bound.img_arrays.is_empty()
+            && bound.bufs.iter().all(|(bn, info)| {
+                use ash::vk::Handle;
+                let want = [*bn as u64, info.buffer.as_raw(), info.offset, info.range];
+                r.descs.chunks_exact(4).any(|c| c == want)
+            });
+        if !like {
+            self.recycle(bound);
+            return refuse(6);
+        }
+        let mut block = std::mem::take(&mut self.join_block);
+        block.clear();
+        block.extend_from_slice(&j.template);
+        block[..res_info].copy_from_slice(&p.sgpr_data[..res_info]);
+        let mut m = mask;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            let ri = res_info + per * i;
+            block[ri..ri + per].copy_from_slice(&p.sgpr_data[ri..ri + per]);
+            let ai = addr_at + (rdna::translate::ADDR_HEADER_DWORDS + rdna::translate::ADDR_INFO_DWORDS * i as u32) as usize;
+            let an = rdna::translate::ADDR_INFO_DWORDS as usize;
+            if ai + an <= block.len() {
+                block[ai..ai + an].copy_from_slice(&p.sgpr_data[ai..ai + an]);
+            }
+        }
+        self.join_block = block;
+        self.join_tsc = [t1.wrapping_sub(t0), t2.wrapping_sub(t1), tsc().wrapping_sub(t2)];
+        Ok(Some(bound))
+    }
+
+    /// Writes the joined command (`join_try`: its block in `join_block`) into the run: its
+    /// SGPR data in the ring, its table entries, and the run's writes noted as the full
+    /// path notes an appended command's. False: no room in the ring or its window (the full
+    /// path records the command).
+    fn join_commit(&mut self, r: &mut CsRun, addr: u64, groups: [u32; 3]) -> bool {
+        let Some(j) = r.join.as_ref() else { return false };
+        let t3 = tsc();
+        let bytes = 4 * self.join_block.len() as u64;
+        let which = j.which;
+        let Some(off) = self.ring_alloc(which, bytes) else {
+            JOIN_STATS[8].fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        let ring = self.slots[self.cur].rings[which];
+        let inside = off >= r.window && (r.window == 0 || off + bytes <= r.window + SGPR_WINDOW_BYTES);
+        let Some((_, rp)) = ring.filter(|x| x.0 == r.ring && inside) else {
+            JOIN_STATS[8].fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.join_block.as_ptr(), rp.add(off as usize) as *mut u32, self.join_block.len());
+            let item = ((off - r.window) / 4) as u32;
+            for k in 0..groups[0] {
+                let e = r.table.add((rdna::translate::BATCH_ENTRY_DWORDS * (r.groups + k)) as usize);
+                e.write(item);
+                e.add(1).write(k);
+            }
+            r.groups += groups[0];
+            r.args.write(r.groups);
+        }
+        let t4 = tsc();
+        // The run's writes (this command's written resources are its first command's), as
+        // `dispatch_inner` notes them for a command it appends.
+        let gens = note_gens();
+        let repeat = super::tune::lean_notes() && !j.writes.is_empty() && self.last_notes.2 == gens && self.last_notes.0 == j.writes && self.last_notes.1 == j.sized;
+        if !repeat && super::images::may_note(&j.writes) {
+            super::images::with(|im| im.note_writes(&j.writes, &j.sized));
+        }
+        if lazy_barriers() {
+            self.dispatched = true;
+        }
+        if repeat {
+            self.own_gen += 1;
+            self.clean_evict(j.writes.iter().copied());
+            for &(b, n) in &j.writes {
+                super::forward::written(b, n);
+                self.pending.insert(b, n);
+                self.note_since(b, n);
+            }
+            NOTES_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.noting = addr;
+            for &(b, n) in &j.writes {
+                self.note_write(b, n);
+            }
+            self.noting = 0;
+            if !j.writes.is_empty() {
+                self.last_notes.0.clone_from(&j.writes);
+                self.last_notes.1.clone_from(&j.sized);
+                self.last_notes.2 = gens;
+            }
+        }
+        let t5 = tsc();
+        for (k, c) in self.join_tsc.iter().enumerate() {
+            JOIN_TSC[k].fetch_add(*c, Ordering::Relaxed);
+        }
+        JOIN_TSC[3].fetch_add(t4.wrapping_sub(t3), Ordering::Relaxed);
+        JOIN_TSC[4].fetch_add(t5.wrapping_sub(t4), Ordering::Relaxed);
+        JOIN_STATS[0].fetch_add(1, Ordering::Relaxed);
+        BATCHED[0].fetch_add(1, Ordering::Relaxed);
+        EXECUTED.fetch_add(1, Ordering::Relaxed);
+        self.batch_shaders.push(addr);
+        true
+    }
+
     /// A direct dispatch of the open GPU-resolved run's program
     /// (`CsRun::gpu`) whose run roots hold the run's values: appended to the
     /// run's dispatch with its own user data, the rest of its SGPR data the
@@ -18904,6 +19315,39 @@ impl Exec {
         let _indirect_laps = shaders::IndirectLaps::new(indirect.is_some());
         // Prepared ahead by the workers (`gpu::ahead`) when it still holds.
         let [pre, _] = cp.take_ahead();
+        // `tune join` 1: a later command of the open batched run without its full
+        // preparation (3: only predicted here, and compared with the join after the full
+        // preparation below).
+        let join_mode = super::tune::join();
+        let mut fast_pred: Option<Vec<u32>> = None;
+        if matches!(join_mode, 1 | 3) && indirect.is_none() && pre.is_none() {
+            if let Some(mut run) = self.cs_run.take() {
+                match self.join_fast(&mut run, cp, groups, initiator) {
+                    Ok(Some(bound)) => {
+                        self.recycle(bound);
+                        if join_mode == 1 {
+                            if self.join_commit(&mut run, cs_addr(cp), groups) {
+                                JOIN_STATS[22].fetch_add(1, Ordering::Relaxed);
+                                self.cs_run = Some(run);
+                                lap.mark(6);
+                                if laps() {
+                                    CS_STEPS[kind][CS_STEP_COUNT].fetch_add(1, Ordering::Relaxed);
+                                }
+                                return Ok(());
+                            }
+                        } else {
+                            fast_pred = Some(self.join_block.clone());
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        self.cs_run = Some(run);
+                        return Err(e);
+                    }
+                }
+                self.cs_run = Some(run);
+            }
+        }
         // (Diagnosis: the replay memo, `tune prep_memo`.)
         let memo = super::tune::prep_memo();
         let memo = memo != 0 && super::replay::replaying() && (memo == 2 || cp.is_main_gfx());
@@ -18972,6 +19416,60 @@ impl Exec {
         cull_census(&p);
         pcopy_census(&p, groups, indirect.is_some());
         lap.mark(1);
+        // `tune join`: a later command of the open batched run, recorded as its data alone
+        // (2: only predicted here, and compared where the full path appends it).
+        let mut join_pred: Option<Vec<u32>> = None;
+        if join_mode != 0 && indirect.is_none() && !lod_rotated {
+            if self.cs_run.as_ref().is_some_and(|r| r.join.is_some()) {
+                JOIN_TSC[5].fetch_add((t_start.elapsed().as_nanos() as f64 * crate::hle::kernel::time::tsc_hz() as f64 / 1e9) as u64, Ordering::Relaxed);
+                JOIN_TSC[6].fetch_add(1, Ordering::Relaxed);
+            }
+            let start_zero = (0x204..0x207).all(|x| cp.reg(Space::Sh, x) == 0);
+            if let Some(mut run) = self.cs_run.take() {
+                match self.join_try(&run, &mut p, groups, initiator, start_zero) {
+                    Ok(Some(bound)) => {
+                        self.recycle(bound);
+                        if join_mode == 3 {
+                            // The join without the full preparation against this one.
+                            match fast_pred.take() {
+                                Some(fp) => {
+                                    JOIN_STATS[26].fetch_add(1, Ordering::Relaxed);
+                                    if fp != self.join_block && JOIN_STATS[27].fetch_add(1, Ordering::Relaxed) < 16 {
+                                        let at = fp.iter().zip(self.join_block.iter()).position(|(a, b)| a != b);
+                                        crate::warn!("gpu[{}]: join check: cs {:#x}: the block without the full preparation differs (first differing dword {at:?} of {} / {})", self.name, p.addr, fp.len(), self.join_block.len());
+                                    }
+                                }
+                                None => {
+                                    JOIN_STATS[28].fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        if join_mode != 2 {
+                            if self.join_commit(&mut run, p.addr, groups) {
+                                self.cs_run = Some(run);
+                                lap.mark(6);
+                                if laps() {
+                                    CS_STEPS[kind][CS_STEP_COUNT].fetch_add(1, Ordering::Relaxed);
+                                }
+                                return Ok(());
+                            }
+                        } else {
+                            join_pred = Some(self.join_block.clone());
+                        }
+                    }
+                    Ok(None) => {
+                        if fast_pred.take().is_some() && JOIN_STATS[29].fetch_add(1, Ordering::Relaxed) < 16 {
+                            crate::warn!("gpu[{}]: join check: cs {:#x} was taken without the full preparation but not with it", self.name, p.addr);
+                        }
+                    }
+                    Err(e) => {
+                        self.cs_run = Some(run);
+                        return Err(e);
+                    }
+                }
+                self.cs_run = Some(run);
+            }
+        }
         // Textures are uploaded from guest memory: earlier GPU writes first.
         let mut textures = std::mem::take(&mut self.tex_scratch);
         textures.clear();
@@ -19478,6 +19976,44 @@ impl Exec {
                 }
                 _ => false,
             };
+        if let Some(pred) = join_pred.take() {
+            JOIN_STATS[9].fetch_add(1, Ordering::Relaxed);
+            let notes = self.cs_run.as_ref().and_then(|r| r.join.as_ref()).is_some_and(|j| j.writes == writes_here && j.sized == sized_here);
+            if !appended {
+                let why = match self.cs_run.as_ref() {
+                    Some(r) if r.batch != self.batch_count => 16,
+                    Some(r) if r.uses != self.cmd_uses.get() => 17,
+                    Some(r) if r.pipeline != pipeline => 18,
+                    Some(r) if r.groups + groups[0] > BATCH_MAX_GROUPS => 19,
+                    Some(r) if bound.window.unwrap_or(0) != r.window => 21,
+                    _ => 20,
+                };
+                JOIN_STATS[why].fetch_add(1, Ordering::Relaxed);
+                if JOIN_STATS[11].fetch_add(1, Ordering::Relaxed) < 16 {
+                    // Which descriptor differs from the run's, and the binding's kind.
+                    let sig = desc_signature(&bound);
+                    let detail = self.cs_run.as_ref().map(|r| {
+                        let at = sig.chunks(4).zip(r.descs.chunks(4)).position(|(a, b)| a != b);
+                        match at {
+                            Some(k) => {
+                                let a = &sig[4 * k..(4 * k + 4).min(sig.len())];
+                                let b = &r.descs[4 * k..(4 * k + 4).min(r.descs.len())];
+                                let bn = (a[0] & 0xFFFF_FFFF) as u32;
+                                let kind = p.tr.out.bindings.iter().find(|x| x.binding == bn).map(|x| format!("{:?}", x.kind)).unwrap_or_default();
+                                format!("entry {k} of {} / {}: binding {bn} ({kind}): now {a:x?}, the run's {b:x?}", sig.len() / 4, r.descs.len() / 4)
+                            }
+                            None => format!("lengths {} / {}", sig.len() / 4, r.descs.len() / 4),
+                        }
+                    });
+                    crate::warn!("gpu[{}]: join check: cs {:#x} was not appended by the full path (why {}; simple {simple}; {})", self.name, p.addr, why - 16, detail.unwrap_or_default());
+                }
+            } else if pred != p.sgpr_data || !notes {
+                if JOIN_STATS[10].fetch_add(1, Ordering::Relaxed) < 16 {
+                    let at = pred.iter().zip(p.sgpr_data.iter()).position(|(a, b)| a != b);
+                    crate::warn!("gpu[{}]: join check: cs {:#x} differs (first differing dword {at:?} of {}; notes the same: {notes})", self.name, p.addr, pred.len());
+                }
+            }
+        }
         if appended {
             BATCHED[0].fetch_add(1, Ordering::Relaxed);
             if let Some(r) = self.cs_run.as_ref() {
@@ -19567,9 +20103,36 @@ impl Exec {
                         } else {
                             None
                         };
+                        let join = (super::tune::join() != 0
+                            && p.tr.spec.gpu_res == 0
+                            && fill.is_none()
+                            && !lod_rotated
+                            && p.addr != VG_PLACEMENT_CS
+                            && p.tr.out.sgpr_pc.is_some()
+                            && !self.held
+                            && super::fe2::on()
+                            && !join_census_on()
+                            && !cull_census_on()
+                            && !super::forward::is_copy_kernel(&p))
+                        .then(|| {
+                            Box::new(JoinRun {
+                                found: p.found.clone(),
+                                template: p.sgpr_data.clone(),
+                                which,
+                                fe2_want: self.fe2_run_want(),
+                                writes: writes_here.clone(),
+                                sized: sized_here.clone(),
+                                reads: bound.reads.clone(),
+                                regs: gpu_run_regs(cp),
+                                wave64,
+                                gens: shaders::join_gens(),
+                                proto: p.clone(),
+                                first: shaders::JoinFirst::new(std::array::from_fn(|i| cp.reg(Space::Sh, 0x240 + i as u32))),
+                            })
+                        });
                         let first = join_census_on().then(|| p.found.clone());
                         let first_user = if join_census_on() { p.sgpr_data.to_vec() } else { Vec::new() };
-                        self.cs_run = Some(CsRun { batch: self.batch_count, uses: self.cmd_uses.get(), pipeline, descs: desc_signature(&bound), args, table, groups: groups[0], ring, window: wbase, gpu, first, first_user });
+                        self.cs_run = Some(CsRun { batch: self.batch_count, uses: self.cmd_uses.get(), pipeline, descs: desc_signature(&bound), args, table, groups: groups[0], ring, window: wbase, gpu, join, first, first_user });
                         BATCHED[1].fetch_add(1, Ordering::Relaxed);
                     }
                     _ => {
