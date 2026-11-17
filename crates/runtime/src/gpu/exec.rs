@@ -10910,14 +10910,28 @@ fn join_census_on() -> bool {
 /// differently, roots the analysis does not follow; then the scalar loads the same way by
 /// their words in the SGPR data: root equal and words the same, root equal but words
 /// differing, root differing and the same, root differing and differing, no root (the
-/// program's own data)].
-static JOIN_CENSUS: Mutex<Option<HashMap<u64, [u64; 16]>>> = Mutex::new(None);
+/// program's own data); then commands whose whole SGPR block is the first command's with
+/// the user words and the loads on differing roots replaced, and commands where it is not;
+/// then those commands by where the block still differs (once a command and place): the
+/// user words, the loads, a resource info block's bias, stride, bound bytes, records, the
+/// program's address, the address block's entries of resources on equal roots, other words
+/// after the program's address].
+static JOIN_CENSUS: Mutex<Option<HashMap<u64, [u64; 27]>>> = Mutex::new(None);
 
 fn join_census(first: &shaders::Found, first_sgpr: &[u32], p: &Prepared) {
-    let mut d = [1u64, 0, 0, 0, p.resources.len() as u64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut d = [0u64; 27];
+    d[0] = 1;
+    d[4] = p.resources.len() as u64;
     let users = (p.tr.spec.user_sgprs as usize).min(p.sgpr_data.len());
     let user = &p.sgpr_data[..users];
     let first_user = &first_sgpr[..users.min(first_sgpr.len())];
+    // The block a run handled as data would write: the first command's, with this command's
+    // user words and its loads on differing roots.
+    let mut block: Vec<u32> = first_sgpr.to_vec();
+    if block.len() == p.sgpr_data.len() {
+        let u = (rdna::translate::SGPR_DATA_USER as usize).min(block.len());
+        block[..u].copy_from_slice(&p.sgpr_data[..u]);
+    }
     for (l, o) in p.tr.plan.loads.iter().zip(rdna::translate::load_offsets(&p.tr.plan)) {
         let (o, n) = (o as usize, l.dwords as usize);
         let same = p.sgpr_data.get(o..o + n).is_some_and(|w| first_sgpr.get(o..o + n) == Some(w));
@@ -10930,8 +10944,13 @@ fn join_census(first: &shaders::Found, first_sgpr: &[u32], p: &Prepared) {
                 (false, false) => 14,
             },
         };
+        if matches!(slot, 13 | 14) && block.len() == p.sgpr_data.len() && o + n <= block.len() {
+            block[o..o + n].copy_from_slice(&p.sgpr_data[o..o + n]);
+        }
         d[slot] += 1;
     }
+    let info = rdna::translate::res_info_offset(&p.tr.plan) as usize;
+    let per = rdna::translate::RES_INFO_DWORDS as usize;
     for (i, (a, b)) in first.resources.iter().zip(p.resources.iter()).enumerate() {
         let same = a == b;
         let roots = p.tr.plan.resources.get(i).and_then(super::gpures::res_roots);
@@ -10947,7 +10966,50 @@ fn join_census(first: &shaders::Found, first_sgpr: &[u32], p: &Prepared) {
                 }
             }
         };
+        // (A resource on a differing root, or one the analysis does not follow, gives its own
+        // info block.)
+        let o = info + per * i;
+        if matches!(slot, 8 | 9 | 10) && block.len() == p.sgpr_data.len() && o + per <= block.len() {
+            block[o..o + per].copy_from_slice(&p.sgpr_data[o..o + per]);
+        }
+        // (And its entry of the address block, when the translation has one.)
+        let a = (rdna::translate::addr_info_offset(&p.tr.plan) + rdna::translate::ADDR_HEADER_DWORDS + rdna::translate::ADDR_INFO_DWORDS * i as u32) as usize;
+        let an = rdna::translate::ADDR_INFO_DWORDS as usize;
+        if matches!(slot, 8 | 9 | 10) && block.len() == p.sgpr_data.len() && a + an <= block.len() {
+            block[a..a + an].copy_from_slice(&p.sgpr_data[a..a + an]);
+        }
         d[slot] += 1;
+    }
+    d[if block == p.sgpr_data { 16 } else { 17 }] += 1;
+    if block != p.sgpr_data && block.len() == p.sgpr_data.len() {
+        let code = rdna::translate::code_base_offset(&p.tr.plan) as usize;
+        let mut seen = 0u32;
+        for (w, (x, y)) in block.iter().zip(p.sgpr_data.iter()).enumerate() {
+            if x == y {
+                continue;
+            }
+            let class = if w < rdna::translate::SGPR_DATA_USER as usize {
+                0
+            } else if w < info {
+                1
+            } else if w < code {
+                2 + (w - info) % per
+            } else if w < code + 2 {
+                6
+            } else if w >= (rdna::translate::addr_info_offset(&p.tr.plan) + rdna::translate::ADDR_HEADER_DWORDS) as usize
+                && w < (rdna::translate::addr_info_offset(&p.tr.plan) + rdna::translate::ADDR_HEADER_DWORDS + rdna::translate::ADDR_INFO_DWORDS * p.resources.len() as u32) as usize
+            {
+                7
+            } else {
+                8
+            };
+            seen |= 1 << class;
+        }
+        for k in 0..9 {
+            if seen & (1 << k) != 0 {
+                d[18 + k] += 1;
+            }
+        }
     }
     let mut plain = first.resources.len() == p.resources.len();
     for (i, (a, b)) in first.resources.iter().zip(p.resources.iter()).enumerate() {
@@ -10967,8 +11029,8 @@ fn join_census(first: &shaders::Found, first_sgpr: &[u32], p: &Prepared) {
     }
     d[5] = plain as u64;
     let mut g = JOIN_CENSUS.lock();
-    let e = g.get_or_insert_with(HashMap::new).entry(p.addr).or_insert([0; 16]);
-    for k in 0..16 {
+    let e = g.get_or_insert_with(HashMap::new).entry(p.addr).or_insert([0; 27]);
+    for k in 0..27 {
         e[k] += d[k];
     }
 }
@@ -10976,7 +11038,7 @@ fn join_census(first: &shaders::Found, first_sgpr: &[u32], p: &Prepared) {
 fn join_census_line() -> String {
     let g = JOIN_CENSUS.lock();
     let Some(m) = g.as_ref() else { return String::new() };
-    let mut v: Vec<(&u64, &[u64; 16])> = m.iter().collect();
+    let mut v: Vec<(&u64, &[u64; 27])> = m.iter().collect();
     v.sort_by(|a, b| b.1[0].cmp(&a.1[0]));
     let all: u64 = v.iter().map(|x| x.1[0]).sum();
     let plain: u64 = v.iter().map(|x| x.1[5]).sum();
@@ -10986,7 +11048,7 @@ fn join_census_line() -> String {
         .map(|(a, d)| {
             let n = d[0].max(1) as f64;
             format!(
-                "cs {a:#x} {} ({:.1} of {:.1} resources differ; written {:.2}, images or samplers {:.2}; only read-only buffers in {:.0}%; resources by roots: equal {} ({} of them resolved differently), a root differing {} ({} of them resolved the same), not followed {}; scalar loads by root: equal {} ({} of them with other words), differing {} ({} of them with the same words), without one {})",
+                "cs {a:#x} {} ({:.1} of {:.1} resources differ; written {:.2}, images or samplers {:.2}; only read-only buffers in {:.0}%; resources by roots: equal {} ({} of them resolved differently), a root differing {} ({} of them resolved the same), not followed {}; scalar loads by root: equal {} ({} of them with other words), differing {} ({} of them with the same words), without one {}; SGPR blocks as the first command's with the words on differing roots: {} right, {} not (differing in user words {}, loads {}, an info block's bias {}, stride {}, bound bytes {}, records {}, the program's address {}, the address entries of resources on equal roots {}, other later words {}))",
                 d[0],
                 d[1] as f64 / n,
                 d[4] as f64 / n,
@@ -11002,7 +11064,18 @@ fn join_census_line() -> String {
                 d[12],
                 d[13] + d[14],
                 d[13],
-                d[15]
+                d[15],
+                d[16],
+                d[17],
+                d[18],
+                d[19],
+                d[20],
+                d[21],
+                d[22],
+                d[23],
+                d[24],
+                d[25],
+                d[26]
             )
         })
         .collect();
