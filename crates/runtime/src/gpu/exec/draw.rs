@@ -1285,7 +1285,9 @@ impl Exec {
     /// Executes a draw with the graphics state of `cp`; returns what
     /// happened (frame captures).
     pub fn draw(&mut self, cp: &Cp, args: DrawArgs) -> std::borrow::Cow<'static, str> {
-        super::ballast_cp(self.ballast_kind, cp.ballast_part());
+        if super::ballast_progs().is_empty() {
+            super::ballast_cp(self.ballast_kind, cp.ballast_part());
+        }
         if DEVICE_LOST.load(Ordering::Relaxed) {
             DRAW_SKIPPED.fetch_add(1, Ordering::Relaxed);
             return "skipped (device lost)".into();
@@ -1302,7 +1304,7 @@ impl Exec {
                 return "skipped (`DS_SKIP_DEPTH`)".into();
             }
         }
-        let t_prog = super::laps().then(std::time::Instant::now);
+        let t_prog = super::prog_census().then(std::time::Instant::now);
         // Menu & HUD Size: the interface layer scaled before the title composites it.
         if super::super::uiscale::scale() < 1.0 {
             let ps = ((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8;

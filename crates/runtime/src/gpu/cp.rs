@@ -378,6 +378,13 @@ pub struct Cp {
     /// stretch is settling (its wait is waited for normally then).
     past_wait: Option<Box<PastWait>>,
     settling: bool,
+    /// Label waits the stretch past a label wait passed on memory (`held_wait`, a held run's
+    /// planning): label, 64-bit, compare function, mask, reference. A write of one by a batch
+    /// submitted meanwhile drops the stretch only when the wait no longer passes at the
+    /// settle (`past_wait_settle`; since 2026-11-17: 41-79 stretches of ~650 a 13 s turning
+    /// window at Castlewall were dropped for such a read, each followed by waits not gone
+    /// past, FINDINGS.md).
+    held_polls: Vec<(u64, bool, u32, u64, u64)>,
     /// The index of the submission's command buffer being run (set by the
     /// queue's worker), and where the worker is to run from next when what
     /// was recorded past a run is dropped in a later buffer than the run's
@@ -624,6 +631,9 @@ pub static HELD_RUNS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
 /// its settling, settled once the label was promised, settled at a stop,
 /// ns the stops waited for the label].
 pub static PAST_WAITS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// Label polls of stretches past label waits kept at their settle (`Cp::past_wait_settle`):
+/// [polls kept, stretches they would have dropped].
+pub static PAST_POLLS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static PAST_WAIT_STOPS: parking_lot::Mutex<Vec<(&'static str, u64)>> = parking_lot::Mutex::new(Vec::new());
 static PAST_WAIT_DROPS: parking_lot::Mutex<Vec<(&'static str, u64)>> = parking_lot::Mutex::new(Vec::new());
 /// The graphics CP's waits on labels queue 0x50 wrote last that did not pass at once and were
@@ -642,7 +652,7 @@ fn note_why(l: &parking_lot::Mutex<Vec<(&'static str, u64)>>, why: &'static str)
 
 /// Clears the statistics of recording past label waits (`profile reset`).
 pub fn past_wait_reset() {
-    for c in &PAST_WAITS {
+    for c in PAST_WAITS.iter().chain(PAST_POLLS.iter()) {
         c.store(0, Ordering::Relaxed);
     }
     PAST_SKIPPED.store(0, Ordering::Relaxed);
@@ -840,6 +850,13 @@ pub fn past_wait_status() -> String {
             String::new()
         } else {
             format!("    stale pages uploaded before their stretch (`tune past_repair`): {} stretches, {} runs, {} pages\n", r(0), r(1), r(2))
+        }
+    } + &{
+        let k = |i: usize| PAST_POLLS[i].load(Ordering::Relaxed);
+        if k(1) == 0 {
+            String::new()
+        } else {
+            format!("    label waits passed on memory kept at their stretch's settle: {} waits in {} stretches a batch submitted meanwhile would have dropped\n", k(0), k(1))
         }
     } + &held_runs_line()
 }
@@ -2270,6 +2287,7 @@ impl Cp {
             past: None,
             past_wait: None,
             settling: false,
+            held_polls: Vec::new(),
             cur_buf: 0,
             rewind: None,
         }
@@ -2446,6 +2464,9 @@ impl Cp {
         if pass(read()) {
             if let Some(e) = self.exec.as_mut() {
                 e.note_held_reads(&[(a, if wide { 8 } else { 4 })], 3);
+            }
+            if self.past_wait.is_some() {
+                self.held_polls.push((a, wide, func, mask, reference));
             }
             label_event(&self.name, b'i', a, read(), reference, at);
             return Flow::Next;
@@ -3418,7 +3439,7 @@ impl Cp {
         // the run's commands before one are checked as of a view no older
         // than theirs, and those after it see what the CPU wrote before the
         // label. In the main command processor's own chunk it passes again.
-        for &(_, a, wide) in &passed {
+        for &(pk, a, wide) in &passed {
             self.last_wait_kind = b'I';
             self.last_wait_gpu = false;
             self.end_copy_scope_after_wait(a, wide);
@@ -3426,6 +3447,11 @@ impl Cp {
             if held_run {
                 if let Some(e) = self.exec.as_mut() {
                     e.note_held_reads(&[(a, if wide { 8 } else { 4 })], 3);
+                }
+                if self.past_wait.is_some() {
+                    let w = |i: u64| f.rd(pk + 4 * (1 + i));
+                    let (reference, mask) = if wide { (addr64(w(3), w(4)), addr64(w(5), w(6))) } else { (w(3) as u64, w(4) as u64) };
+                    self.held_polls.push((a, wide, w(0) & 7, mask, reference));
                 }
             }
             RUN_PASSED[1].fetch_add(1, Ordering::Relaxed);
@@ -4099,6 +4125,7 @@ impl Cp {
     /// is promised or a stop (`past_wait_settle`).
     fn past_wait_start(&mut self, control: u32, a: u64, wide: bool, reference: u64, mask: u64, at: u64) -> Flow {
         self.submit_gpu("wait");
+        self.held_polls.clear();
         self.past_wait = Some(Box::new(PastWait {
             control,
             a,
@@ -4204,10 +4231,38 @@ impl Cp {
                 crate::info!("gpu[{}]: past the wait at {:#x} on {:#x} (written by {writer}): stopped ({why}) at {at:#x} (opcode {op:#x}) after {commands} commands and {} us, {} submission(s) on; waited {} us for the label; packets: {}", self.name, w.at, w.a, w.began.elapsed().as_micros(), self.sub_index - w.sub, waited.as_micros(), seq.join(" "));
             }
         }
+        // Label waits the stretch passed on memory (`held_polls`): a write of such a label by a
+        // batch submitted while the stretch ran (the value read after it landed) is no conflict
+        // while the wait passes on memory now and nothing unfinished writes the label: the
+        // console's command processor, reaching the wait here, passes it the same.
+        let polls = std::mem::take(&mut self.held_polls);
         let e = self.exec.as_mut().unwrap();
+        let conflict = writes.overlaps_any(e.held_reads()) && {
+            let mut kept = 0u64;
+            let mut real = false;
+            for r in e.held_reads().iter().filter(|r| writes.overlaps(r.0, r.1)) {
+                let good = polls.iter().any(|&(a, wide, func, mask, reference)| {
+                    a == r.0 && r.1 == if wide { 8 } else { 4 } && valid(a, 8) && {
+                        let v = if wide { unsafe { rd64(a) } } else { (unsafe { rd32(a) }) as u64 };
+                        compare(func, v & mask, reference & mask) && !super::exec::unfinished_write(a & !3, r.1)
+                    }
+                });
+                if good {
+                    kept += 1;
+                } else {
+                    real = true;
+                    break;
+                }
+            }
+            if !real {
+                PAST_POLLS[0].fetch_add(kept, Ordering::Relaxed);
+                PAST_POLLS[1].fetch_add(1, Ordering::Relaxed);
+            }
+            real
+        };
         let dropped = if matches!(flow, Flow::Stop) {
             Some("shutdown")
-        } else if writes.overlaps_any(e.held_reads()) {
+        } else if conflict {
             Some("read what other queues wrote")
         } else if !e.held_keys().is_empty() && super::images::any_pending() && {
             let keys: Vec<super::images::ImageKey> = e.held_keys().iter().copied().collect();

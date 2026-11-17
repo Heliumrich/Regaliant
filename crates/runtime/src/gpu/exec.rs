@@ -7039,6 +7039,14 @@ fn journal_note_one(w: (u64, u64), who: &str) {
 /// Kinds of the CPU reads of held recording (`Exec::note_held_reads`).
 pub const HELD_READ_KINDS: [&str; 6] = ["shared copy", "texture", "binding", "CP label poll", "CP read", "register pairs"];
 
+/// Whether GPU work not complete yet, or a deferred CP write, writes into [a, a + n) (any
+/// queue's; `Cp::past_wait_settle`'s label polls).
+pub(super) fn unfinished_write(a: u64, n: u64) -> bool {
+    let r = [(a, n)];
+    let done = done_seq();
+    INFLIGHT.latest(&r).is_some_and(|s| s > done) || CP_WRITES.latest(&r).is_some_and(|s| s > done)
+}
+
 /// `DS_TRACE_PAST_DROPS=<n>`: the first n (1: 60) stretches past a label
 /// wait dropped because other queues wrote what they read on the CPU are
 /// logged with that read's kind and range and who wrote it
@@ -8092,6 +8100,27 @@ fn laps() -> bool {
     *ON.get_or_init(|| profiling() || std::env::var("DS_STEP_LAPS").ok().as_deref() == Some("1"))
 }
 
+/// The commands-by-program census (`prog_note`): with the step timers, or alone with
+/// `DS_PROG_CENSUS=1` (one clock pair a command and no step timers, which inflate the small
+/// steps of the commands they time: FINDINGS.md 2026-11-17).
+pub(super) fn prog_census() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| laps() || std::env::var("DS_PROG_CENSUS").ok().as_deref() == Some("1"))
+}
+
+/// `DS_BALLAST_PROGS=<hex>[;<hex>...]` (diagnosis): `tune ballast_ns` spins only at dispatches
+/// of these compute programs (their addresses as the census prints them), not at draws or
+/// other dispatches: an in-boot A/B then prices those programs' commands on the executors
+/// `ballast_at` names.
+pub(super) fn ballast_progs() -> &'static [u64] {
+    static P: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        std::env::var("DS_BALLAST_PROGS")
+            .map(|v| v.split(|c: char| c == ';' || c == ':' || c == '+' || c == ' ').filter_map(|x| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok()).collect())
+            .unwrap_or_default()
+    })
+}
+
 /// Per-command GPU timestamps (DS_PROFILE_GPU=1; `DS_PROFILE_GPU_STAMPS=0`
 /// keeps only the batch ones): BOTTOM_OF_PIPE stamps around every draw and
 /// dispatch serialize the GPU, which inflates the time of small commands.
@@ -9131,12 +9160,12 @@ fn pre_steps_of(steps: &[AtomicU64; 12], what: &str) -> String {
     format!("    batch-start copy lookups by outcome{what}: {calls} calls: {}\n", parts.join(", "))
 }
 
-/// Commands by program (`DS_STEP_LAPS=1`): per (executor class, program
-/// key) the commands and their time from entry to return, collected per
-/// thread and added every PROG_FLUSH commands; `profile reset` clears it.
-/// Classes: 0 the graphics CP, 1 its parallel workers, 2 queue 0x50, 3 the
-/// other compute queues. Keys: a draw's vertex and pixel programs, a
-/// dispatch's program (and 1: indirect).
+/// Commands by program (`DS_STEP_LAPS=1`, or `DS_PROG_CENSUS=1` without the step timers):
+/// per (executor class, program key) the commands and their time from entry to return,
+/// collected per thread and added every PROG_FLUSH commands; `profile reset` clears it.
+/// Classes: 0 the graphics CP, 1 its parallel workers, 2 queue 0x50, 3 the other compute
+/// queues, 4 queue 0x50's workers, 5 the other compute queues' workers. Keys: a draw's
+/// vertex and pixel programs, a dispatch's program (and 1: indirect).
 static PROG_CENSUS: Mutex<Option<HashMap<(u8, u64, u64), [u64; 2]>>> = Mutex::new(None);
 const PROG_FLUSH: u32 = 256;
 static PROG_FROM: AtomicU64 = AtomicU64::new(0);
@@ -9151,7 +9180,13 @@ impl Exec {
     /// This executor's census class.
     fn prog_class(&self) -> u8 {
         if self.deferred {
-            1
+            if self.name.starts_with("gpu-gfx") {
+                1
+            } else if self.name.starts_with("gpu-acb0x50") {
+                4
+            } else {
+                5
+            }
         } else if self.name == "gpu-acb0x50" {
             2
         } else if self.compute_cp {
@@ -9624,7 +9659,7 @@ fn prog_census_lines() -> String {
     let Some(m) = g.as_ref() else { return String::new() };
     let flips = super::FRAMES.load(Ordering::Relaxed).saturating_sub(PROG_FROM.load(Ordering::Relaxed)).max(1) as f64;
     let mut out = String::new();
-    for (c, name) in ["graphics CP", "parallel workers", "queue 0x50", "other compute queues"].iter().enumerate() {
+    for (c, name) in ["graphics CP", "the graphics CP's workers", "queue 0x50", "other compute queues", "queue 0x50's workers", "other compute queues' workers"].iter().enumerate() {
         let mut v: Vec<(&(u8, u64, u64), &[u64; 2])> = m.iter().filter(|(k, _)| k.0 == c as u8).collect();
         if v.is_empty() {
             continue;
@@ -10156,8 +10191,12 @@ pub fn reset_shader_profile() {
 /// `DS_STEP_LAPS=1` without the profiler: the step lines alone (the
 /// profiler's report has them otherwise).
 pub fn laps_report() -> String {
-    if !laps() || profiling() {
+    if profiling() {
         return String::new();
+    }
+    if !laps() {
+        // (`DS_PROG_CENSUS=1`: the census alone.)
+        return if prog_census() { prog_census_lines() } else { String::new() };
     }
     draw_steps_line() + &draw::delta_line() + &shaders::prep_parts_line() + &bind_steps_line() + &pre_steps_line() + &prog_census_lines() + &slow_place_lines() + &shaders::fmt_census_lines()
 }
@@ -18248,7 +18287,7 @@ impl Exec {
             SKIPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        let t_prog = laps().then(std::time::Instant::now);
+        let t_prog = prog_census().then(std::time::Instant::now);
         if super::tune::gpu_chains() != 0 && self.gpu_append(cp, groups, initiator) {
             if let Some(t) = t_prog {
                 prog_note(self.prog_class(), cs_addr(cp), 0, t.elapsed().as_nanos() as u64);
@@ -18524,7 +18563,7 @@ impl Exec {
                 self.xq_need(s, XR_INDIRECT);
             }
         }
-        let t_prog = laps().then(std::time::Instant::now);
+        let t_prog = prog_census().then(std::time::Instant::now);
         let r = self.dispatch_inner(cp, [1, 1, 1], initiator, Some(args));
         if let Some(t) = t_prog {
             prog_note(self.prog_class(), cs_addr(cp), 1, t.elapsed().as_nanos() as u64);
@@ -18543,7 +18582,9 @@ impl Exec {
     /// `indirect`: the arguments' guest address (the GPU reads the group
     /// counts; `groups` is unused).
     fn dispatch_inner(&mut self, cp: &Cp, mut groups: [u32; 3], initiator: u32, indirect: Option<u64>) -> Result<(), String> {
-        ballast_cp(self.ballast_kind, cp.ballast_part());
+        if ballast_progs().is_empty() || ballast_progs().contains(&cs_addr(cp)) {
+            ballast_cp(self.ballast_kind, cp.ballast_part());
+        }
         // Phase times only when profiling (a clock read costs ~20 ns); the
         // total always (slow dispatches are reported).
         let t_start = std::time::Instant::now();
