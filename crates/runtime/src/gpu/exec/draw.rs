@@ -36,6 +36,47 @@ pub static DELTA_BIND: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// DS_STEP_LAPS: draws step time in all by kind (DRAW_KINDS), other / buffer-delta:
 /// [ns, draws] (a batch first draws apart).
 static DELTA_COST: [[[AtomicU64; 2]; 2]; 3] = [const { [const { [const { AtomicU64::new(0) }; 2] }; 2] }; 3];
+/// DS_STEP_LAPS: a draw's steps (`DRAW_STEP_NAMES`, ns; slot 18 the draws) by class (a batch's
+/// first draws apart): 4 for the graphics CP's workers + 2 for a draw without colour targets
+/// + 1 for a buffer-delta draw.
+static STEPS_SPLIT: [[AtomicU64; 19]; 8] = [const { [const { AtomicU64::new(0) }; 19] }; 8];
+/// Pixel stages that read no memory, their preparation taken from the draw before
+/// (`Exec::empty_ps`): [taken (counted with `DS_STEP_LAPS` only), compared with a fresh
+/// preparation (`tune buffer_delta` 2), differing].
+pub static EMPTY_PS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Whether a prepared stage depends on no guest memory: nothing read, no resources.
+fn reads_nothing(p: &Prepared) -> bool {
+    p.found.reads.is_empty() && p.found.resources.is_empty() && p.found.unread.is_empty() && p.found.data_loads.is_empty() && p.cmp_images == 0
+}
+
+/// Whether two preparations of a stage are the same (`tune buffer_delta` 2).
+fn same_prepared(a: &Prepared, b: &Prepared) -> bool {
+    a.addr == b.addr && std::sync::Arc::ptr_eq(&a.found.tr, &b.found.tr) && a.sgpr_data == b.sgpr_data && a.user == b.user && a.code_hash == b.code_hash && reads_nothing(b)
+}
+
+/// Status part: `STEPS_SPLIT`.
+pub(super) fn steps_split_line() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut out = String::new();
+    for (c, steps) in STEPS_SPLIT.iter().enumerate() {
+        let n = steps[18].load(Relaxed);
+        if n == 0 {
+            continue;
+        }
+        let all: u64 = steps[..18].iter().map(|s| s.load(Relaxed)).sum();
+        let parts: Vec<String> = super::DRAW_STEP_NAMES.iter().zip(steps.iter()).map(|(name, s)| format!("{name} {:.2}", s.load(Relaxed) as f64 / n as f64 / 1e3)).collect();
+        out.push_str(&format!(
+            "    a draw by step ({}, {}, {}: {n}, {:.2} us each): {}\n",
+            if c & 4 != 0 { "workers" } else { "the graphics CP" },
+            if c & 2 != 0 { "depth only" } else { "colour targets" },
+            if c & 1 != 0 { "buffer-delta" } else { "full" },
+            all as f64 / n as f64 / 1e3,
+            parts.join(", ")
+        ));
+    }
+    out
+}
 /// DS_STEP_LAPS: draws that were not buffer-delta draws (a batch first draws apart): [all, the
 /// pair of the draw before (refused as a delta), of the one before that, of one of the two
 /// before those, of one of four more, none (the first draw since a dispatch or of its
@@ -227,7 +268,13 @@ pub(super) fn delta_line() -> String {
     } else {
         String::new()
     };
-    format!(
+    let e: Vec<u64> = EMPTY_PS.iter().map(|c| c.load(Relaxed)).collect();
+    let empty = if e.iter().any(|&x| x != 0) {
+        format!("    pixel stages that read no memory: {} preparations taken from the draw before (counted with `DS_STEP_LAPS`), {} compared with a fresh one ({} differing; `tune buffer_delta` 2)\n", e[0], e[1], e[2])
+    } else {
+        String::new()
+    };
+    empty + &format!(
         "    buffer-delta draws: {} of {} candidates (refused: modes {}, translations or indices {}, images or samplers {}, image lookups {}, clears or reloads pending {}, textures {}, rendering instance {}); stages binding the draw before's images and samplers {}, looking them up {}{verified}{costs}\n",
         d[1], d[0], d[2], d[3], d[4], d[5], d[6], d[7], d[8], b[0], b[1]
     )
@@ -1684,15 +1731,41 @@ impl Exec {
             }
         }
         lap.mark(0);
+        // A pixel stage that reads no memory (the depth-only items' usual one: no user data,
+        // resources or loads): the last one prepared under these context registers and
+        // pixel program registers (`Cp::ps_epoch`) and tunables is this draw's too. (`tune
+        // buffer_delta` 2: prepared anyway and compared.)
+        let tune_gen = super::super::tune::generation();
+        let taken = if ps_addr != 0 && !batched && !memo {
+            self.empty_ps.as_ref().filter(|(e, g, p)| *e == self.ps_epoch && *g == tune_gen && p.addr == ps_addr).map(|(_, _, p)| p.clone())
+        } else {
+            None
+        };
+        let (taken, compare) = if super::super::tune::buffer_delta() == 2 { (None, taken) } else { (taken, None) };
+        let ps_taken = taken.is_some();
         let mut ps = if ps_addr != 0 {
-            match pre_ps.and_then(|s| crate::gpu::ahead::take(&s, cp, true)) {
-                Some(p) => Some(p),
-                None if memo => Some(shaders::prep_memo(shaders::prep_memo_key(shaders::StageKind::Pixel, cp.packet_addr(), cp, memo_extra), || shaders::prepare_ps(cp))?),
-                None => Some(shaders::prepare_ps(cp)?),
+            match taken {
+                Some(p) => {
+                    if super::laps() {
+                        EMPTY_PS[0].fetch_add(1, Ordering::Relaxed);
+                    }
+                    Some(p)
+                }
+                None => match pre_ps.and_then(|s| crate::gpu::ahead::take(&s, cp, true)) {
+                    Some(p) => Some(p),
+                    None if memo => Some(shaders::prep_memo(shaders::prep_memo_key(shaders::StageKind::Pixel, cp.packet_addr(), cp, memo_extra), || shaders::prepare_ps(cp))?),
+                    None => Some(shaders::prepare_ps(cp)?),
+                },
             }
         } else {
             None
         };
+        if let (Some(old), Some(p)) = (&compare, &ps) {
+            EMPTY_PS[1].fetch_add(1, Ordering::Relaxed);
+            if !same_prepared(old, p) && EMPTY_PS[2].fetch_add(1, Ordering::Relaxed) < 8 {
+                crate::warn!("gpu[{}]: a pixel stage taken from the draw before would differ from its preparation (ps {ps_addr:#x}, `tune buffer_delta` 2)", self.name);
+            }
+        }
         lap.mark(1);
         // Batched stages that cannot run batched (memory writes, the varying's
         // location taken): the pair is refused and the stages prepared again.
@@ -1796,6 +1869,12 @@ impl Exec {
         }
         drop(batched_guard);
         drop(masks_guard);
+        if !ps_taken && !batched {
+            self.empty_ps = match &ps {
+                Some(p) if reads_nothing(p) && !lod_rotated => Some((self.ps_epoch, tune_gen, p.clone())),
+                _ => None,
+            };
+        }
         lap.mark(2);
         // (A GPU-resolved run's first draw: its steps apart, `DS_STEP_LAPS`.)
         let gpu_open = batched && gpu_pair.is_some();
@@ -2843,6 +2922,12 @@ impl Exec {
             let c = &DELTA_COST[kind][was_delta as usize];
             c[0].fetch_add(lap.local.iter().sum::<u64>(), Ordering::Relaxed);
             c[1].fetch_add(1, Ordering::Relaxed);
+            let depth_only = fixed.colors.iter().all(Option::is_none);
+            let s = &STEPS_SPLIT[(kind == 2) as usize * 4 + depth_only as usize * 2 + was_delta as usize];
+            for (k, v) in lap.local[..18].iter().enumerate() {
+                s[k].fetch_add(*v, Ordering::Relaxed);
+            }
+            s[18].fetch_add(1, Ordering::Relaxed);
         }
         if super::laps() {
             // The pair census: a draw that was not a buffer-delta draw whose pair one of the
@@ -3424,7 +3509,7 @@ impl Exec {
 
 /// `profile reset`: the draw statistics of this module.
 pub(super) fn reset_draw_stats() {
-    for c in DRAW_DIFFS.iter().chain(CONSEC_DIFFS.iter()).chain(BATCH_CANDS.iter()).chain(PREP_REPEAT.iter()).chain(DELTA.iter()).chain(DELTA_VERIFY.iter()).chain(DELTA_BIND.iter()) {
+    for c in DRAW_DIFFS.iter().chain(CONSEC_DIFFS.iter()).chain(BATCH_CANDS.iter()).chain(PREP_REPEAT.iter()).chain(DELTA.iter()).chain(DELTA_VERIFY.iter()).chain(DELTA_BIND.iter()).chain(STEPS_SPLIT.iter().flatten()) {
         c.store(0, Ordering::Relaxed);
     }
 }

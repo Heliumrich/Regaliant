@@ -10353,7 +10353,7 @@ pub fn laps_report() -> String {
         // (`DS_PROG_CENSUS=1`: the census alone.)
         return if prog_census() { prog_census_lines() + &pass_census_lines() } else { String::new() };
     }
-    draw_steps_line() + &draw::delta_line() + &shaders::prep_parts_line() + &bind_steps_line() + &pre_steps_line() + &prog_census_lines() + &pass_census_lines() + &slow_place_lines() + &shaders::fmt_census_lines()
+    draw_steps_line() + &draw::delta_line() + &draw::steps_split_line() + &shaders::prep_parts_line() + &bind_steps_line() + &pre_steps_line() + &prog_census_lines() + &pass_census_lines() + &slow_place_lines() + &shaders::fmt_census_lines()
 }
 
 /// Shaders by total GPU time.
@@ -10862,6 +10862,11 @@ pub struct Exec {
     /// last draw, whatever its programs' addresses (`Cp::draw`): a buffer-delta draw goes
     /// by its stages' translations (`delta_holds`).
     pub(crate) draw_same_ctx: bool,
+    /// The state the draw's pixel stage is prepared from, by name (`Cp::ps_epoch`).
+    pub(crate) ps_epoch: u64,
+    /// The last pixel stage prepared that reads no memory, with its `ps_epoch` and the
+    /// tunables' generation (`draw::EMPTY_PS`).
+    empty_ps: Option<(u64, u64, Prepared)>,
     last_draw_end: (u64, u64),
     /// The last draw's GPU-read arguments and index base (`DS_DRAW_STATS`).
     last_draw_where: (Option<u64>, Option<u64>),
@@ -12457,6 +12462,8 @@ impl Exec {
                 last_draw_sig: [0; 5],
                 draw_same: false,
                 draw_same_ctx: false,
+                ps_epoch: 0,
+                empty_ps: None,
                 last_draw_end: (u64::MAX, 0),
                 last_draw_where: (None, None),
                 draw_run: None,

@@ -73,6 +73,16 @@ pub const VARS: &[Var] = &[
     // 2026-11-16).
     v("doIndexBufferCulling", 0x24a093d, 0x2f32cc0, Kind::Bool),
     v("doSunShadowIndexBufferCulling", 0x23d9927, 0x2f32db0, Kind::Bool),
+    // The sun's shadows: how far from the camera they reach and where its cascades end (float
+    // ConVars built at eboot+0x947a63 to +0x947d02, each 0 to 1000; their storage the render
+    // settings' +0xd8 to +0xe8). The static items' draws into the cascades are the largest
+    // block of commands at the heavy places (FINDINGS.md 2026-11-17 night): a shorter reach
+    // draws fewer of them (`Setting_PC_ShadowDistance`).
+    v("sunShadowMaxDistance", 0x244115b, 0x2f1d380, Kind::Float),
+    v("sunShadowCascadeDistance0", 0x24c5eaf, 0x2f1d480, Kind::Float),
+    v("sunShadowCascadeDistance1", 0x24a0710, 0x2f1d580, Kind::Float),
+    v("sunShadowCascadeDistance2", 0x244a8d4, 0x2f1d680, Kind::Float),
+    v("sunShadowCascadeDistance3", 0x248c595, 0x2f1d780, Kind::Float),
 ];
 
 const VALUE: u64 = 0x68;
@@ -113,6 +123,9 @@ struct State {
     /// A float variable wanted as the title's own value times this factor (`want_scaled`),
     /// where no fixed value is wanted.
     scale: Vec<Option<f32>>,
+    /// A float variable wanted no higher than this (`want_capped`), where neither a fixed
+    /// value nor a factor is wanted: the title's own value where that is lower.
+    cap: Vec<Option<f32>>,
     /// The title's own value, read before the first write.
     orig: Vec<Option<u32>>,
     /// What the port wrote last.
@@ -120,7 +133,7 @@ struct State {
 }
 
 static BASE: AtomicU64 = AtomicU64::new(0);
-static OK: [AtomicBool; 32] = [const { AtomicBool::new(false) }; 32];
+static OK: [AtomicBool; 48] = [const { AtomicBool::new(false) }; 48];
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 static DIRTY: AtomicBool = AtomicBool::new(false);
 
@@ -141,7 +154,7 @@ pub fn init(base: u64, image: &[u8]) {
     } else {
         crate::warn!("pc settings: console variables not where expected (another title version?), left alone: {}", bad.join(", "));
     }
-    *STATE.lock() = Some(State { want: vec![None; VARS.len()], scale: vec![None; VARS.len()], orig: vec![None; VARS.len()], wrote: vec![None; VARS.len()] });
+    *STATE.lock() = Some(State { want: vec![None; VARS.len()], scale: vec![None; VARS.len()], cap: vec![None; VARS.len()], orig: vec![None; VARS.len()], wrote: vec![None; VARS.len()] });
     // The stored PC settings (read before the executable loaded).
     super::apply();
 }
@@ -188,6 +201,22 @@ pub fn want_scaled(name: &str, factor: Option<f32>) {
     }
 }
 
+/// Wants a float variable no higher than `cap` (`None`: no cap), applied at the next `tick`: the
+/// title's own value stays where it is lower, and follows the title's later writes (a level's
+/// own setting).
+pub fn want_capped(name: &str, cap: Option<f32>) {
+    let Some(i) = index(name) else {
+        crate::warn!("pc settings: no console variable {name}");
+        return;
+    };
+    if let Some(s) = STATE.lock().as_mut() {
+        if s.cap[i] != cap {
+            s.cap[i] = cap;
+            DIRTY.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 /// A scaled value as the port writes it: one bit off the plain value, -0.0 for zero. The title's
 /// own later write of the plain value (its setting moved there, as the Motion Blur slider to 0
 /// while the mouse blur is Off) then differs from the port's and is taken as its new own value.
@@ -208,7 +237,7 @@ fn fmt(kind: Kind, bits: u32) -> String {
 /// display mode changes (its render configs: the tessellation), as the render scale's pulses do.
 pub fn tick() {
     static TICKS: AtomicU64 = AtomicU64::new(0);
-    if TICKS.fetch_add(1, Ordering::Relaxed) % 120 == 119 && STATE.lock().as_ref().is_some_and(|s| s.want.iter().any(Option::is_some) || s.scale.iter().any(Option::is_some)) {
+    if TICKS.fetch_add(1, Ordering::Relaxed) % 120 == 119 && STATE.lock().as_ref().is_some_and(|s| s.want.iter().any(Option::is_some) || s.scale.iter().any(Option::is_some) || s.cap.iter().any(Option::is_some)) {
         DIRTY.store(true, Ordering::Relaxed);
     }
     if !DIRTY.load(Ordering::Relaxed) {
@@ -228,7 +257,8 @@ pub fn tick() {
         let obj = base + var.obj;
         let built = unsafe { (obj as *const u64).read_volatile() } != 0;
         let scaled = var.kind == Kind::Float && s.want[i].is_none() && s.scale[i].is_some();
-        if s.want[i].is_none() && !scaled && s.wrote[i].is_none() {
+        let capped = var.kind == Kind::Float && s.want[i].is_none() && !scaled && s.cap[i].is_some();
+        if s.want[i].is_none() && !scaled && !capped && s.wrote[i].is_none() {
             continue;
         }
         if !built {
@@ -253,9 +283,15 @@ pub fn tick() {
             s.orig[i] = Some(cur);
             crate::info!("pc settings: {} set by the title to {}", var.name, fmt(var.kind, cur));
         }
-        let target = s.want[i]
+        // What the port wants written: a fixed value, the title's own times a factor, or a
+        // cap below the title's own; else the title's own put back after a write of the port's.
+        let ports = s.want[i]
             .or_else(|| if scaled { s.orig[i].map(|o| marked(f32::from_bits(o) * s.scale[i].unwrap_or(1.0))) } else { None })
-            .or(if s.wrote[i].is_some() { s.orig[i] } else { None });
+            .or_else(|| match (capped, s.cap[i], s.orig[i]) {
+                (true, Some(cap), Some(o)) if f32::from_bits(o) > cap => Some(marked(cap)),
+                _ => None,
+            });
+        let target = ports.or(if s.wrote[i].is_some() { s.orig[i] } else { None });
         let Some(target) = target else { continue };
         if cur != target || own_cur != target || s.wrote[i] != Some(target) {
             unsafe {
@@ -270,7 +306,7 @@ pub fn tick() {
                 fmt(var.kind, target),
                 s.orig[i].map(|o| fmt(var.kind, o)).unwrap_or_default()
             );
-            s.wrote[i] = if s.want[i].is_some() || scaled { Some(target) } else { None };
+            s.wrote[i] = if ports.is_some() { Some(target) } else { None };
         }
     }
     if !waiting {

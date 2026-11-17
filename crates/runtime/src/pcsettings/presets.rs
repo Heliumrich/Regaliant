@@ -10,17 +10,18 @@ pub const NAMES: [&str; 5] = ["Custom", "Low", "Medium", "High", "Ultra"];
 /// settings' defaults: the Visual Mode's render size, tessellation and texture filtering);
 /// Ultra goes beyond it (the screen's own resolution, the finest tessellation, 16x filtering),
 /// Medium and Low trade detail for speed on modest GPUs (a lower render scale first: the largest
-/// saving). Shadows stay: the title's only switches turn them off altogether (the torches then
-/// light through walls).
+/// saving on the GPU) and on the CPU side (a shorter reach of the sun's shadows: fewer draws
+/// into its cascades). Shadows stay on: the title's own switches turn them off altogether (the
+/// torches then light through walls).
 const PRESETS: [&[(&str, u32)]; 4] = [
-    // Low: 67% render scale, the title's PS4 Pro tessellation.
-    &[("RenderScale", 3), ("GeometryDetail", 1), ("TextureFiltering", 0)],
-    // Medium: 85%, the Performance mode's tessellation.
-    &[("RenderScale", 5), ("GeometryDetail", 2), ("TextureFiltering", 0)],
+    // Low: 67% render scale, the title's PS4 Pro tessellation, the sun's shadows to 25 m.
+    &[("RenderScale", 3), ("GeometryDetail", 1), ("ShadowDistance", 3), ("TextureFiltering", 0)],
+    // Medium: 85%, the Performance mode's tessellation, the sun's shadows to 40 m.
+    &[("RenderScale", 5), ("GeometryDetail", 2), ("ShadowDistance", 2), ("TextureFiltering", 0)],
     // High: as the PS5.
-    &[("RenderScale", 0), ("GeometryDetail", 0), ("TextureFiltering", 0)],
+    &[("RenderScale", 0), ("GeometryDetail", 0), ("ShadowDistance", 0), ("TextureFiltering", 0)],
     // Ultra: 100% (the screen's resolution), the finest tessellation, 16x anisotropic filtering.
-    &[("RenderScale", 6), ("GeometryDetail", 5), ("TextureFiltering", 2)],
+    &[("RenderScale", 6), ("GeometryDetail", 5), ("ShadowDistance", 0), ("TextureFiltering", 2)],
 ];
 
 fn key(id: &str) -> String {

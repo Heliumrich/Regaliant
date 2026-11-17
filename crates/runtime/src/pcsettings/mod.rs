@@ -187,6 +187,13 @@ pub fn items() -> Vec<Item> {
 /// Sharpness's amounts per option (the presenter's pass; 0 off, as the original).
 pub const SHARPNESS: [f32; 5] = [0.0, 0.25, 0.5, 0.75, 1.0];
 
+/// Shadow Distance's caps per option on the sun shadows' reach (`sunShadowMaxDistance`, in the
+/// title's units, metres; `None`: the title's own, 250 in World 1-1 with its last cascade ending
+/// at 100). At a heavy Castlewall view 60 runs x1.03, 40 x1.08 and 25 x1.11 (FINDINGS.md
+/// 2026-11-17 late night): the static items' draws into the cascades are the largest block of
+/// commands there.
+pub const SHADOW_REACH: [Option<f32>; 4] = [None, Some(60.0), Some(40.0), Some(25.0)];
+
 /// The Graphics & Display list's items (a scrolling list opened from the PC tab: `GRAPHICS_LIST`).
 pub fn graphics_items() -> Vec<Item> {
     let s = |v: &str| v.to_string();
@@ -203,6 +210,12 @@ pub fn graphics_items() -> Vec<Item> {
             label: s("Geometry Detail"),
             tooltip: s("How finely stone and walls are shaped. Higher costs more."),
             kind: ItemKind::Choice(vec![s("Visual Mode"), s("Low"), s("Standard"), s("High"), s("Very High"), s("Ultra")], 0),
+        },
+        Item {
+            id: s("ShadowDistance"),
+            label: s("Shadow Distance"),
+            tooltip: s("How far the sun's shadows reach. Shorter runs faster."),
+            kind: ItemKind::Choice(vec![s("Full"), s("60 m"), s("40 m"), s("25 m")], 0),
         },
         Item {
             id: s("TextureFiltering"),
@@ -328,6 +341,7 @@ pub fn apply() {
     convar::want("r_tessellationDensity", geo.map(|g| convar::float(g.0)));
     convar::want("r_tessellationFadeOutStart", geo.map(|g| convar::float(g.1)));
     convar::want("r_tessellationSmallestEdgeLength", geo.map(|g| convar::float(g.2)));
+    convar::want_capped("sunShadowMaxDistance", SHADOW_REACH.get(get("ShadowDistance").unwrap_or(0) as usize).copied().flatten());
     // Anti-Aliasing by its code: the title's TAA, Off (r_aaMethod: EAAMethods::Off 0, TAA 1), or
     // an upscaler in the TAA's place (the TAA stays on: its dispatch is what they replace, its
     // jitter what they need). A code whose upscaler is not ready here falls back to the TAA.
@@ -484,6 +498,7 @@ pub fn state_report() {
         format!("AudioOutput {} (in effect {})", v("AudioOutput"), crate::hle::libs::audio2::OUTPUT_CHOICE.load(Relaxed)),
         format!("QualityPreset (shown {})", presets::current()),
         format!("GeometryDetail {}", v("GeometryDetail")),
+        format!("ShadowDistance {} (cap {:?})", v("ShadowDistance"), SHADOW_REACH.get(store::value("Setting_PC_ShadowDistance").unwrap_or(0) as usize).copied().flatten()),
         format!("TextureFiltering {} (anisotropy {})", v("TextureFiltering"), crate::gpu::images::ANISO.load(Relaxed)),
         format!("AntiAliasing {:?} (upscaler {up:?})", store::raw_value("Setting_PC_AntiAliasing")),
         format!("Bloom {} / Vignette {}", v("Bloom"), v("Vignette")),

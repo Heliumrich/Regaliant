@@ -233,6 +233,8 @@ pub fn draw_state_line() -> String {
 /// Chains of repeatable draws ended, by the opcode of the packet that ended
 /// them (`keeps_repeat`; the status line's top ones).
 pub static REPEAT_ENDS: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+/// The last value given out as a `Cp::ps_epoch` (unique over all command processors).
+static PS_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// The opcodes that ended most chains of repeatable draws (`REPEAT_ENDS`).
 pub fn repeat_ends_line() -> String {
@@ -255,6 +257,13 @@ pub struct Cp {
     /// `DRAW_STATE`), and the last draw's vertex and pixel programs and
     /// primitive type.
     ctx_dirty: bool,
+    /// A register of the pixel program (its address, RSRC1/2 or user data: shader registers
+    /// 0x08-0x2B) changed value since the last draw.
+    ps_dirty: bool,
+    /// Names the context registers and the pixel program's registers of the last draw: a
+    /// new value from `PS_EPOCH` at each draw that finds one of them changed
+    /// (`Exec::ps_epoch`: a pixel stage that reads no memory is then the same stage).
+    ps_epoch: u64,
     last_draw_progs: (u64, u64, u32),
     /// Draws in the current run of draws with the last draw's context
     /// registers, programs and primitive type (`note_draw_run`).
@@ -2236,6 +2245,8 @@ impl Cp {
             args_checked: None,
             repeat_ok: false,
             ctx_dirty: true,
+            ps_dirty: true,
+            ps_epoch: 0,
             last_draw_progs: (0, 0, 0),
             same_run: 0,
             compute,
@@ -2348,6 +2359,7 @@ impl Cp {
     pub fn set_chunk_state(&mut self, s: &ChunkState) {
         self.repeat_ok = false;
         self.ctx_dirty = true;
+        self.ps_dirty = true;
         copy_prefix(&mut self.regs.ctx, &s.regs.ctx, high(Space::Ctx, CTX_DWORDS));
         copy_prefix(&mut self.regs.sh, &s.regs.sh, high(Space::Sh, SH_DWORDS));
         copy_prefix(&mut self.regs.uc, &s.regs.uc, high(Space::Uc, UC_DWORDS));
@@ -5427,6 +5439,9 @@ impl Cp {
         DRAW_STATE[0].fetch_add(1, Ordering::Relaxed);
         // (The context registers and the primitive type alone: `Exec::draw_same_ctx`.)
         let same_ctx = !self.ctx_dirty && progs.2 == self.last_draw_progs.2;
+        if self.ctx_dirty || std::mem::take(&mut self.ps_dirty) || self.ps_epoch == 0 {
+            self.ps_epoch = PS_EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
+        }
         let same = same_ctx && progs == self.last_draw_progs;
         if !self.ctx_dirty {
             DRAW_STATE[1].fetch_add(1, Ordering::Relaxed);
@@ -5447,6 +5462,7 @@ impl Cp {
         let mut e = self.exec.take().unwrap();
         e.draw_same = same;
         e.draw_same_ctx = same_ctx;
+        e.ps_epoch = self.ps_epoch;
         self.last_draw = e.draw(self, args);
         self.exec = Some(e);
         self.split_if_due();
@@ -5822,6 +5838,9 @@ impl Cp {
         if (index as usize) < n {
             if space == Space::Ctx && v[index as usize] != value {
                 self.ctx_dirty = true;
+            }
+            if space == Space::Sh && (0x08..0x2C).contains(&index) && v[index as usize] != value {
+                self.ps_dirty = true;
             }
             v[index as usize] = value;
             note_high(space, index as usize);
