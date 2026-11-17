@@ -1316,7 +1316,7 @@ thread_local! {
 
 #[path = "shaders_lean.rs"]
 mod lean;
-pub(super) use lean::{join_items, JoinFirst};
+pub(super) use lean::{join_content, join_items, join_keys_on, JoinFirst};
 
 /// What a compute stage's template is checked against besides its registers (`tune join`:
 /// a joined run's later commands are prepared from its first while these stand): the

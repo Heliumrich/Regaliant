@@ -757,6 +757,24 @@ fn jword(w: Word, nodes: &[(Ptr, Node)], s: &mut JNodes, rd: &mut Reader, code_b
     }
 }
 
+/// `DS_JOIN_KEYS=1` (a census, `Exec::join_keys_note`): whether a joined command's own data
+/// repeats across frames.
+pub(in crate::gpu) fn join_keys_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_JOIN_KEYS").ok().as_deref() == Some("1"))
+}
+
+thread_local! {
+    /// `DS_JOIN_KEYS`: a hash of the scalar loads the last `join_items` read under differing
+    /// pointers.
+    static JOIN_CONTENT: Cell<u64> = const { Cell::new(0) };
+}
+
+/// `DS_JOIN_KEYS`: the last `join_items`' hash of the loads it read.
+pub(in crate::gpu) fn join_content() -> u64 {
+    JOIN_CONTENT.with(|c| c.get())
+}
+
 /// `tune join` (`Exec::join_fast`): the part of a compute stage's preparation that differs
 /// from its run's first command (`first`, its translation and resources; `jf`). A pointer
 /// that is the first command's is taken to hold what it held then (checked on the title's
@@ -877,6 +895,8 @@ fn join_items_in(addr: u64, lp: &LeanPlan, nodes: &[(Ptr, Node)], te: &TrEntry, 
     }
     block[..16].copy_from_slice(&s.user[..]);
     let mut at = translate::SGPR_DATA_USER as usize;
+    let keys = join_keys_on();
+    let mut content = 0u64;
     for l in &te.loads {
         let n = l.dwords as usize;
         let (b, sm) = jroot(l.from, nodes, s, rd, addr)?;
@@ -890,8 +910,16 @@ fn join_items_in(addr: u64, lp: &LeanPlan, nodes: &[(Ptr, Node)], te: &TrEntry, 
                     block[at + k] = rd.u32(a + 4 * k as u64).unwrap_or(0);
                 }
             }
+            if keys {
+                for &w in &block[at..at + n] {
+                    content = (content ^ w as u64).wrapping_mul(0x0000_0100_0000_01B3).rotate_left(29);
+                }
+            }
         }
         at += n;
+    }
+    if keys {
+        JOIN_CONTENT.with(|c| c.set(content));
     }
     Some(mask)
 }

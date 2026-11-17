@@ -1118,6 +1118,9 @@ const TINY_SNAP_BYTES: u64 = 256;
 /// Tiny read-only buffers bound as snapshots of guest memory
 /// (`TINY_SNAP_BYTES`).
 pub(crate) static TINY_SNAPS: AtomicU64 = AtomicU64::new(0);
+/// Tiny read-only buffers bound from a snapshot (`bind_stage`: the copy kernel's inputs,
+/// and others nothing else placed).
+pub(crate) static TINY_BOUND: AtomicU64 = AtomicU64::new(0);
 
 /// Pipelines unused for this many flips may be evicted (~1-2 minutes).
 const PIPE_IDLE_FLIPS: u32 = 3600;
@@ -10598,8 +10601,22 @@ pub struct Exec {
     bind_only: Option<u64>,
     /// `tune join`: the block of the command being joined (`join_try`).
     join_block: Vec<u32>,
-    /// `tune join`: `join_try`'s cycles by part for the command being joined.
-    join_tsc: [u64; 3],
+    /// `tune join`: joined commands not yet added to `JOIN_STATS` ([all, those without the
+    /// full preparation]; added every 256).
+    join_cnt: [u32; 2],
+    /// `tune join` (`JOIN_FINE`): the time stamps of the dispatch being joined (its entry,
+    /// before and after the partial preparation, after the sync, the binding, the block,
+    /// the ring and table, the notes), the exit of the joined command before when nothing
+    /// came between, whether this dispatch was joined without its full preparation, and
+    /// this executor's sums not yet added to the counters.
+    join_ts: [u64; 8],
+    /// `tune join`: programs by their refusals in a row for what differs between their
+    /// commands (a written or non-buffer resource, no plan): from `JOIN_DEAD_AFTER` on their
+    /// runs are made without a join (its attempts cost what they could never save).
+    join_dead: Vec<(u64, u8)>,
+    join_out: u64,
+    join_fast_done: bool,
+    join_acc: [u64; 11],
     /// `tune join`: resources the next `bind_stage` binds in place of its stage's own
     /// (`bind_only`; `join_fast`: the later command's buffers), and what its partial
     /// preparation read.
@@ -10944,17 +10961,137 @@ struct JoinRun {
 /// run's ring window left); then the join without the full preparation (`join_fast`):
 /// commands it took, refusals for a changed setting, for its partial preparation, for a wait
 /// at its reads; and its check (`tune join` 3): compared, differing, taken by one form
-/// only].
-static JOIN_STATS: [AtomicU64; 30] = [const { AtomicU64::new(0) }; 30];
+/// only; then runs left without a join because their program's commands never joined
+/// (`Exec::join_dead`), and runs given one].
+static JOIN_STATS: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
 
-/// `tune join`: cycles of joined commands by part: [the checks before binding, the buffers'
-/// binding, the block, the ring and table, the notes; the preparation and the shader-read
-/// sync before it (every command that reached the join's attempt)], and that last count.
-static JOIN_TSC: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
+/// `DS_JOIN_KEYS=1` (a census): the commands joined without their full preparation by what is
+/// theirs alone (their program and the user words that differ from their run's first
+/// command's) and what that resolved to (their buffers and the loads under differing
+/// pointers): [commands, new keys; then for a key seen earlier in the same flip, in one of
+/// the two flips before, and longer ago, four counts each: buffers and loads as then, the
+/// buffers alone, the loads alone, neither], and the owners (engine allocators) of the first
+/// differing pointer.
+struct JoinKeys {
+    map: HashMap<u64, (u64, u64, u64)>,
+    stats: [u64; 14],
+    owners: HashMap<u32, u64>,
+    samples: Vec<(u64, u64, u64)>,
+}
+
+static JOIN_KEYS: Mutex<Option<JoinKeys>> = Mutex::new(None);
+
+fn join_keys_note(key: u64, bufs: u64, loads: u64, ptr: u64, addr: u64) {
+    let flip = super::FRAMES.load(Ordering::Relaxed);
+    let mut g = JOIN_KEYS.lock();
+    let s = g.get_or_insert_with(|| JoinKeys { map: HashMap::new(), stats: [0; 14], owners: HashMap::new(), samples: Vec::new() });
+    s.stats[0] += 1;
+    let k = match s.map.get(&key) {
+        Some(&(b, l, f)) => {
+            let age = if f == flip {
+                0
+            } else if f + 2 >= flip {
+                1
+            } else {
+                2
+            };
+            2 + 4 * age + if b == bufs && l == loads {
+                0
+            } else if b == bufs {
+                1
+            } else if l == loads {
+                2
+            } else {
+                3
+            }
+        }
+        None => 1,
+    };
+    s.stats[k] += 1;
+    if s.map.len() > 4_000_000 {
+        s.map.clear();
+    }
+    s.map.insert(key, (bufs, loads, flip));
+    *s.owners.entry(crate::engine::owner(ptr) as u32).or_insert(0) += 1;
+    if s.samples.len() < 24 && s.stats[0] % 50_021 == 1 {
+        s.samples.push((addr, ptr, flip));
+    }
+}
+
+fn join_keys_line() -> String {
+    let g = JOIN_KEYS.lock();
+    let Some(s) = g.as_ref() else { return String::new() };
+    let mut owners: Vec<(u32, u64)> = s.owners.iter().map(|(k, v)| (*k, *v)).collect();
+    owners.sort_by_key(|x| std::cmp::Reverse(x.1));
+    let v = &s.stats;
+    let four = |a: usize| format!("{} / {} / {} / {}", v[a], v[a + 1], v[a + 2], v[a + 3]);
+    format!(
+        "    joined commands by their own key (`DS_JOIN_KEYS`): {} commands, {} with a new key; a key seen before with its buffers and loads as then / the buffers alone / the loads alone / neither: earlier in the flip {}, in one of the two flips before {}, longer ago {}; {} keys kept; the first differing pointer's owner (engine allocator id: commands): {}; samples (program, pointer, flip): {}\n",
+        v[0],
+        v[1],
+        four(2),
+        four(6),
+        four(10),
+        s.map.len(),
+        owners.iter().take(8).map(|(k, n)| format!("{k}: {n}")).collect::<Vec<_>>().join(", "),
+        s.samples.iter().map(|(a, p, f)| format!("{a:#x} {p:#x} {f}")).collect::<Vec<_>>().join("; ")
+    )
+}
+
+/// `tune join`: refusals in a row after which a program's runs are made without a join.
+const JOIN_DEAD_AFTER: u8 = 8;
+
+/// `DS_JOIN_FINE=1` (diagnosis): the joined commands' cycles by part (`JOIN_FINE`).
+fn join_fine_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_JOIN_FINE").ok().as_deref() == Some("1"))
+}
+
+/// A time stamp for `JOIN_FINE` (0 without `DS_JOIN_FINE`).
 #[inline]
 fn tsc() -> u64 {
-    unsafe { core::arch::x86_64::_rdtsc() }
+    if join_fine_on() {
+        unsafe { core::arch::x86_64::_rdtsc() }
+    } else {
+        0
+    }
+}
+
+/// `tune join`: cycles of the commands joined without their full preparation, by executor
+/// ([the graphics CP, its workers, the others]) and part: [from the dispatch's entry to the
+/// partial preparation, the partial preparation, the sync of its reads, the buffers'
+/// binding, the checks after it and the block, the ring and table, the notes, the
+/// dispatch's exit, such commands; the packets between the joined command before and this
+/// one, the commands that had one before].
+static JOIN_FINE: [[AtomicU64; 11]; 3] = [const { [const { AtomicU64::new(0) }; 11] }; 3];
+
+fn join_fine_lines() -> String {
+    let hz = crate::hle::kernel::time::tsc_hz().max(1) as f64;
+    let mut out = String::new();
+    for (k, name) in ["the graphics CP", "its workers", "the others"].iter().enumerate() {
+        let v: Vec<u64> = JOIN_FINE[k].iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        if v[8] == 0 {
+            continue;
+        }
+        let ns = |c: u64, n: u64| c as f64 / hz * 1e9 / n.max(1) as f64;
+        out += &format!(
+            "    joined without the full preparation on {name}: {} commands, ns by part: entry {:.0}, partial preparation {:.0}, sync {:.0}, binding {:.0}, checks and block {:.0}, ring and table {:.0}, notes {:.0}, exit {:.0} (in all {:.0}); the packets between two of them {:.0} ({} cases)\n",
+            v[8],
+            ns(v[0], v[8]),
+            ns(v[1], v[8]),
+            ns(v[2], v[8]),
+            ns(v[3], v[8]),
+            ns(v[4], v[8]),
+            ns(v[5], v[8]),
+            ns(v[6], v[8]),
+            ns(v[7], v[8]),
+            ns(v[..8].iter().sum::<u64>(), v[8]),
+            ns(v[9], v[10]),
+            v[10]
+        );
+    }
+    out
 }
 
 fn join_line() -> String {
@@ -10962,19 +11099,6 @@ fn join_line() -> String {
     if v.iter().all(|&x| x == 0) {
         return String::new();
     }
-    let t: Vec<u64> = JOIN_TSC.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    let hz = crate::hle::kernel::time::tsc_hz().max(1) as f64;
-    let ns = |c: u64, n: u64| c as f64 / hz * 1e9 / n.max(1) as f64;
-    let parts = format!(
-        "    a joined command by part, ns: checks {:.0}, binding its buffers {:.0}, the block {:.0}, ring and table {:.0}, notes {:.0}; before the attempt (every command that came to it, {}): preparation and sync {:.0}\n",
-        ns(t[0], v[0]),
-        ns(t[1], v[0]),
-        ns(t[2], v[0]),
-        ns(t[3], v[0]),
-        ns(t[4], v[0]),
-        t[6],
-        ns(t[5], t[6])
-    );
     format!(
         "    runs as data (`tune join` {}): {} commands joined; refused: the run or the command's shape {}, the executor's state {}, the view moved {}, a differing resource not a read-only buffer {}, a recording while binding {}, a binding unlike the run's {}, the block's size {}, the ring or its window {}; checked {}: {} differed, {} not appended by the full path (another batch {}, something recorded since {}, the pipeline {}, the groups {}, the descriptors {} and the run's window left {}); the executor's state by kind: an open CP write met {}, a barrier wanted {}, resident shadows {}, modes {}\n",
         super::tune::join(),
@@ -11000,11 +11124,13 @@ fn join_line() -> String {
         v[13],
         v[14],
         v[15]
-    ) + &parts
-        + &format!(
+    ) + &format!(
             "    of them without the full preparation: {}; it refused for a changed setting {}, its partial preparation {}, a wait at its reads {}; its check: {} compared, {} differing, {} taken only with the full preparation, {} only without it\n",
             v[22], v[23], v[24], v[25], v[26], v[27], v[28], v[29]
         )
+        + &format!("    runs given a join {}, left without one for a program whose commands never joined {}\n", v[31], v[30])
+        + &join_fine_lines()
+        + &join_keys_line()
 }
 
 /// `DS_JOIN_CENSUS=1` (diagnosis): for every command appended to an open batched dispatch,
@@ -12113,7 +12239,12 @@ impl Exec {
                 bind_reuse: None,
                 bind_only: None,
                 join_block: Vec::new(),
-                join_tsc: [0; 3],
+                join_cnt: [0; 2],
+                join_ts: [0; 8],
+                join_dead: Vec::new(),
+                join_out: 0,
+                join_fast_done: false,
+                join_acc: [0; 11],
                 bind_items: Vec::new(),
                 join_reads: Vec::new(),
                 bind_note: None,
@@ -18024,11 +18155,11 @@ impl Exec {
                         // a video-memory home holding the range (see `homes`).
                         // Front end 2: a tiny read-only buffer no GPU work writes,
                         // as guest memory holds it now (`TINY_SNAP_BYTES`).
-                        let tiny = if read_only && super::fe2::on() && size <= TINY_SNAP_BYTES && matches!(*res_i, Resolved::Buffer(_)) && !super::resident::mirror_mode() {
-                            self.snapshot_as(base, size, 4096, false)
-                        } else {
-                            None
-                        };
+                        let tiny_ok = read_only && super::fe2::on() && size <= TINY_SNAP_BYTES && matches!(*res_i, Resolved::Buffer(_)) && !super::resident::mirror_mode();
+                        // The copy kernel's (`tune copy_snap`); another tiny buffer only when
+                        // nothing places it (below). (From 2026-11-09 to 11-17 a snapshot was
+                        // taken of every tiny buffer and the mirror bound all the same.)
+                        let mut tiny = if tiny_ok && super::tune::copy_snap() && super::forward::is_copy_hash(p.code_hash) { self.snapshot_as(base, size, 4096, false) } else { None };
                         let from_mirror = if tiny.is_some() {
                             None
                         } else if super::resident::mirror_mode() {
@@ -18087,10 +18218,18 @@ impl Exec {
                         if self.stopped && super::fe2::on() {
                             return Err(STOPPED.into());
                         }
-                        let home = from_mirror.or_else(|| {
-                            self.home_bind(base, size, found.tr.plan.resources[i].written, if sized { HomeUse::Sized } else { HomeUse::Unbounded })
-                                .map(|h| (h.0, h.1, h.2))
-                        });
+                        // (A snapshot taken is what the buffer is bound from.)
+                        let home = if tiny.is_some() {
+                            None
+                        } else {
+                            from_mirror.or_else(|| {
+                                self.home_bind(base, size, found.tr.plan.resources[i].written, if sized { HomeUse::Sized } else { HomeUse::Unbounded })
+                                    .map(|h| (h.0, h.1, h.2))
+                            })
+                        };
+                        if tiny_ok && tiny.is_none() && home.is_none() {
+                            tiny = self.snapshot_as(base, size, 4096, false);
+                        }
                         BindClock::mark(&mut clk, 1);
                         // Inside a resident shadow: its working copy is newer.
                         let resident = if read_only && home.is_none() { self.resident_read(base, size)? } else { None };
@@ -18155,6 +18294,9 @@ impl Exec {
                             let unbounded = matches!(*res_i, Resolved::Global(_, None));
                             let kind = if found.tr.plan.resources[i].written { 1 } else { 0 } | if data_load { 2 } else { 0 } | if unbounded { 4 } else { 0 };
                             bound.in_place.push((base, size, kind));
+                        }
+                        if tiny.is_some() {
+                            TINY_BOUND.fetch_add(1, Ordering::Relaxed);
                         }
                         if let Some((hbuf, hoff, avail)) = home {
                             placement = if from_mirror.is_some() { Placement::Mirrored } else { Placement::Home };
@@ -18672,6 +18814,42 @@ impl Exec {
 
     /// Executes a dispatch of `groups` thread groups with the compute state of `cp`.
     pub fn dispatch(&mut self, cp: &Cp, groups: [u32; 3], initiator: u32) {
+        self.join_ts[0] = tsc();
+        self.join_fast_done = false;
+        self.dispatch_in(cp, groups, initiator);
+        // (`JOIN_FINE`.)
+        if !join_fine_on() {
+        } else if self.join_fast_done {
+            let now = tsc();
+            let t = self.join_ts;
+            let a = &mut self.join_acc;
+            for k in 0..7 {
+                a[k] += t[k + 1].wrapping_sub(t[k]);
+            }
+            a[7] += now.wrapping_sub(t[7]);
+            a[8] += 1;
+            if self.join_out != 0 {
+                a[9] += t[0].wrapping_sub(self.join_out);
+                a[10] += 1;
+            }
+            self.join_out = now;
+            if a[8] >= 256 {
+                let kind = match self.prog_class() {
+                    0 => 0,
+                    1 => 1,
+                    _ => 2,
+                };
+                for (k, x) in self.join_acc.iter_mut().enumerate() {
+                    JOIN_FINE[kind][k].fetch_add(*x, Ordering::Relaxed);
+                    *x = 0;
+                }
+            }
+        } else {
+            self.join_out = 0;
+        }
+    }
+
+    fn dispatch_in(&mut self, cp: &Cp, groups: [u32; 3], initiator: u32) {
         // (No buffer-delta draw after a dispatch.)
         self.delta.at = None;
         self.pair_ring_n = 0;
@@ -18827,6 +19005,20 @@ impl Exec {
         }
     }
 
+    /// `tune join`: a command of program `addr` was joined (`ok`) or refused for what
+    /// differs between the program's commands (`join_dead`).
+    #[inline]
+    fn join_note(&mut self, addr: u64, ok: bool) {
+        if ok && self.join_dead.is_empty() {
+            return;
+        }
+        match self.join_dead.iter().position(|x| x.0 == addr) {
+            Some(k) => self.join_dead[k].1 = if ok { 0 } else { self.join_dead[k].1.saturating_add(1) },
+            None if !ok && self.join_dead.len() < 64 => self.join_dead.push((addr, 1)),
+            None => {}
+        }
+    }
+
     /// `tune join`: a later command of the open batched run `r` taken without its full
     /// preparation. Its registers are the first command's but for the user data; its
     /// per-item pointers are resolved by the lean plan (`shaders::join_items`: the first
@@ -18857,6 +19049,7 @@ impl Exec {
             return refuse(23);
         }
         let t0 = tsc();
+        self.join_ts[1] = t0;
         let user: [u32; 16] = std::array::from_fn(|i| cp.reg(Space::Sh, 0x240 + i as u32));
         j.proto.sgpr_data.clear();
         j.proto.sgpr_data.extend_from_slice(&j.template);
@@ -18865,10 +19058,37 @@ impl Exec {
         let (us, ub) = (j.proto.tr.spec.user_sgprs, j.proto.tr.spec.user_base);
         let mask = shaders::join_items(j.proto.addr, j.proto.code_hash, &user, us, ub, &j.found, &mut j.first, &mut j.proto.sgpr_data, &mut items, &mut reads);
         self.bind_items = items;
+        self.join_ts[2] = tsc();
         let Some(mask) = mask else {
             self.join_reads = reads;
+            let a = j.proto.addr;
+            self.join_note(a, false);
             return refuse(24);
         };
+        if shaders::join_keys_on() {
+            let mut key = j.proto.addr.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let mut ptr = 0u64;
+            for k in 0..16 {
+                if user[k] != j.first.user[k] {
+                    key = (key ^ ((k as u64) << 32 | user[k] as u64)).wrapping_mul(0x0000_0100_0000_01B3).rotate_left(23);
+                    if ptr == 0 && k % 2 == 0 {
+                        ptr = user[k] as u64 | (user[k + 1] as u64) << 32;
+                    }
+                }
+            }
+            let mut bufs = 0u64;
+            for (i, r) in &self.bind_items {
+                let w: [u64; 4] = match r {
+                    Resolved::Buffer(v) => [v.base, v.byte_size().unwrap_or(u64::MAX), v.stride as u64 | (v.num_records as u64) << 32, v.format as u64],
+                    Resolved::Global(a, n) => [*a, n.unwrap_or(u64::MAX), 1, 0],
+                    _ => [0; 4],
+                };
+                for x in w {
+                    bufs = (bufs ^ x ^ *i as u64).wrapping_mul(0x0000_0100_0000_01B3).rotate_left(31);
+                }
+            }
+            join_keys_note(key, bufs, shaders::join_content(), ptr, j.proto.addr);
+        }
         // What the partial preparation read, synced as a preparation's reads.
         self.sync_readers = [j.proto.addr, 0];
         let waited = !reads.is_empty() && self.sync_for_stage(&reads, SYNC_CS_READS);
@@ -18912,7 +19132,9 @@ impl Exec {
         let j = r.join.as_ref().expect("checked above");
         self.join_block.clear();
         self.join_block.extend_from_slice(&j.proto.sgpr_data);
-        self.join_tsc = [t1.wrapping_sub(t0), t2.wrapping_sub(t1), tsc().wrapping_sub(t2)];
+        self.join_ts[3] = t1;
+        self.join_ts[4] = t2;
+        self.join_ts[5] = tsc();
         Ok(Some(bound))
     }
 
@@ -18928,7 +19150,6 @@ impl Exec {
         if !std::sync::Arc::ptr_eq(&p.found.tr, &j.found.tr) {
             return Ok(None);
         }
-        let t0 = tsc();
         let refuse = |k: usize| {
             JOIN_STATS[k].fetch_add(1, Ordering::Relaxed);
             Ok(None)
@@ -18953,6 +19174,7 @@ impl Exec {
             return refuse(3);
         }
         if j.found.resources.len() != p.found.resources.len() {
+            self.join_note(p.addr, false);
             return refuse(4);
         }
         let mut mask = 0u64;
@@ -18962,6 +19184,7 @@ impl Exec {
             }
             let plain = i < 64 && matches!(b, Resolved::Buffer(_) | Resolved::Global(..)) && !p.found.tr.plan.resources.get(i).is_some_and(|x| x.written);
             if !plain {
+                self.join_note(p.addr, false);
                 return refuse(4);
             }
             mask |= 1u64 << i;
@@ -18973,7 +19196,6 @@ impl Exec {
         if j.template.len() != p.sgpr_data.len() || res_info + per * p.found.resources.len() > j.template.len() {
             return refuse(7);
         }
-        let t1 = tsc();
         let bound = if mask != 0 {
             self.bind_only = Some(mask);
             self.bind_items.clear();
@@ -18981,7 +19203,6 @@ impl Exec {
         } else {
             self.bound_pool.pop().unwrap_or_default()
         };
-        let t2 = tsc();
         if r.uses != self.cmd_uses.get() {
             self.recycle(bound);
             return refuse(5);
@@ -19027,7 +19248,6 @@ impl Exec {
             }
         }
         self.join_block = block;
-        self.join_tsc = [t1.wrapping_sub(t0), t2.wrapping_sub(t1), tsc().wrapping_sub(t2)];
         Ok(Some(bound))
     }
 
@@ -19037,7 +19257,6 @@ impl Exec {
     /// path records the command).
     fn join_commit(&mut self, r: &mut CsRun, addr: u64, groups: [u32; 3]) -> bool {
         let Some(j) = r.join.as_ref() else { return false };
-        let t3 = tsc();
         let bytes = 4 * self.join_block.len() as u64;
         let which = j.which;
         let Some(off) = self.ring_alloc(which, bytes) else {
@@ -19093,16 +19312,18 @@ impl Exec {
                 self.last_notes.2 = gens;
             }
         }
-        let t5 = tsc();
-        for (k, c) in self.join_tsc.iter().enumerate() {
-            JOIN_TSC[k].fetch_add(*c, Ordering::Relaxed);
+        self.join_ts[6] = t4;
+        self.join_ts[7] = tsc();
+        self.join_cnt[0] += 1;
+        if self.join_cnt[0] >= 256 {
+            JOIN_STATS[0].fetch_add(self.join_cnt[0] as u64, Ordering::Relaxed);
+            JOIN_STATS[22].fetch_add(self.join_cnt[1] as u64, Ordering::Relaxed);
+            self.join_cnt = [0; 2];
         }
-        JOIN_TSC[3].fetch_add(t4.wrapping_sub(t3), Ordering::Relaxed);
-        JOIN_TSC[4].fetch_add(t5.wrapping_sub(t4), Ordering::Relaxed);
-        JOIN_STATS[0].fetch_add(1, Ordering::Relaxed);
         BATCHED[0].fetch_add(1, Ordering::Relaxed);
         EXECUTED.fetch_add(1, Ordering::Relaxed);
         self.batch_shaders.push(addr);
+        self.join_note(addr, true);
         true
     }
 
@@ -19327,7 +19548,8 @@ impl Exec {
                         self.recycle(bound);
                         if join_mode == 1 {
                             if self.join_commit(&mut run, cs_addr(cp), groups) {
-                                JOIN_STATS[22].fetch_add(1, Ordering::Relaxed);
+                                self.join_cnt[1] += 1;
+                                self.join_fast_done = true;
                                 self.cs_run = Some(run);
                                 lap.mark(6);
                                 if laps() {
@@ -19420,10 +19642,6 @@ impl Exec {
         // (2: only predicted here, and compared where the full path appends it).
         let mut join_pred: Option<Vec<u32>> = None;
         if join_mode != 0 && indirect.is_none() && !lod_rotated {
-            if self.cs_run.as_ref().is_some_and(|r| r.join.is_some()) {
-                JOIN_TSC[5].fetch_add((t_start.elapsed().as_nanos() as f64 * crate::hle::kernel::time::tsc_hz() as f64 / 1e9) as u64, Ordering::Relaxed);
-                JOIN_TSC[6].fetch_add(1, Ordering::Relaxed);
-            }
             let start_zero = (0x204..0x207).all(|x| cp.reg(Space::Sh, x) == 0);
             if let Some(mut run) = self.cs_run.take() {
                 match self.join_try(&run, &mut p, groups, initiator, start_zero) {
@@ -20103,7 +20321,12 @@ impl Exec {
                         } else {
                             None
                         };
+                        let join_dead = super::tune::join() != 0 && self.join_dead.iter().any(|x| x.0 == p.addr && x.1 >= JOIN_DEAD_AFTER);
+                        if join_dead {
+                            JOIN_STATS[30].fetch_add(1, Ordering::Relaxed);
+                        }
                         let join = (super::tune::join() != 0
+                            && !join_dead
                             && p.tr.spec.gpu_res == 0
                             && fill.is_none()
                             && !lod_rotated
@@ -20130,6 +20353,9 @@ impl Exec {
                                 first: shaders::JoinFirst::new(std::array::from_fn(|i| cp.reg(Space::Sh, 0x240 + i as u32))),
                             })
                         });
+                        if join.is_some() {
+                            JOIN_STATS[31].fetch_add(1, Ordering::Relaxed);
+                        }
                         let first = join_census_on().then(|| p.found.clone());
                         let first_user = if join_census_on() { p.sgpr_data.to_vec() } else { Vec::new() };
                         self.cs_run = Some(CsRun { batch: self.batch_count, uses: self.cmd_uses.get(), pipeline, descs: desc_signature(&bound), args, table, groups: groups[0], ring, window: wbase, gpu, join, first, first_user });

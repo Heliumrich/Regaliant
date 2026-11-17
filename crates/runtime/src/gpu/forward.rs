@@ -157,6 +157,12 @@ static RECENT_COPIES: Mutex<std::collections::VecDeque<(Arc<str>, u64, u64, u64)
 
 /// A dispatch of `p` on queue `queue` (`exec`, every queue): a copy
 /// kernel's goes into `RECENT_COPIES` with its destination.
+/// Whether `code_hash` is the copy kernel's (once a dispatch of it was recognized).
+#[inline]
+pub fn is_copy_hash(code_hash: u64) -> bool {
+    code_hash != 0 && COPY_HASH.load(Ordering::Relaxed) == code_hash
+}
+
 pub fn note_dispatch(p: &Prepared, groups: [u32; 3], queue: &str) {
     let h = COPY_HASH.load(Ordering::Acquire);
     if h == 0 || p.code_hash != h {

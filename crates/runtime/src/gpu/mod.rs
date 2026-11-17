@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 181] = [
+    static ALL: [Tunable; 182] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -212,7 +212,8 @@ pub mod tune {
         Tunable { name: "xq_pre_c", env: "DS_XQ_PRE_C", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lean", env: "DS_LEAN", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lane", env: "DS_LANE", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "join", env: "DS_JOIN", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "join", env: "DS_JOIN", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "copy_snap", env: "DS_COPY_SNAP", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1480,6 +1481,15 @@ pub mod tune {
     /// block the join would have written is compared with its own); 0: off.
     pub fn join() -> u64 {
         get(180)
+    }
+
+    /// The copy kernel's tiny read-only inputs (its pattern and its control block, at most
+    /// `exec::TINY_SNAP_BYTES`: CPU-written, as its forwarding takes them) are bound from a
+    /// snapshot of guest memory taken when the dispatch is recorded, not from front end 2's
+    /// mirror (a stale pattern there gave whole batches of draw records garbage counts:
+    /// FINDINGS.md 2026-11-17 afternoon). 0: from the mirror like every other buffer.
+    pub fn copy_snap() -> bool {
+        get(181) != 0
     }
 
     /// Whether translations get `rdna::translate::Spec::hw_bounds` (scalar
@@ -3681,8 +3691,9 @@ pub fn status_ex(with_stacks: bool) -> String {
         cp::PROMISED.load(Ordering::Relaxed),
         exec::FOREIGN_WAITS.load(Ordering::Relaxed),
         format!(
-            "; {} read-only buffers bound as snapshots of guest memory taken anew (front end 2's tiny buffers, data loads){}",
+            "; {} read-only buffers bound as snapshots of guest memory taken anew ({} of them tiny ones: the copy kernel's inputs, and others nothing else placed){}",
             exec::TINY_SNAPS.load(Ordering::Relaxed),
+            exec::TINY_BOUND.load(Ordering::Relaxed),
             if exec::UPLOAD_HAZARDS[2].load(Ordering::Relaxed) > 0 {
                 format!(
                     "; {} uploads into the mirror over pages an unfinished batch writes ({} of them the other device queue's)",
