@@ -10812,6 +10812,10 @@ pub struct Exec {
     cs_peeked: HashSet<u64>,
     /// The open batched dispatch (`tune batch_cs`).
     cs_run: Option<CsRun>,
+    /// DS_STEP_LAPS: the program pairs of the last draws of the rendering instance since the
+    /// last dispatch (the pair census, draw.rs).
+    pair_ring: [(u64, u64); 8],
+    pair_ring_n: u32,
     /// Mirror mode: the page runs its batch's bindings write (gathered at
     /// its end: `record_mirror_writeback`), bytes used in the slot's last
     /// extra staging buffer, and pages copied without a claim.
@@ -11941,6 +11945,8 @@ impl Exec {
                 cs_streak: (0, 0),
                 cs_peeked: HashSet::new(),
                 cs_run: None,
+                pair_ring: [(0, 0); 8],
+                pair_ring_n: 0,
                 owned: Vec::new(),
                 mm_own: None,
                 extra_used: 0,
@@ -18401,6 +18407,7 @@ impl Exec {
     pub fn dispatch(&mut self, cp: &Cp, groups: [u32; 3], initiator: u32) {
         // (No buffer-delta draw after a dispatch.)
         self.delta.at = None;
+        self.pair_ring_n = 0;
         if DEVICE_LOST.load(Ordering::Relaxed) {
             SKIPPED.fetch_add(1, Ordering::Relaxed);
             return;

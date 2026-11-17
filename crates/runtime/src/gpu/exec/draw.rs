@@ -36,6 +36,11 @@ pub static DELTA_BIND: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// DS_STEP_LAPS: draws step time in all by kind (DRAW_KINDS), other / buffer-delta:
 /// [ns, draws] (a batch first draws apart).
 static DELTA_COST: [[[AtomicU64; 2]; 2]; 3] = [const { [const { [const { AtomicU64::new(0) }; 2] }; 2] }; 3];
+/// DS_STEP_LAPS: draws that were not buffer-delta draws (a batch first draws apart): [all, the
+/// pair of the draw before (refused as a delta), of the one before that, of one of the two
+/// before those, of one of four more, none (the first draw since a dispatch or of its
+/// instance), none of the last eight pairs].
+static PAIR_CENSUS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 /// What a full draw's targets, pipeline and hazard check gave, that a
 /// buffer-delta draw right after it takes over (`DrawDelta`).
@@ -212,6 +217,13 @@ pub(super) fn delta_line() -> String {
     a draw's steps in all (`DS_STEP_LAPS`, not a batch's first; buffer-delta / other): graphics serial {:.2} us ({}) / {:.2} ({}), own chunks {:.2} ({}) / {:.2} ({}), workers {:.2} ({}) / {:.2} ({})",
             us(0, 1), n(0, 1), us(0, 0), n(0, 0), us(1, 1), n(1, 1), us(1, 0), n(1, 0), us(2, 1), n(2, 1), us(2, 0), n(2, 0)
         )
+        + &{
+            let p: Vec<u64> = PAIR_CENSUS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+            format!(
+                "\n    draws that were not buffer-delta draws (a batch's first apart): {}; with the pair of the draw before {}, of the one before that {}, of one of the two before those {}, of one of four more {}, the first since a dispatch or of its instance {}, none of the last eight pairs {}",
+                p[0], p[1], p[2], p[3], p[4], p[5], p[6]
+            )
+        }
     } else {
         String::new()
     };
@@ -1431,6 +1443,7 @@ impl Exec {
     #[track_caller]
     pub(super) fn end_rendering(&mut self) {
         if self.rendering.take().is_some() {
+            self.pair_ring_n = 0;
             unsafe { ctx().device.cmd_end_rendering(self.cmd()) };
             self.ops[super::OP_PASS_ENDS] += 1;
             if super::super::tune::skip_barriers() & 1 == 0 {
@@ -2803,6 +2816,29 @@ impl Exec {
             let c = &DELTA_COST[kind][was_delta as usize];
             c[0].fetch_add(lap.local.iter().sum::<u64>(), Ordering::Relaxed);
             c[1].fetch_add(1, Ordering::Relaxed);
+        }
+        if super::laps() {
+            // The pair census: a draw that was not a buffer-delta draw whose pair one of the
+            // last draws of this rendering instance had (since the last dispatch).
+            let pair = (vs_addr, ps_addr);
+            let n = self.pair_ring_n as usize;
+            if !was_delta && !first {
+                let pos = (0..n.min(8)).find(|&k| self.pair_ring[(n - 1 - k) % 8] == pair);
+                PAIR_CENSUS[0].fetch_add(1, Ordering::Relaxed);
+                let slot = match pos {
+                    Some(0) => 1,
+                    Some(k) if k < 2 => 2,
+                    Some(k) if k < 4 => 3,
+                    Some(_) => 4,
+                    None if n == 0 => 5,
+                    None => 6,
+                };
+                PAIR_CENSUS[slot].fetch_add(1, Ordering::Relaxed);
+            }
+            if n == 0 || self.pair_ring[(n - 1) % 8] != pair {
+                self.pair_ring[n % 8] = pair;
+                self.pair_ring_n += 1;
+            }
         }
         if super::profiling() {
             super::note_phases(&super::DRAW_PHASES, [t_prep, t_pipe, t_bind, since(t0)]);
