@@ -95,6 +95,9 @@ struct Rec {
     /// The player's position (the gameplay camera's copy) and the camera's yaw, where known.
     pos: Option<[f32; 3]>,
     yaw: Option<f32>,
+    /// `DS_PACE_PAIR=1`: the flip that shows this frame (0: not known) and when it was shown.
+    own_flip: u64,
+    shown: Option<Instant>,
 }
 
 /// The game's clock as the port keeps it: which flip the last frame step's time came from.
@@ -265,10 +268,99 @@ impl Clock {
     }
 }
 
+/// Diagnosis (`DS_PACE_PAIR=1`): lines left to log.
+static PAIR_LEFT: AtomicU32 = AtomicU32::new(0);
+
+fn pair_diag() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("DS_PACE_PAIR").is_some())
+}
+
+/// Control `gamestep pair <n>`: the next n frame steps and frame submits are logged (`DS_PACE_PAIR=1`).
+pub fn pair_log(n: u32) {
+    PAIR_LEFT.store(n, Relaxed);
+}
+
+/// `DS_PACE_PAIR=1`: the last frame submitted with a flip: the title's number for it (esi at
+/// CRenderContext::SubmitAndFlip, one up a frame) and the flip that will show it. The flips
+/// follow the submits one for one, so a submit's flip is its place in their order plus a
+/// constant, learned at a submit with no flip waiting (two blank flips come before the first).
+static LAST_SUBMIT: Mutex<Option<(u32, u64)>> = Mutex::new(None);
+/// Submits with a flip so far, and the constant (flip number minus the submit's place; 0: not
+/// learned yet).
+static SUBMITS: AtomicU64 = AtomicU64::new(0);
+static SUBMIT_FLIP: AtomicU64 = AtomicU64::new(0);
+
+/// The flip that will show the frame being stepped (`DS_PACE_PAIR=1`; 0: not known): the
+/// frame's number is the last submitted one's, up by the steps of the title's ring of eight
+/// frame packets between them, and frame numbers and flips run in step.
+fn own_flip(ring: i32) -> u64 {
+    let Some((frame, flip)) = *LAST_SUBMIT.lock() else { return 0 };
+    if !(0..8).contains(&ring) {
+        return 0;
+    }
+    let ahead = (ring as u32).wrapping_sub(frame) & 7;
+    flip + if ahead == 0 { 8 } else { ahead as u64 }
+}
+
+/// Diagnosis hook at CRenderContext::SubmitAndFlip's entry (rdi the context, esi the frame's
+/// number, edx the display buffer, rbx the caller's submit object).
+pub extern "sysv64" fn submit_hook(regs: *const u64, _arg: u32) {
+    {
+        let frame = unsafe { *regs.add(6) } as u32;
+        let seq = SUBMITS.fetch_add(1, Relaxed) + 1;
+        let (queued, shown) = (crate::hle::libs::videoout::QUEUED_FLIP.load(Relaxed), crate::gpu::FRAMES.load(Relaxed));
+        if queued == shown && shown > 0 {
+            let k = (queued + 1).wrapping_sub(seq);
+            let was = SUBMIT_FLIP.swap(k, Relaxed);
+            if was != 0 && was != k {
+                crate::info!("pace pair: flips minus submits now {k} (was {was}): flips came without a frame's submit, or a submit without a flip");
+            }
+        }
+        let k = SUBMIT_FLIP.load(Relaxed);
+        *LAST_SUBMIT.lock() = (k != 0).then_some((frame, seq.wrapping_add(k)));
+    }
+    if PAIR_LEFT.load(Relaxed) == 0 {
+        return;
+    }
+    PAIR_LEFT.fetch_sub(1, Relaxed);
+    let (rdi, rsi, rdx, rbx) = unsafe { (*regs.add(7), *regs.add(6), *regs.add(2), *regs.add(3)) };
+    let q = |a: u64| if a > 0x10000 && crate::gpu::cp::guest_readable(a, 8) { rdq(a) } else { 0 };
+    let words: Vec<String> = (0..8u64).map(|i| format!("{:x}", q(rbx + i * 8))).collect();
+    crate::info!(
+        "pace pair: submit ctx {rdi:#x} esi {:#x} edx {:#x} obj {rbx:#x} [{}] flips queued {} shown {}",
+        rsi as u32,
+        rdx as u32,
+        words.join(" "),
+        crate::hle::libs::videoout::QUEUED_FLIP.load(Relaxed),
+        crate::gpu::FRAMES.load(Relaxed)
+    );
+}
+
 /// After the title's frame step returned (eboot+0xb27f7c: `mov rax,[rbx+28E8h]`; rbx the
 /// application object, r13b the title's own "one fixed step" request).
 pub extern "sysv64" fn after_step(regs: *const u64, _arg: u32) {
     let app = unsafe { *regs.add(3) };
+    // (`DS_PACE_PAIR=1`: the flip that will show this frame, by the title's ring of frame
+    // packets, whose index was just moved on for it.)
+    let own_flip = if pair_diag() {
+        let base = BASE.load(Relaxed);
+        let render = if base != 0 { rdq(base + RENDER) } else { 0 };
+        let ring = if render != 0 { unsafe { ((render + 8) as *const i32).read_volatile() } } else { -1 };
+        let own = own_flip(ring);
+        if PAIR_LEFT.load(Relaxed) > 0 {
+            PAIR_LEFT.fetch_sub(1, Relaxed);
+            crate::info!(
+                "pace pair: step packet {:#x} ring {ring} its flip {own}; flips queued {} shown {}",
+                unsafe { *regs.add(15) },
+                crate::hle::libs::videoout::QUEUED_FLIP.load(Relaxed),
+                crate::gpu::FRAMES.load(Relaxed)
+            );
+        }
+        own
+    } else {
+        0
+    };
     let forced = unsafe { *regs.add(13) } as u8 != 0;
     let timer = rdq(app + APP_TIMER);
     let base = BASE.load(Relaxed);
@@ -296,8 +388,9 @@ pub extern "sysv64" fn after_step(regs: *const u64, _arg: u32) {
         wrf(timer + T_STEP, step);
         wrf(timer + T_LAST, step);
         wrf(timer + T_ERROR, 0.0);
-        // The frame-counted waits and timers count the game's step.
-        wrf(base + EXPECTED, step);
+        // (The expected step itself stays the title's: its only readers besides the physics
+        // are the developers' automation waits and a timer list absent in play, and the
+        // suite's scripts keep their timing with it.)
         // The physics' fixed step: the frame limit's time a frame, so that a frame at the
         // limit is one physics step (uncapped, and with `tune pace_phys` 2: the game's step).
         let phys = match crate::gpu::tune::pace_phys() {
@@ -326,7 +419,15 @@ pub extern "sysv64" fn after_step(regs: *const u64, _arg: u32) {
         (title, rdf(base + EXPECTED))
     };
     let phase = crate::hle::libs::videoout::latest_flip().map_or(0.0, |(_, at, _)| now.saturating_duration_since(at).as_secs_f32());
-    let rec = Rec { at: now, title, step, interval: interval as f32, flip, newest, phase, phys, pos: crate::camhook::player_pos(), yaw: crate::camhook::camera_yaw() };
+    let rec = Rec { at: now, title, step, interval: interval as f32, flip, newest, phase, phys, pos: crate::camhook::player_pos(), yaw: crate::camhook::camera_yaw(), own_flip, shown: None };
+    // (The frames before it whose flips have been shown since: when.)
+    if own_flip != 0 {
+        for r in s.recs.iter_mut().rev().take(16) {
+            if r.shown.is_none() && r.own_flip != 0 {
+                r.shown = crate::hle::libs::videoout::flip_time(r.own_flip);
+            }
+        }
+    }
     s.frames += 1;
     s.game += step as f64;
     s.total_frames += 1;
@@ -365,11 +466,15 @@ pub fn report() -> String {
     // How far the picture's time strays from the flips' (0: every frame moves by exactly the
     // time it is shown after the one before).
     let window: Vec<Rec> = s.recs.iter().rev().take(s.frames as usize).rev().copied().collect();
-    let stray = format!("{:.2} / {:.2} ms", stray(&window, 1) * 1e3, stray(&window, 2) * 1e3);
+    let stray = match own_stray(&window) {
+        // (`DS_PACE_PAIR=1`: against the flip that showed each frame.)
+        Some((frames, sd, per, mean_lag)) => format!("{:.2} ms from its own flips' (a frame's step {:.2} ms off the time it is shown after the frame before; {frames} frames, shown {:.1} ms after their step)", sd * 1e3, per * 1e3, mean_lag * 1e3),
+        None => format!("{:.2} / {:.2} ms from the flips' (a frame shown one / two flips after its step)", stray(&window, 1) * 1e3, stray(&window, 2) * 1e3),
+    };
     let rate = title_rate();
     let settings = if base != 0 { format!("gameMinDeltaTime {}, gameMaxDeltaTime {}, tolerance {}", setting(base, MIN_DT), setting(base, MAX_DT), setting(base, TOLERANCE)) } else { String::new() };
     let out = format!(
-        "gamestep: {} frames in {:.3} s ({:.2} a second); game time {:.3} s: x{:.4} of real time; steps {}{}; {} at the frame limit's exact step ({:.3} ms held); the picture's time strays {stray} from the flips' (a frame shown one / two flips after its step); the title's refresh rate {} and vsync interval {}; {settings}",
+        "gamestep: {} frames in {:.3} s ({:.2} a second); game time {:.3} s: x{:.4} of real time; steps {}{}; {} at the frame limit's exact step ({:.3} ms held); the picture's time strays {stray}; the title's refresh rate {} and vsync interval {}; {settings}",
         s.frames,
         real,
         if real > 0.0 { (s.frames.saturating_sub(1)) as f64 / real } else { 0.0 },
@@ -409,6 +514,35 @@ fn stray(recs: &[Rec], d: usize) -> f64 {
     let e: Vec<f64> = (0..recs.len() - d).map(|k| game[k] - shown[k + d]).collect();
     let mean = e.iter().sum::<f64>() / e.len() as f64;
     (e.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / e.len() as f64).sqrt()
+}
+
+/// With each frame's own flip known (`DS_PACE_PAIR=1`): over the frames of `recs` that were
+/// shown, how many, the standard deviation (s) of the game time a frame holds minus the time
+/// it was shown, the standard deviation of a frame's step minus the time between its flip and
+/// the frame before's (what the eye sees as uneven motion), and the mean time from a frame's
+/// step to its flip. None without the pairing.
+fn own_stray(recs: &[Rec]) -> Option<(usize, f64, f64, f64)> {
+    let t0 = recs.first()?.at;
+    let mut game = 0.0f64;
+    let mut pts: Vec<(f64, f64, f64, f64)> = Vec::new(); // game time, shown, step, lag
+    for r in recs {
+        game += r.step as f64;
+        if let Some(sh) = r.shown {
+            let shown = sh.saturating_duration_since(t0).as_secs_f64() - t0.saturating_duration_since(sh).as_secs_f64();
+            pts.push((game, shown, r.step as f64, sh.saturating_duration_since(r.at).as_secs_f64()));
+        }
+    }
+    if pts.len() < 16 {
+        return None;
+    }
+    let sd = |v: &[f64]| {
+        let m = v.iter().sum::<f64>() / v.len() as f64;
+        (v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / v.len() as f64).sqrt()
+    };
+    let e: Vec<f64> = pts.iter().map(|p| p.0 - p.1).collect();
+    let per: Vec<f64> = pts.windows(2).map(|w| (w[1].0 - w[0].0) - (w[1].1 - w[0].1)).collect();
+    let lag = pts.iter().map(|p| p.3).sum::<f64>() / pts.len() as f64;
+    Some((pts.len(), sd(&e), sd(&per), lag))
 }
 
 /// Status line: how the game's step is set.

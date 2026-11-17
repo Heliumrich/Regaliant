@@ -410,6 +410,7 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 // real time); `gamestep log <n>`: the last n, one a line.
                 match (parts.next(), parts.next().and_then(|v| v.parse::<usize>().ok())) {
                     (Some("log"), n) => info!("gamestep log:\n{}", gamestep::log(n.unwrap_or(120))),
+                    (Some("pair"), n) => gamestep::pair_log(n.unwrap_or(60) as u32),
                     _ => info!("{}", gamestep::report()),
                 }
                 Ok(())
@@ -1911,6 +1912,9 @@ This happens when other software takes that range. Restart the PC and try again.
         display::init(scratch);
     } else {
         display::init(cfg.paths.display_file());
+    }
+    if !cfg.headless {
+        display::apply_test_mode();
     }
     pcsettings::init(cfg.paths.settings_file(), cfg.safe_mode);
     // The saves: the PC tab's Save Folder (the port's own by default), a PS5 import asked for

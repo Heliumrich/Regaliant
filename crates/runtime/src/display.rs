@@ -49,9 +49,34 @@ pub fn target() -> Option<Monitor> {
     list.iter().find(|m| !want.is_empty() && m.device.eq_ignore_ascii_case(&want)).or_else(|| list.iter().find(|m| m.primary)).or(list.first()).cloned()
 }
 
+/// `DS_TEST_DESKTOP_HZ=<hz>` (tests of the pacing on a real screen, `tools/pace_real.sh`): the
+/// game's monitor runs at this refresh rate, at its desktop resolution, for the whole run in
+/// every window mode (set at the start, put back at the exit).
+pub fn test_hz() -> Option<u32> {
+    static HZ: OnceLock<Option<u32>> = OnceLock::new();
+    *HZ.get_or_init(|| std::env::var("DS_TEST_DESKTOP_HZ").ok().and_then(|v| v.trim().parse().ok()).filter(|h| (24..=500).contains(h)))
+}
+
+/// Sets the test's refresh rate (`test_hz`) on the game's monitor, where it is one of its modes.
+pub fn apply_test_mode() {
+    let (Some(hz), Some(t)) = (test_hz(), target()) else { return };
+    let Some(desk) = registry_mode(&t.device).or_else(|| current_mode(&t.device)) else { return };
+    let m = Mode { w: desk.w, h: desk.h, hz };
+    if !modes(&t.device).contains(&m) {
+        crate::warn!("display: DS_TEST_DESKTOP_HZ: {}x{} at {hz} Hz is not a mode of {}", desk.w, desk.h, t.device);
+        return;
+    }
+    crate::info!("display: DS_TEST_DESKTOP_HZ: {} at {hz} Hz for this run", t.device);
+    set_mode(&t.device, m);
+}
+
 /// The mode exclusive fullscreen takes on `device`: the chosen resolution and rate matched to
 /// its modes (the nearest rate at that resolution); None keeps the desktop's mode.
 pub fn wanted_mode(device: &str) -> Option<Mode> {
+    if let Some(hz) = test_hz() {
+        let desk = registry_mode(device).or_else(|| current_mode(device))?;
+        return Some(Mode { w: desk.w, h: desk.h, hz });
+    }
     let (res, hz) = CHOICE.lock().as_ref().map(|c| (c.res, c.hz)).unwrap_or((None, 0));
     let desk = registry_mode(device).or_else(|| current_mode(device))?;
     let (w, h) = res.unwrap_or((desk.w, desk.h));
@@ -117,6 +142,10 @@ pub fn set_mode(device: &str, mode: Mode) -> bool {
 /// Puts back the desktop's mode on the monitor `set_mode` changed (exclusive fullscreen ends,
 /// the game loses focus or quits); from any thread.
 pub fn restore() {
+    // (A test's rate stays for the run: `restore_on_exit` puts the desktop's back.)
+    if test_hz().is_some() {
+        return;
+    }
     let Some(device) = CHANGED.lock().take() else { return };
     let dev = wide(&device);
     let r = unsafe { ChangeDisplaySettingsExW(dev.as_ptr(), std::ptr::null(), std::ptr::null_mut(), 0, std::ptr::null()) };

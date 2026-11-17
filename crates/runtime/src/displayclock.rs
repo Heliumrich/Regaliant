@@ -324,6 +324,23 @@ fn note(device: &str, now: Instant) {
     // (The period once half a second of vblanks or more is in.)
     let (t0, c0) = s.times[0];
     s.snap = (s.count - c0 >= 60).then(|| Snap { last: now, count: s.count, period: now.duration_since(t0) / (s.count - c0) as u32, mode_hz });
+    // A refresh rate that is not the mode's over that time is variable refresh too (frames
+    // presented every 16.7 ms to a 75 Hz screen that waits for them: no refresh is 1.6 times
+    // the mode's period, but there are 60 a second where a fixed screen has 75): the lock
+    // stays off for three seconds more.
+    if let Some(sn) = s.snap.filter(|_| mode_hz > 0) {
+        let hz = 1.0 / sn.period.as_secs_f64();
+        if (hz / mode_hz as f64 - 1.0).abs() > 0.05 {
+            let mut until = VRR_UNTIL.lock();
+            let at = now + Duration::from_secs(3);
+            if until.is_none_or(|t| t < at) {
+                *until = Some(at);
+            }
+            if !VRR_LOGGED.swap(true, Relaxed) {
+                crate::info!("display clock: {device} refreshes {hz:.1} times a second in its {mode_hz} Hz mode: variable refresh; the vblank keeps its own timer while it does");
+            }
+        }
+    }
 }
 
 /// The presents' cadence in the display's refreshes: per present (`note_present`, the vblank

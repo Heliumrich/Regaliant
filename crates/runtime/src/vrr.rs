@@ -3,15 +3,21 @@
 //! kept by the port's own timer and a late frame is shown the moment it is done, instead of
 //! everything following the display's fixed ticks (`hle::libs::videoout`, PACING.md).
 //!
-//! NVIDIA: the driver is asked (NVAPI through nvapi64.dll where it is installed; a thread of
-//! its own, twice a second): `NvAPI_Disp_GetVRRInfo` for the monitor's display id says whether
-//! variable refresh is active on it now and whether it could be. The interface ids and the
-//! structure's layout are from NVIDIA's public NVAPI headers (PROVENANCE.md); no code of theirs
-//! is in the port, and the library is the driver's own, loaded only if present.
-//! Other vendors: the display clock's own evidence (`displayclock::vrr_seen`: refreshes that
-//! come with the presents instead of at the mode's period).
+//! What decides is the display's own behaviour (`displayclock::vrr_seen`: refreshes that come
+//! with the presents instead of at the mode's steady period), whatever the vendor: it is
+//! what the picture does, and where it cannot be seen (every refresh gets a frame) the two
+//! kinds of screen show the same. A screen wrongly taken as fixed still gets evenly spaced
+//! frames from the grid.
 //!
-//! `tune vrr` (`DS_VRR`): 2 follows these (the default), 1 treats the display as variable
+//! The NVIDIA driver is asked as well (NVAPI through its own nvapi64.dll where installed; a
+//! thread of its own, twice a second: `NvAPI_Disp_GetVRRInfo` for the monitor's display id):
+//! whether variable refresh is possible there decides the refresh rate exclusive fullscreen
+//! picks at Automatic (`possible_on`), and its "active" is logged beside the display's
+//! evidence. The interface ids and the structure's layout are from NVIDIA's public NVAPI
+//! headers (PROVENANCE.md); no code of theirs is in the port, and the library is the
+//! driver's own, loaded only if present.
+//!
+//! `tune vrr` (`DS_VRR`): 2 follows the display (the default), 1 treats it as variable
 //! refresh, 0 as fixed.
 
 use parking_lot::Mutex;
@@ -24,10 +30,13 @@ use std::time::{Duration, Instant};
 /// indicator on, 4 the display in its variable-refresh mode).
 static DRIVER: AtomicU32 = AtomicU32::new(0);
 static STARTED: AtomicBool = AtomicBool::new(false);
-/// Exclusive fullscreen was held for seconds with the driver saying "possible" and never
-/// "active": variable refresh does not take for this game here (a driver setting), so the
-/// screen is treated as fixed-refresh for the session (`possible`).
+/// Exclusive fullscreen kept the screen's own refresh rate because the driver said variable
+/// refresh was possible (`possible_on`), and the screen then went on refreshing at its mode's
+/// steady rate for seconds: variable refresh does not take for this game here (a driver
+/// setting), so `possible_on` says no for the session and the mode is chosen again.
 static NOT_TAKEN: AtomicBool = AtomicBool::new(false);
+/// `possible_on` answered yes for the mode exclusive fullscreen has now.
+static ASSUMED: AtomicBool = AtomicBool::new(false);
 /// Display ids by device name.
 static IDS: Mutex<Vec<(String, u32)>> = Mutex::new(Vec::new());
 
@@ -148,14 +157,16 @@ pub fn start() {
                     );
                 }
                 last = Some((device.clone(), flags));
-                // Exclusive fullscreen held and presenting, "possible" but not "active" for
-                // five seconds: it does not take here.
+                // Exclusive fullscreen held and presenting at a rate kept for variable refresh,
+                // and the screen refreshes at its mode's steady rate for five seconds: it does
+                // not take here.
                 let exclusive = crate::gpu::vk::window::exclusive_wanted().is_some() && crate::gpu::FRAMES.load(Relaxed) > 0;
-                if exclusive && flags & 3 == 2 && crate::gpu::tune::vrr() == 2 && !NOT_TAKEN.load(Relaxed) {
+                if exclusive && ASSUMED.load(Relaxed) && crate::gpu::tune::vrr() == 2 && !NOT_TAKEN.load(Relaxed) && crate::displayclock::snapshot().is_some() && !crate::displayclock::vrr_seen() {
                     let since = *waiting.get_or_insert_with(Instant::now);
                     if since.elapsed() > Duration::from_secs(5) {
                         NOT_TAKEN.store(true, Relaxed);
-                        crate::info!("vrr: {device}: exclusive fullscreen for five seconds and variable refresh did not become active: the screen is paced as a fixed-refresh one (its mode chosen again)");
+                        ASSUMED.store(false, Relaxed);
+                        crate::info!("vrr: {device}: exclusive fullscreen for five seconds and the screen keeps its mode's steady refreshes (the driver: active {}): paced as a fixed-refresh screen, its mode chosen again", flags & 1);
                         crate::gpu::vk::window::reapply_mode();
                     }
                 } else {
@@ -166,15 +177,13 @@ pub fn start() {
         .ok();
 }
 
-/// Whether the window's display refreshes at a variable rate now.
+/// Whether the window's display refreshes at a variable rate now (the display's own
+/// behaviour, `displayclock::vrr_seen`).
 pub fn active() -> bool {
     match crate::gpu::tune::vrr() {
         0 => false,
         1 => true,
-        _ => {
-            let d = DRIVER.load(Relaxed);
-            if d & KNOWN != 0 { d & 1 != 0 } else { crate::displayclock::vrr_seen() }
-        }
+        _ => crate::displayclock::vrr_seen(),
     }
 }
 
@@ -182,12 +191,14 @@ pub fn active() -> bool {
 /// driver's answer, asked now; None where there is none): the screen then keeps its own
 /// refresh rate there (`display::wanted_mode`).
 pub fn possible_on(device: &str) -> Option<bool> {
-    match crate::gpu::tune::vrr() {
+    let r = match crate::gpu::tune::vrr() {
         0 => Some(false),
         1 => Some(true),
         _ if NOT_TAKEN.load(Relaxed) => Some(false),
         _ => ask(device).map(|f| f & 2 != 0),
-    }
+    };
+    ASSUMED.store(r == Some(true), Relaxed);
+    r
 }
 
 /// Status line.
@@ -195,10 +206,10 @@ pub fn status_line() -> String {
     let d = DRIVER.load(Relaxed);
     let driver = if d & KNOWN != 0 { format!("the driver says active {}, possible {}, requested {}", d & 1, d >> 1 & 1, d >> 2 & 1) } else { "no driver answer".into() };
     format!(
-        "    variable refresh (`tune vrr` {}): {}; {driver}{}; the display clock {}\n",
+        "    variable refresh (`tune vrr` {}): {}; the display clock {}; {driver}{}\n",
         crate::gpu::tune::vrr(),
         if active() { "taken as active" } else { "taken as off" },
-        if NOT_TAKEN.load(Relaxed) { " (it did not become active in exclusive fullscreen)" } else { "" },
-        if crate::displayclock::vrr_seen() { "sees refreshes follow the presents" } else { "sees the mode's steady refreshes" }
+        if crate::displayclock::vrr_seen() { "sees refreshes follow the presents" } else { "sees the mode's steady refreshes" },
+        if NOT_TAKEN.load(Relaxed) { " (exclusive fullscreen kept the screen's rate for it and it did not take)" } else { "" }
     )
 }
