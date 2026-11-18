@@ -1664,8 +1664,11 @@ fn make_mirror() -> Result<Mirror, String> {
         return Err("no device-local memory type for the mirror".into());
     };
     let pages = (size / req.alignment) as usize;
+    // (Its device address too, when buffers have them: device faults name device addresses,
+    // `vk::describe_address`.)
+    let va = if c.device_addresses { c.buffer_address(buf) } else { 0 };
     crate::info!(
-        "resident: mirror of guest {MIRROR_BASE:#x}..{MIRROR_END:#x} ({} GiB, sparse pages of {} KiB, memory type {mem_type}; device sparse address space {} GiB)",
+        "resident: mirror of guest {MIRROR_BASE:#x}..{MIRROR_END:#x} ({} GiB, sparse pages of {} KiB, memory type {mem_type}; device sparse address space {} GiB; device address {va:#x})",
         size >> 30,
         req.alignment >> 10,
         c.limits.sparse_address_space_size >> 30
