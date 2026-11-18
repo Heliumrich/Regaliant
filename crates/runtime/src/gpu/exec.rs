@@ -4063,6 +4063,13 @@ fn barrier_progs() -> &'static [u64] {
     P.get_or_init(|| std::env::var("DS_BARRIER_PROGS").ok().map(|v| v.split(';').filter_map(|x| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok()).collect()).unwrap_or_default())
 }
 
+/// `DS_BARRIER_QUEUE=<text>` (with `DS_DISPATCH_BARRIER=8`): the compute queues whose executors'
+/// names contain it (e.g. `acb0x50`) get a barrier after every dispatch.
+fn barrier_queue() -> Option<&'static str> {
+    static Q: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    Q.get_or_init(|| std::env::var("DS_BARRIER_QUEUE").ok().filter(|v| !v.is_empty())).as_deref()
+}
+
 /// `DS_UNORDERED_DIAG`: the graphics queue's parallel workers' dispatches by program.
 static WORKER_PROGS: Mutex<Option<HashMap<u64, u64>>> = Mutex::new(None);
 
@@ -20963,6 +20970,7 @@ impl Exec {
             5 => self.par_worker && self.compute_cp,
             6 => self.compute_cp,
             7 => self.par_worker && !self.compute_cp,
+            8 => self.compute_cp && barrier_queue().is_some_and(|q| q.split(';').any(|x| !x.is_empty() && self.name.contains(x))),
             _ => false,
         };
         if unordered_diag() && self.par_worker && !self.compute_cp {
