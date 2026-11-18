@@ -1242,7 +1242,10 @@ fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, 
         }
         if let Some(p) = ps {
             let from_gs = if key.rect_gs.is_none() { bary_gs_of(key, vs, ps).map_or(0, |(io, _)| io.added()) } else { 0 };
-            let missing = p.0.out.in_mask & !vs.0.out.param_mask & !from_gs;
+            // (A batched vertex stage writes the batch varying besides its parameters, which
+            // `param_mask` leaves out by design.)
+            let batch = if vs.0.out.batched { 1u32 << rdna::translate::BATCH_VARYING } else { 0 };
+            let missing = p.0.out.in_mask & !vs.0.out.param_mask & !from_gs & !batch;
             if key.rect_gs.is_none() && missing != 0 {
                 static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
