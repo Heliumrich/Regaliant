@@ -659,7 +659,7 @@ const FIXES: &[Fix] = &[
         offset: 0xb27f7c,
         from: (7, 0x6aae3b529a211d65),
         change: Change::Hook { at: 0, handler: crate::gamestep::after_step },
-        kind: "PC frame rates, `tune pace`",
+        kind: "PC frame rates, `tune pace_step`",
         why: "the title steps the game by 1/59.94 s at least and in halves of it, whatever the frames' real spacing",
         only_with: None,
     },

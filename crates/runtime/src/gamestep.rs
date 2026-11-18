@@ -1,4 +1,4 @@
-//! The title's frame step (PPSA01341 01.007.000; PACING.md, FINDINGS.md 2026-11-18): how
+//! The title's frame step (PPSA01341 01.007.000; PACING.md, FINDINGS.md 2026-11-17 night): how
 //! much game time each frame advances. The port sets it from the frames shown (`tune
 //! pace_step`), so that the game runs at the same speed at every frame rate and each frame
 //! moves by the time frames are shown for.
@@ -25,7 +25,11 @@
 //! frame is shown as long as the last (the frame limit held), and a frame shown late gives
 //! its extra time to the following frames evenly instead of one frame jumping. No time is
 //! lost or made: the steps add up to the flips' times (but a single time over the title's
-//! `gameMaxDeltaTime` is cut to it, as the title cuts its own).
+//! `gameMaxDeltaTime` is cut to it, as the title cuts its own). The mean of 8 against other
+//! rules, measured with each frame paired to its flip: PACING.md.
+//!
+//! The title's refresh-rate value and its expected step stay its own: the motion blur's scale
+//! reads the one, the developers' automation waits (frames of 1/59.94 s) the other.
 
 use parking_lot::Mutex;
 use std::collections::VecDeque;
