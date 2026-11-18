@@ -205,6 +205,12 @@ pub fn open_path(p: &std::path::Path) {
     unsafe { windows_sys::Win32::UI::Shell::ShellExecuteW(std::ptr::null_mut(), op.as_ptr(), f.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL) };
 }
 
+/// Opens a web address in the default browser.
+pub fn open_url(u: &str) {
+    let (op, f) = (wide("open"), wide(u));
+    unsafe { windows_sys::Win32::UI::Shell::ShellExecuteW(std::ptr::null_mut(), op.as_ptr(), f.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL) };
+}
+
 /// A path for one line of a page (its middle left out when long).
 pub fn short(p: &std::path::Path, max: usize) -> String {
     let s = p.display().to_string();

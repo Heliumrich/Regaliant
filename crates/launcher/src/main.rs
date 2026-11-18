@@ -5,8 +5,9 @@
 //! - Shaders: the game's shaders prepared ahead, with progress (the first Play prepares them
 //!   unless that is turned off).
 //! - Saves: the save folder, the backups the game makes and their restore, the PS5 import folder.
-//! - Play / Reset settings / Open logs. When the game stops with an error, its last error lines
-//!   and its log folder are shown.
+//! - Play / Reset settings / Open logs / Join the Discord (the community's invite in the
+//!   browser). When the game stops with an error, its last error lines and its log folder are
+//!   shown.
 //!
 //! The settings are the files the game reads (`dsconfig::paths`); the game's own settings are
 //! in its menus (SETTINGS > PC).
@@ -44,7 +45,11 @@ const ID_TABS: i32 = 10;
 const ID_PLAY: i32 = 901;
 const ID_RESET: i32 = 903;
 const ID_LOGS: i32 = 904;
+const ID_DISCORD: i32 = 905;
 const ID_STATUS_BAR: i32 = 906;
+
+/// The community's Discord invite (the button "Join the Discord").
+const DISCORD: &str = "https://discord.gg/rSr5JhxxtZ";
 
 /// The game's exit codes when it told the player itself: its files cannot be used, the GPU
 /// device was lost, the processor lacks what the game needs (and 0xD5xx, errors it caught).
@@ -310,6 +315,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 ID_PLAY => play(app),
                 ID_RESET => reset_settings(app),
                 ID_LOGS => ui::open_path(&app.paths.logs()),
+                ID_DISCORD => ui::open_url(DISCORD),
                 100..=199 => game::command(app, id, code),
                 200..=299 => shaders::command(app, id, code),
                 300..=399 => saves::command(app, id, code),
@@ -473,6 +479,9 @@ fn main() {
         app.put(usize::MAX, b.button("Reset settings...", r, ID_RESET), r);
         let r = (282, 548, 110, 36);
         app.put(usize::MAX, b.button("Open logs", r, ID_LOGS), r);
+        // (At the row's right end.)
+        let r = (614, 548, 150, 36);
+        app.put(usize::MAX, b.button("Join the Discord", r, ID_DISCORD), r);
         // (Saves first: the Game page's check refreshes them.)
         saves::build(&mut app);
         game::build(&mut app);

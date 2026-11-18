@@ -12,6 +12,9 @@ FromSoftware or any other rights holder.
 
 This is an early version. Read "Known issues" below before you play.
 
+News, help and more ports: join the Discord at https://discord.gg/rSr5JhxxtZ
+Bug reports: https://github.com/SulphurS16/Regaliant/issues
+
 
 What you need
 -------------
@@ -162,19 +165,20 @@ Estimated, not tested:
 
 Known issues
 ------------
-- The frame rate is below 60 in most places. On the tested PC it is about 35 to 55 fps.
+- The frame rate is below 60 in the busiest places: about 40 to 55 fps on the tested PC.
 - On a first visit some objects can be missing for a moment while their shaders compile, and
   some compiles still stutter, even with prepared shaders. A level's first load can pause for
   a few seconds behind the loading screen. Later visits do not compile them again.
 - Areas, bosses and the story were reached by the developer's shortcuts in testing. A full
   playthrough has not been made.
-- World 8-3 sometimes loads too dark. Restarting the game fixes it.
 - Water outside the Nexus can show bands. Some other rare picture faults are known.
-- The fog in the opening cutscene is much darker than on PS5. Some light shafts look softer
-  too.
+- The sky in the opening cutscene is a little darker than on PS5. Some light shafts look
+  softer too.
 - At 32:9 the character preview in the equipment menu stands at the right edge.
 - In character creation the header can turn bright cyan after the button prompts change, for
   example when you switch between the controller and the keyboard. It is only cosmetic.
+- In character creation the character fills only part of the screen when Render Scale is set
+  to a percentage. Visual Mode shows it whole.
 - HDR has not been seen on an HDR screen yet.
 - AMD and Intel graphics cards have not been tested.
 - Graphics cards without fragment shader barycentrics draw some surfaces through an extra
