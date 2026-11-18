@@ -1395,10 +1395,13 @@ pub mod tune {
     }
 
     /// Threads that compile `async_gfx`'s pipelines (normal priority); 0: a
-    /// sixth of the logical CPUs, at least 2.
+    /// third of the logical CPUs, at least 2 (a sixth before 2026-11-18: a
+    /// new player's first 1-1 walk at 8 against 4 left 9,326 draws out
+    /// against 25,678, a pipeline made 252 ms after its queueing against
+    /// 755 (at most 2.1 against 4.2 s), its frames x0.976 while it compiled).
     pub fn async_gfx_workers() -> usize {
         match get(171) {
-            0 => (std::thread::available_parallelism().map_or(8, |n| n.get()) / 6).max(2),
+            0 => (std::thread::available_parallelism().map_or(8, |n| n.get()) / 3).max(2),
             n => (n as usize).min(16),
         }
     }
