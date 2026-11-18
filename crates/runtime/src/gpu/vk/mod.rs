@@ -1191,6 +1191,12 @@ fn describe_address(a: u64) -> String {
             format!("{} +{:#x} ({state})", r.what, a - r.va)
         })
         .collect();
+    // Front end 2's mirror (a sparse buffer over the guest span; GPU-resolved reads go there at
+    // guest offsets): the guest address it stands for.
+    let m = crate::gpu::resident::mirror_address();
+    if m != 0 && m <= a && a < m + (rdna::translate::PT_END - rdna::translate::PT_BASE) {
+        hits.push(format!("in front end 2's mirror at guest {:#x}", rdna::translate::PT_BASE + (a - m)));
+    }
     if hits.is_empty() {
         // The nearest noted ranges below and above.
         let below = g.iter().filter(|r| r.va + r.size <= a).max_by_key(|r| r.va + r.size).map(|r| format!("{:#x} past the end of {}", a - (r.va + r.size), r.what));
