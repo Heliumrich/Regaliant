@@ -472,7 +472,9 @@ pub struct Spec {
     /// going through the page table: the device address of guest PT_BASE in
     /// it is in the resource's address entry (dwords 0-1, unused otherwise),
     /// addresses outside the span read 0, and their reads are not counted.
-    /// GPU-resolved loads still go through the page table.
+    /// GPU-resolved scalar loads read the mirror too (its address in the
+    /// address block's header, dwords 2-3), outside the span the zero page,
+    /// uncounted (`report_miss`).
     pub pt_linear: bool,
 }
 

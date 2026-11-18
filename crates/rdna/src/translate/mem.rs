@@ -370,7 +370,14 @@ fn rt_vsharp(tr: &mut T, r: usize, sr: u32) -> R<super::RtVsharp> {
 /// GPU-resolved chains: counts a read through a page the table does not
 /// map when `miss` holds (the table's feedback words: count, the guest
 /// address). Call at an instruction's top level (it opens a block).
+/// Nothing under `Spec::pt_linear`: the header's address is the mirror's
+/// there, and the u64 at its feedback offset is guest data (a command
+/// chunk's first words, used as an atomic's address, lost the device on
+/// 2026-11-18); reads outside the span read zeros, uncounted.
 fn report_miss(tr: &mut T, miss: Word, guest: Word) -> R<()> {
+    if tr.spec.pt_linear {
+        return Ok(());
+    }
     let (u, u64t) = (tr.t.u32, tr.t.u64);
     let pt = match tr.pt_addr {
         Some(p) => p,

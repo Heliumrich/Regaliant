@@ -11533,6 +11533,10 @@ pub(super) const F3_WHY: [&str; 6] = ["the view moved since the run's first comm
 /// [ranges placed for them, their bytes; draws, dispatches recorded with
 /// CPU-resolved chains after a refusal].
 pub static F3_PLACED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// GPU-resolved scalar loads of the stages that passed: [at address 0,
+/// outside the span (the shader reads zeros for both), ranges placed in the
+/// mirror (`Spec::pt_linear`)].
+pub static F3_LOADS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// `DS_STEP_LAPS`: [stages placed, TSC cycles reading their chains, checking
 /// the loads' imports and pending writes, placing the buffers; ranges found,
 /// runs placed, runs the batch uploads or placed already].
@@ -11672,12 +11676,15 @@ pub fn f3_line() -> String {
         String::new()
     };
     format!(
-        "    front end 2's GPU-resolved chains: {} ranges placed ({} MiB); not placed: {}; recorded with CPU-resolved chains after that: {} draws, {} dispatches\n",
+        "    front end 2's GPU-resolved chains: {} ranges placed ({} MiB); not placed: {}; recorded with CPU-resolved chains after that: {} draws, {} dispatches; their loads at address 0 {}, outside the span {} (both read zeros), loads' ranges placed in the mirror {}\n",
         v[0],
         v[1] >> 20,
         why.join(", "),
         v[2],
-        v[3]
+        v[3],
+        F3_LOADS[0].load(Ordering::Relaxed),
+        F3_LOADS[1].load(Ordering::Relaxed),
+        F3_LOADS[2].load(Ordering::Relaxed)
     ) + &laps
 }
 
@@ -14341,7 +14348,9 @@ impl Exec {
         // The loads' ranges in import windows (the page table maps them for
         // the batches queued from now on); outside the span the shader reads
         // zeros, which the CPU path would not for readable memory there.
+        let nulls = loads.iter().filter(|&&(a, n)| a == 0 && n != 0).count() as u64;
         loads.retain(|&(a, n)| a != 0 && n != 0);
+        let mut outside = 0u64;
         if f3_regions_on() {
             note_f3_regions(addr, loads, ranges);
         }
@@ -14350,6 +14359,7 @@ impl Exec {
                 if super::cp::guest_readable(a, n) {
                     return Err(F3_OUTSIDE);
                 }
+                outside += 1;
                 continue;
             }
             if span(a, n).is_none() {
@@ -14360,6 +14370,16 @@ impl Exec {
         if pending(self, reads) || pending(self, loads) {
             return Err(F3_PENDING);
         }
+        if found.tr.spec.pt_linear {
+            // (`Spec::pt_linear`: the shader's loads read the mirror too, so
+            // their ranges are placed as the buffers' are; before 2026-11-18
+            // they were only checked, and read stale or never-placed pages.)
+            let n0 = ranges.len();
+            ranges.extend(loads.iter().copied().filter(|&(a, n)| super::fe2::in_span(a, n)));
+            F3_LOADS[2].fetch_add((ranges.len() - n0) as u64, Ordering::Relaxed);
+        }
+        F3_LOADS[0].fetch_add(nulls, Ordering::Relaxed);
+        F3_LOADS[1].fetch_add(outside, Ordering::Relaxed);
         let t2 = tsc();
         // (Read on the CPU now: checked when held work settles, as a
         // preparation's reads are.)
