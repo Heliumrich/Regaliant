@@ -357,6 +357,8 @@ pub struct Cp {
     par_skip: (u64, u64),
     /// Its commands (`tune cp_classes`: serial commands by run length).
     par_skip_n: usize,
+    /// The next run planned before the stretch past a run settled (`plan_ahead`).
+    pre_plan: Option<Box<PrePlan>>,
     /// The serial run being watched (`RUN_EPOCHS`): its end, its epoch when
     /// planned, when.
     run_watch: Option<(u64, u32, Instant)>,
@@ -566,6 +568,54 @@ struct Unheld {
     need: Option<u32>,
     up: HashSet<u64>,
 }
+
+/// What the planner's scan of a run found (`Cp::plan_scan`): its commands' ends, the
+/// indirect arguments read in it, the label waits it holds (packet, label, 64-bit), those a
+/// write earlier in the run meets, its CP writes (packet, address, bytes), whether it holds
+/// flushes or cache actions, its signature (packet headers), why it ends and where.
+struct PlanScan {
+    ends: Vec<u64>,
+    args: Vec<(u64, u64)>,
+    passed: Vec<(u64, u64, bool)>,
+    own_waits: Vec<u64>,
+    cp_writes: Vec<(u64, u64, u64)>,
+    sync: bool,
+    sig: u64,
+    why: usize,
+    run_end: u64,
+}
+
+/// A split run's chunks (`Cp::plan_chunks`): the main command processor's command count,
+/// each worker chunk's first command and start, their start states, the state at the run's
+/// end (`tune past_runs`) with the SH registers its indirect draws set, and the signature
+/// with the count (`tune par_cost`).
+struct PlanChunks {
+    main_n: usize,
+    firsts: Vec<usize>,
+    starts: Vec<u64>,
+    states: Vec<Box<ChunkState>>,
+    end_state: Option<ChunkState>,
+    end_unknown: Vec<u32>,
+    sig: u64,
+}
+
+/// The next parallel run planned before the run recorded past is collected (`Cp::plan_ahead`,
+/// since 2026-11-18): made at the stop "next run" while that run's chunks may still record,
+/// taken by `par_plan` when it plans the same run in the same command buffer and submission
+/// from the same state.
+struct PrePlan {
+    from: u64,
+    end: u64,
+    buf: usize,
+    sub: u64,
+    start: ChunkState,
+    scan: PlanScan,
+    chunks: PlanChunks,
+}
+
+/// Runs planned ahead (`Cp::plan_ahead`): [made, taken, not taken (another run, a dropped
+/// stretch, another state), ns making them].
+static PLAN_AHEAD: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// The graphics command processor recording past a parallel run before
 /// collecting its chunks (`Cp::past_start`): the run, and what is put back
@@ -955,7 +1005,16 @@ pub fn run_passed_line() -> String {
     if v.iter().all(|&x| x == 0) {
         return String::new();
     }
-    format!("; runs' held packets: label waits passed when planned {}, timestamps recorded by workers {}, label waits passed by workers {}, CP writes performed by workers {} (chunks stopped reading an earlier chunk's {}); batches of labels and stamps kept open into a run {}", v[1], v[2], v[3], v[0], super::exec::RUN_WRITE_STOPS.load(Ordering::Relaxed), PRE_RUN_KEPT.load(Ordering::Relaxed))
+    format!("; runs' held packets: label waits passed when planned {}, timestamps recorded by workers {}, label waits passed by workers {}, CP writes performed by workers {} (chunks stopped reading an earlier chunk's {}); batches of labels and stamps kept open into a run {}", v[1], v[2], v[3], v[0], super::exec::RUN_WRITE_STOPS.load(Ordering::Relaxed), PRE_RUN_KEPT.load(Ordering::Relaxed)) + &plan_ahead_part()
+}
+
+/// The runs' status line's part for `PLAN_AHEAD` (empty while none was made).
+fn plan_ahead_part() -> String {
+    let v: Vec<u64> = PLAN_AHEAD.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    if v[0] == 0 {
+        return String::new();
+    }
+    format!("; runs planned ahead {} ({:.1} us each), taken {}, not taken {}", v[0], v[3] as f64 / v[0] as f64 / 1e3, v[1], v[2])
 }
 
 /// Batches with no command, writing labels and stamps only, that went on as
@@ -2284,6 +2343,7 @@ impl Cp {
             par: None,
             par_skip: (0, 0),
             par_skip_n: 0,
+            pre_plan: None,
             run_watch: None,
             par_pool: super::par::Pool::new(),
             chunk_costs: None,
@@ -3265,18 +3325,10 @@ impl Cp {
         }
     }
 
-    /// Splits the synchronization-free run that starts with the command at
-    /// `from` into chunks when it is long enough: the first stays here, the
-    /// others go to the workers' queue now (`gpu::par`).
-    fn par_plan(&mut self, f: &Fetched, from: u64, end: u64) {
-        if self.compute && super::tune::cp_classes() && self.name.strip_prefix("gpu-acb").and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()) == Some(super::tune::cp_classes_acb()) {
-            self.handshake_census(f, from, end);
-        }
-        // (Profile: `tune cp_classes`, `PLAN_PHASES`.)
-        let mut lap = PlanLaps(super::tune::cp_classes().then(Instant::now));
-        let k = if self.compute { compute_workers() } else { super::par::workers() };
-        // Inside a stretch past a label wait (`held_runs_ok`): a held run (`par::Run::held`).
-        let held_run = self.held.is_some();
+    /// The planner's scan of the run at `from` (`par_plan`, `plan_ahead`): its commands up to
+    /// the first packet a run cannot hold. Label waits' reads are prepared and runs'
+    /// timestamps written as it passes them (`run_pass`).
+    fn plan_scan(&mut self, f: &Fetched, from: u64, end: u64) -> PlanScan {
         // The run's commands, its end and the indirect arguments read in it.
         let mut ends: Vec<u64> = Vec::new();
         let mut args: Vec<(u64, u64)> = Vec::new();
@@ -3407,6 +3459,233 @@ impl Cp {
             }
             c = next;
         };
+        PlanScan { ends, args, passed, own_waits, cp_writes, sync, sig, why, run_end }
+    }
+
+    /// A split run's chunks (`par_plan`, `plan_ahead`) and the walks of the command stream for
+    /// their start states and the run's end state (`tune past_runs`; not for a held run).
+    /// `timing`: `tune cp_classes`' counters.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_chunks(&mut self, f: &Fetched, from: u64, ends: &[u64], run_end: u64, n: usize, chunks: usize, chunk_min: usize, sig: u64, held_run: bool, timing: bool) -> PlanChunks {
+        // The main command processor's chunk first (`par::main_weight`
+        // times a worker's), then equal ones for the workers' queue.
+        let m = chunks - 1;
+        let w = super::par::main_weight();
+        let main_n = ((n as f64 * w / (w + m as f64)).round() as usize).clamp(chunk_min, n - m * chunk_min);
+        let per = (n - main_n) / m;
+        // At equal recording cost when the run was measured before, else at
+        // equal command counts.
+        let sig = (sig ^ n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let frame = super::FRAMES.load(Ordering::Relaxed);
+        let costed = {
+            if self.run_costs.len() > 512 && (self.run_costs_pruned != frame || !super::tune::plan_fast()) {
+                self.run_costs_pruned = frame;
+                self.run_costs.retain(|_, r| r.seen + 120 >= frame);
+            }
+            let rc = self.run_costs.entry(sig).or_insert_with(|| RunCost { costs: vec![f32::NAN; n], seen: frame });
+            rc.seen = frame;
+            if rc.costs.len() == n {
+                cost_firsts(&rc.costs, main_n, n, m, chunk_min)
+            } else {
+                None
+            }
+        };
+        if costed.is_some() {
+            PAR_COSTED.fetch_add(1, Ordering::Relaxed);
+        }
+        let firsts: Vec<usize> = costed.unwrap_or_else(|| (0..m).map(|i| main_n + i * per).collect());
+        let starts: Vec<u64> = firsts.iter().map(|&i| if i == 0 { from } else { ends[i - 1] }).collect();
+        // The state at each chunk's start.
+        let mut st = self.chunk_state();
+        let mut states: Vec<Box<ChunkState>> = Vec::new();
+        let mut c = from;
+        // (`tune plan_check`: the same a register at a time.)
+        let mut check = super::tune::plan_check().then(|| self.chunk_state());
+        for &s in &starts {
+            while c < s {
+                let h = f.rd(c);
+                if h >> 30 == 2 {
+                    c += 4;
+                    continue;
+                }
+                let count = (h >> 16) & 0x3FFF;
+                if count == 0x3FFF {
+                    c += 4;
+                    continue;
+                }
+                let n = count as u64 + 1;
+                let at = c;
+                let opc = (h >> 8) & 0xFF;
+                // Register ranges in one copy (most of a run's packets).
+                let regs = match opc {
+                    op::SET_CONTEXT_REG | op::SET_CONTEXT_REG_INDEX => Some((Space::Ctx, CTX_DWORDS)),
+                    op::SET_SH_REG | op::SET_SH_REG_INDEX => Some((Space::Sh, SH_DWORDS)),
+                    op::SET_UCONFIG_REG | op::SET_UCONFIG_REG_INDEX => Some((Space::Uc, UC_DWORDS)),
+                    _ => None,
+                };
+                match regs {
+                    Some((space, cap)) if n >= 2 => {
+                        let v = match space {
+                            Space::Ctx => &mut st.regs.ctx,
+                            Space::Sh => &mut st.regs.sh,
+                            Space::Uc => &mut st.regs.uc,
+                        };
+                        put_regs(v, space, cap, (f.rd(at + 4) & 0xFFFF) as usize, f, at + 8, (n - 1) as usize);
+                    }
+                    _ if timing && matches!(opc, op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT | op::DRAW_INDEX_INDIRECT_MULTI | op::DRAW_INDIRECT_MULTI) => {
+                        let t = Instant::now();
+                        Self::apply_state(&mut st, opc, n, &|i: u64| f.rd(at + 4 * (1 + i)));
+                        PLAN_WALK[1].fetch_add(1, Ordering::Relaxed);
+                        PLAN_WALK[2].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    }
+                    // (Draws, dispatches, NOPs and events change no chunk state.)
+                    _ if Self::acts_on_state(opc) => Self::apply_state(&mut st, opc, n, &|i: u64| f.rd(at + 4 * (1 + i))),
+                    _ => {}
+                }
+                if timing {
+                    PLAN_WALK[0].fetch_add(1, Ordering::Relaxed);
+                }
+                if let Some(st2) = check.as_mut() {
+                    Self::apply_state(st2, opc, n, &|i: u64| f.rd(at + 4 * (1 + i)));
+                }
+                c += 4 * (n + 1);
+            }
+            if let Some(st2) = check.as_ref() {
+                plan_check_states(&st, st2, s);
+            }
+            if timing {
+                let tc = Instant::now();
+                states.push(Box::new(st.clone()));
+                PLAN_CLONE_NS.fetch_add(tc.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            } else {
+                states.push(Box::new(st.clone()));
+            }
+        }
+        // The state at the run's end (`tune past_runs`: the graphics command
+        // processor goes on from there before collecting the chunks).
+        let mut end_unknown: Vec<u32> = Vec::new();
+        let end_state = (super::tune::past_runs() && self.main_gfx && !held_run).then(|| {
+            let tc = timing.then(Instant::now);
+            let mut st = st.clone();
+            if let Some(tc) = tc {
+                PLAN_CLONE_NS.fetch_add(tc.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            let mut c = c;
+            while c < run_end {
+                let h = f.rd(c);
+                if h >> 30 == 2 {
+                    c += 4;
+                    continue;
+                }
+                let count = (h >> 16) & 0x3FFF;
+                if count == 0x3FFF {
+                    c += 4;
+                    continue;
+                }
+                let n = count as u64 + 1;
+                let at = c;
+                let opc = (h >> 8) & 0xFF;
+                let p = |i: u64| f.rd(at + 4 * (1 + i));
+                if matches!(opc, op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT) {
+                    let (vtx_loc, inst_loc) = (p(1) & 0xFFFF, p(1) >> 16);
+                    let inst_loc = if inst_loc != 0 {
+                        inst_loc
+                    } else {
+                        let r = ScanRegs { sh: &st.regs.sh, ctx: &st.regs.ctx };
+                        crate::hle::libs::agc::instance_offset_slot(super::shaders::ngg_addr_of(&r)).map_or(0, |s| 0x8C + s)
+                    };
+                    for r in [vtx_loc, inst_loc] {
+                        if r != 0 && !end_unknown.contains(&r) {
+                            end_unknown.push(r);
+                        }
+                    }
+                }
+                if matches!(opc, op::DRAW_INDEX_INDIRECT_MULTI | op::DRAW_INDIRECT_MULTI) {
+                    let (vtx_loc, inst_loc, id_loc) = (p(1) & 0xFFFF, p(2) & 0xFFFF, p(3) & 0xFFFF);
+                    let inst_loc = if inst_loc != 0 {
+                        inst_loc
+                    } else {
+                        let r = ScanRegs { sh: &st.regs.sh, ctx: &st.regs.ctx };
+                        crate::hle::libs::agc::instance_offset_slot(super::shaders::ngg_addr_of(&r)).map_or(0, |s| 0x8C + s)
+                    };
+                    for r in [vtx_loc, inst_loc, if p(3) & (1 << 31) != 0 { id_loc } else { 0 }] {
+                        if r != 0 && !end_unknown.contains(&r) {
+                            end_unknown.push(r);
+                        }
+                    }
+                }
+                Self::apply_state(&mut st, opc, n, &p);
+                c += 4 * (n + 1);
+            }
+            st
+        });
+        PlanChunks { main_n, firsts, starts, states, end_state, end_unknown, sig }
+    }
+
+    /// The stop "next run" of a stretch recorded past a run: the next run planned now, before
+    /// the run before it is collected (`past_settle` waits for its chunks), as `par_plan`
+    /// would plan it then: its scan, its split and its chunks' start states, which read only
+    /// the command stream and this command processor's state (exact: a check mode made each
+    /// plan again after the collect, 41,473 runs at the heavy Castlewall view, the same chunk
+    /// starts and states in all; FINDINGS.md 2026-11-18). What depends on the run before
+    /// being collected (label waits' effects on the view, fast clears, homes, indirect
+    /// arguments' reads, the batch before the run, the workers) stays in `par_plan`. Returns
+    /// whether the run splits (the main graphics command processor's rule).
+    fn plan_ahead(&mut self, f: &Fetched, from: u64, end: u64) -> bool {
+        let t = Instant::now();
+        self.pre_plan = None;
+        let scan = self.plan_scan(f, from, end);
+        let n = scan.ends.len();
+        let par_min = super::par::graphics_min();
+        let chunk_min = (par_min / 3).clamp(16, PAR_CHUNK_MIN);
+        let chunks = ((super::par::workers() + 1) * super::par::split()).min(n / chunk_min);
+        if n < par_min || chunks < 2 {
+            self.par_skip = (end, scan.run_end);
+            self.par_skip_n = n;
+            return false;
+        }
+        let start = self.chunk_state();
+        let chunks = self.plan_chunks(f, from, &scan.ends, scan.run_end, n, chunks, chunk_min, scan.sig, false, false);
+        self.pre_plan = Some(Box::new(PrePlan { from, end, buf: self.cur_buf, sub: self.sub_index, start, scan, chunks }));
+        PLAN_AHEAD[0].fetch_add(1, Ordering::Relaxed);
+        PLAN_AHEAD[3].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        true
+    }
+
+    /// The plan made ahead for the run at `from` (`plan_ahead`) if it is this run's: in the
+    /// same command buffer and submission, not held, from the same state.
+    fn take_pre_plan(&mut self, from: u64, end: u64, held_run: bool) -> Option<Box<PrePlan>> {
+        let p = self.pre_plan.take()?;
+        if p.from == from && p.end == end && p.buf == self.cur_buf && p.sub == self.sub_index && !held_run && chunk_states_equal(&p.start, &self.chunk_state(), &[]) {
+            PLAN_AHEAD[1].fetch_add(1, Ordering::Relaxed);
+            Some(p)
+        } else {
+            PLAN_AHEAD[2].fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+
+    /// Splits the synchronization-free run that starts with the command at
+    /// `from` into chunks when it is long enough: the first stays here, the
+    /// others go to the workers' queue now (`gpu::par`).
+    fn par_plan(&mut self, f: &Fetched, from: u64, end: u64) {
+        if self.compute && super::tune::cp_classes() && self.name.strip_prefix("gpu-acb").and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()) == Some(super::tune::cp_classes_acb()) {
+            self.handshake_census(f, from, end);
+        }
+        // (Profile: `tune cp_classes`, `PLAN_PHASES`.)
+        let mut lap = PlanLaps(super::tune::cp_classes().then(Instant::now));
+        let k = if self.compute { compute_workers() } else { super::par::workers() };
+        // Inside a stretch past a label wait (`held_runs_ok`): a held run (`par::Run::held`).
+        let held_run = self.held.is_some();
+        // A plan made ahead at the stop "next run" (`plan_ahead`), taken when it is this run's.
+        let (scan, ahead) = match self.take_pre_plan(from, end, held_run) {
+            Some(p) => {
+                let p = *p;
+                (p.scan, Some(p.chunks))
+            }
+            None => (self.plan_scan(f, from, end), None),
+        };
+        let PlanScan { ends, mut args, passed, own_waits, cp_writes, sync, sig, why, run_end } = scan;
         let n = ends.len();
         super::par::note_run(n, why, self.compute);
         let par_min = if self.compute { (super::tune::par_min_compute() as usize).max(super::par::floor()) } else { super::par::graphics_min() };
@@ -3532,162 +3811,15 @@ impl Cp {
             HELD_RUNS[11].fetch_add(1, Ordering::Relaxed);
             return;
         }
-        // The main command processor's chunk first (`par::main_weight`
-        // times a worker's), then equal ones for the workers' queue.
-        let m = chunks - 1;
-        let w = super::par::main_weight();
-        let main_n = ((n as f64 * w / (w + m as f64)).round() as usize).clamp(chunk_min, n - m * chunk_min);
-        let per = (n - main_n) / m;
-        // At equal recording cost when the run was measured before, else at
-        // equal command counts.
-        let sig = (sig ^ n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-        let frame = super::FRAMES.load(Ordering::Relaxed);
-        let costed = {
-            if self.run_costs.len() > 512 && (self.run_costs_pruned != frame || !super::tune::plan_fast()) {
-                self.run_costs_pruned = frame;
-                self.run_costs.retain(|_, r| r.seen + 120 >= frame);
-            }
-            let rc = self.run_costs.entry(sig).or_insert_with(|| RunCost { costs: vec![f32::NAN; n], seen: frame });
-            rc.seen = frame;
-            if rc.costs.len() == n {
-                cost_firsts(&rc.costs, main_n, n, m, chunk_min)
-            } else {
-                None
-            }
+        // The chunks: planned ahead, else now.
+        let pc = match ahead {
+            Some(pc) => pc,
+            None => self.plan_chunks(f, from, &ends, run_end, n, chunks, chunk_min, sig, held_run, lap.0.is_some()),
         };
-        if costed.is_some() {
-            PAR_COSTED.fetch_add(1, Ordering::Relaxed);
-        }
-        let firsts: Vec<usize> = costed.unwrap_or_else(|| (0..m).map(|i| main_n + i * per).collect());
-        let starts: Vec<u64> = firsts.iter().map(|&i| if i == 0 { from } else { ends[i - 1] }).collect();
-        // The state at each chunk's start.
-        let mut st = self.chunk_state();
-        let mut states: Vec<Box<ChunkState>> = Vec::new();
-        let mut c = from;
-        // (`tune plan_check`: the same a register at a time.)
-        let mut check = super::tune::plan_check().then(|| self.chunk_state());
-        for &s in &starts {
-            while c < s {
-                let h = f.rd(c);
-                if h >> 30 == 2 {
-                    c += 4;
-                    continue;
-                }
-                let count = (h >> 16) & 0x3FFF;
-                if count == 0x3FFF {
-                    c += 4;
-                    continue;
-                }
-                let n = count as u64 + 1;
-                let at = c;
-                let opc = (h >> 8) & 0xFF;
-                // Register ranges in one copy (most of a run's packets).
-                let regs = match opc {
-                    op::SET_CONTEXT_REG | op::SET_CONTEXT_REG_INDEX => Some((Space::Ctx, CTX_DWORDS)),
-                    op::SET_SH_REG | op::SET_SH_REG_INDEX => Some((Space::Sh, SH_DWORDS)),
-                    op::SET_UCONFIG_REG | op::SET_UCONFIG_REG_INDEX => Some((Space::Uc, UC_DWORDS)),
-                    _ => None,
-                };
-                match regs {
-                    Some((space, cap)) if n >= 2 => {
-                        let v = match space {
-                            Space::Ctx => &mut st.regs.ctx,
-                            Space::Sh => &mut st.regs.sh,
-                            Space::Uc => &mut st.regs.uc,
-                        };
-                        put_regs(v, space, cap, (f.rd(at + 4) & 0xFFFF) as usize, f, at + 8, (n - 1) as usize);
-                    }
-                    _ if lap.0.is_some() && matches!(opc, op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT | op::DRAW_INDEX_INDIRECT_MULTI | op::DRAW_INDIRECT_MULTI) => {
-                        let t = Instant::now();
-                        Self::apply_state(&mut st, opc, n, &|i: u64| f.rd(at + 4 * (1 + i)));
-                        PLAN_WALK[1].fetch_add(1, Ordering::Relaxed);
-                        PLAN_WALK[2].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    }
-                    // (Draws, dispatches, NOPs and events change no chunk state.)
-                    _ if Self::acts_on_state(opc) => Self::apply_state(&mut st, opc, n, &|i: u64| f.rd(at + 4 * (1 + i))),
-                    _ => {}
-                }
-                if lap.0.is_some() {
-                    PLAN_WALK[0].fetch_add(1, Ordering::Relaxed);
-                }
-                if let Some(st2) = check.as_mut() {
-                    Self::apply_state(st2, opc, n, &|i: u64| f.rd(at + 4 * (1 + i)));
-                }
-                c += 4 * (n + 1);
-            }
-            if let Some(st2) = check.as_ref() {
-                plan_check_states(&st, st2, s);
-            }
-            if lap.0.is_some() {
-                let tc = Instant::now();
-                states.push(Box::new(st.clone()));
-                PLAN_CLONE_NS.fetch_add(tc.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            } else {
-                states.push(Box::new(st.clone()));
-            }
-        }
-        // The state at the run's end (`tune past_runs`: the graphics command
-        // processor goes on from there before collecting the chunks).
-        let mut end_unknown: Vec<u32> = Vec::new();
-        let timing = lap.0.is_some();
-        let end_state = (super::tune::past_runs() && self.main_gfx && !held_run).then(|| {
-            let tc = timing.then(Instant::now);
-            let mut st = st.clone();
-            if let Some(tc) = tc {
-                PLAN_CLONE_NS.fetch_add(tc.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            }
-            let mut c = c;
-            while c < run_end {
-                let h = f.rd(c);
-                if h >> 30 == 2 {
-                    c += 4;
-                    continue;
-                }
-                let count = (h >> 16) & 0x3FFF;
-                if count == 0x3FFF {
-                    c += 4;
-                    continue;
-                }
-                let n = count as u64 + 1;
-                let at = c;
-                let opc = (h >> 8) & 0xFF;
-                let p = |i: u64| f.rd(at + 4 * (1 + i));
-                if matches!(opc, op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT) {
-                    let (vtx_loc, inst_loc) = (p(1) & 0xFFFF, p(1) >> 16);
-                    let inst_loc = if inst_loc != 0 {
-                        inst_loc
-                    } else {
-                        let r = ScanRegs { sh: &st.regs.sh, ctx: &st.regs.ctx };
-                        crate::hle::libs::agc::instance_offset_slot(super::shaders::ngg_addr_of(&r)).map_or(0, |s| 0x8C + s)
-                    };
-                    for r in [vtx_loc, inst_loc] {
-                        if r != 0 && !end_unknown.contains(&r) {
-                            end_unknown.push(r);
-                        }
-                    }
-                }
-                if matches!(opc, op::DRAW_INDEX_INDIRECT_MULTI | op::DRAW_INDIRECT_MULTI) {
-                    let (vtx_loc, inst_loc, id_loc) = (p(1) & 0xFFFF, p(2) & 0xFFFF, p(3) & 0xFFFF);
-                    let inst_loc = if inst_loc != 0 {
-                        inst_loc
-                    } else {
-                        let r = ScanRegs { sh: &st.regs.sh, ctx: &st.regs.ctx };
-                        crate::hle::libs::agc::instance_offset_slot(super::shaders::ngg_addr_of(&r)).map_or(0, |s| 0x8C + s)
-                    };
-                    for r in [vtx_loc, inst_loc, if p(3) & (1 << 31) != 0 { id_loc } else { 0 }] {
-                        if r != 0 && !end_unknown.contains(&r) {
-                            end_unknown.push(r);
-                        }
-                    }
-                }
-                Self::apply_state(&mut st, opc, n, &p);
-                c += 4 * (n + 1);
-            }
-            st
-        });
+        let PlanChunks { main_n, firsts, starts, states, end_state, end_unknown, sig } = pc;
         lap.mark(4);
         let mut workers = Vec::new();
-        for i in 0..k.min(m) {
+        for i in 0..k.min(starts.len()) {
             match self.par_pool.worker(i, &self.name, self.compute) {
                 Some(w) => workers.push(w),
                 None => break,
@@ -4524,6 +4656,8 @@ impl Cp {
         }
         e.past_drop();
         super::par::PAST[2].fetch_add(1, Ordering::Relaxed);
+        // (Execution goes on from the run's end: the next run is planned again.)
+        self.pre_plan = None;
         // Back to where collecting the run would have left it.
         self.ctx_stack = past.stack;
         self.markers = past.markers;
@@ -4567,67 +4701,6 @@ impl Cp {
             return None;
         }
         Some(to)
-    }
-
-    /// Whether `par_plan` would split the run that starts at the command at
-    /// `from` (recording past a run stops there); when not, its end is
-    /// skipped as `par_plan` skips it.
-    fn par_would_split(&mut self, f: &Fetched, from: u64, end: u64) -> bool {
-        let mut c = from;
-        let mut n = 0usize;
-        let run_end = loop {
-            if c >= end || !valid(c, 4) {
-                break c;
-            }
-            let h = f.rd(c);
-            match h >> 30 {
-                3 => {}
-                2 => {
-                    c += 4;
-                    continue;
-                }
-                _ => break c,
-            }
-            let count = (h >> 16) & 0x3FFF;
-            if count == 0x3FFF {
-                c += 4;
-                continue;
-            }
-            if h & 1 != 0 {
-                break c;
-            }
-            let opc = (h >> 8) & 0xFF;
-            let len = count as u64 + 1;
-            let next = c + 4 * (len + 1);
-            if next > end || !valid(c, 4 * (len + 1)) {
-                break c;
-            }
-            if is_command(opc) || self.run_multi(opc) {
-                n += 1;
-                if n >= PAR_MAX {
-                    break next;
-                }
-            } else if opc == op::NOP {
-                if len >= 2 && f.rd(c + 4) == DS_MAGIC && !matches!(f.rd(c + 8), pop::PUSH_MARKER | pop::SET_MARKER | pop::POP_MARKER) {
-                    break c;
-                }
-            } else if !(opc == op::SET_BASE || par_event(opc, self.compute) || is_state(opc)) {
-                let at = c;
-                if self.run_pass(opc, &|i: u64| f.rd(at + 4 * (1 + i))).is_none() {
-                    break c;
-                }
-            }
-            c = next;
-        };
-        let par_min = super::par::graphics_min();
-        let chunk_min = (par_min / 3).clamp(16, PAR_CHUNK_MIN);
-        let chunks = ((super::par::workers() + 1) * super::par::split()).min(n / chunk_min);
-        if n < par_min || chunks < 2 {
-            self.par_skip = (end, run_end);
-            self.par_skip_n = n;
-            return false;
-        }
-        true
     }
 
     /// Folds the per-command costs a chunk measured (its first command:
@@ -6016,7 +6089,7 @@ impl Cp {
                 break;
             }
             let skip = self.par_skip.0 == end && cur < self.par_skip.1;
-            if self.past.is_some() && self.par.is_none() && !skip && is_command(opcode) && h & 1 == 0 && f.words.is_empty() && !f.live && super::par::workers() > 0 && self.par_would_split(&f, cur, end) {
+            if self.past.is_some() && self.par.is_none() && !skip && is_command(opcode) && h & 1 == 0 && f.words.is_empty() && !f.live && super::par::workers() > 0 && self.plan_ahead(&f, cur, end) {
                 // The next parallel run: planned once this one is collected.
                 self.held_stop("next run", cur);
                 match self.past_settle() {
