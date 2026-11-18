@@ -64,11 +64,14 @@ struct Presenter {
 /// swapchain is not destroyed while it waits (`PW_LOCK`, and `PW_GEN` drops older waits).
 static PW_LOCK: Mutex<()> = Mutex::new(());
 static PW_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static PW_TX: Mutex<Option<std::sync::mpsc::Sender<(u64, u64, u64)>>> = Mutex::new(None);
+static PW_TX: Mutex<Option<std::sync::mpsc::Sender<(u64, u64, u64, std::time::Instant)>>> = Mutex::new(None);
 /// Frames by refreshes shown (1 to 7, 8 and more), all intervals and those over 25 ms.
 static PW_STATS: Mutex<([u64; 9], u64, u64)> = Mutex::new(([0; 9], 0, 0));
+/// The time from a present's call to its present wait's return (when the display showed it),
+/// in quarter milliseconds up to 64 ms (the last bucket: more).
+static PW_LATENCY: Mutex<[u64; 257]> = Mutex::new([0; 257]);
 
-fn present_waiter(rx: std::sync::mpsc::Receiver<(u64, u64, u64)>) {
+fn present_waiter(rx: std::sync::mpsc::Receiver<(u64, u64, u64, std::time::Instant)>) {
     crate::log::set_thread_name("present-wait");
     let c = ctx();
     let pw = ash::khr::present_wait::Device::new(&c.instance, &c.device);
@@ -76,9 +79,9 @@ fn present_waiter(rx: std::sync::mpsc::Receiver<(u64, u64, u64)>) {
     let mut missed = 0u32;
     while let Ok(first) = rx.recv() {
         // (Behind, after a wait that timed out: only the newest present is waited for.)
-        let (mut generation, mut sc, mut id) = first;
+        let (mut generation, mut sc, mut id, mut at) = first;
         while let Ok(m) = rx.try_recv() {
-            (generation, sc, id) = m;
+            (generation, sc, id, at) = m;
             prev = None;
         }
         let start = std::time::Instant::now();
@@ -94,6 +97,8 @@ fn present_waiter(rx: std::sync::mpsc::Receiver<(u64, u64, u64)>) {
             match r {
                 Ok(()) => {
                     let now = std::time::Instant::now();
+                    let q = (now.saturating_duration_since(at).as_secs_f64() * 4000.0) as usize;
+                    PW_LATENCY.lock()[q.min(256)] += 1;
                     if let Some(p) = prev {
                         let gap = now.duration_since(p).as_secs_f64();
                         let refresh = crate::displayclock::snapshot().map_or(1.0 / 60.0, |s| s.period.as_secs_f64());
@@ -124,6 +129,28 @@ fn present_waiter(rx: std::sync::mpsc::Receiver<(u64, u64, u64)>) {
 /// The on-screen counts afresh (`profile reset`).
 pub fn reset_stats() {
     *PW_STATS.lock() = ([0; 9], 0, 0);
+    *PW_LATENCY.lock() = [0; 257];
+}
+
+/// The present-to-display times' part of the status line (p50 and p90 in ms; "" when none).
+fn latency_part() -> String {
+    let h = *PW_LATENCY.lock();
+    let n: u64 = h.iter().sum();
+    if n == 0 {
+        return String::new();
+    }
+    let at = |q: f64| -> f64 {
+        let want = (q * n as f64).ceil() as u64;
+        let mut acc = 0;
+        for (i, &c) in h.iter().enumerate() {
+            acc += c;
+            if acc >= want {
+                return i as f64 / 4.0;
+            }
+        }
+        64.0
+    };
+    format!("; present to display p50 {:.2} ms, p90 {:.2} ms ({n} presents)", at(0.5), at(0.9))
 }
 
 /// Status: the frames shown and for how many refreshes each stayed (`DS_PRESENT_STATS=1`).
@@ -135,7 +162,7 @@ pub fn stats_line() -> String {
     let pct = |n: u64| 100.0 * n as f64 / s.1 as f64;
     let refresh = crate::displayclock::snapshot().map_or(1000.0 / 60.0, |x| x.period.as_secs_f64() * 1e3);
     format!(
-        "    on screen (present waits): {} frame intervals; shown 1 refresh {:.1}%, 2 {:.1}%, 3 {:.1}%, 4 {:.1}%, 5+ {:.1}% (a refresh {:.2} ms); over 25 ms {}\n",
+        "    on screen (present waits): {} frame intervals; shown 1 refresh {:.1}%, 2 {:.1}%, 3 {:.1}%, 4 {:.1}%, 5+ {:.1}% (a refresh {:.2} ms); over 25 ms {}{}\n",
         s.1,
         pct(s.0[1]),
         pct(s.0[2]),
@@ -143,7 +170,8 @@ pub fn stats_line() -> String {
         pct(s.0[4]),
         pct(s.0[5..].iter().sum()),
         refresh,
-        s.2
+        s.2,
+        latency_part()
     )
 }
 
@@ -905,7 +933,7 @@ pub fn present(src: Source) -> bool {
                 *tx = Some(s);
             }
             if let Some(s) = tx.as_ref() {
-                s.send((PW_GEN.load(std::sync::atomic::Ordering::Relaxed), p.swapchain.as_raw(), p.present_id)).ok();
+                s.send((PW_GEN.load(std::sync::atomic::Ordering::Relaxed), p.swapchain.as_raw(), p.present_id, std::time::Instant::now())).ok();
             }
         }
         match presented {

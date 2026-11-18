@@ -234,7 +234,11 @@ fn vblank_thread() {
                 if lock_target == 0 || lock_target + 2 <= s.count {
                     lock_target = s.count + 1;
                 }
-                next = s.last + s.period * lock_target.saturating_sub(s.count) as u32 + LOCK_DELAY;
+                let due = s.last + s.period * lock_target.saturating_sub(s.count) as u32;
+                // (`tune tick_lead`: that long before the vblank instead, so the flip made at
+                // the tick can be shown at it; PACING.md "Open" 3.)
+                let lead = crate::gpu::tune::tick_lead();
+                next = if lead == 0 { due + LOCK_DELAY } else { due.checked_sub(Duration::from_micros(lead)).unwrap_or(due) };
             }
             None if locked.is_some() => {
                 locked = None;

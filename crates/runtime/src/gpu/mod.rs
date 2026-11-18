@@ -31,7 +31,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 187] = [
+    static ALL: [Tunable; 188] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -219,6 +219,7 @@ pub mod tune {
         Tunable { name: "pace_smooth", env: "DS_PACE_SMOOTH", default: 8, value: AtomicU64::new(UNSET) },
         Tunable { name: "pace_phys", env: "DS_PACE_PHYS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "vrr", env: "DS_VRR", default: 2, value: AtomicU64::new(UNSET) },
+        Tunable { name: "tick_lead", env: "DS_TICK_LEAD", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1534,6 +1535,14 @@ pub mod tune {
     /// 2 as the driver or the display clock says (`vrr`), 1 always, 0 never.
     pub fn vrr() -> u64 {
         get(186)
+    }
+
+    /// On the display's grid, the title's vblank ticks this many microseconds before the
+    /// display's vblank it is due at (a flip presented then can be shown at that vblank, a
+    /// refresh sooner, where presents go straight to the screen; PACING.md "Open" 3); 0 (the
+    /// default): 300 us after it.
+    pub fn tick_lead() -> u64 {
+        get(187)
     }
 
     /// Whether translations get `rdna::translate::Spec::hw_bounds` (scalar
