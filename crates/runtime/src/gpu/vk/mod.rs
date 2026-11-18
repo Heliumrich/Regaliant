@@ -1062,6 +1062,8 @@ pub mod mark {
     pub const SHADOW_OUT: u64 = 4;
     pub const UPLOAD: u64 = 5;
     pub const BATCH: u64 = 6;
+    /// A GPU-resolved draw run's multi-draw, by its number (`exec::draw`'s run log).
+    pub const RUN: u64 = 7;
 }
 
 /// The device offers partitioned subgroup operations
@@ -1278,6 +1280,7 @@ pub fn checkpoint_report() -> String {
                     mark::SHADOW_OUT => "shadow copy out",
                     mark::UPLOAD => "image upload",
                     mark::BATCH => "batch",
+                    mark::RUN => "GPU-resolved run #",
                     _ => "?",
                 };
                 format!("{:?}: {kind} {:#x}", d.stage, m & ((1 << 56) - 1))

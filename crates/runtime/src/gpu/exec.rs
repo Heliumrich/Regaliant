@@ -6221,6 +6221,12 @@ fn releaser_thread(q: usize) {
             if !ok && lose_device() {
                 let list: Vec<String> = r.shaders.iter().map(|a| format!("{a:#x}")).collect();
                 crate::error!("gpu[{}]: waiting for GPU work: {why}; GPU execution stops (batch #{}: shaders {}; {}); checkpoints: {}", r.name, r.seq, list.join(" "), ops_line(&r.ops), super::vk::checkpoint_report());
+                // (`DS_GPU_CHECKPOINTS=1`: the GPU-resolved runs the checkpoints' run numbers
+                // refer to.)
+                let runs = draw::run_log_report();
+                if !runs.is_empty() {
+                    crate::warn!("gpu: the last GPU-resolved runs recorded:\n{runs}");
+                }
             }
             FLUSHES.fetch_add(1, Ordering::Relaxed);
             collect_timestamps(r.bq, r.queries, &r.shaders, &r.name, r.seq, &r.segs, &r.ops);
@@ -11537,6 +11543,47 @@ pub static F3_PLACED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// outside the span (the shader reads zeros for both), ranges placed in the
 /// mirror (`Spec::pt_linear`)].
 pub static F3_LOADS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// `DS_F3_REWRITE=1`: [GPU-resolved loads' ranges checked when their batch ended, of them
+/// changed by the title since their draw was recorded]. The CPU path copies those words when
+/// it records; the GPU path's shaders read them later, from the mirror, whose missing pages a
+/// batch's prologue copies from the title's memory as it is then.
+pub static F3_REWRITE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+thread_local! {
+    /// This executor's batch's watched ranges: (guest address, bytes, hash at recording).
+    static F3_WATCH: std::cell::RefCell<Vec<(u64, u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn f3_rewrite_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_F3_REWRITE").ok().as_deref() == Some("1"))
+}
+
+/// FNV-1a over the guest dwords of [a, a+n) (None: unreadable or over 4 KiB).
+fn guest_hash(a: u64, n: u64) -> Option<u64> {
+    if n == 0 || n > 4096 || !super::cp::guest_readable(a & !3, n + (a & 3)) {
+        return None;
+    }
+    let (mut h, mut p) = (0xcbf2_9ce4_8422_2325u64, a & !3);
+    while p < a + n {
+        h = (h ^ unsafe { std::ptr::read_volatile(p as *const u32) } as u64).wrapping_mul(0x100_0000_01b3);
+        p += 4;
+    }
+    Some(h)
+}
+
+/// `DS_F3_REWRITE=1`: the ending batch's watched ranges against their hashes at recording.
+fn f3_check_rewrites() {
+    F3_WATCH.with(|w| {
+        let mut w = w.borrow_mut();
+        for &(a, n, h) in w.iter() {
+            F3_REWRITE[0].fetch_add(1, Ordering::Relaxed);
+            if guest_hash(a, n).is_some_and(|x| x != h) && F3_REWRITE[1].fetch_add(1, Ordering::Relaxed) < 12 {
+                crate::info!("gpu: a GPU-resolved load's range {a:#x} (+{n}) changed between its draw's recording and its batch's end (DS_F3_REWRITE)");
+            }
+        }
+        w.clear();
+    });
+}
 /// `DS_STEP_LAPS`: [stages placed, TSC cycles reading their chains, checking
 /// the loads' imports and pending writes, placing the buffers; ranges found,
 /// runs placed, runs the batch uploads or placed already].
@@ -11676,7 +11723,7 @@ pub fn f3_line() -> String {
         String::new()
     };
     format!(
-        "    front end 2's GPU-resolved chains: {} ranges placed ({} MiB); not placed: {}; recorded with CPU-resolved chains after that: {} draws, {} dispatches; their loads at address 0 {}, outside the span {} (both read zeros), loads' ranges placed in the mirror {}\n",
+        "    front end 2's GPU-resolved chains: {} ranges placed ({} MiB); not placed: {}; recorded with CPU-resolved chains after that: {} draws, {} dispatches; their loads at address 0 {}, outside the span {} (both read zeros), loads' ranges placed in the mirror {}; loads' ranges changed before their batch ended {} of {} checked (`DS_F3_REWRITE`)\n",
         v[0],
         v[1] >> 20,
         why.join(", "),
@@ -11684,7 +11731,9 @@ pub fn f3_line() -> String {
         v[3],
         F3_LOADS[0].load(Ordering::Relaxed),
         F3_LOADS[1].load(Ordering::Relaxed),
-        F3_LOADS[2].load(Ordering::Relaxed)
+        F3_LOADS[2].load(Ordering::Relaxed),
+        F3_REWRITE[1].load(Ordering::Relaxed),
+        F3_REWRITE[0].load(Ordering::Relaxed)
     ) + &laps
 }
 
@@ -13128,6 +13177,9 @@ impl Exec {
             }
             self.fe2_mine.clear();
             self.f3_placed.clear();
+            if f3_rewrite_on() {
+                f3_check_rewrites();
+            }
             self.stage_used = 0;
             self.slots[i].seq = PENDING;
             self.pending_promises.clear();
@@ -13213,6 +13265,9 @@ impl Exec {
         }
         self.fe2_mine.clear();
         self.f3_placed.clear();
+        if f3_rewrite_on() {
+            f3_check_rewrites();
+        }
         super::precache::submitted(&std::mem::take(&mut self.shared_pending), seq);
         if !self.res_pages.is_empty() {
             super::resident::submitted(&std::mem::take(&mut self.res_pages), seq);
@@ -13316,6 +13371,9 @@ impl Exec {
         self.fe2_spans.clear();
         self.fe2_mine.clear();
         self.f3_placed.clear();
+        if f3_rewrite_on() {
+            f3_check_rewrites();
+        }
         self.fe2_marked = false;
         self.owned.clear();
         self.eager_action = None;
@@ -14380,6 +14438,16 @@ impl Exec {
         }
         F3_LOADS[0].fetch_add(nulls, Ordering::Relaxed);
         F3_LOADS[1].fetch_add(outside, Ordering::Relaxed);
+        if f3_rewrite_on() {
+            F3_WATCH.with(|w| {
+                let mut w = w.borrow_mut();
+                for &(a, n) in loads.iter() {
+                    if let Some(h) = guest_hash(a, n) {
+                        w.push((a, n, h));
+                    }
+                }
+            });
+        }
         let t2 = tsc();
         // (Read on the CPU now: checked when held work settles, as a
         // preparation's reads are.)

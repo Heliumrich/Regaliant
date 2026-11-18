@@ -3140,6 +3140,73 @@ pub(crate) struct DrawRun {
     appendable: bool,
     /// A GPU-resolved pair's run (`draw_gpu_append`).
     gpu: Option<Box<GpuDrawRun>>,
+    /// Its number in the run log (`DS_GPU_CHECKPOINTS=1`, `RUN_LOG`); 0: none.
+    seq: u64,
+}
+
+/// `DS_GPU_CHECKPOINTS=1`: a GPU-resolved run as recorded (`RUN_LOG`): its draws' sizes and
+/// where their indices and vertices start against the run's index binding.
+struct RunRec {
+    seq: u64,
+    exec: String,
+    batch: u64,
+    pair: (u64, u64),
+    n: u32,
+    max: u32,
+    /// Index size and the binding's base offset (None: not indexed).
+    index: Option<(u32, u64)>,
+    /// The largest draw (count x instances) and its place in the run.
+    big: u64,
+    big_at: u32,
+    /// First indices: the lowest, and the highest first + count.
+    first_lo: u32,
+    end_hi: u64,
+    vertex_lo: i32,
+    vertex_hi: i32,
+    inst_hi: u32,
+}
+
+/// Numbers GPU-resolved runs for the checkpoints (`mark::RUN`).
+static RUN_SEQ: AtomicU64 = AtomicU64::new(0);
+/// The last `RUN_LOG_MAX` GPU-resolved runs (`DS_GPU_CHECKPOINTS=1`), printed when GPU work
+/// stops (`run_log_report`): with the checkpoints' run numbers they name what a hung run held.
+static RUN_LOG: Mutex<std::collections::VecDeque<RunRec>> = Mutex::new(std::collections::VecDeque::new());
+const RUN_LOG_MAX: usize = 512;
+/// Appended draws refused for their size (count x instances `HUGE_DRAW` or more): the full
+/// path logs them (`note_huge_draw`).
+static APPEND_HUGE: AtomicU64 = AtomicU64::new(0);
+
+/// A draw appended to run `seq` (draw `at` of it): its size and starts in its record.
+fn run_log_note(seq: u64, a: &DrawArgs, first: u32, base_vertex: i32, at: u32) {
+    let mut g = RUN_LOG.lock();
+    if let Some(r) = g.iter_mut().rev().find(|r| r.seq == seq) {
+        let size = a.count as u64 * a.instances.max(1) as u64;
+        if size > r.big {
+            (r.big, r.big_at) = (size, at);
+        }
+        r.n = r.n.max(at + 1);
+        r.first_lo = r.first_lo.min(first);
+        r.end_hi = r.end_hi.max(first as u64 + a.count as u64);
+        r.vertex_lo = r.vertex_lo.min(base_vertex);
+        r.vertex_hi = r.vertex_hi.max(base_vertex);
+        r.inst_hi = r.inst_hi.max(a.instances);
+    }
+}
+
+/// The last GPU-resolved runs recorded (`DS_GPU_CHECKPOINTS=1`), oldest first ("" when none):
+/// all `RUN_LOG_MAX`, so the checkpoints' run numbers find theirs.
+pub(super) fn run_log_report() -> String {
+    let g = RUN_LOG.lock();
+    g.iter()
+        .map(|r| {
+            let index = r.index.map_or("not indexed".to_string(), |(s, base)| format!("{s}-byte indices bound at {base:#x}, first {}..{} (end; bytes {:#x})", r.first_lo, r.end_hi, r.end_hi * s as u64));
+            format!(
+                "      run #{} on {} batch {}: vs {:#x} ps {:#x}, {} of {} draws, the largest {} vertex invocations (draw {}), {index}, vertex offsets {}..{}, instances up to {}",
+                r.seq, r.exec, r.batch, r.pair.0, r.pair.1, r.n, r.max, r.big, r.big_at, r.vertex_lo, r.vertex_hi, r.inst_hi
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// A GPU-resolved pair's open run (`gpures`, stage G4): per stage (vertex,
@@ -3218,7 +3285,7 @@ pub(super) fn batch_line() -> String {
         return String::new();
     }
     format!(
-        "    batched draws (GPU-resolved pairs): {} runs, {} draws appended ({:.1} per run), {} runs without room to append (a clear {}, no room in the ring {}, indices at an offset not a multiple of their size {}), {} appends refused\n",
+        "    batched draws (GPU-resolved pairs): {} runs, {} draws appended ({:.1} per run), {} runs without room to append (a clear {}, no room in the ring {}, indices at an offset not a multiple of their size {}), {} appends refused ({} of them for their size)\n",
         v[0],
         v[1],
         (v[0] + v[1]) as f64 / v[0] as f64,
@@ -3226,7 +3293,8 @@ pub(super) fn batch_line() -> String {
         v[4],
         v[5],
         v[6],
-        v[3]
+        v[3],
+        APPEND_HUGE.load(Ordering::Relaxed)
     )
 }
 
@@ -3273,6 +3341,35 @@ impl Exec {
             BATCH_DRAWS[6].fetch_add(1, Ordering::Relaxed);
         }
         let appendable = appendable && max > 1 && at_base;
+        // (`DS_GPU_CHECKPOINTS=1`: a GPU-resolved run gets a number, its checkpoint before its
+        // multi-draw, and a record; a hang then names the run and what it held.)
+        let seq = if gpu.is_some() && crate::gpu::vk::checkpoints_on() {
+            let s = RUN_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+            crate::gpu::vk::checkpoint(cmd, crate::gpu::vk::mark::RUN, s);
+            let mut g = RUN_LOG.lock();
+            if g.len() >= RUN_LOG_MAX {
+                g.pop_front();
+            }
+            g.push_back(RunRec {
+                seq: s,
+                exec: self.name.clone(),
+                batch: self.batch_count,
+                pair: gpu.as_ref().map_or((0, 0), |g| g.pair),
+                n: 1,
+                max: max as u32,
+                index: index.map(|(_, base, size)| (size, base)),
+                big: a.count as u64 * a.instances.max(1) as u64,
+                big_at: 0,
+                first_lo: first,
+                end_hi: first as u64 + a.count as u64,
+                vertex_lo: base_vertex,
+                vertex_hi: base_vertex,
+                inst_hi: a.instances,
+            });
+            s
+        } else {
+            0
+        };
         unsafe {
             let count = ring_ptr.add(off as usize) as *mut u32;
             let args = ring_ptr.add(args_off as usize) as *mut u32;
@@ -3317,6 +3414,7 @@ impl Exec {
                 index: index.map(|(b, base, size)| (b, size, base)),
                 appendable,
                 gpu,
+                seq,
             });
         }
         BATCH_DRAWS[0].fetch_add(1, Ordering::Relaxed);
@@ -3373,6 +3471,12 @@ impl Exec {
         // which the copied SGPR data would miss.
         if !shaders::words_unchanged(&g.stages[0]) || !shaders::words_unchanged(&g.stages[1]) {
             stats[1].fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        }
+        // (A draw of absurd size goes to the full path, which logs it: `APPEND_HUGE`.)
+        if a.count as u64 * a.instances.max(1) as u64 >= HUGE_DRAW {
+            APPEND_HUGE.fetch_add(1, Ordering::Relaxed);
+            stats[3].fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         }
         mark(0);
@@ -3506,6 +3610,9 @@ impl Exec {
             t.add(1).write((items[1] / 4) as u32);
             r.n += 1;
             r.count.write(r.n);
+        }
+        if r.seq != 0 {
+            run_log_note(r.seq, a, first, base_vertex, r.n - 1);
         }
         self.batch_shaders.push(super::DRAW_KEY | ps_addr);
         stats[0].fetch_add(1, Ordering::Relaxed);
