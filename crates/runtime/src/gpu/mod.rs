@@ -1675,7 +1675,9 @@ pub mod tune {
     /// 1 the guest page table is kept and programs found eligible resolve
     /// their per-item chains in the shader (batched compute programs and draw
     /// pairs), 2 compute programs only (front end 2's stage F3: the draws'
-    /// runs cost more than they save, FINDINGS.md 2026-10-28).
+    /// runs cost more than they save, FINDINGS.md 2026-10-28), 3 draw pairs
+    /// only (since 2026-11-18: 1 hung the GPU twice under front end 2 with the
+    /// item culls GPU-resolved, FINDINGS.md 2026-11-18).
     pub fn gpu_chains() -> u64 {
         get(126)
     }

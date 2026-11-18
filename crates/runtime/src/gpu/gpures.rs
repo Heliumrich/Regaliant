@@ -132,7 +132,7 @@ pub fn decided(addr: u64) -> Option<Decided> {
 /// values against this thread's last command of the program (`continues`:
 /// the same run).
 pub fn observe(addr: u64, plan: &Plan, user: &[u32], continues: bool) {
-    if super::tune::gpu_chains() == 0 {
+    if !matches!(super::tune::gpu_chains(), 1 | 2) {
         return;
     }
     let mut g = PROGRAMS.lock();

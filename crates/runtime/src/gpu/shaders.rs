@@ -1825,7 +1825,7 @@ pub fn prep_parts_line() -> String {
 }
 
 pub fn prepare_compute<R: RegRead + ?Sized>(cp: &R, wave64: bool) -> Result<Prepared, String> {
-    if super::tune::r2() && super::tune::gpu_chains() == 0 && !PROBE_ON.load(std::sync::atomic::Ordering::Relaxed) && FORCE_BATCHED.with(|f| f.get()) == 0 {
+    if super::tune::r2() && matches!(super::tune::gpu_chains(), 0 | 3) && !PROBE_ON.load(std::sync::atomic::Ordering::Relaxed) && FORCE_BATCHED.with(|f| f.get()) == 0 {
         return prepare_compute_r2(cp, wave64);
     }
     prep_warm(|| prepare_compute(cp, wave64));
@@ -2156,7 +2156,7 @@ fn cs_spec(addr: u64, rsrc2: u32, local: [u32; 3], wave64: bool, code_hash: u64)
     }
     // GPU-resolved per-item chains (`gpures`, `tune gpu_chains`; batched
     // programs, whose translations use device addresses).
-    if spec.batched && super::tune::gpu_chains() != 0 && super::pagetable::address() != 0 && !NO_GPU_CHAINS.with(|c| c.get()) {
+    if spec.batched && matches!(super::tune::gpu_chains(), 1 | 2) && super::pagetable::address() != 0 && !NO_GPU_CHAINS.with(|c| c.get()) {
         if let Some(d) = super::gpures::decided(addr) {
             spec.gpu_loads = d.gpu_loads;
             spec.gpu_res = d.gpu_res;

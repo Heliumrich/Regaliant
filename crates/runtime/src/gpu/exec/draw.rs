@@ -1819,7 +1819,7 @@ impl Exec {
         // chains the shaders resolve runs batched, its draws after a run's
         // first appended with their user data alone (no preparation).
         let direct = ps_addr != 0 && !rect && self.recording && !sync_mode();
-        let mut gpu_pair = if direct && super::super::tune::gpu_chains() == 1 && ctx().draw_indirect_count && ctx().device_addresses { super::super::gpures::draw_decided(vs_addr, ps_addr) } else { None };
+        let mut gpu_pair = if direct && matches!(super::super::tune::gpu_chains(), 1 | 3) && ctx().draw_indirect_count && ctx().device_addresses { super::super::gpures::draw_decided(vs_addr, ps_addr) } else { None };
         if gpu_pair.is_some() && self.draw_same {
             if let Some(drawn) = self.draw_gpu_append(cp, a, vs_addr, ps_addr)? {
                 return Ok(drawn);
@@ -2006,7 +2006,7 @@ impl Exec {
         // Pairs not decided yet: learned from the draws the CPU resolves (also for the census of
         // GPU-resolved runs, `DS_RUN_CENSUS`, which only counts and prices).
         let run_census = super::super::gpures::census_on();
-        if direct && gpu_pair.is_none() && (super::super::tune::gpu_chains() == 1 || run_census) {
+        if direct && gpu_pair.is_none() && (matches!(super::super::tune::gpu_chains(), 1 | 3) || run_census) {
             if let Some(p) = &ps {
                 let continues = self.draw_same && (self.batch_count, self.cmd_uses.get()) == self.last_draw_end;
                 super::super::gpures::observe_draw((vs.addr, p.addr), [(&vs.tr.plan, &vs.user[..]), (&p.tr.plan, &p.user[..])], continues);

@@ -19029,7 +19029,7 @@ impl Exec {
             return;
         }
         let t_prog = prog_census().then(std::time::Instant::now);
-        if super::tune::gpu_chains() != 0 && self.gpu_append(cp, groups, initiator) {
+        if matches!(super::tune::gpu_chains(), 1 | 2) && self.gpu_append(cp, groups, initiator) {
             if let Some(t) = t_prog {
                 prog_note(self.prog_class(), cs_addr(cp), 0, t.elapsed().as_nanos() as u64);
             }
@@ -19865,7 +19865,7 @@ impl Exec {
         if super::drawcensus::on() {
             super::drawcensus::observe_cs(&self.name, p.addr, &p.tr.plan, indirect.is_some());
         }
-        if super::tune::gpu_chains() != 0 && p.tr.spec.batched && indirect.is_none() {
+        if matches!(super::tune::gpu_chains(), 1 | 2) && p.tr.spec.batched && indirect.is_none() {
             let user = &p.sgpr_data[..p.tr.spec.user_sgprs as usize];
             if p.tr.spec.gpu_res != 0 && super::fe2::on() {
                 // Front end 2 (stage F3): what its per-item chains read placed
