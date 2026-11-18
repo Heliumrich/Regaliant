@@ -18238,7 +18238,11 @@ impl Exec {
             // header (`Spec::addresses`).
             let addr_at = rdna::translate::addr_info_offset(&found.tr.plan) as usize;
             let has_marks = found.tr.out.bindings.iter().any(|b| b.kind == BindingKind::Marks);
-            if found.tr.out.bindings.iter().any(|b| matches!(b.kind, BindingKind::Address(_))) {
+            // (Every address-mode or GPU-resolved stage reads it: a GPU-resolved scalar load
+            // outside the guest span reads the zero page, buffers or none. Before 2026-11-18 only
+            // stages with address-mode buffers had it, and a block's dwords start at zero.)
+            let spec = &found.tr.spec;
+            if spec.addresses || spec.gpu_loads != 0 || spec.gpu_res != 0 || found.tr.out.bindings.iter().any(|b| matches!(b.kind, BindingKind::Address(_))) {
                 p.sgpr_data[addr_at] = fx.zero_va as u32;
                 p.sgpr_data[addr_at + 1] = (fx.zero_va >> 32) as u32;
             }
