@@ -598,6 +598,40 @@ pub fn log(n: usize) -> String {
     out
 }
 
+/// Control `gamestep dump <n>`: the last n frame steps as CSV in the run directory
+/// (`gamestep-<flip>.csv`: the step's time, the title's and the port's step, the time between
+/// flips taken, the flip it came from and the newest then, and with `DS_PACE_PAIR=1` the flip
+/// that showed the frame and when, times in ms from the first step), for offline study of
+/// step rules (PACING.md "Open" 2). Returns the file written.
+pub fn dump(n: usize) -> String {
+    let g = STATE.lock();
+    let Some(s) = g.as_ref() else { return "gamestep dump: no frame step hook".into() };
+    let recs: Vec<Rec> = s.recs.iter().rev().take(n).rev().copied().collect();
+    drop(g);
+    let Some(t0) = recs.first().map(|r| r.at) else { return "gamestep dump: no frame steps".into() };
+    let ms = |t: Instant| t.saturating_duration_since(t0).as_secs_f64() * 1e3 - t0.saturating_duration_since(t).as_secs_f64() * 1e3;
+    let mut out = String::from("at_ms,title_ms,step_ms,interval_ms,flip,newest,own_flip,shown_ms\n");
+    for r in &recs {
+        out += &format!(
+            "{:.4},{:.4},{:.4},{:.4},{},{},{},{}\n",
+            ms(r.at),
+            r.title as f64 * 1e3,
+            r.step as f64 * 1e3,
+            r.interval as f64 * 1e3,
+            r.flip,
+            r.newest,
+            r.own_flip,
+            r.shown.map_or(String::new(), |t| format!("{:.4}", ms(t)))
+        );
+    }
+    let Some(dir) = crate::run_dir() else { return "gamestep dump: no run directory".into() };
+    let path = dir.join(format!("gamestep-{}.csv", crate::gpu::FRAMES.load(Relaxed)));
+    match std::fs::write(&path, out) {
+        Ok(()) => format!("gamestep dump: {} frame steps written to {}", recs.len(), path.display()),
+        Err(e) => format!("gamestep dump: {e}"),
+    }
+}
+
 fn dist(a: [f32; 3], b: [f32; 3]) -> f32 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
 }

@@ -411,6 +411,7 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 match (parts.next(), parts.next().and_then(|v| v.parse::<usize>().ok())) {
                     (Some("log"), n) => info!("gamestep log:\n{}", gamestep::log(n.unwrap_or(120))),
                     (Some("pair"), n) => gamestep::pair_log(n.unwrap_or(60) as u32),
+                    (Some("dump"), n) => info!("{}", gamestep::dump(n.unwrap_or(2000))),
                     _ => info!("{}", gamestep::report()),
                 }
                 Ok(())
