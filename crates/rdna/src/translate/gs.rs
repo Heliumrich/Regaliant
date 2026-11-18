@@ -323,7 +323,7 @@ mod tests {
         let ep = &m.entry_points[0];
         // gl_in, gl_out, 2 inputs, 2 passed, 3 flat, 2 barycentrics.
         assert_eq!(ep.operands.len() - 3, 11);
-        let wb = super::bary_gs(0b0011, 0b1111_1011 | 1 << 31, &io, true);
+        let wb = super::bary_gs(0b0011, 0b1111_1011 | 1 << super::super::BATCH_VARYING, &io, true);
         assert_ne!(w, wb);
         assert_eq!(rspirv::dr::load_words(&wb).expect("parses").entry_points[0].operands.len() - 3, 13);
         // `RDNA_GS_DUMP=<dir>`: both modules written there for spirv-val.

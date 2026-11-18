@@ -505,8 +505,16 @@ pub const BATCH_SINGLE: u32 = 1 << 31;
 pub const BATCH_DRAW_ENTRY_DWORDS: u32 = 2;
 /// The location of the flat varying that carries a batched draw's pixel
 /// stage's SGPR data offset (the vertex stage's parameters must leave it
-/// free: `Output::param_mask` bit 31).
-pub const BATCH_VARYING: u32 = 31;
+/// free: `Output::param_mask` bit 28; a pixel stage reading a parameter
+/// there is not translated batched). 28 keeps the interface within the
+/// 128-component limits with the built-ins (a pixel stage's up to 12:
+/// 28 * 4 + 1 + 12 = 125); at 31 the validation layer reported the batched
+/// stages over maxVertexOutputComponents and maxFragmentInputComponents
+/// (2026-11-18, while the GPU-resolved draws lost the device).
+pub const BATCH_VARYING: u32 = 28;
+/// The locations a stage's interface may use (`bary_gs_io`'s free ones lie
+/// below it).
+pub const VARYING_LOCATIONS: u32 = 31;
 
 /// The byte offset of a stage's SGPR data offset in the push constants
 /// (`Spec::sgpr_pc`): the vertex and pixel stages of a draw push both.
@@ -2518,10 +2526,10 @@ fn per_vertex_locations(code: &[Inst], spec: &Spec) -> BTreeSet<u32> {
 /// Where a pixel stage reading the per-vertex locations `pv` gets them
 /// without fragment barycentrics (`Spec::bary_gs`): each location keeps
 /// vertex 0's value, vertices 1 and 2 and the two barycentrics take free
-/// locations below `BATCH_VARYING` (None when too few are free: the stage
-/// keeps vertex 0's values, faceted).
+/// locations below `VARYING_LOCATIONS` other than `BATCH_VARYING` (None
+/// when too few are free: the stage keeps vertex 0's values, faceted).
 fn bary_gs_io(code: &[Inst], spec: &Spec, pv: &BTreeSet<u32>) -> Option<gs::BaryIo> {
-    let mut used: u32 = 1 << BATCH_VARYING;
+    let mut used: u32 = if spec.batched { 1 << BATCH_VARYING } else { 0 };
     for i in code.iter().filter(|i| i.enc == Enc::Vintrp) {
         if let Some((loc, _)) = attr_location(spec, i.intrp_attr()) {
             used |= 1u32.checked_shl(loc).unwrap_or(0);
@@ -2530,7 +2538,7 @@ fn bary_gs_io(code: &[Inst], spec: &Spec, pv: &BTreeSet<u32>) -> Option<gs::Bary
     for &l in pv {
         used |= 1u32.checked_shl(l).unwrap_or(0);
     }
-    let mut free = (0..BATCH_VARYING).filter(|l| used & (1 << l) == 0);
+    let mut free = (0..VARYING_LOCATIONS).filter(|l| used & (1 << l) == 0);
     let mut per_vertex = Vec::new();
     for &l in pv {
         per_vertex.push((l, [free.next()?, free.next()?]));
@@ -3142,7 +3150,11 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         ok(tr.b.store(out, ps, None, []))?;
     } else if spec.batched && spec.stage == Stage::Fragment {
         // A batched draw's pixel stage: its SGPR data offset from the
-        // vertex stage.
+        // vertex stage (not when one of its own inputs is that location:
+        // the runtime then prepares the pair unbatched).
+        if spec.ps_inputs.iter().any(|i| i.default.is_none() && i.param as u32 == BATCH_VARYING) {
+            return Err(format!("a batched pixel stage reads parameter {BATCH_VARYING}, the batched draw's varying"));
+        }
         let v = tr.input(tr.t.u32, None, Some(BATCH_VARYING));
         tr.b.decorate(v, Decoration::Flat, []);
         tr.sgpr_base = Some(e(tr.b.load(tr.t.u32, None, v, None, []))?);

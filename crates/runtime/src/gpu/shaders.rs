@@ -2696,6 +2696,10 @@ fn ps_spec(addr: u64, rsrc2: u32, ctx: &dyn Fn(u32) -> u32) -> Spec {
         };
         *slot = MrtSpec { export_format: ((col >> (4 * m)) & 0xF) as u8, class };
     }
+    // A batched draw's pixel stage takes its SGPR data offset at the
+    // `BATCH_VARYING` location: not batched when one of its own inputs is
+    // there (the draw path then refuses the pair, "not translated batched").
+    let batched = batched_draw_now() && !ps_inputs.iter().any(|i| i.default.is_none() && i.param as u32 == translate::BATCH_VARYING);
     let mut spec = Spec {
         stage: Stage::Fragment,
         user_sgprs,
@@ -2732,8 +2736,8 @@ fn ps_spec(addr: u64, rsrc2: u32, ctx: &dyn Fn(u32) -> u32) -> Spec {
         hw_bounds: super::tune::hw_bounds_on(),
         base_instance_sgpr: None,
         sgpr_pc: super::tune::sgpr_pc().then_some(translate::sgpr_pc_offset(Stage::Fragment)),
-        addresses: batched_draw_now(),
-        batched: batched_draw_now(),
+        addresses: batched,
+        batched,
         write_marks: marks_wanted(),
         marks_untouched: !super::tune::mark_touch(),
         touch_test: touch_test_wanted(),
