@@ -665,9 +665,8 @@ pub fn walktest(x: i32, y: i32, ms: u64, name: String) {
                 return;
             };
             let until = hold.saturating_sub(Duration::from_millis(100));
-            if until > t0.elapsed() {
-                std::thread::sleep(until - t0.elapsed());
-            }
+            // (One read of the clock: two could straddle `until` and underflow.)
+            std::thread::sleep(until.saturating_sub(t0.elapsed()));
             let (f1, g1) = totals();
             let Some(b) = newest() else { return };
             let (Some(p), Some(q)) = (a.pos, b.pos) else {
@@ -713,9 +712,8 @@ pub fn turntest(x: i32, ms: u64, name: String) {
             std::thread::sleep(Duration::from_millis(1200.min(ms / 2)));
             let (f0, g0) = totals();
             let until = hold.saturating_sub(Duration::from_millis(100));
-            if until > t0.elapsed() {
-                std::thread::sleep(until - t0.elapsed());
-            }
+            // (One read of the clock: two could straddle `until` and underflow.)
+            std::thread::sleep(until.saturating_sub(t0.elapsed()));
             let (f1, g1) = totals();
             let recs: Vec<Rec> = STATE.lock().as_ref().map(|s| s.recs.iter().rev().take((f1 - f0) as usize + 1).rev().copied().collect()).unwrap_or_default();
             // The yaw's change frame to frame, unwrapped (it wraps at pi).

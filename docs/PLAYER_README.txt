@@ -101,8 +101,9 @@ The game runs at the same speed at every frame rate. With the 60 limit each fram
 the screen for the same number of refreshes, so motion stays even:
 - At 60, 120 or 240 Hz the game shows 60 frames a second.
 - With G-Sync or FreeSync it shows 60 in borderless or exclusive fullscreen.
-- In a window on a 165 Hz or 144 Hz screen without G-Sync or FreeSync it shows an even 55 or
-  48. For 60 there, use fullscreen with G-Sync or FreeSync, or set the screen to 120 Hz.
+- In a window on a 165 Hz or 144 Hz screen it shows an even 55 or 48 (G-Sync is often on
+  only for fullscreen). For 60 there, use borderless or exclusive fullscreen with G-Sync or
+  FreeSync, or set the screen to 120 Hz.
 - Exclusive fullscreen with the Automatic refresh rate picks a rate where 60 fits, unless the
   screen has G-Sync or FreeSync.
 
@@ -166,6 +167,8 @@ Estimated, not tested:
 Known issues
 ------------
 - The frame rate is below 60 in the busiest places: about 40 to 55 fps on the tested PC.
+- In a window on a 144 or 165 Hz screen the game shows an even 48 or 55 fps. See "Frame rate
+  and refresh rate" for how to get 60.
 - On a first visit some objects can be missing for a moment while their shaders compile, and
   some compiles still stutter, even with prepared shaders. A level's first load can pause for
   a few seconds behind the loading screen. Later visits do not compile them again.
