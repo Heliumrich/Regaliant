@@ -1224,6 +1224,123 @@ fn store_formatted(tr: &mut T, var: Word, addr: Word, vals: &[Word], fmt: u16) -
     }
 }
 
+/// `FORMAT_RT`: packs `vals` per the format the V# names when the program
+/// runs (`rt_format_entry`'s table, as `load_formatted_rt` reads it: each
+/// component converted by the format's class to its width, placed at its
+/// offset) and stores the element in the size the table gives (1, 2, 4, 8,
+/// 12 or 16 bytes), marking those bytes for resource `r`. A format outside
+/// the table stores nothing, as FORMAT_INVALID does. Call inside the
+/// store's active-lanes block.
+fn store_formatted_rt(tr: &mut T, var: Word, addr: Word, vals: &[Word], r: usize) -> R<()> {
+    let (Some(w3), Some(table)) = (tr.rt_word3, tr.fmt_table) else { return Err("a run-time format store without its V# or table".into()) };
+    let (u, f, bt, i32t) = (tr.t.u32, tr.t.f32, tr.t.bool_, tr.t.i32);
+    let c = |tr: &mut T, v: u32| tr.u(v);
+    let (k12, k7f) = (c(tr, 12), c(tr, 0x7F));
+    let id = e(tr.b.shift_right_logical(u, None, w3, k12))?;
+    let id = e(tr.b.bitwise_and(u, None, id, k7f))?;
+    let pt = tr.b.type_pointer(None, StorageClass::Private, u);
+    let p = e(tr.b.access_chain(pt, None, table, [id]))?;
+    let ent = e(tr.b.load(u, None, p, None, []))?;
+    let (k63, k7, k24, k31, k1, k3, z) = (c(tr, 63), c(tr, 7), c(tr, 24), c(tr, 31), c(tr, 1), c(tr, 3), c(tr, 0));
+    let class = e(tr.b.shift_right_logical(u, None, ent, k24))?;
+    let class = e(tr.b.bitwise_and(u, None, class, k7))?;
+    let valid = e(tr.b.shift_right_logical(u, None, ent, k31))?;
+    let valid = e(tr.b.i_not_equal(bt, None, valid, z))?;
+    let is = |tr: &mut T, k: u32| -> R<Word> {
+        let kk = tr.u(k);
+        e(tr.b.i_equal(bt, None, class, kk))
+    };
+    let cl: Vec<Word> = (0..7).map(|k| is(tr, k)).collect::<R<_>>()?;
+    // Widths and offsets (bits), the element's bytes.
+    let mut w = [z; 4];
+    let mut o = [z; 4];
+    for k in 0..4 {
+        let sh = c(tr, 6 * k as u32);
+        let x = e(tr.b.shift_right_logical(u, None, ent, sh))?;
+        w[k] = e(tr.b.bitwise_and(u, None, x, k63))?;
+        if k > 0 {
+            o[k] = e(tr.b.i_add(u, None, o[k - 1], w[k - 1]))?;
+        }
+    }
+    let bits_ = e(tr.b.i_add(u, None, o[3], w[3]))?;
+    let bytes = e(tr.b.shift_right_logical(u, None, bits_, k3))?;
+    let (f0, fm1, f1) = (tr.f(0.0), tr.f(-1.0), tr.f(1.0));
+    let (k32, all, k16, k5) = (c(tr, 32), c(tr, u32::MAX), c(tr, 16), c(tr, 5));
+    let kj: Vec<Word> = (0..4).map(|j| c(tr, j)).collect();
+    let mut dws = [z; 4];
+    for (k, &v) in vals.iter().enumerate().take(4) {
+        let wk = w[k];
+        // The component's mask: (1 << w) - 1, all bits at 32 (no shift by
+        // 32), none at 0.
+        let wide = e(tr.b.u_greater_than_equal(bt, None, wk, k32))?;
+        let ws = e(tr.b.bitwise_and(u, None, wk, k31))?;
+        let one_sh = e(tr.b.shift_left_logical(u, None, k1, ws))?;
+        let m = e(tr.b.i_sub(u, None, one_sh, k1))?;
+        let mask = e(tr.b.select(u, None, wide, all, m))?;
+        // UNORM: clamp(x, 0, 1) * (2^w - 1); SNORM: clamp(x, -1, 1) *
+        // (2^(w-1) - 1); rounded to even, as `pack_component`.
+        let x = tr.to_f(v)?;
+        let umax = e(tr.b.convert_u_to_f(f, None, mask))?;
+        let wm1 = e(tr.b.i_sub(u, None, wk, k1))?;
+        let wm1 = e(tr.b.bitwise_and(u, None, wm1, k31))?;
+        let half = e(tr.b.shift_left_logical(u, None, k1, wm1))?;
+        let half = e(tr.b.i_sub(u, None, half, k1))?;
+        let smax = e(tr.b.convert_u_to_f(f, None, half))?;
+        let un = tr.glsl3(f, GLOp::NClamp, x, f0, f1)?;
+        let un = e(tr.b.f_mul(f, None, un, umax))?;
+        let un = tr.glsl1(f, GLOp::RoundEven, un)?;
+        let un = e(tr.b.convert_f_to_s(i32t, None, un))?;
+        let un = tr.to_u(un)?;
+        let sn = tr.glsl3(f, GLOp::NClamp, x, fm1, f1)?;
+        let sn = e(tr.b.f_mul(f, None, sn, smax))?;
+        let sn = tr.glsl1(f, GLOp::RoundEven, sn)?;
+        let sn = e(tr.b.convert_f_to_s(i32t, None, sn))?;
+        let sn = tr.to_u(sn)?;
+        let us = e(tr.b.convert_f_to_u(u, None, x))?;
+        let ss = e(tr.b.convert_f_to_s(i32t, None, x))?;
+        let ss = tr.to_u(ss)?;
+        let hv = e(tr.b.composite_construct(tr.t.v2f, None, [x, f0]))?;
+        let h = tr.glsl1(u, GLOp::PackHalf2x16, hv)?;
+        let is16 = e(tr.b.i_equal(bt, None, wk, k16))?;
+        let fl = e(tr.b.select(u, None, is16, h, v))?;
+        // By the class (0 UNORM, 1 SNORM, 2 USCALED, 3 SSCALED, 4 UINT, 5
+        // SINT, 6 FLOAT).
+        let mut raw = v;
+        for (kc, val) in [(0usize, un), (1, sn), (2, us), (3, ss), (6, fl)] {
+            raw = e(tr.b.select(u, None, cl[kc], val, raw))?;
+        }
+        let raw = e(tr.b.bitwise_and(u, None, raw, mask))?;
+        // Placed at its offset in its dword (the table keeps components
+        // inside one dword).
+        let bit = e(tr.b.bitwise_and(u, None, o[k], k31))?;
+        let di = e(tr.b.shift_right_logical(u, None, o[k], k5))?;
+        let placed = e(tr.b.shift_left_logical(u, None, raw, bit))?;
+        for (j, dw) in dws.iter_mut().enumerate() {
+            let at = e(tr.b.i_equal(bt, None, di, kj[j]))?;
+            let add = e(tr.b.select(u, None, at, placed, z))?;
+            *dw = e(tr.b.bitwise_or(u, None, *dw, add))?;
+        }
+    }
+    let two = tr.u(2);
+    let d0 = e(tr.b.shift_right_logical(u, None, addr, two))?;
+    for size in [1u32, 2, 4, 8, 12, 16] {
+        let ks = tr.u(size);
+        let at = e(tr.b.i_equal(bt, None, bytes, ks))?;
+        let at = e(tr.b.logical_and(bt, None, valid, at))?;
+        let dw = dws;
+        tr.guarded(at, &mut |tr| {
+            if size >= 4 {
+                store_dwords(tr, var, addr, &dw[..(size / 4) as usize])?;
+                mark_dwords(tr, r, d0, size / 4)
+            } else {
+                store_bytes(tr, var, addr, dw[0], size)?;
+                mark_bytes(tr, r, addr, size)
+            }
+        })?;
+    }
+    Ok(())
+}
+
 /// Applies V# DST_SEL to formatted-load results.
 /// `FORMAT_RT`: the `n` outputs of a formatted load of the format the V#
 /// names when the program runs, decoded through `rt_format_entry`'s table:
@@ -1946,16 +2063,19 @@ fn mem_access(tr: &mut T, ins: &Inst, name: &str, r: usize, var: Word, addr: Wor
             tr.warn(format!("{:#x}: {name} unsupported", ins.pc));
             return Ok(());
         }
-        // (The runtime keeps the formats of buffers stored formatted.)
-        if fmt == super::FORMAT_RT as u16 {
-            return Err(format!("{:#x}: {name} to a run-time format buffer", ins.pc));
-        }
         let n = comps.len() as u32;
         let mut vals = Vec::new();
         for k in 0..n {
             vals.push(tr.store_vreg(vd + k)?);
         }
         let act = tr.active()?;
+        // (`FORMAT_RT`: packed per the format the V# names when the program
+        // runs, since 2026-11-18; before, the runtime kept stored buffers'
+        // formats in the spec and every format a dispatch bound took a
+        // translation of its own.)
+        if fmt == super::FORMAT_RT as u16 {
+            return tr.guarded(act, &mut |tr| store_formatted_rt(tr, var, addr, &vals, r));
+        }
         let size = format::gfx10(fmt).filter(|f| !f.block && f.components() > 0).map(|f| f.bytes());
         return tr.guarded(act, &mut |tr| {
             store_formatted(tr, var, addr, &vals, fmt)?;

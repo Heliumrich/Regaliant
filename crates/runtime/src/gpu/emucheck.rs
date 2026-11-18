@@ -28,7 +28,8 @@ struct Cfg {
 /// `<shader>[,<shader>...][:<groups>[:<min bytes>[:<min groups>]]]`.
 fn parse(v: &str) -> Option<Cfg> {
     let mut it = v.split(':');
-    let addrs: Vec<u64> = it.next()?.split(',').filter_map(|a| u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()).collect();
+    // (';' too: the run scripts split variables at commas.)
+    let addrs: Vec<u64> = it.next()?.split([',', ';']).filter_map(|a| u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()).collect();
     let groups = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(32);
     let min_bytes = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(0);
     let min_groups = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(0);

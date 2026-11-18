@@ -94,7 +94,6 @@ pub(super) struct LeanPlan {
     nodes: RefCell<Vec<(Ptr, Node)>>,
     res: Vec<Res>,
     fmt_mask: u64,
-    store_fmt: u64,
     dim3: u64,
     dim2: (u64, u64),
     cmp: u64,
@@ -215,7 +214,6 @@ fn plan_for(key: u64, insts: &[rdna::Inst], stage: Stage) -> Option<Rc<LeanPlan>
     let has_buffers = plan.resources.iter().any(|r| r.kind == ResKind::Buffer);
     let fmt_mask = if has_buffers { super::LOCAL_FORMATS.with(|c| *c.borrow_mut().entry(key).or_insert_with(|| super::shared_scan(1, key, || super::format_resources(insts, &plan)))) } else { 0 };
     let compute = stage == Stage::Compute;
-    let store_fmt = if compute && has_buffers { super::LOCAL_STORE_FORMATS.with(|c| *c.borrow_mut().entry(key).or_insert_with(|| super::format_store_resources(insts, &plan))) } else { 0 };
     let any_image = plan.resources.iter().any(|r| r.kind == ResKind::Image);
     let dim3 = if compute && any_image { super::LOCAL_DIM3.with(|c| *c.borrow_mut().entry(key).or_insert_with(|| super::d3_resources(insts, &plan))) } else { 0 };
     let dim2 = if compute && any_image { super::LOCAL_DIM2.with(|c| *c.borrow_mut().entry(key).or_insert_with(|| super::d2_resources(insts, &plan))) } else { (0, 0) };
@@ -226,7 +224,6 @@ fn plan_for(key: u64, insts: &[rdna::Inst], stage: Stage) -> Option<Rc<LeanPlan>
         nodes: RefCell::new(nodes),
         res,
         fmt_mask,
-        store_fmt,
         dim3,
         dim2,
         cmp,
@@ -464,7 +461,7 @@ fn prepare_with(addr: u64, insts: &Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, 
                 let v = Vsharp::decode(&w);
                 let (format, dst_sel) = if lp.fmt_mask & (1 << i.min(63)) == 0 {
                     (0, 0)
-                } else if compute && translate::rt_format_entry(v.format as u16) != 0 && lp.store_fmt & (1 << i.min(63)) == 0 {
+                } else if compute && translate::rt_format_entry(v.format as u16) != 0 {
                     let want = (v.format as u32) << 16 | v.dst_sel as u32;
                     let fgen = super::FMT_GEN.with(|g| g.get());
                     let memo = lp.single.borrow()[i];

@@ -4765,6 +4765,63 @@ mod tests {
         }
     }
 
+    /// `FORMAT_RT` stores (2026-11-18): a formatted store packs per the
+    /// format the V# names when the program runs, translated without a
+    /// warning beside the same program with the format in the spec, the
+    /// table only in the run-time one. RDNA_RT_FORMAT_DUMP=<dir> writes both
+    /// modules for spvval.
+    #[test]
+    fn run_time_buffer_store_formats() {
+        use crate::tables::*;
+        let op = |t: &[(u16, &str)], n: &str| t.iter().find(|(_, x)| x.split('/').next() == Some(n)).unwrap().0 as u32;
+        let mubuf = |opc: u32, vaddr: u32, vdata: u32, srsrc: u32| [(0x38 << 26) | (opc << 18) | (1 << 13), vaddr | vdata << 8 | (srsrc / 4) << 16 | 0x80 << 24];
+        // buffer_load_dwordx4 v[4:7], v0, s[0:3] ; buffer_store_format_xyzw v[4:7], v0, s[4:7] ;
+        // buffer_store_format_x v4, v0, s[4:7] ; s_endpgm
+        let mut words = Vec::new();
+        words.extend(mubuf(op(MUBUF, "buffer_load_dwordx4"), 0, 4, 0));
+        words.extend(mubuf(op(MUBUF, "buffer_store_format_xyzw"), 0, 4, 4));
+        words.extend(mubuf(op(MUBUF, "buffer_store_format_x"), 0, 4, 4));
+        words.push(0xBF81_0000);
+        let code = crate::decode_program(&words).unwrap();
+        let plan = crate::analysis::analyze(&code, 8, 0);
+        assert_eq!(plan.resources.iter().filter(|r| r.formatted).count(), 1);
+        let mut spec = cs_spec([64, 1, 1]);
+        spec.user_sgprs = 8;
+        let specs = |rt: bool| -> Vec<ResSpec> {
+            plan.resources
+                .iter()
+                .map(|r| match r.kind {
+                    ResKind::Global => ResSpec::Global,
+                    _ if r.formatted && rt => ResSpec::Buffer { format: FORMAT_RT, dst_sel: 0 },
+                    _ if r.formatted => ResSpec::Buffer { format: 56, dst_sel: 0xFAC },
+                    _ => ResSpec::Buffer { format: 0, dst_sel: 0 },
+                })
+                .collect()
+        };
+        spec.resources = specs(false);
+        let a = translate(&code, &plan, &spec).unwrap();
+        spec.resources = specs(true);
+        let b = translate(&code, &plan, &spec).unwrap();
+        assert!(a.warnings.is_empty() && b.warnings.is_empty(), "{:?} {:?}", a.warnings, b.warnings);
+        assert_eq!(a.bindings.len(), b.bindings.len());
+        let private = |w: &[u32]| {
+            let mut i = 5;
+            let mut n = 0;
+            while i < w.len() && w[i] >> 16 != 0 {
+                n += (w[i] & 0xFFFF == 59 && w.get(i + 3) == Some(&6)) as usize;
+                i += (w[i] >> 16) as usize;
+            }
+            n
+        };
+        assert_eq!((private(&a.spirv), private(&b.spirv)), (0, 1));
+        if let Ok(dir) = std::env::var("RDNA_RT_FORMAT_DUMP") {
+            for (name, o) in [("rt_store_static.spv", &a), ("rt_store.spv", &b)] {
+                let bytes: Vec<u8> = o.spirv.iter().flat_map(|x| x.to_le_bytes()).collect();
+                std::fs::write(std::path::Path::new(&dir).join(name), bytes).unwrap();
+            }
+        }
+    }
+
     /// `ImageDim::D3OrD2`: an image_load addressed as 3D on a resource that
     /// may be bound with a 2D texture gets a 3D and a 2D variable (`Image`,
     /// `ImageAlt`) and no warning. RDNA_D3OR2D_DUMP=<dir> writes the module

@@ -1456,6 +1456,12 @@ fn seeded_single(code: u64, res: usize, format: u8, dst_sel: u16) -> bool {
 /// before; a different one makes it run-time from now on (every thread). A
 /// specialized translation is used only for V#s of its own format.
 fn single_format(code: u64, res: usize, format: u8, dst_sel: u16) -> bool {
+    // (Diagnosis, `DS_FMT_RT_ONLY=1`: every typed buffer through the run-time
+    // decode, never specialized: checks of `FORMAT_RT` loads and stores.)
+    static RT_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *RT_ONLY.get_or_init(|| std::env::var("DS_FMT_RT_ONLY").ok().as_deref() == Some("1")) {
+        return false;
+    }
     let want = (format as u32) << 16 | dst_sel as u32;
     let key = (code, res);
     let local = FMT_LOCAL.with(|l| l.borrow().get(&key).copied());
@@ -3462,8 +3468,6 @@ pub fn reset_repeats() {
 thread_local! {
     /// `format_resources` per plan.
     static LOCAL_FORMATS: std::cell::RefCell<super::fx::Map<u64, u64>> = std::cell::RefCell::new(super::fx::Map::default());
-    /// `format_store_resources` per plan.
-    static LOCAL_STORE_FORMATS: std::cell::RefCell<super::fx::Map<u64, u64>> = std::cell::RefCell::new(super::fx::Map::default());
     /// `d3_resources` per plan.
     static LOCAL_DIM3: std::cell::RefCell<super::fx::Map<u64, u64>> = std::cell::RefCell::new(super::fx::Map::default());
     /// `d2_resources` per plan.
@@ -3492,38 +3496,20 @@ fn format_resources(insts: &[rdna::Inst], plan: &Plan) -> u64 {
     m
 }
 
-/// The resources of `plan` the program stores formatted
-/// (`buffer_store_format_*`; a bit per resource, all past 64): their
-/// formats stay in the spec (`rdna::translate::FORMAT_RT` decodes loads).
-pub(crate) fn format_store_resources(insts: &[rdna::Inst], plan: &Plan) -> u64 {
-    if plan.resources.len() > 64 {
-        return u64::MAX;
-    }
-    let mut m = 0u64;
-    for i in insts {
-        if i.enc == rdna::Enc::Mubuf && i.name().is_some_and(|n| n.starts_with("buffer_store_format_")) {
-            if let Some(&(r, _)) = plan.inst_res.get(&i.pc) {
-                m |= 1 << r.min(63);
-            }
-        }
-    }
-    m
-}
-
 /// Learned resources keyed as a preparation keys them now (the store keeps
-/// what dispatches had: typed buffers' formats, images' 2D or 3D): formats a
-/// program only loads, of the table, read at run time (`FORMAT_RT`), and
+/// what dispatches had: typed buffers' formats, images' 2D or 3D): typed
+/// buffers' formats of the table read at run time (`FORMAT_RT`; stored ones
+/// too since 2026-11-18), and
 /// 3D-addressed sampled images bound 2D or 3D `ImageDim::D3OrD2`. The
 /// precompile, the compile bench and the guess report key them so.
 pub(crate) fn key_learned(code: u64, insts: &[rdna::Inst], plan: &Plan, resources: &mut [ResSpec]) {
-    let stored = format_store_resources(insts, plan);
     let d3 = d3_resources(insts, plan);
     let (only2d, only2da) = if dim_by_instructions() { d2_resources(insts, plan) } else { (0, 0) };
     for (i, r) in resources.iter_mut().enumerate() {
         match *r {
             // (A program's one format kept, as preparations keep it:
             // `seed_formats` from its learned specs.)
-            ResSpec::Buffer { format, dst_sel } if format != 0 && format != translate::FORMAT_RT && stored & (1 << i.min(63)) == 0 && translate::rt_format_entry(format as u16) != 0 => {
+            ResSpec::Buffer { format, dst_sel } if format != 0 && format != translate::FORMAT_RT && translate::rt_format_entry(format as u16) != 0 => {
                 if !seeded_single(code, i, format, dst_sel) {
                     *r = ResSpec::Buffer { format: translate::FORMAT_RT, dst_sel: 0 };
                 }
@@ -3842,7 +3828,6 @@ pub(crate) fn translate_for_spec(addr: u64, key_spec: Spec) -> Result<Arc<Transl
 pub(crate) fn guess_compute_spec(addr: u64, insts: &[rdna::Inst], plan: &Plan, code_hash: u64, rsrc2: u32, local: [u32; 3]) -> Spec {
     let wave64 = !insts.iter().any(|i| i.name().is_some_and(|n| n.ends_with("_saveexec_b32") || n.ends_with("_wrexec_b32")));
     let fmt = format_resources(insts, plan);
-    let stored = format_store_resources(insts, plan);
     let user_sgprs = ((rsrc2 >> 1) & 0x1F).min(16) as u16;
     let plan_key = code_hash ^ (user_sgprs as u64) << 48;
     let cmp = super::tune::cmp_emulate().then(|| compare_images(plan_key, insts, plan)).unwrap_or(0);
@@ -3851,28 +3836,9 @@ pub(crate) fn guess_compute_spec(addr: u64, insts: &[rdna::Inst], plan: &Plan, c
         .iter()
         .enumerate()
         .map(|(r, res)| match res.kind {
-            ResKind::Buffer if fmt & (1 << r.min(63)) != 0 && stored & (1 << r.min(63)) == 0 => ResSpec::Buffer { format: translate::FORMAT_RT, dst_sel: 0 },
-            // A buffer the program stores to formatted: the format the
-            // title's stores of that width used most (the guess report of
-            // 2026-11-02 night: one component 32-bit unsigned X, 310 of 346;
-            // two 62/XY, three 74/XYZ, four 50/XYZW); a dispatch that binds
-            // another makes its own translation.
-            ResKind::Buffer if fmt & (1 << r.min(63)) != 0 => {
-                let widest = insts
-                    .iter()
-                    .filter(|i| plan.inst_res.get(&i.pc).is_some_and(|x| x.0 == r))
-                    .filter_map(|i| i.name())
-                    .filter(|n| n.starts_with("buffer_store_format_") || n.starts_with("tbuffer_store_format_"))
-                    .map(|n| n.rsplit('_').next().map_or(1, |c| c.len()))
-                    .max()
-                    .unwrap_or(1);
-                match widest {
-                    1 => ResSpec::Buffer { format: 20, dst_sel: 0x4 },
-                    2 => ResSpec::Buffer { format: 62, dst_sel: 0x2C },
-                    3 => ResSpec::Buffer { format: 74, dst_sel: 0x3AC },
-                    _ => ResSpec::Buffer { format: 50, dst_sel: 0xFAC },
-                }
-            }
+            // (Stored ones too since 2026-11-18: `FORMAT_RT` packs stores, so the
+            // guess no longer picks the commonest format of the stores' width.)
+            ResKind::Buffer if fmt & (1 << r.min(63)) != 0 => ResSpec::Buffer { format: translate::FORMAT_RT, dst_sel: 0 },
             ResKind::Buffer => ResSpec::Buffer { format: 0, dst_sel: 0 },
             ResKind::Global => ResSpec::Global,
             ResKind::Sampler => ResSpec::Sampler,
@@ -4266,7 +4232,6 @@ struct PlanRec {
     hints: [u32; 3],
     hints_known: bool,
     fmt: Option<u64>,
-    store_fmt: Option<u64>,
     dim3: Option<u64>,
     /// `d2_resources` (2D-addressed, 2D-array-addressed).
     dim2: Option<(u64, u64)>,
@@ -4435,19 +4400,13 @@ fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: 
                 // Raw accesses do not read the format and swizzle (see
                 // `format_resources`).
                 // (Compute stages: read from the V# when the program runs
-                // where the decoder can and the program only loads it
-                // formatted; +4.7% at four walk places, FINDINGS.md
-                // 2026-11-02 late afternoon.)
+                // where the decoder can; +4.7% at four walk places,
+                // FINDINGS.md 2026-11-02 late afternoon. Stored buffers too
+                // since 2026-11-18: `rdna::translate::FORMAT_RT` packs
+                // stores.)
                 let (format, dst_sel) = if fmt_mask & (1 << i.min(63)) == 0 {
                     (0, 0)
-                } else if spec.stage == Stage::Compute
-                    && translate::rt_format_entry(v.format as u16) != 0
-                    && match rec.get_mut() {
-                        Some(r) => *r.store_fmt.get_or_insert_with(|| LOCAL_STORE_FORMATS.with(|c| *c.borrow_mut().entry(plan_key).or_insert_with(|| format_store_resources(&insts, &plan)))),
-                        None => LOCAL_STORE_FORMATS.with(|c| *c.borrow_mut().entry(plan_key).or_insert_with(|| format_store_resources(&insts, &plan))),
-                    } & (1 << i.min(63))
-                        == 0
-                {
+                } else if spec.stage == Stage::Compute && translate::rt_format_entry(v.format as u16) != 0 {
                     if fmt_census_on() {
                         fmt_census_note(code_hash, addr, i, v.format as u16, v.dst_sel as u16);
                     }
