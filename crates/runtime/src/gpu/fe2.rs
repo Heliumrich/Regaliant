@@ -464,6 +464,12 @@ pub fn last_fine() -> u8 {
     LAST_FINE.with(|c| c.get())
 }
 
+/// The flip, plus one, a CPU write to the page of `a` was last found (`Chunk::wrote`; 0: never
+/// found, or no chunk of the mirror's table holds it). For censuses.
+pub fn wrote_flip(a: u64) -> u32 {
+    chunk(a, false).map_or(0, |c| c.wrote[((a - MIRROR_BASE) >> 12) as usize & (CHUNK_PAGES - 1)].load(Ordering::Relaxed))
+}
+
 /// Front end 2's lean check (`Exec::fe2_place_quick`): whether every page of the read-only range
 /// [lo, hi) (page-aligned, a few words at most) is current for `want` as its state stands
 /// (valid and clean for it, or armed), which `ensure` would find with nothing to do. False:

@@ -11,6 +11,21 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::AtomicU32;
 
 pub static DRAWN: AtomicU64 = AtomicU64::new(0);
+
+/// `DS_RUN_CENSUS`: the run a GPU-resolved pair's draws on this thread would be appended to:
+/// its pair, run roots' values, run user words and per-item buffers' formats as of its first
+/// draw (`Exec::run_census_note`).
+struct RcRun {
+    pair: (u64, u64),
+    roots: Vec<u64>,
+    user: Vec<u32>,
+    formats: Vec<(u8, u16)>,
+}
+
+thread_local! {
+    static RC_RUN: std::cell::RefCell<Option<RcRun>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Draws without visible effect here (metadata passes, all writes disabled).
 pub static DRAW_NOOP: AtomicU64 = AtomicU64::new(0);
 pub static DRAW_SKIPPED: AtomicU64 = AtomicU64::new(0);
@@ -1581,6 +1596,112 @@ impl Exec {
     /// cache's lookups as then, no fast clear or reload pending for its
     /// images and its textures known unwritten. Err: why not (0: no such
     /// draw, `DELTA`'s refusals from 1).
+    /// `DS_RUN_CENSUS` (`gpures::RUN_CENSUS`): this prepared draw against the run of its pair a
+    /// GPU-resolved run on the mirror would make, and the chain walk an append needs, timed
+    /// (with the reads the preparation just made warm in the caches: a floor).
+    fn run_census_note(&mut self, vs: &Prepared, ps: &Prepared, continues: bool) {
+        use super::super::gpures as g;
+        use super::super::resident::PAGE;
+        let c = &g::RUN_CENSUS;
+        c[0].fetch_add(1, Ordering::Relaxed);
+        let Some(d) = g::draw_decided(vs.addr, ps.addr) else {
+            c[1].fetch_add(1, Ordering::Relaxed);
+            RC_RUN.with(|r| *r.borrow_mut() = None);
+            return;
+        };
+        c[2].fetch_add(1, Ordering::Relaxed);
+        let st = [vs, ps];
+        let mut roots = Vec::with_capacity(8);
+        let mut user = Vec::with_capacity(8);
+        let mut formats = Vec::with_capacity(8);
+        for k in 0..2 {
+            let dk = &d.stages[k];
+            for &r in &dk.run_roots {
+                roots.push(g::root_value(r, &st[k].user));
+            }
+            for j in 0..32 {
+                if dk.run_user & (1u32 << j) != 0 {
+                    user.push(st[k].user.get(j).copied().unwrap_or(0));
+                }
+            }
+            for (i, res) in st[k].resources.iter().enumerate().take(64) {
+                if dk.gpu_res & (1u64 << i) != 0 {
+                    if let shaders::Resolved::Buffer(v) = res {
+                        formats.push((v.format, v.dst_sel));
+                    }
+                }
+            }
+        }
+        let pair = (vs.addr, ps.addr);
+        let verdict = RC_RUN.with(|r| match r.borrow().as_ref() {
+            Some(x) if continues && x.pair == pair && x.roots == roots && x.user == user => Some(x.formats == formats),
+            _ => None,
+        });
+        let Some(same_formats) = verdict else {
+            c[5].fetch_add(1, Ordering::Relaxed);
+            RC_RUN.with(|r| *r.borrow_mut() = Some(RcRun { pair, roots, user, formats }));
+            return;
+        };
+        c[if same_formats { 3 } else { 4 }].fetch_add(1, Ordering::Relaxed);
+        // The walk of the per-item chains an append makes (`shaders::gpu_chain_ranges`).
+        let specs: [rdna::translate::Spec; 2] = [0, 1].map(|k| {
+            let mut s = st[k].tr.spec.clone();
+            s.gpu_loads = d.stages[k].gpu_loads;
+            s.gpu_res = d.stages[k].gpu_res;
+            s
+        });
+        let (mut loads, mut bufs, mut reads) = (Vec::new(), Vec::new(), Vec::new());
+        let t = unsafe { core::arch::x86_64::_rdtsc() };
+        let mut ok = true;
+        for k in 0..2 {
+            ok &= shaders::gpu_chain_ranges(st[k].addr, &st[k].tr.plan, &specs[k], &st[k].user, &mut loads, &mut bufs, &mut reads).is_ok();
+        }
+        let cycles = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t);
+        c[6].fetch_add(1, Ordering::Relaxed);
+        c[7].fetch_add(cycles, Ordering::Relaxed);
+        if !ok {
+            c[11].fetch_add(1, Ordering::Relaxed);
+        }
+        c[8].fetch_add((loads.len() + bufs.len()) as u64, Ordering::Relaxed);
+        c[10].fetch_add(loads.len() as u64, Ordering::Relaxed);
+        // Which of them front end 2's mirror holds current as it stands (at most 16 pages each).
+        let want = self.fe2_want(super::super::precache::epoch() as u32);
+        let mut fine = 0u64;
+        for &(a, n) in loads.iter().chain(bufs.iter()) {
+            if a == 0 || n == 0 {
+                continue;
+            }
+            let n = n.min(16 * PAGE);
+            let (lo, hi) = (a & !(PAGE - 1), (a + n).next_multiple_of(PAGE));
+            let in_arena = crate::engine::arena_allocated(a);
+            if super::super::fe2::in_span(a, n) && super::super::fe2::quick_fine(lo, hi, want) {
+                fine += 1;
+                if in_arena {
+                    c[15].fetch_add(1, Ordering::Relaxed);
+                }
+            } else if in_arena {
+                // (Not current: inside the GPU arena's live frame allocations, which a pass
+                // per title submission confined to them would make current, FINDINGS.md
+                // 2026-11-09 night; above a MiB's high-water mark; elsewhere.)
+                c[12].fetch_add(1, Ordering::Relaxed);
+                g::census_stable(a, n, true);
+            } else if crate::engine::alloc_entry_of(a >> 20) != 0 {
+                c[13].fetch_add(1, Ordering::Relaxed);
+            } else {
+                c[14].fetch_add(1, Ordering::Relaxed);
+                g::census_stable(a, n, false);
+                // (By the engine allocator owning it, and whether front end 2 found a CPU
+                // write to its page within the last 4 flips.)
+                let o = crate::engine::owner(a) as usize;
+                let w = super::super::fe2::wrote_flip(a) as u64;
+                let hot = w != 0 && super::super::FRAMES.load(Ordering::Relaxed).saturating_sub(w - 1) < 4;
+                g::RUN_CENSUS_OWNER[o][0].fetch_add(1, Ordering::Relaxed);
+                g::RUN_CENSUS_OWNER[o][1].fetch_add(hot as u64, Ordering::Relaxed);
+            }
+        }
+        c[9].fetch_add(fine, Ordering::Relaxed);
+    }
+
     fn delta_holds(&self, at: Option<(u64, u64)>, keys: [u64; 2], sig: &[(u32, [u32; 8])], indexed: bool) -> Result<Fixed, usize> {
         let d = &self.delta;
         // (Programs at other addresses with the same translations count as the same: the
@@ -1882,11 +2003,16 @@ impl Exec {
         }
         // (A GPU-resolved run's first draw: its steps apart, `DS_STEP_LAPS`.)
         let gpu_open = batched && gpu_pair.is_some();
-        // Pairs not decided yet: learned from the draws the CPU resolves.
-        if direct && gpu_pair.is_none() && super::super::tune::gpu_chains() == 1 {
+        // Pairs not decided yet: learned from the draws the CPU resolves (also for the census of
+        // GPU-resolved runs, `DS_RUN_CENSUS`, which only counts and prices).
+        let run_census = super::super::gpures::census_on();
+        if direct && gpu_pair.is_none() && (super::super::tune::gpu_chains() == 1 || run_census) {
             if let Some(p) = &ps {
                 let continues = self.draw_same && (self.batch_count, self.cmd_uses.get()) == self.last_draw_end;
                 super::super::gpures::observe_draw((vs.addr, p.addr), [(&vs.tr.plan, &vs.user[..]), (&p.tr.plan, &p.user[..])], continues);
+                if run_census {
+                    self.run_census_note(&vs, p, continues);
+                }
             }
         }
         // Stage G4's census of draw runs (`DS_DRAW_CENSUS=1`): a sampled

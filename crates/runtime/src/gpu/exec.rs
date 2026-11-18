@@ -10326,6 +10326,9 @@ pub fn reset_shader_profile() {
     PROG_GEN.fetch_add(1, Ordering::Relaxed);
     PROG_FROM.store(super::FRAMES.load(Ordering::Relaxed), Ordering::Relaxed);
     shaders::reset_prep_parts();
+    for c in super::gpures::RUN_CENSUS.iter().chain(super::gpures::RUN_CENSUS_OWNER.iter().flatten()) {
+        c.store(0, Ordering::Relaxed);
+    }
     for c in DRAW_STEPS.iter().flatten().chain(DRAW_STEPS_GPU.iter().flatten()).chain(HAZARD_STEPS.iter().flatten()).chain(CS_STEPS.iter().flatten()).chain(COPY_STEPS.iter().flatten()).chain(DRAW_STEPS_FIRST.iter().flatten()).chain(CS_STEPS_FIRST.iter().flatten()).chain(SYNC_STEPS.iter()).chain(WAIT_NS.iter()).chain(BIND_STEPS_BY.iter().flatten()).chain(PRE_STEPS_BY.iter().flatten()) {
         c.store(0, Ordering::Relaxed);
     }
@@ -10350,8 +10353,9 @@ pub fn laps_report() -> String {
         return String::new();
     }
     if !laps() {
-        // (`DS_PROG_CENSUS=1`: the census alone.)
-        return if prog_census() { prog_census_lines() + &pass_census_lines() } else { String::new() };
+        // (`DS_PROG_CENSUS=1`: the census alone; `DS_RUN_CENSUS=1`: its line.)
+        let runs = super::gpures::census_line();
+        return runs + &if prog_census() { prog_census_lines() + &pass_census_lines() } else { String::new() };
     }
     draw_steps_line() + &draw::delta_line() + &draw::steps_split_line() + &shaders::prep_parts_line() + &bind_steps_line() + &pre_steps_line() + &prog_census_lines() + &pass_census_lines() + &slow_place_lines() + &shaders::fmt_census_lines()
 }

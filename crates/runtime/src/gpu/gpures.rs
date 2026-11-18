@@ -297,6 +297,88 @@ fn draw_stage(plan: &Plan, roots: &[Root], varies: u64) -> Option<Decided> {
     Some(Decided { gpu_loads, gpu_res, run_roots, item_roots, run_user })
 }
 
+/// `DS_RUN_CENSUS=1` (a census, ROUTE60.md 2026-11-18 morning): the pairs learned as with
+/// `tune gpu_chains` 1 but never drawn GPU-resolved; each prepared draw priced as an append to
+/// its pair's run (`Exec::run_census_note`).
+pub fn census_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_RUN_CENSUS").ok().as_deref() == Some("1"))
+}
+
+/// `DS_RUN_CENSUS`: [prepared draws with a pixel stage, of a pair not (yet) eligible, of an
+/// eligible pair; of those: would append (the run of the pair goes on with the run roots and
+/// run user words of its first draw, the per-item buffers' formats too), would append with
+/// run-time formats (a per-item buffer's format alone differs), opens a run; chain walks an
+/// append makes (timed), their cycles, the ranges they reach, of those current in the mirror
+/// as its state stands (front end 2's quick check over at most 16 pages), loads among the
+/// ranges, walks that failed; ranges not current by place: inside the GPU arena's live frame
+/// allocations, in an arena MiB above its high-water mark, elsewhere; current ranges inside
+/// the live frame allocations].
+pub static RUN_CENSUS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+/// `DS_RUN_CENSUS`: the not-current ranges outside the GPU arena by the engine allocator owning
+/// them: [ranges, of them on pages front end 2 found CPU-written within the last 4 flips].
+pub static RUN_CENSUS_OWNER: [[AtomicU64; 2]; 256] = [const { [const { AtomicU64::new(0) }; 2] }; 256];
+/// `DS_RUN_CENSUS`: whether the not-current ranges' contents change between flips (the first
+/// 64 bytes hashed per address): [outside the arena: checked, seen in an earlier flip, changed
+/// since; inside the arena's live frame allocations: the same three].
+pub static RUN_STABLE: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static RUN_SEEN: [parking_lot::Mutex<Option<HashMap<u64, (u64, u64)>>>; 64] = [const { parking_lot::Mutex::new(None) }; 64];
+
+/// `DS_RUN_CENSUS`: notes the contents of a not-current range an append reaches (`arena`: inside
+/// the GPU arena's live frame allocations) against the last flip that reached it.
+pub fn census_stable(a: u64, n: u64, arena: bool) {
+    let len = n.min(64) as usize;
+    if len == 0 || !crate::mem::readable(a, len as u64) {
+        return;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(a as *const u8, len) };
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &b in bytes {
+        h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3);
+    }
+    let flip = super::FRAMES.load(Ordering::Relaxed);
+    let k = if arena { 3 } else { 0 };
+    RUN_STABLE[k].fetch_add(1, Ordering::Relaxed);
+    let mut g = RUN_SEEN[((a >> 6) as usize) & 63].lock();
+    if let Some((h0, f0)) = g.get_or_insert_with(HashMap::new).insert(a, (h, flip)) {
+        if f0 != flip {
+            RUN_STABLE[k + 1].fetch_add(1, Ordering::Relaxed);
+            if h0 != h {
+                RUN_STABLE[k + 2].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// The census line ("" when off).
+pub fn census_line() -> String {
+    if !census_on() {
+        return String::new();
+    }
+    let c: Vec<u64> = RUN_CENSUS.iter().map(|x| x.load(Ordering::Relaxed)).collect();
+    if c[0] == 0 {
+        return String::new();
+    }
+    let hz = super::threadcpu::tsc_hz();
+    let walk = if c[6] == 0 { 0.0 } else { c[7] as f64 * 1e9 / hz / c[6] as f64 };
+    let per = |x: u64| if c[6] == 0 { 0.0 } else { x as f64 / c[6] as f64 };
+    format!(
+        "    GPU-resolved runs, a census (`DS_RUN_CENSUS`): prepared draws {}, of pairs not eligible {}, eligible {}: would append {} ({:.1}% of the draws), with run-time formats {} more, opening a run {}; an append's chain walk {walk:.0} ns ({} timed, {} failed), reaching {:.2} ranges ({:.2} loads), {:.2} current in the mirror as it stands ({:.2} of them in the GPU arena's live frame allocations); not current: {:.2} in those allocations, {:.2} in an arena MiB above its high-water mark, {:.2} elsewhere\n",
+        c[0], c[1], c[2], c[3], 100.0 * c[3] as f64 / c[0] as f64, c[4], c[5], c[6], c[11], per(c[8]), per(c[10]), per(c[9]), per(c[15]), per(c[12]), per(c[13]), per(c[14])
+    ) + &{
+        let names: std::collections::HashMap<u8, String> = crate::engine::allocators().into_iter().map(|a| (a.id, a.name)).collect();
+        let mut v: Vec<(usize, u64, u64)> = RUN_CENSUS_OWNER.iter().enumerate().map(|(i, x)| (i, x[0].load(Ordering::Relaxed), x[1].load(Ordering::Relaxed))).filter(|x| x.1 > 0).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        let parts: Vec<String> = v.iter().take(8).map(|&(i, n, h)| format!("{} ({i}) {:.2} ({:.2} written within 4 flips)", names.get(&(i as u8)).map_or("?", |s| s.as_str()), per(n), per(h))).collect();
+        let s: Vec<u64> = RUN_STABLE.iter().map(|x| x.load(Ordering::Relaxed)).collect();
+        format!(
+            "      not current elsewhere, by owner (an append's): {}\n      their contents (the first 64 bytes) against the last flip that reached the same address: outside the arena {} checked, {} seen in an earlier flip, {} of those changed; in the arena's live frame allocations {} checked, {} seen in an earlier flip, {} changed\n",
+            parts.join(", "),
+            s[0], s[1], s[2], s[3], s[4], s[5]
+        )
+    }
+}
+
 /// The pair's decision, if its draws are GPU-resolved (eligible).
 pub fn draw_decided(vs: u64, ps: u64) -> Option<std::sync::Arc<DrawDecided>> {
     if DRAW_DECIDED_N.load(Ordering::Relaxed) == 0 {
@@ -312,7 +394,7 @@ pub fn draw_decided(vs: u64, ps: u64) -> Option<std::sync::Arc<DrawDecided>> {
 /// user data (vertex first): its root values against this thread's last
 /// draw of the pair (`continues`: the same run).
 pub fn observe_draw(pair: (u64, u64), stages: [(&Plan, &[u32]); 2], continues: bool) {
-    if super::tune::gpu_chains() == 0 || SETTLED.with(|s| s.borrow().contains(&pair)) {
+    if (super::tune::gpu_chains() == 0 && !census_on()) || SETTLED.with(|s| s.borrow().contains(&pair)) {
         return;
     }
     let mut g = PAIRS.write();
