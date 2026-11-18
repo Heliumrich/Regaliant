@@ -6557,6 +6557,12 @@ impl Cp {
                         None
                     }
                 };
+                // (`DS_DRAW_RING`: direct draws too; the opcode stands in the arguments' column.)
+                if super::drawring::on() && matches!(opcode, op::DRAW_INDEX_2 | op::DRAW_INDEX_OFFSET_2 | op::DRAW_INDEX_AUTO) {
+                    if let Some(a) = args.as_ref() {
+                        super::drawring::note(super::shaders::ngg_addr(self), super::shaders::ps_addr(self), opcode as u64, [a.count, a.instances, 0, 0, 0], a.index.map_or(0, |i| i.0), self.index_count);
+                    }
+                }
                 self.last_draw = multi.take().map_or(std::borrow::Cow::Borrowed("not executed"), std::borrow::Cow::Owned);
                 let args_checked = self.args_checked.take();
                 match args {

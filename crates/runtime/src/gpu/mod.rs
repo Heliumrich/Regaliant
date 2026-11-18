@@ -3549,6 +3549,7 @@ pub fn profile_report() -> String {
     s.push_str(&exec::write_logs_line());
     s.push_str(&exec::f3_regions_line());
     s.push_str(&exec::race_line());
+    s.push_str(&exec::unordered_mirror_line());
     s.push_str(&forward::status_line());
     s.push_str(&fe2::callers_line());
     s.push_str(&resident::backing_line());
@@ -3596,6 +3597,7 @@ pub fn profile_report() -> String {
     s.push_str(&exec::async_line());
     s.push_str(&shaders::fmt_line());
     s.push_str(&vk::framewatch::line());
+    s.push_str(&exec::worker_progs_line());
     s.push_str(&crate::pcsettings::pointer::direct_line());
     s.push_str(&crate::displayclock::status_line());
     s.push_str(&vk::present::stats_line());
@@ -3760,11 +3762,13 @@ pub fn status_ex(with_stacks: bool) -> String {
             "; {} read-only buffers bound as snapshots of guest memory taken anew ({} of them tiny ones: the copy kernel's inputs, and others nothing else placed){}",
             exec::TINY_SNAPS.load(Ordering::Relaxed),
             exec::TINY_BOUND.load(Ordering::Relaxed),
-            if exec::UPLOAD_HAZARDS[2].load(Ordering::Relaxed) > 0 {
+            if exec::UPLOAD_HAZARDS[2].load(Ordering::Relaxed) > 0 || exec::SUBMIT_HAZARDS[0].load(Ordering::Relaxed) > 0 {
                 format!(
-                    "; {} uploads into the mirror over pages an unfinished batch writes ({} of them the other device queue's)",
+                    "; {} uploads into the mirror over pages an unfinished batch writes ({} of them the other device queue's); at closed batches' submission {} ({} over pages front end 4 holds)",
                     exec::UPLOAD_HAZARDS[2].load(Ordering::Relaxed),
-                    exec::UPLOAD_HAZARDS[0].load(Ordering::Relaxed)
+                    exec::UPLOAD_HAZARDS[0].load(Ordering::Relaxed),
+                    exec::SUBMIT_HAZARDS[0].load(Ordering::Relaxed),
+                    exec::SUBMIT_HAZARDS[1].load(Ordering::Relaxed)
                 )
             } else {
                 String::new()

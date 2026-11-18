@@ -1108,6 +1108,30 @@ fn upload_hazard_on() -> bool {
 /// Uploads into the mirror over pages an unfinished batch writes: [the
 /// writer on the other device queue, on the same one, all].
 pub(crate) static UPLOAD_HAZARDS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// `DS_UPLOAD_HAZARD=1`, at a closed batch's submission (a parallel run's part, a held batch; in
+/// program order, its run's earlier parts queued by then): its copies into the mirror over pages
+/// an unfinished batch writes, which its recording could not see (`note_submit_hazards`):
+/// [copies, of them over pages front end 4 holds, logged].
+pub(crate) static SUBMIT_HAZARDS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+fn note_submit_hazards(name: &str, ups: &[(u64, u64)]) {
+    let done = done_seq();
+    for &(a, n) in ups {
+        let Some(s) = INFLIGHT.latest(&[(a, n)]) else { continue };
+        if s <= done {
+            continue;
+        }
+        SUBMIT_HAZARDS[0].fetch_add(1, Ordering::Relaxed);
+        let held = super::fe2::c4_on() && super::fe2::c4_any_held(a, a + n);
+        if held {
+            SUBMIT_HAZARDS[1].fetch_add(1, Ordering::Relaxed);
+        }
+        if SUBMIT_HAZARDS[2].fetch_add(1, Ordering::Relaxed) < 200 {
+            let wname = BATCHES.lock().iter().find(|x| x.seq == s).map(|x| x.name.clone()).unwrap_or_default();
+            crate::info!("gpu: upload hazard at submission: {name} copies {a:#x}+{n:#x} into the mirror while batch {s} of {wname} writing it is unfinished (done {done}){}, flip {}", if held { ", held by front end 4" } else { "" }, super::FRAMES.load(Ordering::Relaxed));
+        }
+    }
+}
 
 /// Front end 2: read-only buffer bindings of at most this many bytes that
 /// no unfinished GPU work or pending CP write writes are copied from guest
@@ -4029,6 +4053,34 @@ fn bind_descriptors(cmd: vk::CommandBuffer, at: vk::PipelineBindPoint, layout: v
 /// flushes, cache actions, end-of-pipe events) instead of a full barrier
 /// after every dispatch: consecutive independent dispatches overlap on the
 /// GPU as on the console (`DS_LAZY_BARRIERS=0`: a barrier after each).
+/// Diagnosis (`DS_DISPATCH_BARRIER=<mode>`, 2026-11-18 night): with lazy barriers on, a full
+/// barrier after the dispatches of 1 the index culls (`CULL_CS`), 2 parallel workers' executors,
+/// 3 the other executors.
+/// `DS_BARRIER_PROGS=<hex>[;<hex>...]` (with `DS_DISPATCH_BARRIER=4`): the programs whose
+/// dispatches in parallel workers' chunks get a barrier after them.
+fn barrier_progs() -> &'static [u64] {
+    static P: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    P.get_or_init(|| std::env::var("DS_BARRIER_PROGS").ok().map(|v| v.split(';').filter_map(|x| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok()).collect()).unwrap_or_default())
+}
+
+/// `DS_UNORDERED_DIAG`: the graphics queue's parallel workers' dispatches by program.
+static WORKER_PROGS: Mutex<Option<HashMap<u64, u64>>> = Mutex::new(None);
+
+/// Logs `WORKER_PROGS` (the status report).
+pub fn worker_progs_line() -> String {
+    let g = WORKER_PROGS.lock();
+    let Some(m) = g.as_ref() else { return String::new() };
+    let mut v: Vec<(u64, u64)> = m.iter().map(|(&k, &n)| (k, n)).collect();
+    v.sort_by_key(|x| std::cmp::Reverse(x.1));
+    let s: Vec<String> = v.iter().take(40).map(|(k, n)| format!("{k:#x} {n}")).collect();
+    format!("    graphics workers' dispatches by program (`DS_UNORDERED_DIAG`): {}\n", s.join(", "))
+}
+
+fn dispatch_barrier_diag() -> u64 {
+    static M: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *M.get_or_init(|| std::env::var("DS_DISPATCH_BARRIER").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
 fn lazy_barriers() -> bool {
     super::tune::lazy_barriers()
 }
@@ -7381,6 +7433,27 @@ fn check_races(done: u64) {
             );
         }
     }
+}
+
+/// `DS_UNORDERED_DIAG=1` (`Exec::note_unordered_mirror`).
+fn unordered_diag() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_UNORDERED_DIAG").ok().as_deref() == Some("1"))
+}
+
+static UNORDERED_MIRROR: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static UNORDERED_WAR: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// The unordered mirror reads' status line ("" when off).
+pub fn unordered_mirror_line() -> String {
+    if !unordered_diag() {
+        return String::new();
+    }
+    format!(
+        "    dispatches reading what their batch wrote since its last barrier (`DS_UNORDERED_DIAG`): {} by the command processors, {} in parallel workers' chunks\n",
+        UNORDERED_MIRROR[0].load(Ordering::Relaxed),
+        UNORDERED_MIRROR[1].load(Ordering::Relaxed)
+    )
 }
 
 /// The race checks' status line ("" when off).
@@ -17385,10 +17458,26 @@ impl Exec {
     /// A dispatch binding `bound` is recorded: what it reads and samples
     /// joins the lists since the last barrier (its writes come through
     /// `note_write`).
+    /// `DS_UNORDERED_DIAG`: a draw's reads (its stages' bindings and its indices) join the
+    /// reads since the last barrier (`note_unordered_mirror`'s writes after reads).
+    pub(super) fn note_draw_reads(&mut self, bounds: &[Bound], index: Option<(u64, u64)>) {
+        if let Some(v) = self.since_reads.as_mut() {
+            for b in bounds {
+                v.extend(b.reads.iter().copied());
+            }
+            if let Some(r) = index {
+                v.push(r);
+            }
+            if v.len() > 65536 {
+                self.since_reads = None;
+            }
+        }
+    }
+
     fn note_since_reads(&mut self, bound: &Bound, args: Option<u64>) {
         if let Some(v) = self.since_reads.as_mut() {
             v.extend(bound.reads.iter().copied().chain(args.map(|a| (a, 12))));
-            if v.len() > SINCE_MAX {
+            if v.len() > if unordered_diag() { 65536 } else { SINCE_MAX } {
                 self.since_reads = None;
             }
         }
@@ -17408,7 +17497,7 @@ impl Exec {
     /// A GPU write of [a, a + n) recorded in this batch (`since_barrier`).
     fn note_since(&mut self, a: u64, n: u64) {
         if let Some(v) = self.since_barrier.as_mut() {
-            if v.len() < if super::tune::race_checks() { 4096 } else { SINCE_MAX } {
+            if v.len() < if super::tune::race_checks() { 4096 } else if unordered_diag() { 65536 } else { SINCE_MAX } {
                 v.push((a, n));
             } else {
                 self.since_barrier = None;
@@ -17490,6 +17579,46 @@ impl Exec {
     /// Whether this batch wrote into [a, a + n) since its last full barrier.
     fn written_since_barrier(&self, a: u64, n: u64) -> bool {
         self.since_barrier.as_ref().is_none_or(|v| v.iter().any(|&(w, m)| w < a + n && a < w + m))
+    }
+
+    /// Diagnosis (`DS_UNORDERED_DIAG=1`, 2026-11-18 night): a dispatch about to be recorded that
+    /// reads what this batch's GPU work wrote since its last full barrier (front end 2's
+    /// bindings, which `note_unordered` does not see): counted by executor kind
+    /// ([others, parallel workers, logged]), the first 300 logged.
+    fn note_unordered_mirror(&self, bound: &Bound, prog: u64) {
+        if let Some(r) = self.since_reads.as_ref() {
+            for &(a, n) in &bound.writes {
+                if let Some(&(ra, rn)) = r.iter().find(|&&(x, m)| x < a + n && a < x + m) {
+                    UNORDERED_WAR[self.par_worker as usize].fetch_add(1, Ordering::Relaxed);
+                    if !self.compute_cp && UNORDERED_WAR[2].fetch_add(1, Ordering::Relaxed) < 300 {
+                        let k = self.batch_shaders.len();
+                        crate::info!(
+                            "gpu[{}]: unordered write: cs {prog:#x} writes {a:#x}+{n:#x}, which this batch read since its last barrier ({ra:#x}+{rn:#x}; its last shaders {:x?}){}",
+                            self.name,
+                            &self.batch_shaders[k.saturating_sub(3)..],
+                            if self.par_worker { ", in a parallel worker's chunk" } else { "" }
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+        let Some(w) = self.since_barrier.as_ref() else { return };
+        for &(a, n) in &bound.reads {
+            if let Some(&(wa, wn)) = w.iter().find(|&&(x, m)| x < a + n && a < x + m) {
+                UNORDERED_MIRROR[self.par_worker as usize].fetch_add(1, Ordering::Relaxed);
+                if !self.compute_cp && UNORDERED_MIRROR[2].fetch_add(1, Ordering::Relaxed) < 300 {
+                    let k = self.batch_shaders.len();
+                    crate::info!(
+                        "gpu[{}]: unordered read: cs {prog:#x} reads {a:#x}+{n:#x}, which this batch wrote since its last barrier ({wa:#x}+{wn:#x}; its last shaders {:x?}){}",
+                        self.name,
+                        &self.batch_shaders[k.saturating_sub(3)..],
+                        if self.par_worker { ", in a parallel worker's chunk" } else { "" }
+                    );
+                }
+                return;
+            }
+        }
     }
 
     /// Diagnosis (`tune race_checks`): counts the in-place bindings of the
@@ -18151,6 +18280,9 @@ impl Exec {
                 let mut gens = std::mem::take(&mut self.fe2_gens);
                 super::fe2::generations(&b.fe2_up, &mut gens);
                 self.fe2_gens = gens;
+                if upload_hazard_on() {
+                    note_submit_hazards(&self.name, &b.fe2_up);
+                }
             }
             let lists = b.lists;
             let on_c = b.on_c;
@@ -20388,7 +20520,10 @@ impl Exec {
             self.barrier_wanted = false;
             self.dispatched = false;
         }
-        if profiling() {
+        if unordered_diag() {
+            self.note_unordered_mirror(&bound, p.addr);
+        }
+        if profiling() || unordered_diag() {
             self.note_since_reads(&bound, indirect);
         }
         // Arguments draws read on the GPU since the last barrier, which this
@@ -20820,7 +20955,21 @@ impl Exec {
         cs_dump(&p);
         stamp(2);
         lap.mark(12);
-        if !lazy_barriers() {
+        let diag = match dispatch_barrier_diag() {
+            1 => CULL_CS.contains(&p.addr),
+            2 => self.par_worker,
+            3 => !self.par_worker,
+            4 => self.par_worker && barrier_progs().contains(&p.addr),
+            5 => self.par_worker && self.compute_cp,
+            6 => self.compute_cp,
+            7 => self.par_worker && !self.compute_cp,
+            _ => false,
+        };
+        if unordered_diag() && self.par_worker && !self.compute_cp {
+            let mut g = WORKER_PROGS.lock();
+            *g.get_or_insert_with(HashMap::new).entry(p.addr).or_insert(0) += 1;
+        }
+        if !lazy_barriers() || diag {
             self.barrier();
         }
         // Written shadows stay resident for the rest of the batch (see Shadow);

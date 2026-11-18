@@ -2649,6 +2649,10 @@ impl Exec {
             if super::super::tune::race_checks() {
                 self.note_unordered(&bounds, &[vs.addr, ps_addr], true);
             }
+            if super::unordered_diag() {
+                let ib = a.index.map(|(ad, sz)| (ad, a.count as u64 * sz as u64));
+                self.note_draw_reads(&bounds, ib);
+            }
             if let Some(r) = self.rendering.as_mut() {
                 for t in r.colors.iter().flatten() {
                     let a = t.image;
