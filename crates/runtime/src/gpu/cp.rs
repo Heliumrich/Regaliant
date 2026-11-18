@@ -6511,6 +6511,9 @@ impl Cp {
                             if super::verify::args_check_on() {
                                 self.args_checked = Some((a, w));
                             }
+                            if super::drawring::on() {
+                                super::drawring::note(super::shaders::ngg_addr(self), super::shaders::ps_addr(self), a, w, self.index_base, self.index_count);
+                            }
                             if super::capture::capturing() {
                                 let ty = self.reg(Space::Uc, crate::hle::libs::agc_cmd::REG_VGT_INDEX_TYPE) & 3;
                                 indirect = Some(format!("args {w:?} locs {vtx_loc:#x}/{inst_loc:#x} index {:#x} type {ty} size {}{}", self.index_base, self.index_count, self.index_range(w[2], w[0])));

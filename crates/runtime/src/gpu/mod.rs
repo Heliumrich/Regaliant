@@ -11,6 +11,7 @@ pub mod capture;
 pub mod cp;
 pub mod desc;
 pub mod emucheck;
+pub mod drawring;
 pub mod frameprobe;
 pub mod slotcensus;
 pub mod hitch;
@@ -1810,9 +1811,8 @@ pub mod tune {
     /// queues' batches on a queue of a compute-only family (set up when the value is 2 or more
     /// at boot: `vk::async_compute_boot`; live at batch boundaries; x1.013-1.046 in-run,
     /// FINDINGS.md 2026-11-16); 0 (the default again since 2026-11-18: with 2 a boot without
-    /// prepared shaders lost the device, a compute batch writing at address 0, and the
-    /// player's 0.1.0 showed stray giant triangles in the Nexus; FINDINGS.md 2026-11-18
-    /// night), every batch on the main queue; 1, one
+    /// prepared shaders lost the device, a compute batch writing at address 0; FINDINGS.md
+    /// 2026-11-18 night), every batch on the main queue; 1, one
     /// queue with a census of the waits
     /// the main queue's batches would need, by reason, counted and marked in
     /// the timeline (`after #seq (xq ...)`, `tools/schedmodel.py`).

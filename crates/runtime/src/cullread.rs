@@ -144,6 +144,7 @@ pub fn status() -> String {
     }
     if c.iter().any(|&x| x > 0) {
         out += &format!("    view masks at the reads against the culls' walk: {} the same, {} changed\n", c[0], c[1]);
+        out += &format!("    cull masks at the draws against the culls' walk, word for word: {} the same, {} changed\n", MASK_CMP_DRAW[0].load(Ordering::Relaxed), MASK_CMP_DRAW[1].load(Ordering::Relaxed));
     }
     out
 }
@@ -218,6 +219,20 @@ fn wait_masks(masks: &[(u64, u64)]) {
 /// the reads' walks against them: [the same, changed].
 static WALKED: parking_lot::Mutex<Option<std::collections::HashMap<u64, u64>>> = parking_lot::Mutex::new(None);
 static MASK_CMP: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Diagnosis (`DS_CULLREAD_DIAG`, 2026-11-18 night): per cull mask, its words at the culls' walk
+/// (and when); the draws' walks of that mask against them, word for word: [the same, changed,
+/// logged].
+static WALKED_WORDS: parking_lot::Mutex<Option<std::collections::HashMap<u64, (Vec<u64>, f64)>>> = parking_lot::Mutex::new(None);
+static MASK_CMP_DRAW: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+fn mask_words(m: u64, count: u64) -> Option<Vec<u64>> {
+    let words = count.div_ceil(64) as usize;
+    if words == 0 || !crate::gpu::cp::guest_readable(m, 8 * words as u64) {
+        return None;
+    }
+    let w = unsafe { std::slice::from_raw_parts(m as *const u64, words) };
+    Some(w.iter().enumerate().map(|(k, &x)| x & if (k as u64 + 1) * 64 <= count { u64::MAX } else { (1u64 << (count % 64)) - 1 }).collect())
+}
 
 fn mask_bits(m: u64, count: u64) -> u64 {
     let words = count.div_ceil(64) as usize;
@@ -244,6 +259,9 @@ pub extern "sysv64" fn mask_wait_cull(regs: *const u64, _arg: u32) {
     if diag_on() {
         if let Some(&(m, _)) = masks.first() {
             WALKED.lock().get_or_insert_with(std::collections::HashMap::new).insert(m, mask_bits(m, count));
+            if let Some(w) = mask_words(m, count) {
+                WALKED_WORDS.lock().get_or_insert_with(std::collections::HashMap::new).insert(m, (w, crate::log::elapsed_ms()));
+            }
         }
     }
 }
@@ -278,6 +296,20 @@ pub extern "sysv64" fn mask_wait_draw(regs: *const u64, _arg: u32) {
     let cull_slot = if cull != 0 { rd32(cull + 0x44).zip(rd32(cull + 0x48)).and_then(|(k, i)| mask_slot(k, i as i32)) } else { None };
     let (masks, _) = masks_of(set, ctx, &[mask_slot(kind, idx as i32), cull_slot]);
     wait_masks(&masks);
+    if diag_on() && cull_slot.is_some() {
+        let (cm, count) = masks_of(set, ctx, &[cull_slot]);
+        if let Some(&(m, _)) = cm.first() {
+            let now = mask_words(m, count);
+            let g = WALKED_WORDS.lock();
+            if let (Some((then, at)), Some(now)) = (g.as_ref().and_then(|t| t.get(&m)), now) {
+                let changed: u32 = then.iter().zip(now.iter()).map(|(a, b)| (a ^ b).count_ones()).sum::<u32>() + (then.len() != now.len()) as u32;
+                MASK_CMP_DRAW[(changed != 0) as usize].fetch_add(1, Ordering::Relaxed);
+                if changed != 0 && MASK_CMP_DRAW[2].fetch_add(1, Ordering::Relaxed) < 2000 {
+                    crate::info!("cull read: the draws walked cull mask {m:#x} with {changed} of its {count} bits changed since the culls' walk ({:.1} ms before)", crate::log::elapsed_ms() - at);
+                }
+            }
+        }
+    }
 }
 
 /// The code inserted before the read (registers kept, flags clobbered: the displaced `cmp`

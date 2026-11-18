@@ -309,6 +309,9 @@ impl Watch {
                 if n >= CELLS / 4 {
                     STATS[2].fetch_add(1, Relaxed);
                 }
+                if n >= 20 {
+                    super::super::drawring::dump(tm);
+                }
                 if n >= SAVE_CELLS && !self.ring.is_empty() && self.saved < save_max() && tm >= save_from() {
                     let times = [(self.grids[0].0, 'a'), (tm, 'b'), (self.grids[2].0, 'c')];
                     self.save(tm, times);
