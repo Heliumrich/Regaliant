@@ -18244,7 +18244,9 @@ impl Exec {
             }
             let gpu_res = found.tr.spec.gpu_res;
             if gpu_res != 0 || found.tr.spec.gpu_loads != 0 {
-                let pt = super::pagetable::address();
+                // (`Spec::pt_linear`: the mirror's device address, which GPU-resolved scalar
+                // loads read at guest offsets; else the guest page table's.)
+                let pt = if found.tr.spec.pt_linear { super::resident::mirror_address() } else { super::pagetable::address() };
                 p.sgpr_data[addr_at + 2] = pt as u32;
                 p.sgpr_data[addr_at + 3] = (pt >> 32) as u32;
             }

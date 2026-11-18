@@ -252,9 +252,13 @@ fn zero_page(tr: &mut T) -> R<Word> {
 /// GPU-resolved chains: the device address of guest address `a` (u64)
 /// through the guest page table, and whether the table maps it (else the
 /// address is meaningless: callers use the zero page). `linear`: the
-/// GPU-resolved buffer it is read for; with `Spec::pt_linear` such reads
-/// go to one buffer at guest offsets instead (front end 2's mirror, its
-/// device address in the resource's address entry), inside the span only.
+/// GPU-resolved buffer it is read for; with `Spec::pt_linear` every such
+/// read goes to one buffer at guest offsets instead (front end 2's mirror),
+/// inside the span only: a buffer's through the device address in its
+/// address entry, a scalar load's (`linear` None) through the address
+/// block header's dwords 2-3, which then hold the mirror's device address
+/// in place of the page table's (since 2026-11-18: before, loads read
+/// through the page table of host import windows, across PCIe).
 fn pt_translate(tr: &mut T, a: Word, linear: Option<usize>) -> R<(Word, Word)> {
     let (u64t, b) = (tr.t.u64, tr.t.bool_);
     let pt = match tr.pt_addr {
@@ -273,10 +277,15 @@ fn pt_translate(tr: &mut T, a: Word, linear: Option<usize>) -> R<(Word, Word)> {
     let rel = e(tr.b.i_sub(u64t, None, a, lo_c))?;
     let z64 = tr.u64c(0);
     let rel = e(tr.b.select(u64t, None, inside, rel, z64))?;
-    if let (true, Some(r)) = (tr.spec.pt_linear, linear) {
-        let lo = tr.addr_info(r, 0)?;
-        let hi = tr.addr_info(r, 1)?;
-        let base = u64_of(tr, lo, hi)?;
+    if tr.spec.pt_linear {
+        let base = match linear {
+            Some(r) => {
+                let lo = tr.addr_info(r, 0)?;
+                let hi = tr.addr_info(r, 1)?;
+                u64_of(tr, lo, hi)?
+            }
+            None => pt,
+        };
         let dev = e(tr.b.i_add(u64t, None, base, rel))?;
         return Ok((dev, inside));
     }

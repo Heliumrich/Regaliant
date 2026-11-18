@@ -2160,7 +2160,7 @@ fn cs_spec(addr: u64, rsrc2: u32, local: [u32; 3], wave64: bool, code_hash: u64)
         if let Some(d) = super::gpures::decided(addr) {
             spec.gpu_loads = d.gpu_loads;
             spec.gpu_res = d.gpu_res;
-            // Front end 2: its buffers from the mirror at guest offsets.
+            // Front end 2: its buffers and scalar loads from the mirror at guest offsets.
             spec.pt_linear = super::fe2::on();
         }
     }
