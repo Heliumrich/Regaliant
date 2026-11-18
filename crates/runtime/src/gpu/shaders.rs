@@ -1103,7 +1103,12 @@ pub fn mark_batchable(addr: u64) -> bool {
     if batch_marked(addr) {
         return false;
     }
-    if super::compile::enabled() && (super::compile::has_pipeline(addr) || program_hash(addr).is_ok_and(super::precompile::learned_unbatched_only)) {
+    // (Every program since 2026-11-18, not only those with a pipeline or unbatched learned
+    // specs: a new player's prepared store holds the unbatched forms, and batching a program at
+    // once compiled its batched form where the dispatch stood (the follicle update 1.4 s, index
+    // culling ~0.2 s in a first 1-1 walk); unbatched until its batched pipeline is made, a
+    // dispatch takes the stored form.)
+    if super::compile::enabled() {
         for a in &PENDING_BATCHED {
             if a.compare_exchange(0, addr, Ordering::AcqRel, Ordering::Acquire).is_ok() {
                 crate::info!("gpu: cs {addr:#x} batched once its batched pipeline is made (runs of consecutive dispatches)");
