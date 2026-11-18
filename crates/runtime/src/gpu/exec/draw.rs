@@ -1876,6 +1876,10 @@ impl Exec {
             };
         }
         lap.mark(2);
+        // (`DS_ITEM_CENSUS=1`: the draw's content for the lookup in the frame before.)
+        if super::super::itemcensus::on() {
+            super::super::itemcensus::note(pass_key(cp), &vs, ps.as_ref(), a.index.map(|i| i.0), a.count);
+        }
         // (A GPU-resolved run's first draw: its steps apart, `DS_STEP_LAPS`.)
         let gpu_open = batched && gpu_pair.is_some();
         // Pairs not decided yet: learned from the draws the CPU resolves.

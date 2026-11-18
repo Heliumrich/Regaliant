@@ -7398,6 +7398,9 @@ impl Cp {
             // completes here as for a flip).
             pop::FLIP if super::replay::replaying() => self.sync(),
             pop::FLIP if super::tune::flip_async() => {
+                if super::itemcensus::on() && self.is_main_gfx() {
+                    super::itemcensus::flip();
+                }
                 label_event(&self.name, b'F', 0, self.sub_index, 0, at);
                 // Queued now, shown once this queue's GPU work before it
                 // completed (as the hardware's CP queues it) instead of the

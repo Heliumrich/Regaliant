@@ -2116,6 +2116,7 @@ pub mod pacing;
 pub mod pagetable;
 pub mod gpures;
 pub mod drawcensus;
+pub mod itemcensus;
 pub mod particles;
 pub mod forward;
 pub mod hscensus;

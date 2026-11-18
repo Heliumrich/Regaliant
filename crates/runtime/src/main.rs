@@ -429,6 +429,12 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     _ => Err("usage: walktest <x> <y> <ms 1000..60000> [name]".into()),
                 }
             }
+            "itemcensus" => {
+                // `itemcensus` (`DS_ITEM_CENSUS=1`): a frame's prepared draws against the frame
+                // before by content, the totals since the last report.
+                info!("{}", gpu::itemcensus::report());
+                Ok(())
+            }
             "turntest" => {
                 // `turntest <x> <ms> [name]`: the right stick held sideways, the camera's turn
                 // over the hold's steady part logged (`gamestep::turntest`).
