@@ -92,6 +92,18 @@ XeSS are trademarks of Intel Corporation. AMD and FSR are trademarks of Advanced
 Inc.
 
 
+Frame rate and refresh rate
+---------------------------
+The game runs at the same speed at every frame rate. With the 60 limit each frame stays on
+the screen for the same number of refreshes, so motion stays even:
+- At 60, 120 or 240 Hz the game shows 60 frames a second.
+- With G-Sync or FreeSync it shows 60 in borderless or exclusive fullscreen.
+- In a window on a 165 Hz or 144 Hz screen without G-Sync or FreeSync it shows an even 55 or
+  48. For 60 there, use fullscreen with G-Sync or FreeSync, or set the screen to 120 Hz.
+- Exclusive fullscreen with the Automatic refresh rate picks a rate where 60 fits, unless the
+  screen has G-Sync or FreeSync.
+
+
 The launcher
 ------------
 - Game: the game folder and its check, what your PC brings, and safe mode for the next start.
