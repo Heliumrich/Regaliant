@@ -90,6 +90,24 @@ pub fn trace_clears() -> bool {
     *ON.get_or_init(|| std::env::var("DS_TRACE_CLEARS").is_ok_and(|v| v == "1"))
 }
 
+/// Metadata entries dropped because their image was rendered with another metadata address
+/// (`Images::surface_image`, `meta_key`).
+pub static META_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Notes a pending fast clear of `key` (its metadata at `meta`; `v` the value a fill gave,
+/// None: a write of unknown data). An unknown write does not replace a clear whose value a
+/// fill gave: other data written over the block once the image no longer uses it (the title's
+/// memory reused, noted by whichever recorder got there first) is not a clear of the image,
+/// and taken for one it lost the real clear (2026-11-18: garbage clear codes, one-frame
+/// shadow flicker). False: nothing changed.
+pub fn merge_clear<S: std::hash::BuildHasher>(map: &mut std::collections::HashMap<ImageKey, (u64, Option<u32>), S>, key: ImageKey, meta: u64, v: Option<u32>) -> bool {
+    if v.is_none() && map.get(&key).is_some_and(|p| p.1.is_some()) {
+        return false;
+    }
+    map.insert(key, (meta, v));
+    true
+}
+
 /// Whether any fast clear or overwrite reload is pending.
 pub fn any_pending() -> bool {
     PENDING.load(std::sync::atomic::Ordering::Acquire) != 0
@@ -1593,6 +1611,11 @@ pub struct Images {
     /// Fast-clear metadata address -> (image, clear value); ordered for the
     /// range lookups of `note_meta_writes`.
     meta_of: std::collections::BTreeMap<u64, (ImageKey, [u32; 2])>,
+    /// The metadata address each image was last rendered with (`surface_image`): one
+    /// rendered with another address, or with none, drops its old entry in `meta_of`. The
+    /// title reuses a dropped metadata block for other data, and every write there was taken
+    /// for a fast clear of the image (garbage clear codes, 2026-11-18).
+    meta_key: HashMap<ImageKey, u64>,
     /// The writes `note_writes` last applied, with LOOKUP_GEN and note_gen
     /// then: the per-item culls report the same two ranges thousands of
     /// times per frame, and noting them again changes nothing until a
@@ -2794,7 +2817,7 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
             let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).expect("image cmd")[0];
             let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).expect("image fence");
             let qp = upload_stamps();
-            *g = Some(Images { qp, map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), last_note: None, note_gen: 0, view_memo: memo_map(), key_memo: memo_map(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, inflight: Default::default(), spare_cmds: Vec::new(), detile_free: Vec::new(), copy_pool: vk::CommandPool::null(), copy_spare: Vec::new(), copy_timeline: vk::Semaphore::null(), copy_value: 0, reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwritten_keys: Default::default(), pending_change: 0, pending_published: 0, scrub_keys: Vec::new(), scrub_gen: 0, scrub_at: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), depth_grows: 0, depth_feeds: Default::default(), refreshing: HashMap::default() });
+            *g = Some(Images { qp, map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), meta_key: HashMap::default(), last_note: None, note_gen: 0, view_memo: memo_map(), key_memo: memo_map(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, inflight: Default::default(), spare_cmds: Vec::new(), detile_free: Vec::new(), copy_pool: vk::CommandPool::null(), copy_spare: Vec::new(), copy_timeline: vk::Semaphore::null(), copy_value: 0, reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwritten_keys: Default::default(), pending_change: 0, pending_published: 0, scrub_keys: Vec::new(), scrub_gen: 0, scrub_at: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), depth_grows: 0, depth_feeds: Default::default(), refreshing: HashMap::default() });
         }
     }
     let im = g.as_mut().unwrap();
@@ -4050,6 +4073,9 @@ impl Images {
                 v.0 = new_key;
             }
         }
+        if let Some(m) = self.meta_key.remove(&old) {
+            self.meta_key.insert(new_key, m);
+        }
         if let Some(n) = self.pending_clears.remove(&old) {
             self.pending_clears.insert(new_key, n);
             self.pending_change += 1;
@@ -4361,7 +4387,12 @@ impl Images {
         }
         for &(b, n) in writes {
             for (&meta, &(key, _)) in self.meta_of.range(b..b.saturating_add(n)) {
-                self.pending_clears.insert(key, (meta, None));
+                // A clear whose value a fill gave stays: a write of other data over the
+                // block after it (noted later, perhaps by another queue's recorder) is not a
+                // clear of the image (`merge_clear`).
+                if !merge_clear(&mut self.pending_clears, key, meta, None) {
+                    continue;
+                }
                 self.pending_change += 1;
                 if trace_clears() {
                     crate::info!("trace clears: {:#x} ({:?}) pending: write {b:#x}+{n:#x} covers its metadata {meta:#x} (for flip {}, {})", key.base, key.format, crate::hle::libs::videoout::QUEUED_FLIP.load(std::sync::atomic::Ordering::Relaxed) + 1, std::thread::current().name().unwrap_or("?"));
@@ -4441,8 +4472,9 @@ impl Images {
     /// the work before them.
     pub fn apply_held(&mut self, clears: &std::collections::HashMap<ImageKey, (u64, Option<u32>)>, over: &std::collections::HashSet<ImageKey>) {
         for (k, &(meta, v)) in clears {
-            self.pending_clears.insert(*k, (meta, v));
-            self.pending_change += 1;
+            if merge_clear(&mut self.pending_clears, *k, meta, v) {
+                self.pending_change += 1;
+            }
         }
         for k in over {
             let Some(img) = self.map.get_mut(k) else { continue };
@@ -4867,6 +4899,7 @@ impl Images {
         self.pending_change += 1;
         self.stencil_of.retain(|_, v| *v != *k);
         self.meta_of.retain(|_, v| v.0 != *k);
+        self.meta_key.remove(k);
         if img.gpu_written && !self.by_base.get(&k.base).is_some_and(|ks| ks.iter().any(|x| self.map.get(x).is_some_and(|i| i.gpu_written))) {
             self.gpu_bases.remove(&k.base);
         }
@@ -5355,6 +5388,16 @@ impl Images {
         }
         if s.meta != 0 {
             mark_note_pages(s.meta, 4);
+            // One metadata address per image: rendered with another one, its old entry goes
+            // (`meta_key`; a pending clear noted there is dropped with it at `take_clears`).
+            if let Some(old) = self.meta_key.insert(k, s.meta).filter(|&m| m != s.meta) {
+                if self.meta_of.get(&old).is_some_and(|v| v.0 == k) {
+                    self.meta_of.remove(&old);
+                    META_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.note_gen += 1;
+                    NOTE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+                }
+            }
         }
         if s.meta != 0 && self.meta_of.insert(s.meta, (k, s.clear)) != Some((k, s.clear)) {
             self.note_gen += 1;

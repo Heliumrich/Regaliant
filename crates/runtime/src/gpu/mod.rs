@@ -182,7 +182,7 @@ pub mod tune {
         Tunable { name: "fe2_back_granule", env: "DS_FE2_BACK_GRANULE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "ballast_ns", env: "DS_BALLAST_NS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "ballast_at", env: "DS_BALLAST_AT", default: 0, value: AtomicU64::new(UNSET) },
-        Tunable { name: "async_compute", env: "DS_ASYNC_COMPUTE", default: 2, value: AtomicU64::new(UNSET) },
+        Tunable { name: "async_compute", env: "DS_ASYNC_COMPUTE", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "vram_others", env: "DS_VRAM_OTHERS", default: 512, value: AtomicU64::new(UNSET) },
         Tunable { name: "mirror_cold", env: "DS_MIRROR_COLD", default: 3600, value: AtomicU64::new(UNSET) },
         Tunable { name: "buffer_delta", env: "DS_BUFFER_DELTA", default: 1, value: AtomicU64::new(UNSET) },
@@ -1806,11 +1806,13 @@ pub mod tune {
     }
 
     /// Ordered async compute (RENDERER.md "Ordered async compute"; the
-    /// default from 2026-11-01 to 2026-11-14 and again since 2026-11-16): 2, the compute
+    /// default from 2026-11-01 to 2026-11-14 and from 2026-11-16 to 11-18): 2, the compute
     /// queues' batches on a queue of a compute-only family (set up when the value is 2 or more
     /// at boot: `vk::async_compute_boot`; live at batch boundaries; x1.013-1.046 in-run,
-    /// FINDINGS.md 2026-11-16, its one-frame faults of 2026-11-14 gone with the culling-read
-    /// fixes); 0, every batch on the main queue (the default 2026-11-14 to 11-16); 1, one
+    /// FINDINGS.md 2026-11-16); 0 (the default again since 2026-11-18: with 2 a boot without
+    /// prepared shaders lost the device, a compute batch writing at address 0, and the
+    /// player's 0.1.0 showed stray giant triangles in the Nexus; FINDINGS.md 2026-11-18
+    /// night), every batch on the main queue; 1, one
     /// queue with a census of the waits
     /// the main queue's batches would need, by reason, counted and marked in
     /// the timeline (`after #seq (xq ...)`, `tools/schedmodel.py`).

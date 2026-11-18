@@ -306,6 +306,9 @@ fn note_gens() -> [u64; 4] {
 /// Fast clears resolved without waiting for the GPU (metadata value known
 /// from the fill that wrote it).
 pub static FAST_CLEARS_KNOWN: AtomicU64 = AtomicU64::new(0);
+/// Pending clears whose metadata, read from memory, held more than one code: other data,
+/// not a clear (`Exec::record_fast_clears`).
+pub static FAST_CLEARS_NOT_UNIFORM: AtomicU64 = AtomicU64::new(0);
 /// Block-compressed textures refreshed from GPU-written block views.
 pub static BLOCK_COPIES: AtomicU64 = AtomicU64::new(0);
 /// Of those, with the mip tail from a view of the tail block (`tune block_tails`).
@@ -15559,10 +15562,25 @@ impl Exec {
                     v
                 }
                 None => {
-                    if !super::cp::guest_readable(c.meta, 4) {
+                    // A value read from memory is a clear only when the block holds one code
+                    // throughout, as a fast clear leaves it: the title's other data written
+                    // over a block the image no longer uses is not one (2026-11-18: garbage
+                    // codes taken for clears, a few of them looking valid).
+                    const SAMPLE: u64 = 64;
+                    let n = if super::cp::guest_readable(c.meta, SAMPLE) {
+                        SAMPLE
+                    } else if super::cp::guest_readable(c.meta, 4) {
+                        4
+                    } else {
+                        continue;
+                    };
+                    let first = unsafe { std::ptr::read_volatile(c.meta as *const u32) };
+                    let uniform = first.to_le_bytes().iter().all(|&x| x == first as u8) && (1..n / 4).all(|i| unsafe { std::ptr::read_volatile((c.meta + 4 * i) as *const u32) } == first);
+                    if !uniform {
+                        FAST_CLEARS_NOT_UNIFORM.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
-                    unsafe { std::ptr::read_volatile(c.meta as *const u32) }
+                    first
                 }
             };
             let k = c.key;
@@ -17909,7 +17927,7 @@ impl Exec {
         }
         self.held_keys.extend(h.keys.iter().copied());
         for (k, v) in &h.clears {
-            self.held_clears.insert(*k, *v);
+            super::images::merge_clear(&mut self.held_clears, *k, v.0, v.1);
         }
         self.held_over.extend(h.over.iter().copied());
         if self.past_grow {
@@ -17991,7 +18009,7 @@ impl Exec {
     fn held_note(&mut self, writes: &[(u64, u64)], sized: &[(u64, u64)], fill: Option<((u64, u64), u32)>) {
         let (clears, over) = super::images::with(|im| im.notes_for(writes, sized, fill));
         for (k, meta, v) in clears {
-            self.held_clears.insert(k, (meta, v));
+            super::images::merge_clear(&mut self.held_clears, k, meta, v);
         }
         self.held_over.extend(over);
     }
@@ -18006,7 +18024,7 @@ impl Exec {
             (c, o, if zero { im.zero_fill_targets(base, len) } else { Vec::new() })
         });
         for (k, meta, v) in clears {
-            self.held_clears.insert(k, (meta, v));
+            super::images::merge_clear(&mut self.held_clears, k, meta, v);
         }
         self.held_over.extend(over);
         for z in &zeroed {
@@ -20958,7 +20976,7 @@ impl Drop for Exec {
 /// One status line for hang reports.
 pub fn status() -> String {
     format!(
-        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them from a resident shadow, {} of them behind a barrier of their own; {} render passes ended into the next full barrier; draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU, {} title timestamps written by the CPU, left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges ({} before an in-place use), {} skipped; {} draws executed ({} reading their arguments on the GPU, {} repeating the draw before (chains ended by opcode: {}), {} barriers before a dispatch rewrote them), {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait), {} fill-kernel dispatches recorded as buffer fills ({} of them only clearing the GPU-written images they cover, {} MiB not stored), {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
+        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them from a resident shadow, {} of them behind a barrier of their own; {} render passes ended into the next full barrier; draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU, {} title timestamps written by the CPU, left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges ({} before an in-place use), {} skipped; {} draws executed ({} reading their arguments on the GPU, {} repeating the draw before (chains ended by opcode: {}), {} barriers before a dispatch rewrote them), {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait; {} read from memory refused, not one code throughout; {} metadata addresses dropped for an image's newer one), {} fill-kernel dispatches recorded as buffer fills ({} of them only clearing the GPU-written images they cover, {} MiB not stored), {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
         EXECUTED.load(Ordering::Relaxed),
         GPU_INDIRECT.load(Ordering::Relaxed),
         SHADOW_ARGS.load(Ordering::Relaxed),
@@ -20992,6 +21010,8 @@ pub fn status() -> String {
         WATCHDOG_STOPS.load(Ordering::Relaxed),
         FAST_CLEARS.load(Ordering::Relaxed),
         FAST_CLEARS_KNOWN.load(Ordering::Relaxed),
+        FAST_CLEARS_NOT_UNIFORM.load(Ordering::Relaxed),
+        super::images::META_DROPPED.load(Ordering::Relaxed),
         FILLS_IN_PLACE.load(Ordering::Relaxed),
         FILL_SKIPS[0].load(Ordering::Relaxed),
         FILL_SKIPS[1].load(Ordering::Relaxed) >> 20,
