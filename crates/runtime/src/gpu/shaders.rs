@@ -1458,11 +1458,32 @@ fn seeded_single(code: u64, res: usize, format: u8, dst_sel: u16) -> bool {
     FMT_SEEN.read().as_ref().and_then(|m| m.get(&(code, res)).copied()) == Some(want)
 }
 
+thread_local! {
+    /// Set while `with_fmt_rt` runs.
+    static FMT_FORCE_RT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with the compute preparations it makes taking every formatted buffer at run time
+/// (`translate::FORMAT_RT`), as the run-time variant a missing specialized key falls back to
+/// (`fmt_run_time`), without noting formats (`single_format`): a batched program's run-time
+/// variant is made beside its specialized one in the background (`gpu::compile`; 2026-11-19:
+/// 30 of a first walk's 48 run-time variant misses were batched dispatches, whose run-time
+/// variant the launcher's preparation never makes).
+pub fn with_fmt_rt<T>(f: impl FnOnce() -> T) -> T {
+    FMT_FORCE_RT.with(|c| c.set(true));
+    let r = f();
+    FMT_FORCE_RT.with(|c| c.set(false));
+    r
+}
+
 /// Whether resource `res` of the program with code `code` can be specialized
 /// to `format` and `dst_sel`: the first pair seen for it, or the same as
 /// before; a different one makes it run-time from now on (every thread). A
 /// specialized translation is used only for V#s of its own format.
 fn single_format(code: u64, res: usize, format: u8, dst_sel: u16) -> bool {
+    if FMT_FORCE_RT.with(|c| c.get()) {
+        return false;
+    }
     // (Diagnosis, `DS_FMT_RT_ONLY=1`: every typed buffer through the run-time
     // decode, never specialized: checks of `FORMAT_RT` loads and stores.)
     static RT_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -3999,6 +4020,63 @@ pub(crate) fn guess_d3_variant(guess: &Spec) -> Option<Spec> {
     Some(s)
 }
 
+/// The class a stored value's last writer computes it in (`guess_image_class`): a conversion by
+/// its result (`v_cvt_f32_u32` makes a float), else by its operands' type as for loads.
+fn store_class_votes(n: &str) -> (u32, u32) {
+    if n.starts_with("v_cvt_f32") || n.starts_with("v_cvt_f16") || n.starts_with("v_cvt_pk") && n.contains("_f") {
+        return (0, 1);
+    }
+    if n.starts_with("v_cvt_u32") || n.starts_with("v_cvt_i32") || n.starts_with("v_cvt_u16") || n.starts_with("v_cvt_i16") || n.starts_with("v_cvt_flr_i32") || n.starts_with("v_cvt_rpi_i32") {
+        return (1, 0);
+    }
+    let int = n.contains("_u32") || n.contains("_i32") || n.contains("_b32") || n.contains("_u16") || n.contains("_i16") || n.contains("bfe") || n.contains("bfi") || n.contains("lshl") || n.contains("lshr") || n.contains("ashr") || n.contains("and_") || n.contains("or_") || n.contains("xor") || n.contains("perm");
+    let float = !int && (n.contains("_f32") || n.contains("_f16") || n.contains("_f64"));
+    (int as u32, float as u32)
+}
+
+/// The integer and float votes of what a move or select `j` (at `at`) passes on: its value
+/// sources' last writers before it (within 64 instructions), followed through further moves and
+/// selects up to `depth` steps (`store_class_votes`); an inline integer constant votes integer,
+/// an inline float constant float.
+fn passed_on_votes(insts: &[rdna::Inst], at: usize, j: &rdna::Inst, depth: u32) -> (u32, u32) {
+    let n = j.name().unwrap_or("");
+    let srcs: &[usize] = if n.starts_with("v_cndmask") { &[0, 1] } else { &[0] };
+    let (mut iv, mut fv) = (0u32, 0u32);
+    for &s in srcs {
+        let o = j.src(s) as u32;
+        match o {
+            128..=208 => iv += 1,
+            240..=248 => fv += 1,
+            256..=511 => {
+                let v = o - 256;
+                for (back, w) in insts[..at].iter().rev().take(64).enumerate() {
+                    if !matches!(w.enc, rdna::Enc::Vop1 | rdna::Enc::Vop2 | rdna::Enc::Vop3 | rdna::Enc::Vop3p) || w.vdst() as u32 != v {
+                        continue;
+                    }
+                    let Some(wn) = w.name() else { break };
+                    if wn.starts_with("v_cmp") || wn.starts_with("v_readlane") || wn.starts_with("v_readfirstlane") {
+                        continue;
+                    }
+                    let (a, b) = if wn.starts_with("v_mov") || wn.starts_with("v_cndmask") {
+                        if depth > 0 {
+                            passed_on_votes(insts, at - 1 - back, w, depth - 1)
+                        } else {
+                            (0, 0)
+                        }
+                    } else {
+                        store_class_votes(wn)
+                    };
+                    iv += a;
+                    fv += b;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    (iv, fv)
+}
+
 /// An image's number class as its program uses it (`guess_compute_spec`; the class itself comes
 /// from the descriptor's format at run time): an image the program only loads from or stores to,
 /// whose loaded words feed integer operations first, or whose stored words integer operations
@@ -4012,6 +4090,8 @@ fn guess_image_class(insts: &[rdna::Inst], plan: &Plan, r: usize) -> NumClass {
         return NumClass::Float;
     }
     let (mut int_votes, mut float_votes) = (0u32, 0u32);
+    // (What stored words' moves and selects pass on: decides only when nothing else voted.)
+    let (mut passed_int, mut passed_float) = (0u32, 0u32);
     // (The class an instruction computes in, by its name: integer, float, or neither.)
     let class_of = |n: &str| -> (bool, bool) {
         let int = n.contains("_u32") || n.contains("_i32") || n.contains("_b32") || n.contains("_u16") || n.contains("_i16") || n.contains("bfe") || n.contains("bfi") || n.contains("lshl") || n.contains("lshr") || n.contains("ashr") || n.contains("and_") || n.contains("or_") || n.contains("xor") || n.contains("perm") || n.starts_with("v_cvt_f32_u") || n.starts_with("v_cvt_f32_i") || n.starts_with("v_cvt_f32_ubyte");
@@ -4031,7 +4111,7 @@ fn guess_image_class(insts: &[rdna::Inst], plan: &Plan, r: usize) -> NumClass {
             let first = i.vdst() as u32;
             let count = i.mimg_dmask().count_ones().max(1);
             let mut found = 0u32;
-            for j in insts[..k].iter().rev().take(64) {
+            for (back, j) in insts[..k].iter().rev().take(64).enumerate() {
                 if !matches!(j.enc, rdna::Enc::Vop1 | rdna::Enc::Vop2 | rdna::Enc::Vop3 | rdna::Enc::Vop3p) {
                     continue;
                 }
@@ -4044,14 +4124,18 @@ fn guess_image_class(insts: &[rdna::Inst], plan: &Plan, r: usize) -> NumClass {
                     continue;
                 }
                 found |= 1 << (d - first);
-                // (Moves and selects pass a value on: no vote.)
-                if !(n.starts_with("v_mov") || n.starts_with("v_cndmask")) {
-                    let (int, float) = class_of(n);
-                    if int {
-                        int_votes += 1;
-                    } else if float {
-                        float_votes += 1;
-                    }
+                // (Moves and selects pass a value on: the values they pass vote, followed two
+                // steps back (2026-11-19: the BC3 face encoder cs 0x8026ec300 stores words its
+                // selects pick from bit operations; with no vote it was guessed Float, and its
+                // first dispatch compiled in place).)
+                if n.starts_with("v_mov") || n.starts_with("v_cndmask") {
+                    let (int, float) = passed_on_votes(insts, k - 1 - back, j, 2);
+                    passed_int += int;
+                    passed_float += float;
+                } else {
+                    let (int, float) = store_class_votes(n);
+                    int_votes += int;
+                    float_votes += float;
                 }
                 if found == (1u32 << count) - 1 {
                     break;
@@ -4091,6 +4175,9 @@ fn guess_image_class(insts: &[rdna::Inst], plan: &Plan, r: usize) -> NumClass {
                 break;
             }
         }
+    }
+    if int_votes == 0 && float_votes == 0 {
+        (int_votes, float_votes) = (passed_int, passed_float);
     }
     if int_votes > float_votes { NumClass::Uint } else { NumClass::Float }
 }

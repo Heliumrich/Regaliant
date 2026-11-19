@@ -73,7 +73,9 @@ const AGAIN: usize = 10;
 /// Batched forms handed over (`submit_batched`), and those made.
 const BATCHED: usize = 11;
 const BATCHED_MADE: usize = 12;
-static STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+/// Batched programs' run-time variants made beside them (`run_batched`).
+const BATCHED_RT: usize = 13;
+static STATS: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
 
 /// Compute programs whose pipeline was created or found present: scans skip
 /// them before their per-scan limit (it filled with programs compiled
@@ -305,16 +307,30 @@ fn run_batched(slot: &Slot) {
             } else if r == Some(false) {
                 STATS[PRESENT].fetch_add(1, Ordering::Relaxed);
             }
-            r.is_some()
+            r.map(|_| p.tr.key)
         }
-        _ => false,
+        _ => None,
     };
-    if made {
+    if made.is_some() {
         STATS[BATCHED_MADE].fetch_add(1, Ordering::Relaxed);
     } else {
         STATS[FAILED].fetch_add(1, Ordering::Relaxed);
     }
-    shaders::batched_ready(addr, made);
+    shaders::batched_ready(addr, made.is_some());
+    // Its run-time variant too when its formatted buffers were specialized (another key): a
+    // later batched dispatch binding other formats takes it while its own key is made in the
+    // background, instead of compiling that key where it stands (`shaders::with_fmt_rt`).
+    if let Some(key) = made {
+        if let Ok(q) = shaders::with_fmt_rt(|| shaders::with_batched(addr, || shaders::prepare_compute(regs, slot.wave64()))) {
+            if !regs.missed.load(Ordering::Relaxed) && q.tr.spec.batched && q.tr.key != key {
+                let t = std::time::Instant::now();
+                if super::exec::precompile(&q) == Some(true) {
+                    STATS[BATCHED_RT].fetch_add(1, Ordering::Relaxed);
+                    STATS[COMPILE_NS].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
+            }
+        }
+    }
 }
 
 /// Hands the stage of a program marked batchable while it had a pipeline
@@ -496,7 +512,7 @@ pub fn status() -> String {
     let stops: Vec<String> = stops.iter().take(6).map(|(k, n)| format!("{k:#x} {n}")).collect();
     let stops = if stops.is_empty() { String::new() } else { format!(" (by {})", stops.join(", ")) };
     format!(
-        "    pipelines compiled ahead: {} scans at first uses ({} ms; ended by their buffer's end {}, the command limit {}, another packet {}{stops}; {} commands found), {} programs handed to {} workers ({} of them with a pipeline already, for other specs; {} over the per-scan limit) and {} stages prepared at label waits, {} prepared, {} pipelines created ({} ms of compiles), {} present already, {} failed or not prepared; command processors waited {} times for a pipeline in flight ({} ms), {} compiles of one pipeline avoided, {} programs batchable from a run's first dispatch, {} batched forms made in the background ({} handed over)\n",
+        "    pipelines compiled ahead: {} scans at first uses ({} ms; ended by their buffer's end {}, the command limit {}, another packet {}{stops}; {} commands found), {} programs handed to {} workers ({} of them with a pipeline already, for other specs; {} over the per-scan limit) and {} stages prepared at label waits, {} prepared, {} pipelines created ({} ms of compiles), {} present already, {} failed or not prepared; command processors waited {} times for a pipeline in flight ({} ms), {} compiles of one pipeline avoided, {} programs batchable from a run's first dispatch, {} batched forms made in the background ({} handed over; {} run-time variants beside them)\n",
         s[SCANS],
         s[SCAN_NS] / 1_000_000,
         SCAN_ENDS[0].load(Ordering::Relaxed),
@@ -518,6 +534,7 @@ pub fn status() -> String {
         dups,
         super::exec::BATCHABLE_AHEAD.load(Ordering::Relaxed),
         s[BATCHED_MADE],
-        s[BATCHED]
+        s[BATCHED],
+        s[BATCHED_RT]
     ) + &gfx
 }
