@@ -1182,6 +1182,12 @@ struct GfxJob {
 }
 
 static ASYNC_GFX: parking_lot::Mutex<Option<AsyncGfx>> = parking_lot::Mutex::new(None);
+
+/// No pipeline queued for the background graphics workers or being made by them (the
+/// self-play's end waits for it: its statistics leave out jobs dropped as made meanwhile).
+pub fn async_gfx_idle() -> bool {
+    ASYNC_GFX.lock().as_ref().is_none_or(|s| s.pending.is_empty() && s.jobs.is_empty() && s.ahead.is_empty())
+}
 static ASYNC_GFX_CV: parking_lot::Condvar = parking_lot::Condvar::new();
 static ASYNC_GFX_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// [draws left out, pipelines queued, of them from the store, made, their

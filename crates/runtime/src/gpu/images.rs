@@ -111,12 +111,24 @@ fn union_layers(a: u128, b: u128) -> u128 {
 /// pending but for its layers, which add up; a fill's value an unknown write replaces at the
 /// same metadata is kept aside in the entry for its use.
 pub fn merge_clear<S: std::hash::BuildHasher>(map: &mut std::collections::HashMap<ImageKey, PendingClear, S>, key: ImageKey, meta: u64, v: Option<u32>, layers: u128) {
-    let kept = match (v, map.get(&key)) {
-        (None, Some(&(m, Some(old), _, _))) if m == meta => Some(old),
-        (None, Some(&(m, None, kept, _))) if m == meta => kept,
+    let prev = map.get(&key).copied();
+    // (Layers that meet: either clear is the whole image's (0), or their masks overlap. A fill
+    // kept aside answers only for the layers it filled: one layer's value must not clear another
+    // layer an unknown write reached, the release review of 2026-11-19.)
+    let meets = |pl: u128| pl == 0 || layers == 0 || pl & layers != 0;
+    let kept = match (v, prev) {
+        (None, Some((m, Some(old), _, pl))) if m == meta && meets(pl) => Some(old),
+        (None, Some((m, None, kept, pl))) if m == meta && meets(pl) => kept,
         _ => None,
     };
-    let layers = map.get(&key).map_or(layers, |e| union_layers(e.3, layers));
+    // A fill of another value than the pending one's over fewer layers than it pends: no one
+    // value holds for them all, so none is taken (each run reads its own back when recorded).
+    let covers = |pl: u128| layers == 0 || (pl != 0 && pl & !layers == 0);
+    let v = match (v, prev) {
+        (Some(x), Some((m, pv, _, pl))) if m == meta && pv != Some(x) && !covers(pl) => None,
+        _ => v,
+    };
+    let layers = prev.map_or(layers, |e| union_layers(e.3, layers));
     map.insert(key, (meta, v, kept, layers));
 }
 
@@ -147,7 +159,8 @@ pub fn merge_pending<S: std::hash::BuildHasher>(map: &mut std::collections::Hash
 /// layers are whole 64 KiB blocks only (the ones measured); others keep whole-image clears.
 pub fn meta_layer_bytes(k: &ImageKey) -> Option<u64> {
     // (`tune layer_clears 0` / `DS_LAYER_CLEARS=0`: whole-image clears, as before.)
-    if !is_depth(k.format) || k.layers <= 1 || k.layers > 128 || k.ty3d || !super::tune::layer_clears() {
+    // (One mip level only: a mip-mapped array lays its levels' metadata out otherwise.)
+    if !is_depth(k.format) || k.layers <= 1 || k.layers > 128 || k.levels != 1 || k.ty3d || !super::tune::layer_clears() {
         return None;
     }
     let s = k.width.div_ceil(8) as u64 * k.height.div_ceil(8) as u64 * 4;
@@ -267,6 +280,39 @@ mod clear_tests {
         assert_eq!(c[&atlas].3, 1 | 1 << 5);
         merge_pending(&mut c, atlas, (m, Some(0), None, 0));
         assert_eq!(c[&atlas].3, 0);
+        // A mip-mapped depth array: whole-image clears (its levels' metadata lies otherwise).
+        assert_eq!(meta_layer_bytes(&ImageKey { levels: 2, ..atlas }), None);
+    }
+
+    /// Fills of layers keep their values to their layers: a value kept aside answers only for
+    /// the layers it filled, and fills of other values over other layers take none.
+    #[test]
+    fn layer_merges() {
+        let atlas = ImageKey { base: 0x10_ab90_0000, format: vk::Format::D32_SFLOAT, width: 1024, height: 1024, layers: 80, levels: 1, ty3d: false, cube: false };
+        let m = 0x10_0820_0000u64;
+        let mut c: HashMap<ImageKey, PendingClear> = HashMap::default();
+        // Layer 3 filled, then an unknown write reaching layer 5 only: layer 3's value is not
+        // kept for it.
+        merge_clear(&mut c, atlas, m, Some(0), 1 << 3);
+        merge_clear(&mut c, atlas, m, None, 1 << 5);
+        assert_eq!(c[&atlas], (m, None, None, 1 << 3 | 1 << 5));
+        // An unknown write over the filled layer keeps the fill aside.
+        c.clear();
+        merge_clear(&mut c, atlas, m, Some(0), 1 << 3);
+        merge_clear(&mut c, atlas, m, None, 1 << 3);
+        assert_eq!(c[&atlas], (m, None, Some(0), 1 << 3));
+        // Two layers filled with other values: no one value for both.
+        c.clear();
+        merge_clear(&mut c, atlas, m, Some(0), 1 << 3);
+        merge_clear(&mut c, atlas, m, Some(u32::MAX), 1 << 5);
+        assert_eq!(c[&atlas], (m, None, None, 1 << 3 | 1 << 5));
+        // The same value, or a later fill over every pending layer: that value.
+        c.clear();
+        merge_clear(&mut c, atlas, m, Some(0), 1 << 3);
+        merge_clear(&mut c, atlas, m, Some(0), 1 << 5);
+        assert_eq!(c[&atlas], (m, Some(0), None, 1 << 3 | 1 << 5));
+        merge_clear(&mut c, atlas, m, Some(u32::MAX), 1 << 3 | 1 << 5 | 1 << 7);
+        assert_eq!(c[&atlas], (m, Some(u32::MAX), None, 1 << 3 | 1 << 5 | 1 << 7));
     }
 }
 
@@ -5571,7 +5617,8 @@ impl Images {
         self.meta_now.insert(k, (s.meta, super::FRAMES.load(std::sync::atomic::Ordering::Relaxed)));
         // `DS_TRACE_LAYER_BINDS=1` (diagnosis): binds of layered depth surfaces, each distinct
         // (base, slice, layers, metadata) once, with the flip.
-        if k.layers > 1 && is_depth(k.format) && std::env::var("DS_TRACE_LAYER_BINDS").ok().as_deref() == Some("1") {
+        static TRACE_LAYER_BINDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if k.layers > 1 && is_depth(k.format) && *TRACE_LAYER_BINDS.get_or_init(|| std::env::var("DS_TRACE_LAYER_BINDS").ok().as_deref() == Some("1")) {
             static SEEN: Mutex<Option<std::collections::HashSet<(u64, u32, u32, u64)>>> = Mutex::new(None);
             if SEEN.lock().get_or_insert_with(Default::default).insert((s.base, s.slice, s.layers, s.meta)) {
                 crate::info!("layer bind: {:#x} {}x{} {:?} slice {} of {} (image {} layers), metadata {:#x}, flip {}", s.base, s.width, s.height, s.format, s.slice, s.layers, k.layers, s.meta, super::FRAMES.load(std::sync::atomic::Ordering::Relaxed));

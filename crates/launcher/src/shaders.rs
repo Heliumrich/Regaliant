@@ -29,7 +29,10 @@ pub const TIMER: usize = 3;
 pub const CHECK_TIMER: usize = 4;
 
 /// The self-play's exit status when the stop file ended it (`prepplay::EXIT_STOPPED`).
-const STAGE_STOPPED: i32 = 3;
+const STAGE_STOPPED: i32 = 12;
+/// The game's exit status when another session holds the player's data folder
+/// (`main::EXIT_RUNNING`): the step did not run.
+const GAME_RUNNING: i32 = 9;
 
 /// This build's translation fingerprint (`dsport --translation-fingerprint`): None while the
 /// check runs, then its answer.
@@ -205,6 +208,8 @@ struct Played {
     newgame: Option<i32>,
     parts: u8,
     tour: Option<i32>,
+    /// The preparation's time ran out before the last part ended (the latest levels left).
+    cut: bool,
 }
 
 /// The translation, card and driver the self-play's record holds for.
@@ -227,7 +232,7 @@ fn played(app: &App) -> Played {
         return Played::default();
     }
     let code = |k: &str| get(k).parse::<i32>().ok();
-    Played { newgame: code("newgame"), parts: get("parts").parse().unwrap_or(0), tour: code("tour") }
+    Played { newgame: code("newgame"), parts: get("parts").parse().unwrap_or(0), tour: code("tour"), cut: get("cut") == "1" }
 }
 
 /// The self-play's record changed by `f` (with the translation, card and driver now).
@@ -237,12 +242,44 @@ fn record(app: &App, f: impl FnOnce(&mut Played)) {
     let (translation, device, driver) = identity();
     let line = |v: Option<i32>| v.map_or(String::new(), |c| c.to_string());
     let t = format!(
-        "# The game's self-play that learned the shaders (dsport --prepare-play); written by the launcher\n# (0: played to its end, 3: stopped, other: it could not go on; parts: the levels' parts played)\nnewgame = {}\nparts = {}\ntour = {}\ntranslation = {translation}\ndriver = {driver}\ndevice = {device}\n",
+        "# The game's self-play that learned the shaders (dsport --prepare-play); written by the launcher\n# (0: played to its end, {STAGE_STOPPED}: stopped, other: it could not go on; parts: the levels' parts played; cut: the time ran out first)\nnewgame = {}\nparts = {}\ntour = {}\ncut = {}\ntranslation = {translation}\ndriver = {driver}\ndevice = {device}\n",
         line(p.newgame),
         p.parts,
         line(p.tour),
+        p.cut as u8,
     );
     let _ = std::fs::write(played_file(app), t);
+}
+
+/// The prepared marker as the launcher writes it when the self-play's last part ended without
+/// one: the date, this card and driver and this version's translation (`compute_state`'s keys).
+fn write_marker(app: &App) {
+    let (translation, device, driver) = identity();
+    if translation.is_empty() || device.is_empty() {
+        return;
+    }
+    let t = format!(
+        "# The game's shaders prepared ahead; written by the launcher (the self-play's last part ended without marking them)\ndate = {}\nprograms = unknown\ndevice = {device}\ndriver = {driver}\ntranslation = {translation}\n",
+        utc_stamp()
+    );
+    let _ = std::fs::write(marker(app), t);
+}
+
+/// Now as `YYYYMMDD-HHMMSS` (UTC).
+fn utc_stamp() -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()) as i64;
+    let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
+    // Civil from days (Howard Hinnant).
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{y:04}{m:02}{d:02}-{:02}{:02}{:02}", rem / 3600, (rem / 60) % 60, rem % 60)
 }
 
 /// Whether the shaders are prepared for this graphics card and driver (the compute shaders, and
@@ -255,7 +292,7 @@ pub fn state(app: &App) -> (bool, String) {
     let ended = |c: Option<i32>| c.is_some_and(|c| c != STAGE_STOPPED);
     let p = played(app);
     match (p.newgame, p.tour) {
-        (Some(0), Some(0)) if p.parts >= LEVEL_PARTS => (true, text),
+        (Some(0), Some(0)) if !p.cut => (true, text),
         (Some(0), Some(0)) => (true, format!("{text} The latest levels are left to their first visits.")),
         // (A stage that could not go on: what it learned is kept, and play learns the rest.)
         (Some(c), _) if c != 0 && ended(Some(c)) => (true, format!("{text} Some graphics shaders could not be learned ahead.")),
@@ -358,8 +395,9 @@ pub fn start(app: &mut App, play_after: bool) {
     // (The next part of the levels when the new game was played for this version, card and
     // driver and the levels are not done; else, and when everything is done, the new game.)
     let p = played(app);
+    let save = app.paths.cache.join("prepare").join("user").join("saves");
     let first = match p {
-        Played { newgame: Some(0), parts, tour } if parts < LEVEL_PARTS && tour != Some(0) => Step::Levels(parts + 1),
+        Played { newgame: Some(0), parts, tour, .. } if parts < LEVEL_PARTS && tour != Some(0) && save.is_dir() => Step::Levels(parts + 1),
         _ => Step::NewGame,
     };
     app.shaders.deadline = Some(std::time::SystemTime::now() + BUDGET);
@@ -471,18 +509,34 @@ pub fn tick(app: &mut App) {
         let _ = std::fs::remove_file(progress_file(app).with_extension("stop"));
         let stopped = app.shaders.stopping.take().is_some();
         let code = if stopped && code != 0 { STAGE_STOPPED } else { code };
+        // (Another game session held the player's folder: the step did not run.)
+        if code == GAME_RUNNING {
+            app.shaders.play_after = false;
+            finish(app, Some("The game is running, so the shaders cannot be prepared now. Close the game and press Prepare now.".into()));
+            return;
+        }
+        let cut = app.shaders.deadline.is_some_and(|d| std::time::SystemTime::now() >= d);
         match step {
-            // (A new game played again makes a new save: the levels are played again too.)
-            Step::NewGame => record(app, |p| *p = Played { newgame: Some(code), parts: 0, tour: None }),
+            // (A new game played again makes a new save: the levels are played again too. One
+            // stopped leaves the record as it was: a store prepared before stays prepared.)
+            Step::NewGame if code != STAGE_STOPPED => record(app, |p| *p = Played { newgame: Some(code), ..Played::default() }),
+            Step::NewGame => {}
             // (A part that could not go on is passed: the next part plays its own levels.)
             Step::Levels(i) if code != STAGE_STOPPED => record(app, |p| {
                 p.parts = p.parts.max(i);
                 if i >= LEVEL_PARTS {
                     p.tour = Some(code);
+                    p.cut = cut;
                 }
             }),
             Step::Levels(_) => record(app, |p| p.tour = Some(STAGE_STOPPED)),
             Step::Compute => {}
+        }
+        // The last part ended without marking the store prepared (it could not go on, or the
+        // session ended unasked): the launcher marks it, so that Play does not prepare again
+        // (the release review of 2026-11-19).
+        if step == Step::Levels(LEVEL_PARTS) && code != STAGE_STOPPED && !compute_state(app).0 {
+            write_marker(app);
         }
         if stopped {
             finish(app, Some("Preparation stopped. The next one goes on where it left off.".into()));

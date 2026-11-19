@@ -56,10 +56,11 @@ impl Stage {
     }
 }
 
-/// A stage stopped by the launcher's stop file.
-pub const EXIT_STOPPED: i32 = 3;
+/// A stage stopped by the launcher's stop file (apart from `main`'s exit codes: 3 is the game
+/// files' error, 9 another session running).
+pub const EXIT_STOPPED: i32 = 12;
 /// A stage that could not go on (a screen it waited for did not come).
-pub const EXIT_FAILED: i32 = 4;
+pub const EXIT_FAILED: i32 = 13;
 
 /// The character's name in the self-play's own save.
 const NAME: &str = "Prepare";
@@ -87,6 +88,8 @@ struct Setup {
     chunk: Option<(usize, usize)>,
     /// When the whole preparation's time is up (`--prepare-deadline`).
     deadline: Option<std::time::SystemTime>,
+    /// The player's own folders (the settings copied from them, `prepare_files`).
+    player_paths: dsconfig::paths::Paths,
 }
 
 /// The longest the last levels session waits at its end for the background compute preparation
@@ -106,6 +109,9 @@ fn time_left() -> Option<Duration> {
 
 static SETUP: OnceLock<Setup> = OnceLock::new();
 
+/// The background compute preparation was started (`compute_tail` waits for it only then).
+static BACKGROUND_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The player's settings folder, whose one-session lock a self-play run takes.
 pub fn player_user() -> Option<&'static Path> {
     SETUP.get().map(|s| s.player_user.as_path())
@@ -120,36 +126,7 @@ pub fn setup(stage: Stage, cfg: &mut crate::Config) {
     let store = cfg.cache.clone().unwrap_or_else(|| player.shaders());
     let dir = player.cache.join("prepare");
     let user = dir.join("user");
-    let _ = std::fs::create_dir_all(&user);
-    // The player's PC settings (some choose shader variants: the upscaler, the Visual Mode),
-    // display choices and game folder; never their saves, key bindings or trophies.
-    match std::fs::read_to_string(player.settings_file()) {
-        Ok(t) => {
-            let kept: String = t.lines().filter(|l| !PRIVATE_SETTINGS.iter().any(|k| l.trim_start().starts_with(k))).map(|l| format!("{l}\n")).collect();
-            let _ = std::fs::write(user.join("pcsettings.txt"), kept);
-        }
-        Err(_) => {
-            let _ = std::fs::remove_file(user.join("pcsettings.txt"));
-        }
-    }
-    for f in ["display.txt", "game.txt"] {
-        let src = player.user.join(f);
-        if src.is_file() {
-            let _ = std::fs::copy(&src, user.join(f));
-        } else {
-            let _ = std::fs::remove_file(user.join(f));
-        }
-    }
     let paths = dsconfig::paths::Paths { layout: player.layout, exe_dir: player.exe_dir.clone(), user, cache: dir, root: player.root.clone() };
-    if stage == Stage::NewGame {
-        // A new game from nothing: no saves, trophies or title folders of an earlier one.
-        for d in [paths.saves(), paths.save_backups(), paths.runtime()] {
-            let _ = std::fs::remove_dir_all(d);
-        }
-        for f in [paths.save_folder_record(), paths.achievements_file()] {
-            let _ = std::fs::remove_file(f);
-        }
-    }
     if let Some(name) = cfg.run_dir.file_name().map(|n| n.to_string_lossy().into_owned()) {
         cfg.run_dir = cfg.run_dir.with_file_name(format!("{name}-prepare-{}", stage.name()));
     }
@@ -172,13 +149,50 @@ pub fn setup(stage: Stage, cfg: &mut crate::Config) {
     cfg.headless = true;
     let threads = if cfg.prepare_threads > 0 { cfg.prepare_threads } else { std::thread::available_parallelism().map_or(4, |n| n.get() / 2).max(2) };
     let deadline = cfg.prepare_deadline.map(|s| std::time::UNIX_EPOCH + Duration::from_secs(s));
-    let _ = SETUP.set(Setup { stage, player_user: player.user, progress: cfg.progress.clone(), runtime, store, threads, chunk: cfg.prepare_chunk, deadline });
+    let _ = SETUP.set(Setup { stage, player_user: player.user.clone(), player_paths: player, progress: cfg.progress.clone(), runtime, store, threads, chunk: cfg.prepare_chunk, deadline });
+}
+
+/// The self-play's own files made ready (`start`: after the one-session lock, before the settings
+/// and saves are read): the player's PC settings (some choose shader variants: the upscaler, the
+/// Visual Mode), display choices and game folder copied, never their saves, key bindings or
+/// trophies; for a new game, no saves, trophies or title folders of an earlier one.
+fn prepare_files(s: &Setup) {
+    let paths = crate::paths();
+    let player = &s.player_paths;
+    let user = &paths.user;
+    let _ = std::fs::create_dir_all(user);
+    match std::fs::read_to_string(player.settings_file()) {
+        Ok(t) => {
+            let kept: String = t.lines().filter(|l| !PRIVATE_SETTINGS.iter().any(|k| l.trim_start().starts_with(k))).map(|l| format!("{l}\n")).collect();
+            let _ = std::fs::write(user.join("pcsettings.txt"), kept);
+        }
+        Err(_) => {
+            let _ = std::fs::remove_file(user.join("pcsettings.txt"));
+        }
+    }
+    for f in ["display.txt", "game.txt"] {
+        let src = player.user.join(f);
+        if src.is_file() {
+            let _ = std::fs::copy(&src, user.join(f));
+        } else {
+            let _ = std::fs::remove_file(user.join(f));
+        }
+    }
+    if s.stage == Stage::NewGame {
+        for d in [paths.saves(), paths.save_backups(), paths.runtime()] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        for f in [paths.save_folder_record(), paths.achievements_file()] {
+            let _ = std::fs::remove_file(f);
+        }
+    }
 }
 
 /// Starts the stage (`main`, once the log is open; before the title starts: the tour's
 /// automation is read at its boot): its driver thread plays it and ends the session.
 pub fn start(app: &Path) {
     let Some(s) = SETUP.get() else { return };
+    prepare_files(s);
     crate::log::tap_on();
     crate::info!(
         "prepare-play: stage {} (the shader preparation's self-play: no window, no sound, the system's controllers, keyboard and mouse left alone; its settings, saves and title folders in {})",
@@ -234,6 +248,7 @@ pub fn start(app: &Path) {
     // (`DS_PREPARE_BACKGROUND=0`: none, a test).
     if std::env::var("DS_PREPARE_BACKGROUND").ok().as_deref() != Some("0") {
         crate::gpu::compbench::background(app.to_path_buf(), s.threads);
+        BACKGROUND_ON.store(true, Relaxed);
     }
     let (stage, progress, store, app) = (s.stage, s.progress.clone(), s.store.clone(), app.to_path_buf());
     let spawned = std::thread::Builder::new().name("prepare-play".into()).spawn(move || {
@@ -272,6 +287,12 @@ pub fn start(app: &Path) {
             Err(End::Failed(why)) => {
                 crate::error!("prepare-play: stage {} could not go on: {why} (after {:.0} s)", stage.name(), p.t0.elapsed().as_secs_f64());
                 p.drain(60);
+                let last = SETUP.get().and_then(|s| s.chunk).is_none_or(|(i, n)| i == n) || past_deadline();
+                if stage == Stage::Tour && last {
+                    crate::gpu::compbench::background_stop();
+                    let b = &crate::gpu::compbench::BACKGROUND;
+                    crate::gpu::compbench::write_marker(&app, &store.join("prepared.txt"), b[1].load(Relaxed) as usize, b[0].load(Relaxed) as usize, b[2].load(Relaxed) as usize, p.t0.elapsed().as_secs_f64());
+                }
                 EXIT_FAILED
             }
         };
@@ -476,12 +497,14 @@ impl Play {
     /// kept as they are made, and this session ends after them.
     fn drain(&mut self, secs: u64) {
         let s = &crate::gpu::exec::draw::ASYNC_GFX_STATS;
-        let pending = || s[1].load(Relaxed).saturating_sub(s[3].load(Relaxed) + s[7].load(Relaxed));
+        // (The workers' own state: their statistics leave out jobs dropped as made meanwhile, and
+        // the arithmetic of them never reached 0, the whole limit waited at every end.)
+        let idle = crate::gpu::exec::draw::async_gfx_idle;
         let t = Instant::now();
-        while pending() > 0 && t.elapsed() < Duration::from_secs(secs) {
+        while !idle() && t.elapsed() < Duration::from_secs(secs) && self.check_stop().is_ok() {
             std::thread::sleep(Duration::from_millis(250));
         }
-        crate::info!("prepare-play: {} graphics pipelines queued, {} made, {} failed, {} still queued", s[1].load(Relaxed), s[3].load(Relaxed), s[7].load(Relaxed), pending());
+        crate::info!("prepare-play: {} graphics pipelines queued, {} made, {} failed; the workers {} ({:.0} s waited)", s[1].load(Relaxed), s[3].load(Relaxed), s[7].load(Relaxed), if idle() { "idle" } else { "still busy" }, t.elapsed().as_secs_f64());
     }
 
     /// Waits up to `secs` for a line matching any of `pats` from line `at` on.
@@ -692,6 +715,9 @@ impl Play {
     /// it too: Err).
     fn compute_tail(&mut self) -> Result<(), End> {
         let b = &crate::gpu::compbench::BACKGROUND;
+        if !BACKGROUND_ON.load(Relaxed) {
+            return Ok(());
+        }
         let t = Instant::now();
         let left = || b[0].load(Relaxed).saturating_sub(b[1].load(Relaxed));
         crate::info!("prepare-play: the background compute preparation has {} of {} items left", left(), b[0].load(Relaxed));
@@ -835,8 +861,7 @@ fn tour_script(app: &Path) -> Result<(String, u32), String> {
 ///   the "Enter fog" prompt, `Play::tour`), then fighting it;
 /// - every fourth of its area points that place the player (world 1's), each a walk and a fight;
 /// - the camera at its screenshot positions, `dirs` headings each;
-/// - the gameplay camera back (`ToggleDebugCamera`), every enemy's death at once
-///   (`cp11_allSuicideExceptPlayer`).
+/// - the gameplay camera back (`ToggleDebugCamera`).
 /// Each step prints `dsport-tour: step <n> (<what>)`, each level `dsport-tour: level <w>-<l>`.
 fn levels_lines(text: &str, poi_text: &str, o: &LevelOpts) -> Option<(String, u32)> {
     let (per_level, dirs) = (o.per_level, o.dirs);
@@ -883,7 +908,7 @@ fn levels_lines(text: &str, poi_text: &str, o: &LevelOpts) -> Option<(String, u3
     // main menu and the save's load, ~50-80 s.)
     let mut out: Vec<String> = [
         "// The shader preparation's levels (written by the game's self-play from misc/automation/demonssoulsscreenshots.txt and misc/dspointsofinterest.txt)",
-        "wait 90.0",
+        "wait 120.0",
         "waitForLevelLoading",
         "waitForResourceLoading",
         "print \"dsport-tour: start\"",
@@ -1019,11 +1044,14 @@ fn levels_lines(text: &str, poi_text: &str, o: &LevelOpts) -> Option<(String, u3
         }
         // The gameplay camera back (`SetCameraPos` turns the debug camera on, and it stays on
         // through level loads: the next level's walk looked into the void, -211521).
-        out.extend(["+ToggleDebugCamera", "wait 0.5"].map(String::from));
-        // Every enemy's death at once (its boss's too: "Demon Vanquished").
-        out.push("+cp11_allSuicideExceptPlayer".into());
-        out.push(w(4.0));
-        shot(&mut out, format!("lv{ftag}_deaths"));
+        if !picked.is_empty() {
+            out.extend(["+ToggleDebugCamera", "wait 0.5"].map(String::from));
+        }
+        // (No `cp11_allSuicideExceptPlayer`, every enemy's death at once: after it and a teleport
+        // the title's physics wrote through a freed object at eboot+0x15d5605, the known
+        // kill-all fault of FINDINGS.md 2026-11-16, at the next level's boss door, -230554. The
+        // fights' kills give the deaths' effects.)
+        shot(&mut out, format!("lv{ftag}_end"));
     }
     out.push("print \"dsport-tour: done\"".into());
     out.push(String::new());
@@ -1071,8 +1099,8 @@ mod tests {
         assert!(s.contains("posX=1.00 posY=2.00 posZ=3.00 eulerX=-5.00 eulerY=30.00 eulerZ=0.00"));
         assert!(s.contains("dsport-tour: step 19 (boss 3-1 Boss C)") && s.ends_with("print \"dsport-tour: done\"\n"));
         assert_eq!(s.matches("dsport-textreset").count(), 2);
-        // The gameplay camera back after each level's views.
-        assert_eq!(s.matches("+ToggleDebugCamera").count(), 3);
+        // The gameplay camera back after each level's views (3-1 has none: no toggle).
+        assert_eq!(s.matches("+ToggleDebugCamera").count(), 2);
         // 2-1 alone: its start, its cutscene, one position's two headings.
         let (_, one) = super::levels_lines(text, poi, &o(1, 2, vec![(2, 1)])).unwrap();
         assert_eq!(one, 4);

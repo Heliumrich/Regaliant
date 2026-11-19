@@ -8,8 +8,9 @@ player's own game files on Windows.
 - The game's own program runs on the PC's processor. Its system calls, audio, saves, controllers
   and video output are reimplemented for Windows. Its graphics commands and shaders run on Vulkan.
 - A launcher checks the game files and their version, sets the display (window mode, monitor,
-  resolution, refresh rate, render scale, frame rate limit), prepares the shaders ahead, lists save
-  backups and restores them, and starts the game. It also offers a safe mode, a settings reset and
+  resolution, refresh rate, render scale, frame rate limit), prepares the shaders ahead (the game
+  plays a new game and then its levels, enemies, bosses and cutscenes by itself in the background,
+  hidden and silent, within an hour), lists save backups and restores them, and starts the game. It also offers a safe mode, a settings reset and
   a button that opens the Discord invite.
 - PC settings inside the game's own menus (SETTINGS > PC): window mode with monitor, resolution and
   refresh rate, HDR, aspect ratios up to 32:9, render scale, sharpening, quality presets,
