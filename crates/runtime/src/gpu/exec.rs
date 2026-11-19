@@ -308,7 +308,7 @@ fn note_gens() -> [u64; 4] {
 pub static FAST_CLEARS_KNOWN: AtomicU64 = AtomicU64::new(0);
 /// Pending clears whose metadata, read from memory, held more than one code (other data, not
 /// a clear; `Exec::record_fast_clears`): refused, and applied with the value of the fill
-/// whose clear an unknown write had replaced (`images::fill_before`).
+/// whose clear an unknown write had replaced (`images::PendingClear`'s kept value).
 pub static FAST_CLEARS_NOT_UNIFORM: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// Block-compressed textures refreshed from GPU-written block views.
 pub static BLOCK_COPIES: AtomicU64 = AtomicU64::new(0);
@@ -1143,6 +1143,46 @@ fn note_submit_hazards(name: &str, ups: &[(u64, u64)]) {
 /// A/B at the vista: x1.001 (level).
 const TINY_SNAP_BYTES: u64 = 256;
 
+/// The title's immediate-mode vertex program (code hash): the engine's 2D primitives,
+/// positions already in clip space (w 1) and a colour per vertex, ~106 non-indexed draws of 4-6
+/// vertices a frame (HUD and overlay quads). The CPU writes their vertices into a block of a
+/// per-frame allocator just before each frame's submission (the buffer descriptors cover the
+/// rest of the block, 3,072 records); front end 2's mirror served other bytes for those pages
+/// in about one frame in 1,500 with the player's save in the Nexus, and the quads became huge
+/// flat-coloured triangles and screen halves (FINDINGS.md 2026-11-19). Their vertex buffers
+/// are bound from a snapshot of the bytes each draw reads, taken as it is recorded
+/// (`DS_IMM_SNAP=0`: the mirror, as before).
+const IMM_PROGS: [u64; 1] = [0x7536_75b8_fbec_e491];
+
+fn imm_snap_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_IMM_SNAP").ok().as_deref() != Some("0"))
+}
+
+/// Whether the program with this code hash binds its vertex buffers from snapshots: the
+/// immediate-mode program (`IMM_PROGS`), and for diagnosis `DS_SNAP_PROGS=<hex code
+/// hash>[;...]` (2026-11-19).
+fn snap_prog(h: u64) -> bool {
+    static S: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    let v = S.get_or_init(|| std::env::var("DS_SNAP_PROGS").map_or(Vec::new(), |v| v.split(';').filter_map(|x| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok()).collect()));
+    (imm_snap_on() && IMM_PROGS.contains(&h)) || (!v.is_empty() && v.contains(&h))
+}
+
+/// `snap_prog`'s programs' vertex buffers: [not bound from a snapshot, bound from one].
+pub(crate) static SNAP_PROG_BINDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+thread_local! {
+    /// The draw being recorded, when it is non-indexed and of one instance: its first vertex
+    /// and vertex count (`exec/draw.rs` sets it around the draw): the bytes a vertex buffer
+    /// indexed by the vertex reads (`snap_prog`'s snapshots).
+    static SNAP_VERTS: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Sets `SNAP_VERTS` for the draw about to be recorded (None after it).
+pub(super) fn set_snap_verts(v: Option<(u64, u64)>) {
+    SNAP_VERTS.with(|c| c.set(v));
+}
+
 /// Tiny read-only buffers bound as snapshots of guest memory
 /// (`TINY_SNAP_BYTES`).
 pub(crate) static TINY_SNAPS: AtomicU64 = AtomicU64::new(0);
@@ -1301,6 +1341,40 @@ pub fn lod_stats_words(slot: usize) -> Vec<u32> {
     unsafe { std::slice::from_raw_parts(p, n).to_vec() }
 }
 
+/// The vertex outlier census's counts at the last `outlier_note` (`shaders::vs_outlier`).
+static OUTLIER_LAST: Mutex<Option<(Vec<u32>, Option<std::fs::File>)>> = Mutex::new(None);
+
+/// Diagnosis (`DS_VS_OUTLIER`): the census slots whose count moved since the last call, one line
+/// each into outliers.txt in the run directory: ms, flip, program code hash, vertices since,
+/// the largest magnitude so far and a sample position (x, y, z, w).
+pub fn outlier_note(ms: f64, flip: u64) {
+    use rdna::translate::{OUTLIER_SLOTS, OUTLIER_STRIDE};
+    use std::io::Write;
+    if super::shaders::vs_outlier().is_none() {
+        return;
+    }
+    let p = fixed().debug_ptr as *const u32;
+    let mut g = OUTLIER_LAST.lock();
+    let (last, file) = g.get_or_insert_with(|| (vec![0u32; OUTLIER_SLOTS as usize], crate::run_dir().and_then(|d| std::fs::File::create(d.join("outliers.txt")).ok())));
+    let mut out = String::new();
+    for (s, l) in last.iter_mut().enumerate() {
+        let base = s * OUTLIER_STRIDE as usize;
+        let n = unsafe { std::ptr::read_volatile(p.add(base + 2)) };
+        if n == *l {
+            continue;
+        }
+        let d = n.wrapping_sub(*l);
+        *l = n;
+        let w: Vec<u32> = (0..OUTLIER_STRIDE as usize).map(|k| unsafe { std::ptr::read_volatile(p.add(base + k)) }).collect();
+        let tag = (w[1] as u64) << 32 | w[0] as u64;
+        let f = |x: u32| f32::from_bits(x);
+        out += &format!("{ms:.1} {flip} {tag:#018x} {d} {:.3e} {:.3e} {:.3e} {:.3e} {:.3e}\n", f(w[3]), f(w[4]), f(w[5]), f(w[6]), f(w[7]));
+    }
+    if let (Some(fl), false) = (file.as_mut(), out.is_empty()) {
+        let _ = fl.write_all(out.as_bytes());
+    }
+}
+
 /// Contents of the register-dump buffer (`DS_DUMP`); `clear` zeroes it
 /// (call with no GPU work using it in flight).
 pub fn debug_dump(clear: bool) -> Vec<u32> {
@@ -1350,6 +1424,9 @@ fn fixed() -> &'static Fixed {
         let (dummy, _) = c.device_buffer(DUMMY_BYTES, usage).expect("dummy buffer");
         let (zero, _) = c.device_buffer(ZERO_PAGE_BYTES, usage).expect("zero page");
         let (debug, _, debug_ptr) = c.host_buffer(rdna::translate::DUMP_DWORDS as u64 * 4, usage).expect("debug buffer");
+        if super::shaders::vs_outlier().is_some() {
+            unsafe { std::ptr::write_bytes(debug_ptr, 0, rdna::translate::DUMP_DWORDS as usize * 4) };
+        }
         let (lodstats, _) = c.device_buffer(super::lodstats::SLOT_BYTES, usage).expect("LOD statistics buffer");
         let (lod_readback, _, lod_readback_ptr) = c.host_buffer(super::lodstats::SLOT_BYTES * super::lodstats::RING as u64, usage).expect("LOD statistics readback");
         let (watchdog, _, watchdog_ptr) = c.host_buffer(rdna::translate::WATCHDOG_DWORDS as u64 * 4, usage).expect("watchdog buffer");
@@ -8225,7 +8302,7 @@ pub struct HeldChunk {
     /// notes (fast clears pending, images overwritten).
     pub reads: Vec<(u64, u64)>,
     pub keys: HashSet<super::images::ImageKey>,
-    pub clears: HashMap<super::images::ImageKey, (u64, Option<u32>)>,
+    pub clears: HashMap<super::images::ImageKey, super::images::PendingClear>,
     pub over: HashSet<super::images::ImageKey>,
     /// Front end 2: the ranges its checks placed, the pages its batches upload, the oldest
     /// epoch its checks wanted (`Exec::past_current_for`).
@@ -10912,7 +10989,7 @@ pub struct Exec {
     /// Its own image-cache notes (`Images::notes_for`), never in the image
     /// cache before a hand-over: fast clears pending (metadata address,
     /// value when known) and GPU-owned images overwritten by its work.
-    held_clears: HashMap<super::images::ImageKey, (u64, Option<u32>)>,
+    held_clears: HashMap<super::images::ImageKey, super::images::PendingClear>,
     held_over: HashSet<super::images::ImageKey>,
     /// The images its commands used.
     held_keys: HashSet<super::images::ImageKey>,
@@ -14127,8 +14204,9 @@ impl Exec {
                                 crate::info!("gpu[{}]: page memo check: {base:#x}+{size:#x} (written {written}) answered {result:x?}, placed {full:x?}", self.name);
                             }
                         }
-                        if work && PAGE_MEMO_CHECKS[2].load(Ordering::Relaxed) <= 20 {
-                            crate::info!("gpu[{}]: page memo check: {base:#x}+{size:#x} (written {written}) answered from the memo, but the full placement had work to do", self.name);
+                        if work && PAGE_MEMO_CHECKS[2].load(Ordering::Relaxed) <= 400 {
+                            let pw = pending_writes(base, size.max(1));
+                            crate::info!("gpu[{}]: page memo check: {base:#x}+{size:#x} (written {written}) answered from the memo, but the full placement had work to do (a writer in flight: {pw:?}, done now {}, batch {})", self.name, done_now(), self.batch_count);
                         }
                     }
                     self.fe2_memo_answer(base, size, written, want);
@@ -15587,7 +15665,7 @@ impl Exec {
                 self.stop("fast clear (the current frame's)");
                 return;
             }
-            let mine: Vec<(super::images::ImageKey, u64, Option<u32>)> = keys.iter().filter_map(|k| self.held_clears.get(k).map(|&(m, v)| (*k, m, v))).collect();
+            let mine: Vec<(super::images::ImageKey, u64, Option<u32>, Option<u32>)> = keys.iter().filter_map(|k| self.held_clears.get(k).map(|&(m, v, kept)| (*k, m, v, kept))).collect();
             if mine.is_empty() {
                 return;
             }
@@ -15598,7 +15676,7 @@ impl Exec {
             for x in &mine {
                 self.held_clears.remove(&x.0);
             }
-            let clears = super::images::with(|im| mine.iter().filter_map(|&(k, m, v)| im.fast_clear_of(k, m, v)).collect::<Vec<_>>());
+            let clears = super::images::with(|im| mine.iter().filter_map(|&(k, m, v, kept)| im.fast_clear_of(k, m, v, kept)).collect::<Vec<_>>());
             self.end_rendering();
             self.record_fast_clears(clears, false);
             return;
@@ -15661,7 +15739,7 @@ impl Exec {
                     }
                     // (A fill's clear an unknown write replaced: other data over the block
                     // leaves it standing, a later clear of one code replaces it.)
-                    let before = super::images::fill_before(c.key, c.meta);
+                    let before = c.kept;
                     if let Some(first) = super::images::uniform_word(&words[..n as usize / 4]) {
                         first
                     } else if let Some(v) = before {
@@ -18072,8 +18150,8 @@ impl Exec {
             self.held_kinds.resize(self.held_reads.len(), u8::MAX);
         }
         self.held_keys.extend(h.keys.iter().copied());
-        for (k, v) in &h.clears {
-            super::images::merge_clear(&mut self.held_clears, *k, v.0, v.1);
+        for (k, &e) in &h.clears {
+            super::images::merge_pending(&mut self.held_clears, *k, e);
         }
         self.held_over.extend(h.over.iter().copied());
         if self.past_grow {
@@ -18589,7 +18667,27 @@ impl Exec {
                         // The copy kernel's (`tune copy_snap`); another tiny buffer only when
                         // nothing places it (below). (From 2026-11-09 to 11-17 a snapshot was
                         // taken of every tiny buffer and the mirror bound all the same.)
-                        let mut tiny = if tiny_ok && super::tune::copy_snap() && super::forward::is_copy_hash(p.code_hash) { self.snapshot_as(base, size, 4096, false) } else { None };
+                        // The immediate-mode program's vertex buffers (`snap_prog`): a snapshot of
+                        // the bytes the draw reads (its vertices by their index), at most 4 KiB.
+                        let listed = snap_prog(p.code_hash) && read_only && super::fe2::on() && !super::resident::mirror_mode();
+                        let imm = if listed {
+                            match (res_i, SNAP_VERTS.with(|c| c.get())) {
+                                (Resolved::Buffer(v), Some((first, count))) => Some((first + count) * v.stride as u64).filter(|&n| n > 0 && n <= 4096),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(n) = imm {
+                            size = size.min(n.next_multiple_of(16));
+                        }
+                        let mut tiny = if (tiny_ok && super::tune::copy_snap() && super::forward::is_copy_hash(p.code_hash)) || imm.is_some() { self.snapshot_as(base, size, 4096, false) } else { None };
+                        if listed {
+                            let k = SNAP_PROG_BINDS[tiny.is_some() as usize].fetch_add(1, Ordering::Relaxed);
+                            if k < 4 {
+                                crate::info!("gpu[{}]: immediate-mode program {:#018x}: {base:#x}+{size:#x} {}", self.name, p.code_hash, if tiny.is_some() { "bound from a snapshot" } else if imm.is_none() { "not a draw's vertex buffer it can size (the mirror)" } else { "not snapshotted (pending writes, a held batch or no space)" });
+                            }
+                        }
                         let from_mirror = if tiny.is_some() {
                             None
                         } else if super::resident::mirror_mode() {

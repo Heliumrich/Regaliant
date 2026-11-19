@@ -277,6 +277,7 @@ impl Watch {
             }
         }
         STATS[0].fetch_add(1, Relaxed);
+        super::super::exec::outlier_note(t as f64, self.pending_flip[slot] as u64);
         if let Some(f) = self.file.as_mut() {
             let mut rec = Vec::with_capacity(4 + CELLS);
             rec.extend_from_slice(&(t as f32).to_le_bytes());

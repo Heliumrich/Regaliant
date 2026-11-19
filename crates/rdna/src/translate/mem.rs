@@ -3495,6 +3495,59 @@ pub fn export(tr: &mut T, ins: &Inst) -> R<()> {
                 let ni = e(tr.b.logical_or(bt, None, n, i))?;
                 bad = e(tr.b.logical_or(bt, None, bad, ni))?;
             }
+            // Diagnosis (`Spec::outlier`): finite positions counted in the program's census
+            // slots: beyond the threshold (|x|, |y| or |w|) under the code hash, and with |w|
+            // under 1e-4 (points at or near infinity, all-zero ones too) under the hash with its
+            // lowest bit flipped.
+            if let (Some((tbits, tag)), Some(buf)) = (tr.spec.outlier, tr.dump_buf) {
+                let f = tr.t.f32;
+                let u = tr.t.u32;
+                let ax = tr.glsl1(f, GLOp::FAbs, cs[0])?;
+                let ay = tr.glsl1(f, GLOp::FAbs, cs[1])?;
+                let aw = tr.glsl1(f, GLOp::FAbs, cs[3])?;
+                let m1 = tr.glsl2(f, GLOp::FMax, ax, ay)?;
+                let m = tr.glsl2(f, GLOp::FMax, m1, aw)?;
+                let t = tr.f(f32::from_bits(tbits));
+                let over = e(tr.b.f_ord_greater_than(bt, None, m, t))?;
+                let tiny = tr.f(1.0e-4);
+                let wz = e(tr.b.f_ord_less_than(bt, None, aw, tiny))?;
+                let fin = e(tr.b.logical_not(bt, None, bad))?;
+                let live = e(tr.b.logical_and(bt, None, fin, act))?;
+                let mu = tr.to_u(m)?;
+                let mut raw = Vec::with_capacity(4);
+                for &c in &cs {
+                    raw.push(tr.to_u(c)?);
+                }
+                for (class_tag, c) in [(tag, over), (tag ^ 1, wz)] {
+                    let cond = e(tr.b.logical_and(bt, None, c, live))?;
+                    let base = super::outlier_slot(class_tag) * super::OUTLIER_STRIDE;
+                    tr.guarded(cond, &mut |tr| {
+                        let z = tr.u(0);
+                        let at = |tr: &mut T, k: u32| -> R<Word> {
+                            let i = tr.u(base + k);
+                            e(tr.b.access_chain(tr.t.sb_u32, None, buf, [z, i]))
+                        };
+                        let p0 = at(tr, 0)?;
+                        let lo = tr.u(class_tag as u32);
+                        ok(tr.b.store(p0, lo, None, []))?;
+                        let p1 = at(tr, 1)?;
+                        let hi = tr.u((class_tag >> 32) as u32);
+                        ok(tr.b.store(p1, hi, None, []))?;
+                        let scope = tr.u(spirv::Scope::Device as u32);
+                        let sem = tr.u(0);
+                        let one = tr.u(1);
+                        let p2 = at(tr, 2)?;
+                        e(tr.b.atomic_i_add(u, None, p2, scope, sem, one))?;
+                        let p3 = at(tr, 3)?;
+                        e(tr.b.atomic_u_max(u, None, p3, scope, sem, mu))?;
+                        for (k, &v) in raw.iter().enumerate() {
+                            let p = at(tr, 4 + k as u32)?;
+                            ok(tr.b.store(p, v, None, []))?;
+                        }
+                        Ok(())
+                    })?;
+                }
+            }
             for (k, c) in cs.iter_mut().enumerate() {
                 let o = tr.f([0.0, 0.0, -1.0, 1.0][k]);
                 *c = e(tr.b.select(tr.t.f32, None, bad, o, *c))?;

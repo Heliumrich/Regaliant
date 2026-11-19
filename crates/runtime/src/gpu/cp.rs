@@ -7016,13 +7016,16 @@ impl Cp {
             super::exec::journal_write(dst, if daic { 4 } else { bytes as u64 }, &self.name, src, u32::MAX, "CP DMA", false);
         }
         if super::exec::enabled() {
+            // (Held: the packet's effect is dropped and it runs again later, `effect`; its value
+            // is noted then, a note now would let another queue's use apply it first.)
+            let held = self.held.is_some();
             super::images::with(|im| {
                 im.note_meta_writes(&[(dst, if daic { 4 } else { bytes as u64 })]);
                 im.note_overwrites(&[(dst, if daic { 4 } else { bytes as u64 })]);
                 // A fill of memory with an immediate dword of one byte value (a clear code): a
                 // fast clear over metadata it covers has that value, no read after the GPU
                 // work; other dwords are other data, read at the image's use (2026-11-18 night).
-                if src_sel == 2 && dst_sel == 0 && !das && !daic && super::images::uniform_word(&[src as u32]).is_some() {
+                if !held && src_sel == 2 && dst_sel == 0 && !das && !daic && super::images::uniform_word(&[src as u32]).is_some() {
                     im.note_meta_fill(dst, bytes, src as u32);
                 }
             });

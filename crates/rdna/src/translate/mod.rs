@@ -476,6 +476,11 @@ pub struct Spec {
     /// address block's header, dwords 2-3), outside the span the zero page,
     /// uncounted (`report_miss`).
     pub pt_linear: bool,
+    /// Diagnosis (vertex stage): (a threshold as f32 bits, the program's code hash): every
+    /// vertex whose exported position is finite with |x|, |y| or |w| above the threshold counts
+    /// in the debug binding's slot of the hash ([`outlier_slot`], [`OUTLIER_STRIDE`]): the
+    /// hash, a count, the largest magnitude and a sample position.
+    pub outlier: Option<(u32, u64)>,
 }
 
 /// The guest page table of GPU-resolved chains (`Spec::gpu_loads`,
@@ -634,6 +639,11 @@ impl std::hash::Hash for Spec {
         if self.bary_gs {
             0x4247_5348u32.hash(state);
         }
+        if let Some((t, tag)) = self.outlier {
+            0x4F55_544Cu32.hash(state);
+            t.hash(state);
+            tag.hash(state);
+        }
     }
 }
 
@@ -682,6 +692,17 @@ pub const DUMP_DWORDS: u32 = 8192 * DUMP_STRIDE;
 pub const DUMP_POS: u32 = 1 << 31;
 /// Vertex slots per instance of a positions-only dump.
 pub const DUMP_POS_VERTICES: u32 = 64;
+
+/// The vertex outlier census (`Spec::outlier`): slots of the debug binding, `OUTLIER_STRIDE`
+/// dwords each: [code hash low, high, vertices counted, the largest magnitude (f32 bits), a
+/// sample position x, y, z, w (f32 bits)].
+pub const OUTLIER_SLOTS: u32 = 32768;
+pub const OUTLIER_STRIDE: u32 = 8;
+
+/// The census slot of a program's code hash (`Spec::outlier`).
+pub fn outlier_slot(tag: u64) -> u32 {
+    (tag.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 49) as u32 & (OUTLIER_SLOTS - 1)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BindingKind {
@@ -2858,7 +2879,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         tr.decorate_binding(v, bnd);
         tr.watchdog = Some(v);
     }
-    if spec.dump.is_some() && matches!(spec.stage, Stage::Compute | Stage::Vertex) {
+    if (spec.dump.is_some() && matches!(spec.stage, Stage::Compute | Stage::Vertex)) || (spec.outlier.is_some() && matches!(spec.stage, Stage::Vertex)) {
         let v = tr.sb_var();
         let bnd = tr.alloc_binding(BindingKind::Debug);
         tr.decorate_binding(v, bnd);
@@ -4525,6 +4546,7 @@ mod tests {
             gpu_loads: 0,
             gpu_res: 0,
             pt_linear: false,
+            outlier: None,
         }
     }
 

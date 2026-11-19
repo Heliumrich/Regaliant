@@ -1414,6 +1414,19 @@ impl Exec {
                 return "skipped (`DS_SKIP_DEPTH`)".into();
             }
         }
+        // Diagnosis (`DS_SKIP_NGG` / `DS_SKIP_PS=<hex lo>-<hex hi>[;...]`, 2026-11-19): draws
+        // whose NGG or pixel program's code hash lies in a listed range left out (the Nexus
+        // triangles' bisection by program: code hashes are the same in every boot, the
+        // programs' addresses are not).
+        if skip_progs_on() && skip_by_program(cp) {
+            DRAW_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            return "skipped (`DS_SKIP_NGG` / `DS_SKIP_PS`)".into();
+        }
+        if let Some(t) = imm_check() {
+            if shaders::ngg_addr(cp) == t {
+                imm_check_draw(cp, &args, t);
+            }
+        }
         let t_prog = super::prog_census().then(std::time::Instant::now);
         self.census_kind = 0;
         // Menu & HUD Size: the interface layer scaled before the title composites it.
@@ -1423,7 +1436,10 @@ impl Exec {
                 self.scale_ui_layer(cp);
             }
         }
+        // (The vertices a non-indexed draw of one instance reads: `snap_prog`'s snapshots.)
+        set_snap_verts(if args.index.is_none() && args.instances == 1 { Some((args.base_vertex.unwrap_or_else(|| ctx_reg(cp, 0x28408) as i32).max(0) as u64, args.count as u64)) } else { None });
         let r = self.draw_inner(cp, &args);
+        set_snap_verts(None);
         self.ui_sub = None;
         self.ui_job = None;
         if let Some(t) = t_prog {
@@ -3819,6 +3835,147 @@ fn note_draw_diff(last: &mut [u64; 5], sig: [u64; 5], consecutive: bool) -> usiz
     }
     *last = sig;
     k
+}
+
+/// Diagnosis (`DS_IMM_CHECK=<hex vertex program address>`, 2026-11-19): that program's draws (a
+/// pass-through vertex program: position xyz through the buffer descriptor in user data 0-3,
+/// colour xyzw through 4-7) have their positions read from guest memory as they are recorded;
+/// non-finite ones and ones beyond 1e3 are logged (`imm check:`), with the first draws' as
+/// samples.
+fn imm_check() -> Option<u64> {
+    static D: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *D.get_or_init(|| std::env::var("DS_IMM_CHECK").ok().and_then(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()))
+}
+
+/// `DS_IMM_CHECK`: [draws checked, draws with a bad position, lines logged, rechecks, data
+/// changed at a recheck, changes logged].
+pub static IMM_CHECKS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// `DS_IMM_CHECK`'s recheck: the checked draws' positions as recorded (draw number, ms, base,
+/// the first four vertices' 48 bytes), looked at again 4-40 ms later.
+static IMM_SNAPS: parking_lot::Mutex<std::collections::VecDeque<(u64, f64, u64, [u32; 12])>> = parking_lot::Mutex::new(std::collections::VecDeque::new());
+
+fn imm_recheck(now: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut g = IMM_SNAPS.lock();
+    while let Some(&(k, at, base, then)) = g.front() {
+        if now - at < 4.0 {
+            break;
+        }
+        g.pop_front();
+        if now - at > 40.0 || !super::super::cp::guest_readable(base, 48) {
+            continue;
+        }
+        let cur: [u32; 12] = std::array::from_fn(|i| unsafe { std::ptr::read_volatile((base + 4 * i as u64) as *const u32) });
+        IMM_CHECKS[3].fetch_add(1, Relaxed);
+        if cur != then {
+            IMM_CHECKS[4].fetch_add(1, Relaxed);
+            if IMM_CHECKS[5].fetch_add(1, Relaxed) < 300 {
+                let f = |w: &[u32; 12]| w.chunks(3).map(|c| format!("{:.3},{:.3},{:.3}", f32::from_bits(c[0]), f32::from_bits(c[1]), f32::from_bits(c[2]))).collect::<Vec<_>>().join(" ");
+                crate::info!("imm recheck: draw {k} at {base:#x} changed {:.1} ms after it was recorded: then {}; now {}", now - at, f(&then), f(&cur));
+            }
+        }
+    }
+}
+
+fn imm_check_draw(cp: &Cp, args: &DrawArgs, prog: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let ud = |i: u32| cp.reg(Space::Sh, 0x8C + i);
+    let (d0, d1, d2, d3) = (ud(0), ud(1), ud(2), ud(3));
+    let base = d0 as u64 | ((d1 & 0xFFFF) as u64) << 32;
+    let stride = ((d1 >> 16) & 0x3FFF) as u64;
+    let n = args.count.min(16) as u64;
+    let first = args.base_vertex.unwrap_or(0).max(0) as u64;
+    let k = IMM_CHECKS[0].fetch_add(1, Relaxed);
+    let mut bad = Vec::new();
+    let mut all = Vec::new();
+    for i in 0..n {
+        let a = base + (first + i) * stride;
+        if !super::super::cp::guest_readable(a, 12) {
+            bad.push(format!("v{i} unreadable at {a:#x}"));
+            continue;
+        }
+        let p: [f32; 3] = unsafe { [std::ptr::read_volatile(a as *const f32), std::ptr::read_volatile((a + 4) as *const f32), std::ptr::read_volatile((a + 8) as *const f32)] };
+        if p.iter().any(|x| !x.is_finite() || x.abs() > 1e3) {
+            bad.push(format!("v{i} {p:?} at {a:#x}"));
+        }
+        all.push(format!("{:.3},{:.3},{:.3}", p[0], p[1], p[2]));
+    }
+    let cbase = ud(4) as u64 | ((ud(5) & 0xFFFF) as u64) << 32;
+    let now = crate::log::elapsed_ms();
+    imm_recheck(now);
+    if stride == 12 && n >= 4 && super::super::cp::guest_readable(base + first * 12, 48) {
+        let a = base + first * 12;
+        let snap: [u32; 12] = std::array::from_fn(|i| unsafe { std::ptr::read_volatile((a + 4 * i as u64) as *const u32) });
+        let mut g = IMM_SNAPS.lock();
+        if g.len() < 4096 {
+            g.push_back((k, now, a, snap));
+        }
+    }
+    if !bad.is_empty() {
+        IMM_CHECKS[1].fetch_add(1, Relaxed);
+        if IMM_CHECKS[2].fetch_add(1, Relaxed) < 300 {
+            crate::info!("imm check: draw {k} of {prog:#x}: V# {d0:08x} {d1:08x} {d2:08x} {d3:08x} (base {base:#x}, stride {stride}, colours at {cbase:#x}), count {} first {first}: bad {}; all {}", args.count, bad.join("; "), all.join(" "));
+        }
+    } else if k < 6 || k % 20000 == 0 {
+        crate::info!("imm check: draw {k} of {prog:#x} (sample): V# {d0:08x} {d1:08x} {d2:08x} {d3:08x} (base {base:#x}, stride {stride}, colours at {cbase:#x}), count {} first {first}: {}", args.count, all.join(" "));
+    }
+}
+
+/// `DS_SKIP_NGG` / `DS_SKIP_PS`: code-hash ranges `[lo, hi)` (a single hash stands for itself).
+fn skip_ranges() -> &'static (Vec<(u64, u64)>, Vec<(u64, u64)>) {
+    static S: std::sync::OnceLock<(Vec<(u64, u64)>, Vec<(u64, u64)>)> = std::sync::OnceLock::new();
+    S.get_or_init(|| {
+        let p = |s: &str| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+        let ranges = |var: &str| -> Vec<(u64, u64)> {
+            std::env::var(var).map_or(Vec::new(), |v| {
+                v.split(';')
+                    .filter(|e| !e.trim().is_empty())
+                    .filter_map(|e| match e.split_once('-') {
+                        Some((a, b)) => Some((p(a)?, p(b)?)),
+                        None => p(e).map(|a| (a, a.saturating_add(1))),
+                    })
+                    .collect()
+            })
+        };
+        let r = (ranges("DS_SKIP_NGG"), ranges("DS_SKIP_PS"));
+        if !r.0.is_empty() || !r.1.is_empty() {
+            crate::info!("gpu: draws left out by program code hash (`DS_SKIP_NGG` {:x?}, `DS_SKIP_PS` {:x?})", r.0, r.1);
+        }
+        r
+    })
+}
+
+fn skip_progs_on() -> bool {
+    let r = skip_ranges();
+    !r.0.is_empty() || !r.1.is_empty()
+}
+
+thread_local! {
+    /// Programs this thread has left out (each logged once a thread).
+    static SKIPPED_PROGS: std::cell::RefCell<std::collections::HashSet<u64>> = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+fn skip_by_program(cp: &Cp) -> bool {
+    let (ngg, ps) = skip_ranges();
+    let inside = |r: &[(u64, u64)], addr: u64| -> Option<u64> {
+        if r.is_empty() || addr == 0 {
+            return None;
+        }
+        let h = super::super::shaders::program_hash(addr).ok()?;
+        r.iter().any(|&(lo, hi)| h >= lo && h < hi).then_some(h)
+    };
+    let (na, pa) = (shaders::ngg_addr(cp), shaders::ps_addr(cp));
+    let hit = inside(ngg, na).map(|h| ("NGG", h, na)).or_else(|| inside(ps, pa).map(|h| ("pixel", h, pa)));
+    match hit {
+        Some((k, h, a)) => {
+            if SKIPPED_PROGS.with(|s| s.borrow_mut().insert(h)) {
+                crate::info!("gpu: draws of the {k} program {h:#018x} (at {a:#x}) left out");
+            }
+            true
+        }
+        None => false,
+    }
 }
 
 fn skip_depth() -> Option<u64> {

@@ -2148,6 +2148,7 @@ fn cs_spec(addr: u64, rsrc2: u32, local: [u32; 3], wave64: bool, code_hash: u64)
         gpu_loads: 0,
         gpu_res: 0,
         pt_linear: false,
+        outlier: None,
     };
     if super::tune::per_lane() != 0 && per_lane_program(code_hash) && !plain_modes() {
         let votes = lane_votes_program(code_hash);
@@ -2762,6 +2763,7 @@ fn ps_spec(addr: u64, rsrc2: u32, ctx: &dyn Fn(u32) -> u32) -> Spec {
         gpu_loads: 0,
         gpu_res: 0,
         pt_linear: false,
+        outlier: None,
     };
     if spec.batched {
         if let Some((l, r)) = gpu_draw_masks_now(1) {
@@ -2856,6 +2858,44 @@ pub fn set_probe(v: &str) -> Result<(), String> {
     *PROBE.lock() = Some(p);
     PROBE_ON.store(p.is_some(), std::sync::atomic::Ordering::Relaxed);
     Ok(())
+}
+
+/// Diagnosis (`DS_VS_OUTLIER=<threshold>`, 2026-11-19): every vertex program counts the vertices
+/// it exports with |x|, |y| or |w| of the clip position above the threshold, in its census slot
+/// (`rdna::translate::OUTLIER_SLOTS`; `exec::outlier_note` writes the counts that moved each
+/// frame to outliers.txt in the run directory). The f32 bits.
+pub fn vs_outlier() -> Option<u32> {
+    static T: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var("DS_VS_OUTLIER").ok().and_then(|v| v.trim().parse::<f32>().ok()).filter(|t| *t > 0.0).map(f32::to_bits))
+}
+
+/// `DS_VS_OUTLIER_LOW=<hex code hash>:<threshold>[;...]`: those programs' census thresholds
+/// (2D programs whose positions stay within a few units).
+fn outlier_low(h: u64) -> Option<u32> {
+    static L: std::sync::OnceLock<Vec<(u64, u32)>> = std::sync::OnceLock::new();
+    L.get_or_init(|| {
+        std::env::var("DS_VS_OUTLIER_LOW").map_or(Vec::new(), |v| {
+            v.split(';')
+                .filter_map(|e| {
+                    let (a, t) = e.split_once(':')?;
+                    Some((u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()?, t.trim().parse::<f32>().ok()?.to_bits()))
+                })
+                .collect()
+        })
+    })
+    .iter()
+    .find(|e| e.0 == h)
+    .map(|e| e.1)
+}
+
+/// The census's code hash `h`, its program's address logged at its first use (outliers.txt
+/// names programs by hash).
+fn outlier_named(h: u64, addr: u64) -> u64 {
+    static SEEN: parking_lot::Mutex<Option<std::collections::HashSet<u64>>> = parking_lot::Mutex::new(None);
+    if SEEN.lock().get_or_insert_with(std::collections::HashSet::new).insert(h) {
+        crate::info!("vertex outlier census: program {h:#018x} at {addr:#x}");
+    }
+    h
 }
 
 /// `DS_DUMP=<shader>:<pc>:<x>,<y>,<z>` (hex shader address and pc, decimal
@@ -3088,6 +3128,7 @@ fn ngg_spec(addr: u64, rsrc2: u32, stages: u32, insts: &[rdna::Inst]) -> Spec {
         gpu_loads: 0,
         gpu_res: 0,
         pt_linear: false,
+        outlier: vs_outlier().and_then(|t| program_hash(addr).ok().map(|h| (outlier_low(h).unwrap_or(t), outlier_named(h, addr)))),
     };
     if spec.batched {
         if let Some((l, r)) = gpu_draw_masks_now(0) {
@@ -4112,6 +4153,7 @@ pub(crate) fn vertex_spec(addr: u64, user_sgprs: u16, wave64: bool, base_instanc
         gpu_loads: 0,
         gpu_res: 0,
         pt_linear: false,
+        outlier: vs_outlier().and_then(|t| program_hash(addr).ok().map(|h| (outlier_low(h).unwrap_or(t), outlier_named(h, addr)))),
     })
 }
 
@@ -4172,6 +4214,7 @@ pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr
         gpu_loads: 0,
         gpu_res: 0,
         pt_linear: false,
+        outlier: None,
     }
 }
 
@@ -4250,6 +4293,7 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         gpu_loads: 0,
         gpu_res: 0,
         pt_linear: false,
+        outlier: None,
     };
     if super::tune::per_lane() != 0 && per_lane_program(code_hash) && !plain_modes() {
         let votes = lane_votes_program(code_hash);

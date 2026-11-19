@@ -90,41 +90,39 @@ pub fn trace_clears() -> bool {
     *ON.get_or_init(|| std::env::var("DS_TRACE_CLEARS").is_ok_and(|v| v == "1"))
 }
 
-/// The values fills gave pending clears that a write of unknown data then replaced (by image
-/// and metadata address; `merge_clear`). The block is read at the image's use: one code
-/// throughout is a later clear (a fill kernel's other codes and CP DMA fills reach us only as
-/// unknown writes), anything else is other data over the block, and the fill's clear stands
-/// (2026-11-18 night: the title reuses metadata blocks an image no longer uses).
-static FILL_BEFORE: Mutex<Option<HashMap<(ImageKey, u64), u32>>> = Mutex::new(None);
+/// A pending fast clear: its metadata address, the value a fill gave it (None: a write of
+/// unknown data), and the value of a fill that such a write replaced, kept aside for the use
+/// (`merge_clear`). The block is read at the image's use: one code throughout is a later clear
+/// (a fill kernel's other codes and CP DMA fills reach us only as unknown writes), anything else
+/// is other data over the block, and the kept fill's clear stands (2026-11-18 night: the title
+/// reuses metadata blocks an image no longer uses). The kept value lives in the entry, so it
+/// moves and ends with it (2026-11-19: a table of its own outlived entries dropped elsewhere).
+pub type PendingClear = (u64, Option<u32>, Option<u32>);
 
 /// Notes a pending fast clear of `key` (its metadata at `meta`; `v` the value a fill gave,
-/// None: a write of unknown data), replacing the one pending; a fill's value replaced by an
-/// unknown write is kept aside for its use (`FILL_BEFORE`, `fill_before`).
-pub fn merge_clear<S: std::hash::BuildHasher>(map: &mut std::collections::HashMap<ImageKey, (u64, Option<u32>), S>, key: ImageKey, meta: u64, v: Option<u32>) {
-    match (v, map.get(&key)) {
-        (None, Some(&(m, Some(old)))) if m == meta => {
-            let mut g = FILL_BEFORE.lock();
-            let t = g.get_or_insert_with(HashMap::default);
-            // (Entries of images never used again: dropped wholesale past a bound.)
-            if t.len() >= 4096 {
-                t.clear();
-            }
-            t.insert((key, meta), old);
-        }
-        (Some(_), _) => {
-            if let Some(t) = FILL_BEFORE.lock().as_mut() {
-                t.remove(&(key, meta));
-            }
-        }
-        _ => {}
-    }
-    map.insert(key, (meta, v));
+/// None: a write of unknown data), replacing the one pending; a fill's value an unknown write
+/// replaces at the same metadata is kept aside in the entry for its use.
+pub fn merge_clear<S: std::hash::BuildHasher>(map: &mut std::collections::HashMap<ImageKey, PendingClear, S>, key: ImageKey, meta: u64, v: Option<u32>) {
+    let kept = match (v, map.get(&key)) {
+        (None, Some(&(m, Some(old), _))) if m == meta => Some(old),
+        (None, Some(&(m, None, kept))) if m == meta => kept,
+        _ => None,
+    };
+    map.insert(key, (meta, v, kept));
 }
 
-/// The value a fill gave the clear of `key` at `meta` before a write of unknown data replaced
-/// it (`merge_clear`), taken.
-pub fn fill_before(key: ImageKey, meta: u64) -> Option<u32> {
-    FILL_BEFORE.lock().as_mut().and_then(|t| t.remove(&(key, meta)))
+/// Merges a pending clear `e` noted later (a held stretch's, a chunk's) into `map`: its own
+/// fill or kept fill wins; with neither, it is an unknown write over what `map` holds.
+pub fn merge_pending<S: std::hash::BuildHasher>(map: &mut std::collections::HashMap<ImageKey, PendingClear, S>, key: ImageKey, e: PendingClear) {
+    match e {
+        (meta, None, None) => merge_clear(map, key, meta, None),
+        (meta, Some(v), _) => {
+            map.insert(key, (meta, Some(v), None));
+        }
+        (meta, None, kept) => {
+            map.insert(key, (meta, None, kept));
+        }
+    }
 }
 
 /// The word of a metadata block whose first dwords `words` hold one byte value throughout, as
@@ -157,24 +155,50 @@ mod clear_tests {
 
     #[test]
     fn fill_kept_aside() {
-        let mut m: HashMap<ImageKey, (u64, Option<u32>)> = HashMap::default();
+        let mut m: HashMap<ImageKey, PendingClear> = HashMap::default();
         let k = key(0x7_0000_0000);
         // A fill, then other data over the block: the write replaces it, the fill's value kept.
         merge_clear(&mut m, k, 0x2000, Some(0));
         merge_clear(&mut m, k, 0x2000, None);
-        assert_eq!(m.get(&k), Some(&(0x2000, None)));
-        assert_eq!(fill_before(k, 0x2000), Some(0));
-        assert_eq!(fill_before(k, 0x2000), None);
+        assert_eq!(m.get(&k), Some(&(0x2000, None, Some(0))));
+        // More unknown writes keep it.
+        merge_clear(&mut m, k, 0x2000, None);
+        assert_eq!(m.get(&k), Some(&(0x2000, None, Some(0))));
         // A later fill takes the place of the one kept aside.
         merge_clear(&mut m, k, 0x2000, Some(u32::MAX));
-        merge_clear(&mut m, k, 0x2000, None);
-        merge_clear(&mut m, k, 0x2000, Some(0));
-        assert_eq!(m.get(&k), Some(&(0x2000, Some(0))));
-        assert_eq!(fill_before(k, 0x2000), None);
-        // An unknown write with no fill before keeps nothing aside.
+        assert_eq!(m.get(&k), Some(&(0x2000, Some(u32::MAX), None)));
+        // An unknown write with no fill before keeps nothing aside; nor does one at other
+        // metadata (the image rendered with another block).
         let k2 = key(0x7_0010_0000);
         merge_clear(&mut m, k2, 0x3000, None);
-        assert_eq!(fill_before(k2, 0x3000), None);
+        assert_eq!(m.get(&k2), Some(&(0x3000, None, None)));
+        merge_clear(&mut m, k, 0x2800, None);
+        assert_eq!(m.get(&k), Some(&(0x2800, None, None)));
+        // Taken (used or dropped), nothing stays behind for a later unknown write.
+        m.remove(&k);
+        merge_clear(&mut m, k, 0x2000, None);
+        assert_eq!(m.get(&k), Some(&(0x2000, None, None)));
+    }
+
+    #[test]
+    fn held_entries_merge() {
+        let k = key(0x7_0020_0000);
+        // A stretch that filled v1 and then wrote other data, over a committed fill v0: v1 kept.
+        let mut c: HashMap<ImageKey, PendingClear> = HashMap::default();
+        merge_clear(&mut c, k, 0x4000, Some(0x40));
+        let mut h: HashMap<ImageKey, PendingClear> = HashMap::default();
+        merge_clear(&mut h, k, 0x4000, Some(0x80));
+        merge_clear(&mut h, k, 0x4000, None);
+        merge_pending(&mut c, k, h[&k]);
+        assert_eq!(c.get(&k), Some(&(0x4000, None, Some(0x80))));
+        // A stretch that only wrote other data over a committed fill: the committed one kept.
+        let mut c: HashMap<ImageKey, PendingClear> = HashMap::default();
+        merge_clear(&mut c, k, 0x4000, Some(0x40));
+        merge_pending(&mut c, k, (0x4000, None, None));
+        assert_eq!(c.get(&k), Some(&(0x4000, None, Some(0x40))));
+        // A stretch's own fill wins.
+        merge_pending(&mut c, k, (0x4000, Some(0xC0), None));
+        assert_eq!(c.get(&k), Some(&(0x4000, Some(0xC0), None)));
     }
 }
 
@@ -909,6 +933,8 @@ pub struct FastClear {
     /// The metadata's first word, known from the fill that wrote it (no read
     /// back after the GPU work).
     pub known: Option<u32>,
+    /// A fill's value a later write of unknown data replaced (`PendingClear`).
+    pub kept: Option<u32>,
 }
 
 /// Blocks of a block-compressed texture that GPU work stored through an
@@ -1698,7 +1724,7 @@ pub struct Images {
     /// Images whose metadata a GPU or CP write covered since (fast clears).
     /// Images whose fast-clear metadata was written: (metadata address, its
     /// first word when the writer's value is known: `note_meta_fill`).
-    pending_clears: HashMap<ImageKey, (u64, Option<u32>)>,
+    pending_clears: HashMap<ImageKey, PendingClear>,
     samplers: HashMap<([u32; 4], bool, u8), vk::Sampler>,
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
@@ -4528,9 +4554,9 @@ impl Images {
     /// Notes a held executor's own fast clears and overwritten images once
     /// its batches go to the GPU (`Exec::past_commit`): after the notes of
     /// the work before them.
-    pub fn apply_held(&mut self, clears: &std::collections::HashMap<ImageKey, (u64, Option<u32>)>, over: &std::collections::HashSet<ImageKey>) {
-        for (k, &(meta, v)) in clears {
-            merge_clear(&mut self.pending_clears, *k, meta, v);
+    pub fn apply_held(&mut self, clears: &std::collections::HashMap<ImageKey, PendingClear>, over: &std::collections::HashSet<ImageKey>) {
+        for (k, &e) in clears {
+            merge_pending(&mut self.pending_clears, *k, e);
             self.pending_change += 1;
         }
         for k in over {
@@ -4548,9 +4574,9 @@ impl Images {
 
     /// The fast clear of image `k` with metadata at `meta` (`take_clears`'s
     /// entry for a clear a held executor noted itself).
-    pub fn fast_clear_of(&self, k: ImageKey, meta: u64, known: Option<u32>) -> Option<FastClear> {
+    pub fn fast_clear_of(&self, k: ImageKey, meta: u64, known: Option<u32>, kept: Option<u32>) -> Option<FastClear> {
         let (Some(img), Some(&(_, clear))) = (self.map.get(&k), self.meta_of.get(&meta)) else { return None };
-        Some(FastClear { key: k, image: img.image, meta, clear, known })
+        Some(FastClear { key: k, image: img.image, meta, clear, known, kept })
     }
 
     /// The fill kernel stored `v` in every word of [base, base+len): the fast
@@ -4577,7 +4603,7 @@ impl Images {
 
     /// Whether every pending fast clear among `keys` has a known value.
     pub fn clears_known(&self, keys: &[ImageKey]) -> bool {
-        keys.iter().all(|k| self.pending_clears.get(k).is_none_or(|&(_, v)| v.is_some()))
+        keys.iter().all(|k| self.pending_clears.get(k).is_none_or(|&(_, v, _)| v.is_some()))
     }
 
     /// The images with a fast clear pending.
@@ -4594,7 +4620,7 @@ impl Images {
     pub fn take_clears(&mut self, keys: &[ImageKey]) -> Vec<FastClear> {
         let mut out = Vec::new();
         for k in keys {
-            let Some((meta, known)) = self.pending_clears.remove(k) else { continue };
+            let Some((meta, known, kept)) = self.pending_clears.remove(k) else { continue };
             self.pending_change += 1;
             self.note_gen += 1;
             NOTE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -4602,7 +4628,7 @@ impl Images {
             if out.iter().any(|c: &FastClear| c.key == *k) {
                 continue;
             }
-            out.push(FastClear { key: *k, image: img.image, meta, clear, known });
+            out.push(FastClear { key: *k, image: img.image, meta, clear, known, kept });
         }
         out
     }
