@@ -5585,6 +5585,11 @@ impl Images {
     /// Reads mip 0 / layer 0 of one aspect back: color texels, depth as 32-bit
     /// float (D32 formats) or 16-bit unorm (D16), stencil as bytes.
     pub fn read_back_aspect(&mut self, image: vk::Image, format: vk::Format, aspect: vk::ImageAspectFlags, width: u32, height: u32) -> Result<Vec<u8>, String> {
+        self.read_back_level(image, format, aspect, width, height, 0)
+    }
+
+    /// `read_back_aspect` of one mip level (`width`, `height`: that level's size).
+    pub fn read_back_level(&mut self, image: vk::Image, format: vk::Format, aspect: vk::ImageAspectFlags, width: u32, height: u32, level: u32) -> Result<Vec<u8>, String> {
         let bpp = if aspect == vk::ImageAspectFlags::STENCIL {
             1
         } else if aspect == vk::ImageAspectFlags::DEPTH {
@@ -5599,7 +5604,7 @@ impl Images {
             let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
             c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
             let region = vk::BufferImageCopy::default()
-                .image_subresource(vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: 0, base_array_layer: 0, layer_count: 1 })
+                .image_subresource(vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: level, base_array_layer: 0, layer_count: 1 })
                 .image_extent(vk::Extent3D { width, height, depth: 1 });
             c.device.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::GENERAL, buf, &[region]);
             let hb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
@@ -5863,8 +5868,11 @@ impl Images {
     /// (mip 0, layer 0) to `<dir>/<name>.png`; its description.
     pub fn dump_one(&mut self, base: u64, dir: &std::path::Path, name: &str) -> Result<String, String> {
         // A depth surface: its depth as R32 floats (`<name>.raw`).
-        if let Some(k) = self.map.values().filter(|i| i.key.base == base && is_depth(i.key.format)).map(|i| i.key).next() {
-            if self.map.values().all(|i| i.key.base != base || is_depth(i.key.format)) {
+        if let Some(k) = self.map.values().filter(|i| i.key.base == base && is_depth(i.key.format)).max_by_key(|i| i.gpu_written).map(|i| i.key) {
+            // (Also when the color images there were never written by the GPU: a depth
+            // surface's R32F alias the cache keeps apart.)
+            let only_depth = self.map.values().all(|i| i.key.base != base || is_depth(i.key.format));
+            if only_depth || self.map[&k].gpu_written && self.map.values().all(|i| i.key.base != base || is_depth(i.key.format) || !i.gpu_written) {
                 let image = self.map[&k].image;
                 let raw = self.read_back_aspect(image, k.format, vk::ImageAspectFlags::DEPTH, k.width, k.height)?;
                 let mut out = Vec::with_capacity(raw.len() + 8);
@@ -5875,22 +5883,36 @@ impl Images {
                 return Ok(format!("{}x{} {:?} depth", k.width, k.height, k.format));
             }
         }
-        let k = self.map.values().filter(|i| i.key.base == base && !is_depth(i.key.format)).max_by_key(|i| (i.key.width as u64 * i.key.height as u64, i.gpu_written)).map(|i| i.key).ok_or("no color image there")?;
+        let k = self.map.values().filter(|i| i.key.base == base && !is_depth(i.key.format)).max_by_key(|i| (i.key.width as u64 * i.key.height as u64, i.gpu_written, i.key.levels)).map(|i| i.key).ok_or("no color image there")?;
+        // Every image cached at that address (writers and readers keyed apart would show here).
+        let all: Vec<String> = self.map.values().filter(|i| i.key.base == base).map(|i| format!("{}x{}x{} {:?} {} levels{}", i.key.width, i.key.height, i.key.layers, i.key.format, i.key.levels, if i.gpu_written { " gpu-written" } else { "" })).collect();
         let image = self.map[&k].image;
         let raw = self.read_back(image, k.format, k.width, k.height)?;
         // Float images as their raw texels too (`<name>.raw`: width, height as u32, then the
-        // texels): a PNG clamps their range.
+        // texels): a PNG clamps their range. R32F images with mips: each further level as
+        // `<name>_m<level>.raw` (depth pyramids).
         if matches!(k.format, vk::Format::R16G16B16A16_SFLOAT | vk::Format::R32G32B32A32_SFLOAT | vk::Format::R16G16_SFLOAT | vk::Format::B10G11R11_UFLOAT_PACK32 | vk::Format::R32_SFLOAT) {
             let mut out = Vec::with_capacity(raw.len() + 8);
             out.extend_from_slice(&k.width.to_le_bytes());
             out.extend_from_slice(&k.height.to_le_bytes());
             out.extend_from_slice(&raw);
             std::fs::write(dir.join(format!("{name}.raw")), out).map_err(|e| e.to_string())?;
+            if k.format == vk::Format::R32_SFLOAT && !k.ty3d && k.layers == 1 {
+                for level in 1..k.levels {
+                    let (w, h) = ((k.width >> level).max(1), (k.height >> level).max(1));
+                    let raw = self.read_back_level(image, k.format, vk::ImageAspectFlags::COLOR, w, h, level)?;
+                    let mut out = Vec::with_capacity(raw.len() + 8);
+                    out.extend_from_slice(&w.to_le_bytes());
+                    out.extend_from_slice(&h.to_le_bytes());
+                    out.extend_from_slice(&raw);
+                    std::fs::write(dir.join(format!("{name}_m{level}.raw")), out).map_err(|e| e.to_string())?;
+                }
+            }
         }
         if let Some(rgba) = to_rgba8(k.format, &raw) {
             std::fs::write(dir.join(format!("{name}.png")), super::png::encode(k.width, k.height, &rgba)).map_err(|e| e.to_string())?;
         }
-        Ok(format!("{}x{} {:?}", k.width, k.height, k.format))
+        Ok(format!("{}x{} {:?} {} levels (cached there: {})", k.width, k.height, k.format, k.levels, all.join("; ")))
     }
 
     /// Writes the GPU-written color images (mip 0, layer 0) to `dir` as PNG
@@ -5968,12 +5990,25 @@ impl Images {
     /// The cached image a T# resolves to (mip 0, layer 0): raw texels in its
     /// Vulkan format, width, height and bytes per texel (diagnostics).
     pub fn snapshot_raw(&mut self, t: &Tsharp) -> Result<(Vec<u8>, u32, u32, u32), String> {
+        self.snapshot_raw_level(t, 0)
+    }
+
+    /// `snapshot_raw` of one mip level (absolute; color images only past level 0).
+    pub fn snapshot_raw_level(&mut self, t: &Tsharp, level: u32) -> Result<(Vec<u8>, u32, u32, u32), String> {
         let want = Self::key_of(t).ok_or("unsupported format")?;
         let key = match self.lookup(&want, false) {
             Some((k, _)) => k,
             None => self.alias(&want, false).ok_or("not cached")?,
         };
         let image = self.map[&key].image;
+        if level > 0 {
+            if is_depth(key.format) || is_compressed(key.format) || texel_bytes(key.format) == 0 || level >= key.levels {
+                return Err(format!("level {level} of {:?} ({} levels) not read", key.format, key.levels));
+            }
+            let (w, h) = ((key.width >> level).max(1), (key.height >> level).max(1));
+            let raw = self.read_back_level(image, key.format, vk::ImageAspectFlags::COLOR, w, h, level)?;
+            return Ok((raw, w, h, texel_bytes(key.format)));
+        }
         if is_depth(key.format) {
             // Rendered depth or stencil read as a texture (R32F / R16 / R8 uint).
             let aspect = if want.format == vk::Format::R8_UINT { vk::ImageAspectFlags::STENCIL } else { vk::ImageAspectFlags::DEPTH };

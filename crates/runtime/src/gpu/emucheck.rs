@@ -104,7 +104,8 @@ struct Img {
 struct Env {
     /// Bytes written by the interpreter (guest memory is not modified).
     writes: BTreeMap<u64, u8>,
-    images: HashMap<u64, Option<Img>>,
+    /// Images read, by (base, mip level).
+    images: HashMap<(u64, u32), Option<Img>>,
     /// Texels written: (image base, x, y) -> raw value.
     texels: HashMap<(u64, u32, u32), [u32; 4]>,
     /// T# of each written image.
@@ -114,11 +115,11 @@ struct Env {
 }
 
 impl Env {
-    fn image(&mut self, t: &[u32; 8]) -> Option<&Img> {
+    fn image(&mut self, t: &[u32; 8], level: u32) -> Option<&Img> {
         let ts = Tsharp::decode(t);
         self.images
-            .entry(ts.base)
-            .or_insert_with(|| super::images::with(|im| im.snapshot_raw(&ts)).ok().map(|(data, width, height, texel)| Img { data, width, height, texel }))
+            .entry((ts.base, level))
+            .or_insert_with(|| super::images::with(|im| im.snapshot_raw_level(&ts, level)).ok().map(|(data, width, height, texel)| Img { data, width, height, texel }))
             .as_ref()
     }
 }
@@ -146,13 +147,16 @@ impl rdna::emu::Env for Env {
 
     fn texel(&mut self, t: &[u32; 8], x: u32, y: u32, z: u32, level: u32) -> Option<[u32; 4]> {
         let base = Tsharp::decode(t).base;
-        if let Some(v) = self.texels.get(&(base, x, y)) {
-            return Some(*v);
+        if level == 0 {
+            if let Some(v) = self.texels.get(&(base, x, y)) {
+                return Some(*v);
+            }
         }
-        if z != 0 || level != 0 {
+        // (Mip levels past 0 as the GPU holds them: depth pyramids the culls sample.)
+        if z != 0 {
             return None;
         }
-        let Some(img) = self.image(t) else {
+        let Some(img) = self.image(t, level) else {
             self.missing_images += 1;
             return None;
         };
@@ -304,16 +308,37 @@ pub fn prepare(cp: &Cp, groups: [u32; 3], initiator: u32) -> Option<Pending> {
         }
         (pc, g, regs, lanes)
     });
+    // `DS_DUMP_ALL=1` with `DS_DUMP` and `DS_DUMP_V`: every interpreted group's waves log those
+    // VGPRs at the dump's address (the interpreter's values only; it matches the GPU where
+    // the dump's own group was compared).
+    let dump_all = std::env::var("DS_DUMP_ALL").ok().as_deref() == Some("1");
+    let dump_v: Vec<usize> = std::env::var("DS_DUMP_V").map(|l| l.split(|c| c == ';' || c == ' ').filter_map(|x| x.trim().trim_start_matches('v').parse::<usize>().ok()).collect()).unwrap_or_default();
     for k in 0..n {
         let lin = k * total / n + (total / n) / 2;
         let g = [(lin % groups[0] as u64) as u32, ((lin / groups[0] as u64) % groups[1].max(1) as u64) as u32, (lin / (groups[0] as u64 * groups[1].max(1) as u64)) as u32];
         let mut l = launch.clone();
         l.group = g;
+        let lanes = if l.wave64 { 64 } else { 32 };
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<(usize, Vec<Vec<u32>>)>>> = Default::default();
         let mut grp = rdna::emu::Group::new(&insts, &mut env, l);
+        if let (true, Some((pc, _)), false) = (dump_all, super::shaders::dump_for(addr), dump_v.is_empty()) {
+            let (seen, dump_v) = (seen.clone(), dump_v.clone());
+            grp.trace = Some(Box::new(move |w, ins: &rdna::Inst, _s: &[u32; 128], v: &[[u32; 64]]| {
+                if ins.pc == pc {
+                    seen.lock().unwrap().push((w as usize, dump_v.iter().map(|&r| v.get(r).map(|x| x[..lanes].to_vec()).unwrap_or_default()).collect()));
+                }
+            }));
+        }
         if let Err(e) = grp.run(50_000_000) {
             errors.push(format!("group {g:?}: {e}"));
         }
         steps += grp.steps;
+        for (w, regs) in seen.lock().unwrap().iter() {
+            for (r, vals) in dump_v.iter().zip(regs) {
+                let words: Vec<String> = vals.iter().map(|x| format!("{x:08x}")).collect();
+                crate::info!("emu check: cs {addr:#x}: group {g:?} wave {w} v{r} at dump: {}", words.join(" "));
+            }
+        }
     }
     if env.writes.len() < c.min_bytes && env.texels.is_empty() {
         // (Too little written: not compared, not counted.)
@@ -486,12 +511,12 @@ fn compare_dump(addr: u64, pc: u32, g: [u32; 3], regs: &Dump, lanes: usize) {
     if let Some((v, s, _)) = regs.get(&0) {
         let words: Vec<String> = s.iter().map(|x| format!("{x:08x}")).collect();
         crate::info!("emu check: cs {addr:#x}: interpreter SGPRs of wave 0 after {pc:#x}: {}", words.join(" "));
-        // `DS_DUMP_V=<vgpr>[;<vgpr>...]`: those VGPRs of the wave's first 16 lanes as well.
+        // `DS_DUMP_V=<vgpr>[;<vgpr>...]`: those VGPRs of the wave's lanes as well.
         if let Ok(list) = std::env::var("DS_DUMP_V") {
             for r in list.split(|c| c == ';' || c == ' ').filter_map(|x| x.trim().trim_start_matches('v').parse::<usize>().ok()) {
-                if let Some(lanes) = v.get(r) {
-                    let words: Vec<String> = lanes.iter().take(16).map(|x| format!("{x:08x}")).collect();
-                    crate::info!("emu check: cs {addr:#x}: interpreter v{r} of wave 0 lanes 0-15 after {pc:#x}: {}", words.join(" "));
+                if let Some(vals) = v.get(r) {
+                    let words: Vec<String> = vals.iter().take(lanes).map(|x| format!("{x:08x}")).collect();
+                    crate::info!("emu check: cs {addr:#x}: interpreter v{r} of wave 0 lanes 0-{} after {pc:#x}: {}", lanes - 1, words.join(" "));
                 }
             }
         }

@@ -25,13 +25,10 @@
 //! off).
 //! `DS_VG_DIAG=<lines>` logs the active entity lists, resets and enable values.
 //!
-//! The active list itself (`keep_hook`, 2026-11-19): an entity is active when its bounds lie
-//! within a distance and touch the view frustum (eboot+0xa60da0). One at the view's edge left
-//! and re-entered the list as the camera moved by a pixel (the player's tilts in the tutorial
-//! courtyard: four entities in and out over consecutive frames), and every change renumbers the
-//! models of the entities after it, whose plants then vanish and grow back over ~50 frames (the
-//! courtyard's dry leaves). An entity that passed the test within the last `DS_VG_KEEP` frames
-//! (default 120; 0 off) stays in the list, in its place, while its own models are present.
+//! The instance pool (`pool_hook`, 2026-11-19 afternoon): the title sizes it at 147,456
+//! instances in `VirtualGeometryRendering`'s constructor, and the views' plant capacities at
+//! the tutorial courtyard reach ~220k near a level view: the last ranges' plants were stored
+//! past its end and vanished in view (`DS_VG_POOL`, below).
 
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -156,81 +153,12 @@ pub extern "sysv64" fn reset_hook(regs: *const u64, _arg: u32) {
     }
 }
 
-fn keep_frames() -> u64 {
-    static K: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *K.get_or_init(|| std::env::var("DS_VG_KEEP").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(120))
-}
-
-/// Per (update, entity): the flip it last passed the title's view test.
-static LAST_PASS: Mutex<Option<std::collections::HashMap<(u64, u64), u64>>> = Mutex::new(None);
-/// [entities that passed, kept in the list after failing, not kept for want of room in the
-/// lists, not kept as their models were gone].
-static KEEP: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-
 fn rd64(a: u64) -> u64 {
     unsafe { (a as *const u64).read_volatile() }
 }
 
 fn rd32(a: u64) -> u32 {
     unsafe { (a as *const u32).read_volatile() }
-}
-
-/// The per-frame update's step to the next entity (eboot+0xa55170, `add r14,8`; reached after
-/// every entity, passed or not: r14 the entity's slot, r15 the update, whose active entities
-/// are [+0x48, +0x50) with room to +0x58; the hashed id list ends at [rbp-0xD8], room to
-/// [rbp-0xD0]). A passed entity was appended last; one that failed but passed within
-/// `keep_frames()` flips is appended to both lists as the title appends a passed one (its id
-/// at +0x220), when its own check holds (models present: +0x50 bit 4, +0xB0 != +0xB8) and both
-/// lists have room (they are not grown here: none is kept then).
-pub extern "sysv64" fn keep_hook(regs: *const u64, _arg: u32) {
-    let keep = keep_frames();
-    if keep == 0 {
-        return;
-    }
-    let r = |i: usize| unsafe { *regs.add(i) };
-    let (rbp, r14, r15) = (r(5), r(14), r(15));
-    let ent = rd64(r14);
-    if ent == 0 {
-        return;
-    }
-    let (begin, end, cap) = (rd64(r15 + 0x48), rd64(r15 + 0x50), rd64(r15 + 0x58));
-    let passed = end > begin && rd64(end - 8) == ent;
-    let now = flip();
-    let mut g = LAST_PASS.lock();
-    let m = g.get_or_insert_with(std::collections::HashMap::new);
-    if passed {
-        KEEP[0].fetch_add(1, Ordering::Relaxed);
-        if m.len() >= 4096 {
-            m.retain(|_, &mut t| now.saturating_sub(t) <= keep);
-        }
-        m.insert((r15, ent), now);
-        return;
-    }
-    let Some(&last) = m.get(&(r15, ent)) else { return };
-    if now.saturating_sub(last) > keep {
-        m.remove(&(r15, ent));
-        return;
-    }
-    drop(g);
-    if rd32(ent + 0x50) & 0x10 == 0 || rd64(ent + 0xb0) == rd64(ent + 0xb8) {
-        KEEP[3].fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-    let (ids_end, ids_cap) = (rd64(rbp.wrapping_sub(0xd8)), rd64(rbp.wrapping_sub(0xd0)));
-    if end + 8 > cap || ids_end + 4 > ids_cap || ids_end == 0 {
-        KEEP[2].fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-    unsafe {
-        (ids_end as *mut u32).write_volatile(rd32(ent + 0x220));
-        (rbp.wrapping_sub(0xd8) as *mut u64).write_volatile(ids_end + 4);
-        (end as *mut u64).write_volatile(ent);
-        ((r15 + 0x50) as *mut u64).write_volatile(end + 8);
-    }
-    let n = KEEP[1].fetch_add(1, Ordering::Relaxed) + 1;
-    if n <= 3 || n <= diag_limit() {
-        crate::info!("vg scene: entity {:x} kept in the active list at flip {now} ({} flip(s) after it last passed the view test)", rd32(ent + 0x220), now - last);
-    }
 }
 
 /// Diagnosis (`DS_VG_DIAG`): the spawn grid's centre (eboot+0xa5c37d, the branch of the
@@ -268,16 +196,52 @@ pub extern "sysv64" fn cell_hook(regs: *const u64, _arg: u32) {
 
 /// The status report's line.
 pub fn status() -> String {
-    let v = |i: usize| KEEP[i].load(Ordering::Relaxed);
     format!(
-        "    VG active entities (`DS_VG_KEEP` {} flips): {} passes of the view test, {} kept after failing it, {} not kept for want of room, {} not kept without models; {} numbering resets\n",
-        keep_frames(),
-        v(0),
-        v(1),
-        v(2),
-        v(3),
-        RESETS.load(Ordering::Relaxed)
+        "    VG scene: {} numbering resets; instance pool {}
+",
+        RESETS.load(Ordering::Relaxed),
+        match POOL.load(Ordering::Relaxed) {
+            0 => format!("the title's {TITLE_POOL}"),
+            n => format!("{n} (the title's {TITLE_POOL})"),
+        }
     )
+}
+
+/// The instance pool the title's VirtualGeometryRendering constructor sizes (eboot+0xa54215,
+/// `mov dword [r12+18h],24000h`: 147,456 instances of 48 bytes; beside it 32,768 triangle
+/// records at +10h and 98,304 staged instances at +14h).
+const TITLE_POOL: u32 = 0x24000;
+/// The pool size set, 0 while the title's stands.
+static POOL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// `DS_VG_POOL=<instances>` (0: the title's 147,456; default 393,216). The allocation pass (cs
+/// 0x10089ad300) lays out each model's capacity for each view as prefix sums over the views
+/// in order, with no clamp, and the placement (cs 0x10089ad900) stores each instance at its
+/// model's counter: ranges that start past the pool's end are dropped by the buffer's bounds.
+/// At the tutorial courtyard the capacities reach ~220k near a level view (147,456 passed from
+/// a slight upward tilt on), so the last views' plants (the leafy rosettes, then the dry
+/// leaves) vanished in view and came back as the tilt changed.
+fn pool_size() -> u32 {
+    static P: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *P.get_or_init(|| std::env::var("DS_VG_POOL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0x60000))
+}
+
+/// After the constructor's budget stores (eboot+0xa54223, `mov r13,[r12+28h]`; r12 the
+/// object): the pool's size raised before anything allocates from it.
+pub extern "sysv64" fn pool_hook(regs: *const u64, _arg: u32) {
+    let want = pool_size();
+    if want == 0 || want == TITLE_POOL {
+        return;
+    }
+    let at = unsafe { *regs.add(12) } + 0x18;
+    let cur = rd32(at);
+    if cur != TITLE_POOL {
+        crate::warn!("vg pool: the constructor's pool size is {cur} (expected {TITLE_POOL}): left alone");
+        return;
+    }
+    unsafe { (at as *mut u32).write_volatile(want) };
+    POOL.store(want, Ordering::Relaxed);
+    crate::info!("vg pool: instance pool {cur} -> {want} instances ({} -> {} MiB)", cur as u64 * 48 >> 20, want as u64 * 48 >> 20);
 }
 
 /// The rebuild's spawn enable store (`mov [r15+1],al`): during a hold, al = 0 and the

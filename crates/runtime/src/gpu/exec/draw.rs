@@ -3140,6 +3140,59 @@ impl Exec {
                         dc.bias = Some(bw);
                     }
                 }
+                // DS_TRACE_DEPTH_DRAWS=<hex depth base> (diagnosis): the first 400 draws into that
+                // depth surface, with their depth, cull, polygon offset, clip, clamp and
+                // conservative rasterization registers.
+                {
+                    // (`<hex base>[;<hex base>..]:<flip>`: from that flip on.)
+                    static WANT: std::sync::OnceLock<Option<(Vec<u64>, u64)>> = std::sync::OnceLock::new();
+                    static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    let want = WANT.get_or_init(|| {
+                        let v = std::env::var("DS_TRACE_DEPTH_DRAWS").ok()?;
+                        let (b, f) = v.split_once(':').unwrap_or((v.as_str(), "0"));
+                        let bases: Vec<u64> = b.split([';', ',']).filter_map(|x| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok()).collect();
+                        (!bases.is_empty()).then(|| (bases, f.trim().parse().unwrap_or(0)))
+                    });
+                    let flip_now = || crate::hle::libs::videoout::QUEUED_FLIP.load(std::sync::atomic::Ordering::Relaxed) + 1;
+                    if let Some((ws, s)) = want.as_ref().filter(|(_, f)| flip_now() >= *f).and_then(|(ws, _)| Some((ws, depth_surface(cp)?))) {
+                        let db_render = reg(0x28000);
+                        if ws.contains(&s.base) && SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 400 {
+                            crate::info!(
+                                "depth draw {:#x} flip {}: vs {vs_addr:#x} count {} instances {} indexed {} | depth control {dctl:#x} (test {z_test} write {z_write} func {}) clear {} | mode {mode:#x} (cull {:?} front {}) poly offset db fmt {:#x} clamp {} front {} x16 + {} back {} x16 + {} | clip {:#x} | db render {db_render:#x} override {:#x} override2 {:#x} | vport z [{}, {}] x {} {} y {} {} z scale {} offset {} vte {:#x} | cons raster {:#x} | aa config {:#x} | sc mode {:#x}",
+                                s.base,
+                                crate::hle::libs::videoout::QUEUED_FLIP.load(std::sync::atomic::Ordering::Relaxed) + 1,
+                                a.count,
+                                a.instances,
+                                a.index.is_some(),
+                                (dctl >> 4) & 7,
+                                f32r(reg(0x2802C)),
+                                cull,
+                                mode & 4 != 0,
+                                reg(0x28B78),
+                                f32r(reg(0x28B7C)),
+                                f32r(reg(0x28B80)),
+                                f32r(reg(0x28B84)),
+                                f32r(reg(0x28B88)),
+                                f32r(reg(0x28B8C)),
+                                reg(0x28810),
+                                reg(0x2800C),
+                                reg(0x28010),
+                                f32r(reg(0x282D0)),
+                                f32r(reg(0x282D4)),
+                                f32r(reg(0x2843C)),
+                                f32r(reg(0x28440)),
+                                f32r(reg(0x28444)),
+                                f32r(reg(0x28448)),
+                                f32r(reg(0x2844C)),
+                                f32r(reg(0x28450)),
+                                reg(0x28818),
+                                reg(0x28C54),
+                                reg(0x28BE0),
+                                reg(0x28A48),
+                            );
+                        }
+                    }
+                }
                 if dc.set(20, 1) {
                     c.device.cmd_set_line_width(cmd, 1.0);
                 }

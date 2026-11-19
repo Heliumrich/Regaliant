@@ -233,17 +233,6 @@ const FIXES: &[Fix] = &[
         why: "spawning waits until the scene's model numbering has held for a few frames",
         only_with: None,
     },
-    // The per-frame update's step to the next VG entity after its view test (`add r14,8;
-    // cmp r14,rbx`), reached passed or not.
-    Fix {
-        name: "VG entities kept active briefly after their view test",
-        offset: 0xa55170,
-        from: (7, 0x45e5731eed15fdc1),
-        change: Change::Hook { at: 0, handler: crate::vgdiag::keep_hook },
-        kind: "title timing",
-        why: "an entity at the view's edge left and re-entered the scene's list as the camera moved by a pixel, and each change renumbered the models after it: their plants (the tutorial courtyard's dry leaves) vanished and grew back",
-        only_with: None,
-    },
     // Diagnosis: the VG spawn grid's new centre stored (`vmovss [rdi+20h],xmm2; vmovss
     // [rdi+24h],xmm1`), the rebuild of the frame's spawn data marked after it.
     Fix {
@@ -254,6 +243,17 @@ const FIXES: &[Fix] = &[
         kind: "diagnosis",
         why: "the spawn grid's centre cell changes, with the camera's position (DS_VG_DIAG)",
         only_with: Some("DS_VG_DIAG"),
+    },
+    // The VirtualGeometryRendering constructor after its budget stores (`mov r13,[r12+28h]`,
+    // after `mov dword [r12+18h],24000h` and a call that reads only its locals).
+    Fix {
+        name: "VG instance pool raised",
+        offset: 0xa54223,
+        from: (5, 0x0b5567a3b0018a0b),
+        change: Change::Hook { at: 0, handler: crate::vgdiag::pool_hook },
+        kind: "title budget",
+        why: "the views' plant capacities overran the 147,456-instance pool near a level view (the tutorial courtyard's leaves vanished in view as the camera tilted)",
+        only_with: None,
     },
     // The TAA's per-view jitter (`jitter`): its function's entry, `mov rax,[rdi+68h]; cmp
     // dword ptr [rax+0AACh],0` (the forced index's test).

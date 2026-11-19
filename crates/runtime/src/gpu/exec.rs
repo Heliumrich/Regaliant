@@ -4771,10 +4771,11 @@ pub(super) fn explain_wait(queue: &str, c: (u64, u64), stages: &[&Prepared]) {
     }
 }
 
-/// `DS_TAP_CS=<hex>:<resource>[,...]` (diagnosis): after each dispatch of that compute program,
-/// the first 64 bytes of its buffer resource as bound (what the GPU holds there after the
-/// dispatch) are copied to a host buffer, and logged 32 taps later beside the guest memory's
-/// bytes when the dispatch was recorded and the flip it belongs to (`tap cs` lines).
+/// `DS_TAP_CS=<hex>:<resource>[:<bytes>][,...]` (diagnosis): after each dispatch of that compute
+/// program, the first 64 bytes (or the given count, at most 2048) of its buffer resource as bound
+/// (what the GPU holds there after the dispatch) are copied to a host buffer, and logged 32 taps
+/// later beside the guest memory's bytes when the dispatch was recorded and the flip it belongs
+/// to (`tap cs` lines). `DS_TAP_FROM=<flip>`: only dispatches from that flip on.
 struct Tap {
     buf: vk::Buffer,
     ptr: *mut u8,
@@ -4784,16 +4785,24 @@ struct Tap {
 unsafe impl Send for Tap {}
 static TAP: Mutex<Option<Tap>> = Mutex::new(None);
 const TAP_SLOTS: u64 = 256;
-const TAP_SLOT: u64 = 256;
+const TAP_SLOT: u64 = 2048;
 
-fn tap_list() -> &'static [(u64, usize)] {
-    static L: std::sync::OnceLock<Vec<(u64, usize)>> = std::sync::OnceLock::new();
+fn tap_list() -> &'static [(u64, usize, u64)] {
+    static L: std::sync::OnceLock<Vec<(u64, usize, u64)>> = std::sync::OnceLock::new();
     L.get_or_init(|| {
         std::env::var("DS_TAP_CS").unwrap_or_default().split([',', ';']).filter_map(|v| {
-            let (a, r) = v.split_once(':')?;
-            Some((u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()?, r.trim().parse().ok()?))
+            let mut it = v.split(':');
+            let a = u64::from_str_radix(it.next()?.trim().trim_start_matches("0x"), 16).ok()?;
+            let r = it.next()?.trim().parse().ok()?;
+            let n = it.next().and_then(|x| x.trim().parse::<u64>().ok()).unwrap_or(64).clamp(4, TAP_SLOT) & !3;
+            Some((a, r, n))
         }).collect()
     })
+}
+
+fn tap_from() -> u64 {
+    static F: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DS_TAP_FROM").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
 }
 
 impl Exec {
@@ -4802,8 +4811,11 @@ impl Exec {
         if list.is_empty() {
             return;
         }
-        for &(addr, res) in list {
+        for &(addr, res, want) in list {
             if addr != p.addr {
+                continue;
+            }
+            if crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1 < tap_from() {
                 continue;
             }
             let mut g = TAP.lock();
@@ -4824,7 +4836,7 @@ impl Exec {
                     // The binding of that resource (its descriptor buffer info).
                     let Some(bn) = p.tr.out.bindings.iter().find(|b| matches!(b.kind, BindingKind::Buffer(i) if i == res)).map(|b| b.binding) else { continue };
                     let Some(info) = bound.bufs.iter().find(|(x, _)| *x == bn).map(|(_, i)| *i) else { continue };
-                    let n = info.range.min(64);
+                    let n = info.range.min(want);
                     let mut cpu: Vec<u32> = (0..n / 4).map(|k| v.base + 4 * k).map(|a| if super::cp::guest_readable(a, 4) { unsafe { std::ptr::read_volatile(a as *const u32) } } else { 0xdead_beef }).collect();
                     // The whole buffer's guest words: how many are not zero (per mille), the
                     // last word's index that is, and their count (appended to the guest words).
@@ -4927,19 +4939,45 @@ impl Exec {
 }
 
 /// `DS_TRACE_CS_IMAGES=<hex>[,...]` (diagnosis): each dispatch of those compute programs logs,
-/// at the flip it is recorded in, its image resources (T# base, type, size, read or written)
-/// and the image handles it was bound to (`trace cs images` lines).
+/// at the flip it is recorded in, its image resources (T# base, type, size, levels, format)
+/// and samplers (S# words) and the image handles it was bound to (`trace cs images` lines).
+/// An entry `f<format>` (decimal, e.g. `f22` for R32F) also logs the first dispatch of every
+/// compute program binding an image of that format; `q<queue>` (e.g. `qacb0x20`) the first
+/// dispatch of every program on that queue, with its buffers.
 fn trace_cs_images(queue: &str, p: &Prepared, bound: &Bound) {
-    static ADDRS: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-    let addrs = ADDRS.get_or_init(|| {
-        std::env::var("DS_TRACE_CS_IMAGES").unwrap_or_default().split([',', ';']).filter_map(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()).collect()
+    static ADDRS: std::sync::OnceLock<(Vec<u64>, Vec<u16>, Vec<String>)> = std::sync::OnceLock::new();
+    let (addrs, formats, queues) = ADDRS.get_or_init(|| {
+        let list = std::env::var("DS_TRACE_CS_IMAGES").unwrap_or_default();
+        let items: Vec<&str> = list.split([',', ';']).map(|v| v.trim()).filter(|v| !v.is_empty()).collect();
+        (
+            items.iter().filter(|v| !v.starts_with('f') && !v.starts_with('q')).filter_map(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()).collect(),
+            items.iter().filter_map(|v| v.strip_prefix('f')?.parse().ok()).collect(),
+            items.iter().filter_map(|v| v.strip_prefix('q')).map(|q| q.to_string()).collect(),
+        )
     });
-    if addrs.is_empty() || !addrs.contains(&p.addr) {
+    if addrs.is_empty() && formats.is_empty() && queues.is_empty() {
         return;
+    }
+    if !addrs.contains(&p.addr) {
+        let by_format = p.resources.iter().any(|r| matches!(r, Resolved::Image(t) if formats.contains(&t.format))) || queues.iter().any(|q| queue.ends_with(q.as_str()));
+        static SEEN: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
+        if !by_format || !SEEN.lock().get_or_insert_with(Default::default).insert(p.addr) {
+            return;
+        }
+        // (Its code too, in the run's shaders/, for rdnadis.)
+        super::capture::save_program(p.addr);
+    } else {
+        // Listed programs: their first 256 dispatches.
+        static LISTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if LISTED.fetch_add(1, Ordering::Relaxed) >= 256 {
+            return;
+        }
     }
     use ash::vk::Handle;
     let res: Vec<String> = p.resources.iter().enumerate().filter_map(|(i, r)| match r {
-        Resolved::Image(t) => Some(format!("{i}:{:#x} t{} {}x{}x{} f{}", t.base, t.ty, t.width, t.height, t.depth, t.format)),
+        Resolved::Image(t) => Some(format!("{i}:{:#x} t{} {}x{}x{} f{} levels {}..{} of {} min_lod {}", t.base, t.ty, t.width, t.height, t.depth, t.format, t.base_level, t.last_level, t.max_mip + 1, t.min_lod)),
+        Resolved::Sampler(s) => Some(format!("{i}:S# {:08x} {:08x} {:08x} {:08x}", s[0], s[1], s[2], s[3])),
+        Resolved::Buffer(v) if !queues.is_empty() => Some(format!("{i}:V# {:#x} stride {} records {}", v.base, v.stride, v.num_records)),
         _ => None,
     }).collect();
     let images: Vec<String> = bound.images.iter().map(|i| format!("{:x}", i.as_raw())).collect();
