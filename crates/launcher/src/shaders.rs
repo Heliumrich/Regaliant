@@ -83,9 +83,18 @@ pub enum Step {
     Compute,
     /// The game plays a new game by itself (`--prepare-play newgame`).
     NewGame,
-    /// The game visits its levels by itself (`--prepare-play tour`, the save `NewGame` made).
-    Tour,
+    /// The game visits the i-th of `LEVEL_PARTS` parts of its levels by itself (`--prepare-play
+    /// tour --prepare-chunk i/n`, the save `NewGame` made): each part its own session, so that
+    /// the memory a session's level changes take stays bounded.
+    Levels(u8),
 }
+
+/// The levels' parts (sessions).
+const LEVEL_PARTS: u8 = 3;
+
+/// The whole preparation's time: the levels end at the next level after it (the latest levels
+/// are left to the player's first visits), so that it stays within an hour on slower PCs.
+const BUDGET: std::time::Duration = std::time::Duration::from_secs(55 * 60);
 
 impl Step {
     /// The self-play stage (None: the compute step).
@@ -93,7 +102,7 @@ impl Step {
         match self {
             Step::Compute => None,
             Step::NewGame => Some("newgame"),
-            Step::Tour => Some("tour"),
+            Step::Levels(_) => Some("tour"),
         }
     }
 
@@ -102,7 +111,15 @@ impl Step {
         match self {
             Step::Compute => 0,
             Step::NewGame => 2400,
-            Step::Tour => 7200,
+            Step::Levels(_) => 3600,
+        }
+    }
+
+    /// Its number among the self-play's steps (1 the new game).
+    fn number(self) -> u8 {
+        match self {
+            Step::Levels(i) => i + 1,
+            _ => 1,
         }
     }
 }
@@ -125,6 +142,8 @@ pub struct Page {
     stopping: Option<Instant>,
     /// The game starts once the stop is done.
     then_play: bool,
+    /// When the preparation's time is up (`BUDGET` from its start).
+    deadline: Option<std::time::SystemTime>,
 }
 
 fn h(v: usize) -> HWND {
@@ -139,7 +158,7 @@ fn marker(app: &App) -> PathBuf {
     app.paths.shaders().join("prepared.txt")
 }
 
-/// The self-play's stages and how they ended (`record_stage`).
+/// The self-play's stages and how they ended (`record`).
 fn played_file(app: &App) -> PathBuf {
     app.paths.shaders().join("played.txt")
 }
@@ -178,38 +197,50 @@ fn compute_state(app: &App) -> (bool, String) {
     }
 }
 
-/// How the self-play's stages ended (None: not played) for the compute shaders prepared now
-/// (their translation and driver: a new preparation plays again).
-fn played(app: &App) -> (Option<i32>, Option<i32>) {
-    let kv = read_kv(&played_file(app));
-    let prep = read_kv(&marker(app));
-    let get = |kv: &[(String, String)], k: &str| kv.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone()).unwrap_or_default();
-    if kv.is_empty() || ["translation", "driver", "device"].iter().any(|k| get(&kv, k) != get(&prep, k)) {
-        return (None, None);
-    }
-    let code = |k: &str| get(&kv, k).parse::<i32>().ok();
-    (code("newgame"), code("tour"))
+/// How the self-play went (played.txt): the new game's end, the levels' parts played, the last
+/// part's end (0: played to its end or to the preparation's time, 3: stopped, other: it could
+/// not go on); for this game version's translation, this card and driver (else nothing).
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+struct Played {
+    newgame: Option<i32>,
+    parts: u8,
+    tour: Option<i32>,
 }
 
-/// A stage ended with `code` (its line in played.txt, with the compute shaders' translation,
-/// driver and card).
-fn record_stage(app: &App, stage: &str, code: i32) {
-    let prep = read_kv(&marker(app));
-    let get = |k: &str| prep.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone()).unwrap_or_default();
-    // (A new game played again makes a new save: its tour is played again too.)
-    let (newgame, _) = played(app);
-    let (newgame, tour) = match stage {
-        "newgame" => (Some(code), None),
-        _ => (newgame, Some(code)),
+/// The translation, card and driver the self-play's record holds for.
+fn identity() -> (String, String, String) {
+    let translation = match checked_translation() {
+        Some(Ok(t)) => t,
+        _ => String::new(),
     };
+    match sys::gpu() {
+        Ok(g) => (translation, g.name, g.driver.to_string()),
+        Err(_) => (translation, String::new(), String::new()),
+    }
+}
+
+fn played(app: &App) -> Played {
+    let kv = read_kv(&played_file(app));
+    let get = |k: &str| kv.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone()).unwrap_or_default();
+    let (translation, device, driver) = identity();
+    if kv.is_empty() || get("device") != device || get("driver") != driver || (!translation.is_empty() && get("translation") != translation) {
+        return Played::default();
+    }
+    let code = |k: &str| get(k).parse::<i32>().ok();
+    Played { newgame: code("newgame"), parts: get("parts").parse().unwrap_or(0), tour: code("tour") }
+}
+
+/// The self-play's record changed by `f` (with the translation, card and driver now).
+fn record(app: &App, f: impl FnOnce(&mut Played)) {
+    let mut p = played(app);
+    f(&mut p);
+    let (translation, device, driver) = identity();
     let line = |v: Option<i32>| v.map_or(String::new(), |c| c.to_string());
     let t = format!(
-        "# The game's self-play that learned the graphics shaders (dsport --prepare-play); written by the launcher\n# (0: played to its end, 3: stopped, other: it could not go on)\nnewgame = {}\ntour = {}\ntranslation = {}\ndriver = {}\ndevice = {}\n",
-        line(newgame),
-        line(tour),
-        get("translation"),
-        get("driver"),
-        get("device")
+        "# The game's self-play that learned the shaders (dsport --prepare-play); written by the launcher\n# (0: played to its end, 3: stopped, other: it could not go on; parts: the levels' parts played)\nnewgame = {}\nparts = {}\ntour = {}\ntranslation = {translation}\ndriver = {driver}\ndevice = {device}\n",
+        line(p.newgame),
+        p.parts,
+        line(p.tour),
     );
     let _ = std::fs::write(played_file(app), t);
 }
@@ -222,12 +253,14 @@ pub fn state(app: &App) -> (bool, String) {
         return (ok, text);
     }
     let ended = |c: Option<i32>| c.is_some_and(|c| c != STAGE_STOPPED);
-    match played(app) {
-        (Some(0), Some(0)) => (true, text),
+    let p = played(app);
+    match (p.newgame, p.tour) {
+        (Some(0), Some(0)) if p.parts >= LEVEL_PARTS => (true, text),
+        (Some(0), Some(0)) => (true, format!("{text} The latest levels are left to their first visits.")),
         // (A stage that could not go on: what it learned is kept, and play learns the rest.)
         (Some(c), _) if c != 0 && ended(Some(c)) => (true, format!("{text} Some graphics shaders could not be learned ahead.")),
         (Some(0), t) if ended(t) => (true, format!("{text} Some graphics shaders could not be learned ahead.")),
-        _ => (false, "The compute shaders are prepared. The graphics shaders are not learned yet: Prepare now does it.".into()),
+        _ => (false, "The shaders are partly prepared. Prepare now finishes them.".into()),
     }
 }
 
@@ -322,12 +355,14 @@ pub fn start(app: &mut App, play_after: bool) {
     }
     let _ = std::fs::create_dir_all(&dir);
     wait_check();
-    // (The levels when the new game was played for the compute shaders prepared now; else, and
-    // when everything is done, the new game.)
-    let first = match (compute_state(app).0, played(app)) {
-        (true, (Some(0), t)) if t != Some(0) => Step::Tour,
+    // (The next part of the levels when the new game was played for this version, card and
+    // driver and the levels are not done; else, and when everything is done, the new game.)
+    let p = played(app);
+    let first = match p {
+        Played { newgame: Some(0), parts, tour } if parts < LEVEL_PARTS && tour != Some(0) => Step::Levels(parts + 1),
         _ => Step::NewGame,
     };
+    app.shaders.deadline = Some(std::time::SystemTime::now() + BUDGET);
     app.shaders.play_after = play_after;
     app.shaders.stopping = None;
     app.shaders.then_play = false;
@@ -358,6 +393,12 @@ fn begin(app: &mut App, step: Step) -> bool {
         None => cmd.arg("--precompile-all").arg(sys::prepare_threads().to_string()),
         Some(s) => cmd.arg("--prepare-play").arg(s).arg("--seconds").arg(step.seconds().to_string()).arg("--prepare-threads").arg(sys::prepare_threads().to_string()),
     };
+    if let Step::Levels(i) = step {
+        cmd.arg("--prepare-chunk").arg(format!("{i}/{LEVEL_PARTS}"));
+        if let Some(d) = app.shaders.deadline.and_then(|d| d.duration_since(std::time::UNIX_EPOCH).ok()) {
+            cmd.arg("--prepare-deadline").arg(d.as_secs().to_string());
+        }
+    }
     cmd.arg("--progress").arg(&progress).current_dir(&app.paths.exe_dir).creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
     match cmd.spawn() {
         Ok(c) => {
@@ -365,11 +406,11 @@ fn begin(app: &mut App, step: Step) -> bool {
             app.shaders.step = Some(step);
             app.shaders.started = Some(Instant::now());
             let text = match step {
-                Step::Compute => "Preparing the compute shaders: reading the game's shader files...",
-                Step::NewGame => "Preparing the shaders, step 1 of 2: the game starts a new game in the background...",
-                Step::Tour => "Preparing the shaders, step 2 of 2: the game loads its save in the background...",
+                Step::Compute => "Preparing the compute shaders: reading the game's shader files...".to_string(),
+                Step::NewGame => format!("Preparing the shaders, step 1 of {}: the game starts a new game in the background...", LEVEL_PARTS + 1),
+                Step::Levels(_) => format!("Preparing the shaders, step {} of {}: the game loads its save in the background...", step.number(), LEVEL_PARTS + 1),
             };
-            unsafe { ui::set_text(h(app.shaders.status), text) };
+            unsafe { ui::set_text(h(app.shaders.status), &text) };
             true
         }
         Err(e) => {
@@ -429,8 +470,19 @@ pub fn tick(app: &mut App) {
         app.shaders.child = None;
         let _ = std::fs::remove_file(progress_file(app).with_extension("stop"));
         let stopped = app.shaders.stopping.take().is_some();
-        if let Some(s) = step.stage() {
-            record_stage(app, s, if stopped && code != 0 { STAGE_STOPPED } else { code });
+        let code = if stopped && code != 0 { STAGE_STOPPED } else { code };
+        match step {
+            // (A new game played again makes a new save: the levels are played again too.)
+            Step::NewGame => record(app, |p| *p = Played { newgame: Some(code), parts: 0, tour: None }),
+            // (A part that could not go on is passed: the next part plays its own levels.)
+            Step::Levels(i) if code != STAGE_STOPPED => record(app, |p| {
+                p.parts = p.parts.max(i);
+                if i >= LEVEL_PARTS {
+                    p.tour = Some(code);
+                }
+            }),
+            Step::Levels(_) => record(app, |p| p.tour = Some(STAGE_STOPPED)),
+            Step::Compute => {}
         }
         if stopped {
             finish(app, Some("Preparation stopped. The next one goes on where it left off.".into()));
@@ -445,9 +497,12 @@ pub fn tick(app: &mut App) {
                 finish(app, Some(format!("Preparation ended with an error (code {code}). Open logs shows its log.")));
                 return;
             }
-            Step::NewGame if code == 0 => Some(Step::Tour),
+            Step::NewGame if code == 0 => Some(Step::Levels(1)),
             // (The new game could not be played: the compute shaders on their own, as before.)
             Step::NewGame if !compute_state(app).0 => Some(Step::Compute),
+            // (The next part even past the preparation's time: it marks the shaders prepared at
+            // once then.)
+            Step::Levels(i) if i < LEVEL_PARTS => Some(Step::Levels(i + 1)),
             _ => None,
         };
         if let Some(n) = next {
@@ -480,10 +535,12 @@ pub fn tick(app: &mut App) {
             Some(&[c, all]) if all > 0 => format!(" Compute shaders: {c} of {all}."),
             _ => String::new(),
         };
+        let steps = LEVEL_PARTS + 1;
+        let budget = app.shaders.deadline.and_then(|d| d.duration_since(std::time::SystemTime::now()).ok()).map_or(String::new(), |l| format!(" At most {} minutes left.", (l.as_secs() / 60).max(1)));
         let text = match step {
             Step::Compute => format!("Preparing the compute shaders: {done} of {total} ({:.0}%).{eta}", frac * 100.0),
-            Step::NewGame => format!("Preparing the shaders, step 1 of 2: the game plays a new game in the background, {done} of {total}.{compute}"),
-            Step::Tour => format!("Preparing the shaders, step 2 of 2: the game visits its levels in the background, {done} of {total}.{eta}{compute}"),
+            Step::NewGame => format!("Preparing the shaders, step 1 of {steps}: the game plays a new game in the background, {done} of {total}.{budget}{compute}"),
+            Step::Levels(_) => format!("Preparing the shaders, step {} of {steps}: the game visits its levels in the background, {done} of {total}.{budget}{compute}", step.number()),
         };
         unsafe {
             ui::set_text(h(app.shaders.status), &text);

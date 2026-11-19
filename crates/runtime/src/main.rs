@@ -95,6 +95,12 @@ pub struct Config {
     /// `--prepare-threads <n>`: the self-play's background compute preparation's threads (0: half
     /// the logical CPUs).
     pub prepare_threads: usize,
+    /// `--prepare-chunk <i>/<n>`: the self-play's levels stage plays the i-th of n parts of the
+    /// levels (each its own session: the memory a session's level changes take is bounded).
+    pub prepare_chunk: Option<(usize, usize)>,
+    /// `--prepare-deadline <unix seconds>`: when the whole preparation's time is up (the levels
+    /// stage ends at the next level after it).
+    pub prepare_deadline: Option<u64>,
     pub trace: bool,
     pub lenient: bool,
     pub debug: bool,
@@ -216,6 +222,8 @@ fn parse_args() -> Config {
     let mut record_bench = None;
     let mut prepare_play = None;
     let mut prepare_threads = 0usize;
+    let mut prepare_chunk = None;
+    let mut prepare_deadline = None;
     let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -247,6 +255,14 @@ fn parse_args() -> Config {
                 }));
             }
             "--prepare-threads" => prepare_threads = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+            "--prepare-chunk" => {
+                prepare_chunk = args.next().and_then(|v| {
+                    let (i, n) = v.split_once('/')?;
+                    let (i, n) = (i.trim().parse::<usize>().ok()?, n.trim().parse::<usize>().ok()?);
+                    (n >= 1 && (1..=n).contains(&i)).then_some((i, n))
+                })
+            }
+            "--prepare-deadline" => prepare_deadline = args.next().and_then(|v| v.parse().ok()),
             "--pb-test" => std::process::exit(gpu::pcache::pb_test()),
             "--compile-bench" => {
                 let min = args.next().expect("--compile-bench needs <min instructions> <max programs>");
@@ -322,6 +338,8 @@ fn parse_args() -> Config {
         dispatch_bench,
         prepare_play,
         prepare_threads,
+        prepare_chunk,
+        prepare_deadline,
     }
 }
 

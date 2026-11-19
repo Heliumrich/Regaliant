@@ -721,6 +721,45 @@ static SPANS_FREED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// (u64::MAX: none). Imports are looked up only while a batch records, so a
 /// batch that began after an import was dropped cannot use it.
 static EXEC_GENS: Mutex<Vec<std::sync::Arc<AtomicU64>>> = Mutex::new(Vec::new());
+/// The executors' names in EXEC_GENS's order (`backlog_watch`).
+static EXEC_GEN_NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Dropped imports waiting long (`reap_dead_spans`): when the oldest open batch's generation last
+/// changed, and when it was last told. A batch left open pins every import dropped after it:
+/// the shader preparation's levels filled the host heap with 1,962 of them (-215941).
+static BACKLOG_SEEN: Mutex<(u64, Option<std::time::Instant>, Option<std::time::Instant>)> = Mutex::new((u64::MAX, None, None));
+
+/// Dropped imports not freed yet, and the memory heaps' use (the self-play's level log).
+pub fn import_backlog() -> String {
+    format!("{} dropped imports waiting; memory: {}", GRAVEYARD_LEN.load(Ordering::Relaxed), super::vk::ctx_heaps())
+}
+
+/// Tells (once a minute) which executor's open batch holds dropped imports from being freed,
+/// when over 256 wait and that batch has been open over 30 s.
+fn backlog_watch(oldest_open: u64) {
+    let waiting = GRAVEYARD_LEN.load(Ordering::Relaxed);
+    let now = std::time::Instant::now();
+    let mut g = BACKLOG_SEEN.lock();
+    if g.0 != oldest_open {
+        *g = (oldest_open, Some(now), g.2);
+        return;
+    }
+    let held_for = g.1.map_or(0.0, |t| now.duration_since(t).as_secs_f64());
+    if waiting <= 256 || held_for < 30.0 || g.2.is_some_and(|t| now.duration_since(t).as_secs() < 60) {
+        return;
+    }
+    g.2 = Some(now);
+    drop(g);
+    let gens: Vec<u64> = EXEC_GENS.lock().iter().map(|a| a.load(Ordering::SeqCst)).collect();
+    let names = EXEC_GEN_NAMES.lock().clone();
+    let holders: Vec<String> = gens.iter().enumerate().filter(|&(_, v)| *v == oldest_open).map(|(i, _)| names.get(i).cloned().unwrap_or_else(|| format!("#{i}"))).collect();
+    crate::warn!(
+        "gpu: {waiting} dropped imports wait to be freed: the oldest open batch began at generation {oldest_open} (now {}), {held_for:.0} s ago, on {}; memory: {}",
+        SPAN_GEN.load(Ordering::Relaxed),
+        holders.join(", "),
+        super::vk::ctx_heaps()
+    );
+}
 
 /// Whether an import, in use or dropped and not freed yet, may cover guest
 /// [base, base+len): true also while the lists are busy (callers inside the
@@ -873,6 +912,7 @@ fn reap_dead_spans() {
         return;
     }
     let oldest_open = EXEC_GENS.lock().iter().map(|g| g.load(Ordering::SeqCst)).min().unwrap_or(u64::MAX);
+    backlog_watch(oldest_open);
     let next = NEXT_SEQ.load(Ordering::SeqCst);
     let done = done_seq();
     // Taken out under the graveyard's lock and freed outside it (the
@@ -12782,7 +12822,9 @@ impl Exec {
                 closed: Vec::new(),
                 open_gen: {
                     let g = std::sync::Arc::new(AtomicU64::new(u64::MAX));
-                    EXEC_GENS.lock().push(g.clone());
+                    let mut gens = EXEC_GENS.lock();
+                    gens.push(g.clone());
+                    EXEC_GEN_NAMES.lock().push(name.to_string());
                     g
                 },
                 shares_pre: true,
