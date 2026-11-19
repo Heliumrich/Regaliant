@@ -4836,6 +4836,10 @@ impl Exec {
                     // The binding of that resource (its descriptor buffer info).
                     let Some(bn) = p.tr.out.bindings.iter().find(|b| matches!(b.kind, BindingKind::Buffer(i) if i == res)).map(|b| b.binding) else { continue };
                     let Some(info) = bound.bufs.iter().find(|(x, _)| *x == bn).map(|(_, i)| *i) else { continue };
+                    // (An empty or unmapped resource is bound as no buffer: nothing to copy.)
+                    if info.buffer == vk::Buffer::null() {
+                        continue;
+                    }
                     let n = info.range.min(want);
                     let mut cpu: Vec<u32> = (0..n / 4).map(|k| v.base + 4 * k).map(|a| if super::cp::guest_readable(a, 4) { unsafe { std::ptr::read_volatile(a as *const u32) } } else { 0xdead_beef }).collect();
                     // The whole buffer's guest words: how many are not zero (per mille), the
@@ -4940,7 +4944,8 @@ impl Exec {
 
 /// `DS_TRACE_CS_IMAGES=<hex>[,...]` (diagnosis): each dispatch of those compute programs logs,
 /// at the flip it is recorded in, its image resources (T# base, type, size, levels, format)
-/// and samplers (S# words) and the image handles it was bound to (`trace cs images` lines).
+/// and samplers (S# words) and the image handles it was bound to (`trace cs images` lines;
+/// addresses without `0x` are taken as such unless they start with `f` or `q`).
 /// An entry `f<format>` (decimal, e.g. `f22` for R32F) also logs the first dispatch of every
 /// compute program binding an image of that format; `q<queue>` (e.g. `qacb0x20`) the first
 /// dispatch of every program on that queue, with its buffers.
@@ -4966,12 +4971,6 @@ fn trace_cs_images(queue: &str, p: &Prepared, bound: &Bound) {
         }
         // (Its code too, in the run's shaders/, for rdnadis.)
         super::capture::save_program(p.addr);
-    } else {
-        // Listed programs: their first 256 dispatches.
-        static LISTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if LISTED.fetch_add(1, Ordering::Relaxed) >= 256 {
-            return;
-        }
     }
     use ash::vk::Handle;
     let res: Vec<String> = p.resources.iter().enumerate().filter_map(|(i, r)| match r {

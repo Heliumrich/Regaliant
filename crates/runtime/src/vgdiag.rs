@@ -223,7 +223,8 @@ static POOL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0)
 /// leaves) vanished in view and came back as the tilt changed.
 fn pool_size() -> u32 {
     static P: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *P.get_or_init(|| std::env::var("DS_VG_POOL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0x60000))
+    // (At most 2,097,152 instances, 96 MiB: a mistyped value would ask the title for gigabytes.)
+    *P.get_or_init(|| std::env::var("DS_VG_POOL").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0x60000).min(0x20_0000))
 }
 
 /// After the constructor's budget stores (eboot+0xa54223, `mov r13,[r12+28h]`; r12 the
