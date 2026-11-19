@@ -351,7 +351,8 @@ sysv! {
         0
     }
     fn scePadSetVibration(h: i32, param: *const u8) -> i32 {
-        if !param.is_null() {
+        // (The shader preparation's self-play leaves the player's controller alone.)
+        if !param.is_null() && !crate::input::SYSTEM_OFF.load(std::sync::atomic::Ordering::Relaxed) {
             let mut v = XINPUT_VIBRATION { wLeftMotorSpeed: (*param as u16) * 257, wRightMotorSpeed: (*param.add(1) as u16) * 257 };
             XInputSetState(0, &mut v);
         }

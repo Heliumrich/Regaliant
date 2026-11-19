@@ -1524,8 +1524,12 @@ fn tracking_test() -> Result<String, String> {
     Ok("write tracking on sections through the host: writes to taken pages answered there (the values below the stack pointer intact, nothing passed on) and reported by the next take only".into())
 }
 
-/// Arguments of a mode that runs no game: never hosted by default.
-const NO_GAME: [&str; 5] = ["--pipeline-test", "--dispatch-bench", "--compile-bench", "--record-bench", "--precompile-all"];
+/// Arguments of a mode that runs no game: never hosted by default. (The launcher's shader
+/// preparation, `--precompile-all`, is hosted as a game session is since 2026-11-19: on another
+/// player's PC the driver refused 259 of 262 pipeline binaries the unhosted preparation had made
+/// in the first game session, and took those game sessions made; the device and its settings
+/// were the same line for line.)
+const NO_GAME: [&str; 4] = ["--pipeline-test", "--dispatch-bench", "--compile-bench", "--record-bench"];
 
 /// Whether this process hosts dsport instead of running it: with `--host`,
 /// and by default when front end 2 is wanted (it arms quiet guest pages, and

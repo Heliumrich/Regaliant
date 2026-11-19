@@ -46,6 +46,7 @@ mod textbox;
 mod uistate;
 mod vrr;
 mod tls;
+mod prepplay;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -89,6 +90,8 @@ pub struct Config {
     pub safe_mode: bool,
     /// `--dispatch-bench` (`gpu::dispbench`).
     pub dispatch_bench: bool,
+    /// `--prepare-play <newgame|tour>`: the shader preparation's self-play (`prepplay`).
+    pub prepare_play: Option<prepplay::Stage>,
     pub trace: bool,
     pub lenient: bool,
     pub debug: bool,
@@ -208,6 +211,7 @@ fn parse_args() -> Config {
     let mut safe_mode = false;
     let mut dispatch_bench = false;
     let mut record_bench = None;
+    let mut prepare_play = None;
     let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -231,6 +235,13 @@ fn parse_args() -> Config {
             "--dispatch-bench" => dispatch_bench = true,
             "--progress" => progress = Some(PathBuf::from(args.next().expect("--progress needs a file"))),
             "--safe-mode" => safe_mode = true,
+            "--prepare-play" => {
+                let s = args.next().unwrap_or_default();
+                prepare_play = Some(prepplay::Stage::parse(&s).unwrap_or_else(|| {
+                    eprintln!("--prepare-play needs a stage (newgame or tour), not '{s}'");
+                    std::process::exit(2);
+                }));
+            }
             "--pb-test" => std::process::exit(gpu::pcache::pb_test()),
             "--compile-bench" => {
                 let min = args.next().expect("--compile-bench needs <min instructions> <max programs>");
@@ -293,7 +304,7 @@ fn parse_args() -> Config {
         debug,
         // The launcher's translation check and shader preparation (and the compile bench) run
         // no game: no window (each showed an empty one until 2026-11-14) and no message boxes.
-        headless: headless || translation_fingerprint || precompile_all.is_some() || compile_bench.is_some(),
+        headless: headless || translation_fingerprint || precompile_all.is_some() || compile_bench.is_some() || prepare_play.is_some(),
         control,
         cache,
         pipeline_test,
@@ -304,6 +315,7 @@ fn parse_args() -> Config {
         progress,
         safe_mode,
         dispatch_bench,
+        prepare_play,
     }
 }
 
@@ -1669,8 +1681,10 @@ fn single_instance(cfg: &Config) {
     }
     use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
     use windows_sys::Win32::System::Threading::CreateMutexW;
-    // (Named by the data folder: a checkout and a player's install do not exclude each other.)
-    let key: String = cfg.paths.user.display().to_string().chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).collect();
+    // (Named by the data folder: a checkout and a player's install do not exclude each other. The
+    // shader preparation's self-play takes the player's: it shares their shader store.)
+    let user = prepplay::player_user().unwrap_or(&cfg.paths.user);
+    let key: String = user.display().to_string().chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).collect();
     let name: Vec<u16> = format!("Local\\Regaliant_{key}").encode_utf16().chain(std::iter::once(0)).collect();
     // (Kept for the process's life: never closed.)
     let h = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
@@ -1827,10 +1841,16 @@ This happens when other software takes that range. Restart the PC and try again.
             std::process::exit(EXIT_EARLY as i32);
         }
     };
-    let cfg = parse_args();
+    let mut cfg = parse_args();
+    // The shader preparation's self-play: its own folders, the player's shader store, no window,
+    // sound or system input (before any thread starts).
+    if let Some(stage) = cfg.prepare_play {
+        prepplay::setup(stage, &mut cfg);
+    }
     PATHS.set(cfg.paths.clone()).ok();
     HEADLESS.store(cfg.headless, std::sync::atomic::Ordering::Relaxed);
-    prune_runs(&cfg.paths.logs(), cfg.paths.logs_kept());
+    // (The run's own logs folder: the self-play's log is among the player's.)
+    prune_runs(cfg.run_dir.parent().unwrap_or(&cfg.paths.logs()), cfg.paths.logs_kept());
     if let Err(e) = std::fs::create_dir_all(&cfg.run_dir).and_then(|_| log::init(&cfg.run_dir.join("dsport.log"))) {
         player_error(&format!("The game could not write its log in {}.\n\n{e}", cfg.run_dir.display()));
         std::process::exit(1);
@@ -1839,7 +1859,7 @@ This happens when other software takes that range. Restart the PC and try again.
     // A session in progress (the launcher's: one left behind did not end normally). Runs of no
     // game write none (the launcher's check left its marker behind, then read as a session that
     // did not end normally, or replaced a running game's).
-    if cfg.precompile_all.is_none() && cfg.compile_bench.is_none() && !cfg.translation_fingerprint {
+    if cfg.precompile_all.is_none() && cfg.compile_bench.is_none() && !cfg.translation_fingerprint && cfg.prepare_play.is_none() {
         let _ = std::fs::write(cfg.paths.running_marker(), format!("pid {}\nlog {}\n", std::process::id(), cfg.run_dir.display()));
     }
     log::set_thread_name("host");
@@ -1876,6 +1896,8 @@ This happens when other software takes that range. Restart the PC and try again.
     }
     cpucheck::check();
     single_instance(&cfg);
+    // (Its driver reads the log from here on; the title reads the tour's automation at its boot.)
+    prepplay::start(&cfg.app);
     exception::install();
     heapsites::start();
     hosted::init();
@@ -2165,6 +2187,11 @@ This happens when other software takes that range. Restart the PC and try again.
         if let Some(s) = cfg.seconds {
             if start.elapsed() >= Duration::from_secs(s) {
                 info!("time limit of {s}s reached; guest thread stacks:\n{}", thread_summary_ex(true));
+                // (A self-play stage that ran out of time did not play to its end.)
+                if cfg.prepare_play.is_some() {
+                    error!("prepare-play: the stage did not end within its time limit of {s} s");
+                    shutdown(prepplay::EXIT_FAILED);
+                }
                 shutdown(0);
             }
         }

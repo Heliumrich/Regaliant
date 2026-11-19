@@ -1,8 +1,11 @@
-//! The Shaders page: the game's shaders prepared ahead (`dsport --precompile-all`, every compute
-//! program of the game's shader files compiled into the player's own pipeline store), with its
-//! progress, a stop that lets the current shaders finish, and the option to prepare them when
-//! Play is pressed the first time. Prepared shaders hold for one graphics card and driver
-//! (prepared.txt records them) and for the game's translation of them: a new driver, or a
+//! The Shaders page: the game's shaders prepared ahead, in three steps: every compute program of
+//! the game's shader files compiled into the player's own pipeline store (`dsport
+//! --precompile-all`), then the game plays by itself in the background to learn the graphics
+//! shaders (`dsport --prepare-play newgame`, then `tour`: no window, no sound, the player's
+//! controllers, keyboard and mouse left alone; its saves and settings its own). Its progress, a
+//! stop that lets the current step end, and the option to prepare them when Play is pressed the
+//! first time. Prepared shaders hold for one graphics card and driver (prepared.txt records them,
+//! played.txt the self-play's stages) and for the game's translation of them: a new driver, or a
 //! version of the port that translates the shaders differently (`dsport
 //! --translation-fingerprint`, checked once at start on a thread of its own), asks for another
 //! preparation.
@@ -23,6 +26,9 @@ const ID_AUTO: i32 = 203;
 pub const TIMER: usize = 3;
 /// The timer that waits for the translation check (`start_check`).
 pub const CHECK_TIMER: usize = 4;
+
+/// The self-play's exit status when the stop file ended it (`prepplay::EXIT_STOPPED`).
+const STAGE_STOPPED: i32 = 3;
 
 /// This build's translation fingerprint (`dsport --translation-fingerprint`): None while the
 /// check runs, then its answer.
@@ -69,6 +75,45 @@ pub fn check_tick(app: &mut App) {
     }
 }
 
+/// The preparation's steps, in order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Step {
+    /// The compute programs compiled (`--precompile-all`).
+    Compute,
+    /// The game plays a new game by itself (`--prepare-play newgame`).
+    NewGame,
+    /// The game visits its levels by itself (`--prepare-play tour`, the save `NewGame` made).
+    Tour,
+}
+
+impl Step {
+    fn number(self) -> u32 {
+        match self {
+            Step::Compute => 1,
+            Step::NewGame => 2,
+            Step::Tour => 3,
+        }
+    }
+
+    /// The self-play stage (None: the compute step).
+    fn stage(self) -> Option<&'static str> {
+        match self {
+            Step::Compute => None,
+            Step::NewGame => Some("newgame"),
+            Step::Tour => Some("tour"),
+        }
+    }
+
+    /// The session's time limit (a stage that hangs ends).
+    fn seconds(self) -> u64 {
+        match self {
+            Step::Compute => 0,
+            Step::NewGame => 2400,
+            Step::Tour => 7200,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Page {
     status: usize,
@@ -77,6 +122,9 @@ pub struct Page {
     stop: usize,
     auto: usize,
     child: Option<Child>,
+    /// The step the child runs.
+    step: Option<Step>,
+    /// When the step began.
     started: Option<Instant>,
     /// The game starts when the preparation is done (it began from Play).
     pub play_after: bool,
@@ -98,8 +146,14 @@ fn marker(app: &App) -> PathBuf {
     app.paths.shaders().join("prepared.txt")
 }
 
-/// Whether the shaders are prepared for this graphics card and driver; the status line.
-pub fn state(app: &App) -> (bool, String) {
+/// The self-play's stages and how they ended (`record_stage`).
+fn played_file(app: &App) -> PathBuf {
+    app.paths.shaders().join("played.txt")
+}
+
+/// Whether the compute shaders are prepared for this graphics card, driver and translation; the
+/// status line.
+fn compute_state(app: &App) -> (bool, String) {
     // (They are prepared from the game's files: nothing to do before a folder is chosen.)
     if !app.game.ok {
         return (false, "Choose the game's folder on the Game page first.".into());
@@ -131,6 +185,59 @@ pub fn state(app: &App) -> (bool, String) {
     }
 }
 
+/// How the self-play's stages ended (None: not played) for the compute shaders prepared now
+/// (their translation and driver: a new preparation plays again).
+fn played(app: &App) -> (Option<i32>, Option<i32>) {
+    let kv = read_kv(&played_file(app));
+    let prep = read_kv(&marker(app));
+    let get = |kv: &[(String, String)], k: &str| kv.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone()).unwrap_or_default();
+    if kv.is_empty() || ["translation", "driver", "device"].iter().any(|k| get(&kv, k) != get(&prep, k)) {
+        return (None, None);
+    }
+    let code = |k: &str| get(&kv, k).parse::<i32>().ok();
+    (code("newgame"), code("tour"))
+}
+
+/// A stage ended with `code` (its line in played.txt, with the compute shaders' translation,
+/// driver and card).
+fn record_stage(app: &App, stage: &str, code: i32) {
+    let prep = read_kv(&marker(app));
+    let get = |k: &str| prep.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone()).unwrap_or_default();
+    // (A new game played again makes a new save: its tour is played again too.)
+    let (newgame, _) = played(app);
+    let (newgame, tour) = match stage {
+        "newgame" => (Some(code), None),
+        _ => (newgame, Some(code)),
+    };
+    let line = |v: Option<i32>| v.map_or(String::new(), |c| c.to_string());
+    let t = format!(
+        "# The game's self-play that learned the graphics shaders (dsport --prepare-play); written by the launcher\n# (0: played to its end, 3: stopped, other: it could not go on)\nnewgame = {}\ntour = {}\ntranslation = {}\ndriver = {}\ndevice = {}\n",
+        line(newgame),
+        line(tour),
+        get("translation"),
+        get("driver"),
+        get("device")
+    );
+    let _ = std::fs::write(played_file(app), t);
+}
+
+/// Whether the shaders are prepared for this graphics card and driver (the compute shaders, and
+/// the self-play played or tried to its end); the status line.
+pub fn state(app: &App) -> (bool, String) {
+    let (ok, text) = compute_state(app);
+    if !ok {
+        return (ok, text);
+    }
+    let ended = |c: Option<i32>| c.is_some_and(|c| c != STAGE_STOPPED);
+    match played(app) {
+        (Some(0), Some(0)) => (true, text),
+        // (A stage that could not go on: what it learned is kept, and play learns the rest.)
+        (Some(c), _) if c != 0 && ended(Some(c)) => (true, format!("{text} Some graphics shaders could not be learned ahead.")),
+        (Some(0), t) if ended(t) => (true, format!("{text} Some graphics shaders could not be learned ahead.")),
+        _ => (false, "The compute shaders are prepared. The graphics shaders are not learned yet: Prepare now does it.".into()),
+    }
+}
+
 pub fn prepared(app: &App) -> bool {
     wait_check();
     state(app).0
@@ -151,7 +258,7 @@ pub fn build(app: &mut App) {
     let b: Builder = app.builder();
     unsafe {
         let r = (16, 62, 748, 62);
-        app.put(2, b.label("The game compiles each shader the first time it needs it, which makes play stutter. Preparing them here once takes about 20 to 60 minutes and makes the longest stutters much shorter. Some stutter remains on first visits. Nothing of it shows while you play.", r, -1), r);
+        app.put(2, b.label("The game compiles each shader the first time it needs it, which makes play stutter. Preparing them here compiles the compute shaders, then the game plays a new game and visits every level by itself to learn the graphics shaders. Nothing of it shows or sounds, but the graphics card is busy. It takes one to two hours, once.", r, -1), r);
         let r = (16, 134, 748, 40);
         app.shaders.status = app.put(2, b.label("", r, -1), r) as usize;
         let r = (16, 178, 748, 20);
@@ -164,7 +271,7 @@ pub fn build(app: &mut App) {
         app.shaders.auto = app.put(2, b.check("Prepare the shaders when Play is pressed and they are not prepared yet.", r, ID_AUTO), r) as usize;
         ui::set_check(h(app.shaders.auto), app.launch.prepare_shaders);
         let where_ = format!(
-            "Prepared shaders are kept in {}. They take up to 4 GB. Preparing uses {} of this PC's {} processor threads.",
+            "Prepared shaders are kept in {}. They take up to 5 GB. Preparing uses {} of this PC's {} processor threads.",
             ui::short(&app.paths.shaders(), 70),
             sys::prepare_threads(),
             sys::threads()
@@ -198,7 +305,9 @@ pub fn stopping(app: &App) -> bool {
     app.shaders.stopping.is_some()
 }
 
-/// Starts the preparation (`play_after`: the game starts when it is done).
+/// Starts the preparation (`play_after`: the game starts when it is done) at its first step not
+/// done: the compute shaders unless they are prepared, then the self-play's stages not played
+/// (all three again when everything is done: Prepare now).
 pub fn start(app: &mut App, play_after: bool) {
     // (Not without the game's files: it ended with "an error (code 3)", 2026-11-19.)
     if app.shaders.child.is_some() || app.running.is_some() || !app.game.ok {
@@ -212,13 +321,42 @@ pub fn start(app: &mut App, play_after: bool) {
     let dir = app.paths.shaders();
     if let Some(free) = sys::free_space(&dir) {
         if free < 3 << 30 {
-            let t = format!("Only {} is free on the drive of {}. Preparing the shaders needs up to 4 GB. Prepare them anyway?", sys::gb(free), dir.display());
+            let t = format!("Only {} is free on the drive of {}. Preparing the shaders needs up to 5 GB. Prepare them anyway?", sys::gb(free), dir.display());
             if unsafe { ui::message(app.hwnd, &t, crate::TITLE, windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONWARNING | windows_sys::Win32::UI::WindowsAndMessaging::MB_YESNO) } != windows_sys::Win32::UI::WindowsAndMessaging::IDYES {
                 return;
             }
         }
     }
     let _ = std::fs::create_dir_all(&dir);
+    wait_check();
+    let first = if !compute_state(app).0 {
+        Step::Compute
+    } else {
+        match played(app) {
+            (Some(0), Some(0)) => Step::Compute,
+            (Some(0), _) => Step::Tour,
+            _ => Step::NewGame,
+        }
+    };
+    app.shaders.play_after = play_after;
+    app.shaders.stopping = None;
+    app.shaders.then_play = false;
+    if begin(app, first) {
+        unsafe {
+            ui::set_progress(h(app.shaders.bar), 0);
+            ui::show(h(app.shaders.bar), true);
+            ui::enable(h(app.shaders.prepare), false);
+            ui::enable(h(app.shaders.stop), true);
+            windows_sys::Win32::UI::WindowsAndMessaging::SetTimer(app.hwnd, TIMER, 500, None);
+        }
+        app.update_play();
+        app.set_status(if play_after { "Preparing the shaders first. The game starts when they are done." } else { "" });
+    }
+}
+
+/// Starts `step`'s child (false when it could not be started: the status says why).
+fn begin(app: &mut App, step: Step) -> bool {
+    let exe = dsconfig::paths::game_exe_in(&app.paths.exe_dir);
     let progress = progress_file(app);
     let _ = std::fs::remove_file(&progress);
     let _ = std::fs::remove_file(progress.with_extension("stop"));
@@ -226,26 +364,30 @@ pub fn start(app: &mut App, play_after: bool) {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
     let mut cmd = std::process::Command::new(&exe);
-    cmd.arg("--precompile-all").arg(sys::prepare_threads().to_string()).arg("--progress").arg(&progress).current_dir(&app.paths.exe_dir).creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
+    match step.stage() {
+        None => cmd.arg("--precompile-all").arg(sys::prepare_threads().to_string()),
+        Some(s) => cmd.arg("--prepare-play").arg(s).arg("--seconds").arg(step.seconds().to_string()),
+    };
+    cmd.arg("--progress").arg(&progress).current_dir(&app.paths.exe_dir).creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
     match cmd.spawn() {
         Ok(c) => {
             app.shaders.child = Some(c);
+            app.shaders.step = Some(step);
             app.shaders.started = Some(Instant::now());
-            app.shaders.play_after = play_after;
-            app.shaders.stopping = None;
-            app.shaders.then_play = false;
-            unsafe {
-                ui::set_text(h(app.shaders.status), "Preparing the shaders. Reading the game's shader files...");
-                ui::set_progress(h(app.shaders.bar), 0);
-                ui::show(h(app.shaders.bar), true);
-                ui::enable(h(app.shaders.prepare), false);
-                ui::enable(h(app.shaders.stop), true);
-                windows_sys::Win32::UI::WindowsAndMessaging::SetTimer(app.hwnd, TIMER, 500, None);
-            }
-            app.update_play();
-            app.set_status(if play_after { "Preparing the shaders first. The game starts when they are done." } else { "" });
+            let text = match step {
+                Step::Compute => "Preparing the shaders, step 1 of 3: reading the game's shader files...",
+                Step::NewGame => "Preparing the shaders, step 2 of 3: the game starts a new game in the background...",
+                Step::Tour => "Preparing the shaders, step 3 of 3: the game loads its save in the background...",
+            };
+            unsafe { ui::set_text(h(app.shaders.status), text) };
+            true
         }
-        Err(e) => app.set_status(&format!("Could not start the preparation: {e}")),
+        Err(e) => {
+            app.shaders.child = None;
+            app.shaders.step = None;
+            app.set_status(&format!("Could not start the preparation: {e}"));
+            false
+        }
     }
 }
 
@@ -269,7 +411,18 @@ pub fn stop(app: &mut App) {
     }
 }
 
-/// The timer: progress, and the end of the preparation.
+/// The preparation ended (`note`: what the page says when it is not the usual state).
+fn finish(app: &mut App, note: Option<String>) {
+    app.shaders.step = None;
+    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::KillTimer(app.hwnd, TIMER) };
+    refresh(app);
+    app.update_play();
+    if let Some(n) = note {
+        unsafe { ui::set_text(h(app.shaders.status), &n) };
+    }
+}
+
+/// The timer: progress, and the end of each step.
 pub fn tick(app: &mut App) {
     let Some(child) = app.shaders.child.as_mut() else { return };
     let exited = match child.try_wait() {
@@ -281,22 +434,40 @@ pub fn tick(app: &mut App) {
     if exited.is_none() && app.shaders.stopping.is_some_and(|t| t.elapsed().as_secs() > 90) {
         let _ = child.kill();
     }
+    let step = app.shaders.step.unwrap_or(Step::Compute);
     if let Some(code) = exited {
         app.shaders.child = None;
-        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::KillTimer(app.hwnd, TIMER) };
         let _ = std::fs::remove_file(progress_file(app).with_extension("stop"));
         let stopped = app.shaders.stopping.take().is_some();
-        refresh(app);
-        app.update_play();
+        if let Some(s) = step.stage() {
+            record_stage(app, s, if stopped && code != 0 { STAGE_STOPPED } else { code });
+        }
         if stopped {
-            unsafe { ui::set_text(h(app.shaders.status), "Preparation stopped. The next one goes on where it left off.") };
+            finish(app, Some("Preparation stopped. The next one goes on where it left off.".into()));
             if std::mem::take(&mut app.shaders.then_play) {
                 crate::start_game(app);
             }
-        } else if code != 0 || !prepared(app) {
-            app.shaders.play_after = false;
-            unsafe { ui::set_text(h(app.shaders.status), &format!("Preparation ended with an error (code {code}). Open logs shows its log.")) };
-        } else if std::mem::take(&mut app.shaders.play_after) {
+            return;
+        }
+        let next = match step {
+            Step::Compute if code != 0 || !compute_state(app).0 => {
+                app.shaders.play_after = false;
+                finish(app, Some(format!("Preparation ended with an error (code {code}). Open logs shows its log.")));
+                return;
+            }
+            Step::Compute => Some(Step::NewGame),
+            Step::NewGame if code == 0 => Some(Step::Tour),
+            _ => None,
+        };
+        if let Some(n) = next {
+            if begin(app, n) {
+                return;
+            }
+        }
+        // (A stage that could not go on: what it learned is kept, and the game can be played.)
+        let note = (code != 0 && step != Step::Compute).then(|| format!("The game's self-play could not finish (code {code}): some graphics shaders are learned only while you play. Open logs shows its log."));
+        finish(app, note);
+        if std::mem::take(&mut app.shaders.play_after) && prepared(app) {
             crate::start_game(app);
         }
         return;
@@ -304,16 +475,21 @@ pub fn tick(app: &mut App) {
     if app.shaders.stopping.is_some() {
         return;
     }
-    // Progress: "<done> <shaders>" and "<code done> <code>".
+    // Progress: "<done> <of>" and "<code done> <code>" (the self-play: its steps twice).
     let Ok(t) = std::fs::read_to_string(progress_file(app)) else { return };
     let nums: Vec<u64> = t.split_whitespace().filter_map(|w| w.parse().ok()).collect();
     if let [done, total, wdone, wtotal] = nums[..] {
         let frac = if wtotal > 0 { wdone as f64 / wtotal as f64 } else { 0.0 };
         let el = app.shaders.started.map_or(0.0, |s| s.elapsed().as_secs_f64());
         let left = if frac > 0.02 { el * (1.0 - frac) / frac } else { 0.0 };
-        let eta = if frac > 0.02 { format!(" About {} minutes left.", (left / 60.0).ceil().max(1.0) as u64) } else { String::new() };
+        let eta = if frac > 0.02 && step != Step::NewGame { format!(" About {} minutes left in this step.", (left / 60.0).ceil().max(1.0) as u64) } else { String::new() };
+        let what = match step {
+            Step::Compute => format!("the compute shaders, {done} of {total} ({:.0}%)", frac * 100.0),
+            Step::NewGame => format!("the game plays a new game in the background, {done} of {total}"),
+            Step::Tour => format!("the game visits its levels in the background, {done} of {total}"),
+        };
         unsafe {
-            ui::set_text(h(app.shaders.status), &format!("Preparing the shaders: {done} of {total} ({:.0}%).{eta}", frac * 100.0));
+            ui::set_text(h(app.shaders.status), &format!("Preparing the shaders, step {} of 3: {what}.{eta}", step.number()));
             ui::set_progress(h(app.shaders.bar), (frac * 1000.0) as u32);
         }
     }

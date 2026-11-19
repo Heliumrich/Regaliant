@@ -358,6 +358,13 @@ fn init_inner() -> Result<(), String> {
         }
         let (pdev, qf, props) = chosen.ok_or("no Vulkan device with graphics+compute")?;
         let device_name = CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy().into_owned();
+        // (The driver's version and pipeline cache id: players' logs are compared by them.)
+        let driver_desc = {
+            let v = props.driver_version;
+            let ver = if props.vendor_id == 0x10de { format!("{}.{:02}", v >> 22, (v >> 14) & 0xff) } else { format!("{}.{}.{}", v >> 22, (v >> 12) & 0x3ff, v & 0xfff) };
+            let uuid: String = props.pipeline_cache_uuid.iter().map(|b| format!("{b:02x}")).collect();
+            format!("driver {ver} ({v:#x}), pipeline cache {uuid}")
+        };
         let prio = [1.0f32];
         // A transfer-only family for the copy queue (`DS_COPY_QUEUE=0`: none).
         let copy_family = if std::env::var("DS_COPY_QUEUE").ok().as_deref() != Some("0") {
@@ -887,7 +894,7 @@ fn init_inner() -> Result<(), String> {
             subgroup_size,
             subgroup32,
         };
-        crate::info!("Vulkan device: {} (queue family {qf}, validation {})", ctx.device_name, validation);
+        crate::info!("Vulkan device: {} (queue family {qf}, validation {}; {driver_desc})", ctx.device_name, validation);
         if let Some(v) = gpu_compat() {
             crate::info!("Vulkan: DS_GPU_COMPAT={v}: partitioned subgroups {}, fragment barycentrics {} (geometry shader instead {}), 32-lane subgroups required for {:?}", ctx.partitioned, ctx.barycentric, ctx.bary_gs, ctx.subgroup32);
         }

@@ -27,6 +27,28 @@ pub static TRACE_HLE: AtomicBool = AtomicBool::new(false);
 static SINK: Mutex<Option<BufWriter<File>>> = Mutex::new(None);
 static START: OnceLock<Instant> = OnceLock::new();
 
+/// A tap of the lines written (`prepplay`'s self-play reads the log as the development drivers
+/// do): while on, each line is kept, the last `TAP_KEEP`, with a running count.
+static TAP_ON: AtomicBool = AtomicBool::new(false);
+static TAP: Mutex<(u64, std::collections::VecDeque<String>)> = Mutex::new((0, std::collections::VecDeque::new()));
+const TAP_KEEP: usize = 16_384;
+
+/// Starts keeping the lines written from now on (`tap_read`).
+pub fn tap_on() {
+    TAP_ON.store(true, Ordering::Release);
+}
+
+/// The lines written since line `cursor` (a count of lines since the tap began; lines older
+/// than the last `TAP_KEEP` are gone) and the cursor after them.
+pub fn tap_read(cursor: u64) -> (Vec<String>, u64) {
+    let g = TAP.lock();
+    let (total, lines) = (&g.0, &g.1);
+    let first = total - lines.len() as u64;
+    let from = cursor.max(first);
+    let out = lines.iter().skip((from - first) as usize).cloned().collect();
+    (out, *total)
+}
+
 thread_local! {
     static THREAD_NAME: RefCell<String> = RefCell::new(String::new());
 }
@@ -140,6 +162,14 @@ pub fn write(level: Level, args: fmt::Arguments) {
     };
     let line = format!("[{:>10.3}][{}] {}: {}\n", elapsed_ms(), thread_name(), tag, args);
     let line = redact(&line);
+    if TAP_ON.load(Ordering::Relaxed) {
+        let mut t = TAP.lock();
+        t.0 += 1;
+        t.1.push_back(line.trim_end().to_string());
+        if t.1.len() > TAP_KEEP {
+            t.1.pop_front();
+        }
+    }
     // Errors go to stderr and the file at once; warnings to stderr only the first ones, and to
     // the file through its buffer (flushed every 250 ms, and by the crash handlers).
     let echo = level == Level::Error || (level == Level::Warn && WARNINGS.fetch_add(1, Ordering::Relaxed) < STDERR_WARNINGS);

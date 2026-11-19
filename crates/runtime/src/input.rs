@@ -318,7 +318,15 @@ fn scripted(st: &mut PadState, flip: u64, quiet: bool) {
     }
 }
 
+/// The system's controllers, keyboard and mouse are not read (the shader preparation's self-play,
+/// `prepplay`: it plays by its own presses while the player may be using the PC); the presses
+/// and sticks given through `press_for`, `hold_stick` and the control channel still reach the game.
+pub static SYSTEM_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn xinput_state() -> Option<XINPUT_STATE> {
+    if SYSTEM_OFF.load(Relaxed) {
+        return None;
+    }
     for i in 0..4 {
         let mut s: XINPUT_STATE = unsafe { std::mem::zeroed() };
         if unsafe { XInputGetState(i, &mut s) } == 0 {
@@ -1246,8 +1254,9 @@ fn mouse_look(st: &mut PadState, l: &Layout) {
 const WALK_TILT: f32 = 0.4;
 
 fn keyboard_mouse(st: &mut PadState) {
-    // A key binding being captured: the keyboard and mouse are the menu's alone.
-    if crate::pcsettings::bindings::capturing() {
+    // A key binding being captured: the keyboard and mouse are the menu's alone; none at all in
+    // the shader preparation's self-play (`SYSTEM_OFF`).
+    if crate::pcsettings::bindings::capturing() || SYSTEM_OFF.load(Relaxed) {
         return;
     }
     let l = layout();

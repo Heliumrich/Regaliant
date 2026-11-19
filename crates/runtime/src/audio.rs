@@ -440,8 +440,16 @@ fn soft_knee(v: f32) -> f32 {
 /// scale (`mix_into`).
 const SOFT_KNEE: f32 = 0.8;
 
+/// No sound at all (the shader preparation's self-play, `prepplay`): the streams drain on the
+/// null device's clock and no output device is opened.
+pub static SILENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn output_thread() {
     crate::log::set_thread_name("audio-out");
+    if SILENT.load(Ordering::Relaxed) {
+        crate::info!("audio: silent (no output device opened)");
+        null_device();
+    }
     // Little work per wake-up, but late work is heard: above the title's
     // threads and the GPU front end's (`gpu::prio`).
     unsafe {
