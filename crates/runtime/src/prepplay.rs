@@ -79,7 +79,15 @@ struct Setup {
     progress: Option<PathBuf>,
     /// The self-play's own title folders (the tour's automation file goes to its devlog).
     runtime: PathBuf,
+    /// The player's shader store (its `prepared.txt` is written when the levels end).
+    store: PathBuf,
+    /// The background compute preparation's threads (`--prepare-threads`; 0: half the CPUs).
+    threads: usize,
 }
+
+/// The longest the levels stage waits at its end for the background compute preparation (the
+/// whole preparation stays within about an hour on slower PCs).
+const COMPUTE_TAIL: Duration = Duration::from_secs(600);
 
 static SETUP: OnceLock<Setup> = OnceLock::new();
 
@@ -139,11 +147,16 @@ pub fn setup(stage: Stage, cfg: &mut crate::Config) {
     }
     crate::audio::SILENT.store(true, Relaxed);
     crate::input::SYSTEM_OFF.store(true, Relaxed);
+    // The levels at the self-play's game speed (`level_speed`; the new game's screens at their own).
+    if stage == Stage::Tour {
+        crate::gamestep::SPEED_X100.store((level_speed() * 100.0).round() as u32, Relaxed);
+    }
     let runtime = paths.runtime();
     cfg.paths = paths;
-    cfg.cache = Some(store);
+    cfg.cache = Some(store.clone());
     cfg.headless = true;
-    let _ = SETUP.set(Setup { stage, player_user: player.user, progress: cfg.progress.clone(), runtime });
+    let threads = if cfg.prepare_threads > 0 { cfg.prepare_threads } else { std::thread::available_parallelism().map_or(4, |n| n.get() / 2).max(2) };
+    let _ = SETUP.set(Setup { stage, player_user: player.user, progress: cfg.progress.clone(), runtime, store, threads });
 }
 
 /// Starts the stage (`main`, once the log is open; before the title starts: the tour's
@@ -173,7 +186,7 @@ pub fn start(app: &Path) {
                     crate::error!("prepare-play: writing the tour into {}: {e}", devlog.display());
                     end(EXIT_FAILED);
                 }
-                crate::info!("prepare-play: the tour has {views} views");
+                crate::info!("prepare-play: the levels stage has {views} steps");
                 views + TOUR_STEPS
             }
             Err(e) => {
@@ -182,7 +195,10 @@ pub fn start(app: &Path) {
             }
         },
     };
-    let (stage, progress) = (s.stage, s.progress.clone());
+    // The compute programs' guessed variants (the launcher's former first step, `--precompile-all`)
+    // made beside the play on threads of the lowest priority: the CPU the play leaves idle.
+    crate::gpu::compbench::background(app.to_path_buf(), s.threads);
+    let (stage, progress, store, app) = (s.stage, s.progress.clone(), s.store.clone(), app.to_path_buf());
     let spawned = std::thread::Builder::new().name("prepare-play".into()).spawn(move || {
         crate::log::set_thread_name("prepare-play");
         let mut p = Play::new(progress, total);
@@ -193,6 +209,17 @@ pub fn start(app: &Path) {
         let code = match r {
             Ok(()) => {
                 p.drain(180);
+                if stage == Stage::Tour {
+                    // The background compute preparation: its rest, for at most `COMPUTE_TAIL`;
+                    // then the store is marked prepared (with how much of the list was made).
+                    let r = p.compute_tail();
+                    crate::gpu::compbench::background_stop();
+                    let b = &crate::gpu::compbench::BACKGROUND;
+                    crate::gpu::compbench::write_marker(&app, &store.join("prepared.txt"), b[1].load(Relaxed) as usize, b[0].load(Relaxed) as usize, b[2].load(Relaxed) as usize, p.t0.elapsed().as_secs_f64());
+                    if r.is_err() {
+                        end(EXIT_STOPPED);
+                    }
+                }
                 p.done();
                 crate::info!("prepare-play: stage {} played to its end in {:.0} s", stage.name(), p.t0.elapsed().as_secs_f64());
                 0
@@ -304,7 +331,9 @@ impl Play {
 
     fn write_progress(&self) {
         if let Some(p) = &self.progress {
-            let t = format!("{} {}\n{} {}\n", self.done_steps, self.total, self.done_steps, self.total);
+            // (A third line: the background compute preparation's items made and listed.)
+            let b = &crate::gpu::compbench::BACKGROUND;
+            let t = format!("{} {}\n{} {}\n{} {}\n", self.done_steps, self.total, self.done_steps, self.total, b[1].load(Relaxed), b[0].load(Relaxed));
             let tmp = p.with_extension("tmp");
             if std::fs::write(&tmp, t).is_ok() {
                 let _ = std::fs::rename(&tmp, p);
@@ -496,9 +525,12 @@ impl Play {
         if !self.wait_for("committed [\"SAVEDATA0PlayerProfile0\"]", m, 60.0)? {
             return Err(End::Failed("the character was not saved".into()));
         }
-        // The opening cinematic, played to its end (its own graphics).
+        // The opening cinematic, skipped (a prerecorded movie: its few pipelines are the attract
+        // movie's; ~2.5 minutes).
         if self.wait_for("create thread 'Bink IO'", m, 60.0)? {
-            self.step("the opening cinematic");
+            self.step("the opening cinematic skipped");
+            self.sleep(3.0)?;
+            self.press("cross", 4000);
         }
         if !self.wait_in_game(m, "Crescent Moon Grass", 420.0)? {
             return Err(End::Failed("not in the game after the cinematic".into()));
@@ -563,14 +595,18 @@ impl Play {
         if !self.wait_for("dsport-tour: start", m, 300.0)? {
             return Err(End::Failed("the tour did not start".into()));
         }
-        self.step("the tour");
-        let mut seen = 0usize;
+        self.step("the levels");
+        let (mut seen, mut fogs, mut levels) = (0usize, 0usize, 0usize);
         let mut last = Instant::now();
+        // Presses of Cross still to come at a fog door (a press while the player still moves
+        // may not take: -214433's 2-2 door kept its prompt).
+        let mut fog_presses: Vec<Instant> = Vec::new();
         loop {
             if self.w.found("dsport-tour: done", m) {
+                self.coverage("the end");
                 return Ok(());
             }
-            let n = self.w.count("dsport-tour: view", m);
+            let n = self.w.count("dsport-tour: step", m);
             if n > seen {
                 for _ in seen..n {
                     self.done_steps = (self.done_steps + 1).min(self.total);
@@ -579,37 +615,172 @@ impl Play {
                 seen = n;
                 last = Instant::now();
             }
-            // (A level load and its resources take ~10-60 s; a view that never ends is a stall.)
-            if last.elapsed() > Duration::from_secs(600) {
-                return Err(End::Failed(format!("the tour stopped after {seen} views")));
+            // A boss's fog door: its prompt pressed (the script prints `dsport-textreset` before
+            // each door, so each prompt is logged again).
+            let f = self.w.count("Enter fog", m);
+            if f > fogs {
+                fogs = f;
+                let now = Instant::now();
+                fog_presses = vec![now, now + Duration::from_millis(1500), now + Duration::from_millis(3000)];
+                crate::info!("prepare-play: a fog door's prompt ({fogs} so far): Cross now and twice after");
             }
-            self.sleep(1.0)?;
+            if fog_presses.first().is_some_and(|t| Instant::now() >= *t) {
+                fog_presses.remove(0);
+                self.press("cross", 200);
+            }
+            let l = self.w.count("dsport-tour: level", m);
+            if l > levels {
+                levels = l;
+                self.coverage(&format!("level {l} starts"));
+            }
+            // (A level load and its resources take ~10-60 s; a step that never ends is a stall.)
+            if last.elapsed() > Duration::from_secs(600) {
+                return Err(End::Failed(format!("the levels stopped after {seen} steps")));
+            }
+            self.sleep(0.25)?;
         }
+    }
+
+    /// The background compute preparation's rest, for at most `COMPUTE_TAIL` (the stop file ends
+    /// it too: Err).
+    fn compute_tail(&mut self) -> Result<(), End> {
+        let b = &crate::gpu::compbench::BACKGROUND;
+        let t = Instant::now();
+        let left = || b[0].load(Relaxed).saturating_sub(b[1].load(Relaxed));
+        crate::info!("prepare-play: the background compute preparation has {} of {} items left", left(), b[0].load(Relaxed));
+        while (b[0].load(Relaxed) == 0 || left() > 0) && t.elapsed() < COMPUTE_TAIL {
+            self.sleep(1.0)?;
+            self.write_progress();
+        }
+        crate::info!("prepare-play: the background compute preparation made {} of {} items ({} failed; {:.0} s waited at the end)", b[1].load(Relaxed), b[0].load(Relaxed), b[2].load(Relaxed), t.elapsed().as_secs_f64());
+        Ok(())
+    }
+
+    /// The pipelines met so far (the coverage log: what each level added).
+    fn coverage(&self, at: &str) {
+        use crate::gpu::exec::{FIRST_USES, draw};
+        crate::info!(
+            "prepare-play: at {at} ({:.0} s): {} graphics pipelines queued for the background, {} graphics and {} compute pipelines missing at their first use",
+            self.t0.elapsed().as_secs_f64(),
+            draw::ASYNC_GFX_STATS[1].load(Relaxed),
+            draw::GFX_FIRST_USES[0].load(Relaxed),
+            FIRST_USES[0].load(Relaxed)
+        );
     }
 }
 
-/// The tour's automation script (the title's developer automation: `tools/tour.py` writes the
-/// development tours the same way) and its number of views: the screenshot positions of
-/// `misc/automation/demonssoulsscreenshots.txt`, each level loaded once, the camera at each
-/// position looking four ways (the position's yaw and three quarter turns from it).
-/// `DS_PREPARE_TOUR=<positions a level>[:<directions>]` changes the choice (0 positions: all).
-fn tour_script(app: &Path) -> Result<(String, u32), String> {
-    let src = app.join("misc").join("automation").join("demonssoulsscreenshots.txt");
-    let text = std::fs::read_to_string(&src).map_err(|e| format!("{}: {e}", src.display()))?;
-    let (per_level, dirs) = std::env::var("DS_PREPARE_TOUR")
-        .ok()
-        .and_then(|v| {
-            let mut it = v.split(':');
-            let p = it.next()?.trim().parse::<usize>().ok()?;
-            let d = it.next().map_or(Some(4), |d| d.trim().parse::<u32>().ok())?;
-            Some((p, d.clamp(1, 8)))
-        })
-        .unwrap_or((0, 4));
-    tour_lines(&text, per_level, dirs).ok_or_else(|| format!("no positions in {}", src.display()))
+/// The levels stage's choices: `DS_PREPARE_TOUR=<camera positions a level>[:<headings>[:<dwell
+/// s>]]` (0 positions: all; default 6, 3 headings, 0.5 s), `DS_PREPARE_LEVELS=<w-l>,...` (only
+/// those levels), `DS_PREPARE_SHOTS=1` (screenshots at its walks and bosses: tests),
+/// `DS_PREPARE_SPEED=<x>` (the game's speed, default 2: `gamestep::SPEED_X100`; the walks' and
+/// fights' waits and holds are its share of their real-time lengths).
+struct LevelOpts {
+    per_level: usize,
+    dirs: u32,
+    dwell: f64,
+    only: Vec<(u32, u32)>,
+    shots: bool,
+    speed: f64,
 }
 
-/// The tour's script from the automation file's text (None: no positions in it).
-fn tour_lines(text: &str, per_level: usize, dirs: u32) -> Option<(String, u32)> {
+/// The levels stage's game speed (`DS_PREPARE_SPEED`, 0.25 to 4; default 2).
+fn level_speed() -> f64 {
+    std::env::var("DS_PREPARE_SPEED").ok().and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(2.0).clamp(0.25, 4.0)
+}
+
+impl LevelOpts {
+    fn from_env() -> LevelOpts {
+        let mut o = LevelOpts { per_level: 6, dirs: 3, dwell: 0.5, only: Vec::new(), shots: std::env::var("DS_PREPARE_SHOTS").ok().as_deref() == Some("1"), speed: level_speed() };
+        if let Ok(v) = std::env::var("DS_PREPARE_TOUR") {
+            let mut it = v.split(':');
+            if let Some(p) = it.next().and_then(|p| p.trim().parse().ok()) {
+                o.per_level = p;
+            }
+            if let Some(d) = it.next().and_then(|d| d.trim().parse::<u32>().ok()) {
+                o.dirs = d.clamp(1, 8);
+            }
+            if let Some(w) = it.next().and_then(|w| w.trim().parse::<f64>().ok()) {
+                o.dwell = w.clamp(0.1, 5.0);
+            }
+        }
+        if let Ok(v) = std::env::var("DS_PREPARE_LEVELS") {
+            o.only = v.split([',', ';']).filter_map(|l| level_of(l.trim())).collect();
+        }
+        o
+    }
+}
+
+/// "w-l" as (world, level).
+fn level_of(s: &str) -> Option<(u32, u32)> {
+    let (a, b) = s.split_once('-')?;
+    Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+}
+
+/// A point of interest of the title's developers (`misc/dspointsofinterest.txt`: `+poi
+/// group="..." name="..." script="..." command="+cp11_loadLevel <w> <l>"
+/// commandIfNoSpawnLocation="SetPlayerPos ..."`) that places the player.
+struct Poi {
+    group: String,
+    name: String,
+    level: (u32, u32),
+    /// The placement (`SetPlayerPos posX=.. ... camEulerZ=..`).
+    pos: String,
+}
+
+fn pois(text: &str) -> Vec<Poi> {
+    let field = |l: &str, k: &str| -> Option<String> {
+        let key = format!("{k}=\"");
+        let i = l.find(&key)? + key.len();
+        let j = l[i..].find('"')?;
+        Some(l[i..i + j].to_string())
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let l = line.trim();
+        if !l.starts_with("+poi") {
+            continue;
+        }
+        let (Some(group), Some(name), Some(command)) = (field(l, "group"), field(l, "name"), field(l, "command")) else { continue };
+        let pos = field(l, "commandIfNoSpawnLocation").unwrap_or_default().trim().trim_start_matches('+').trim().to_string();
+        let mut w = command.split_whitespace().skip_while(|t| !t.ends_with("cp11_loadLevel")).skip(1);
+        let (Some(a), Some(b)) = (w.next().and_then(|v| v.parse().ok()), w.next().and_then(|v| v.parse().ok())) else { continue };
+        // (A name or group with quotes or markers would break the script's lines.)
+        if pos.starts_with("SetPlayerPos ") && !pos.contains('"') {
+            out.push(Poi { group: group.replace(['"', '\\'], ""), name: name.replace(['"', '\\'], ""), level: (a, b), pos });
+        }
+    }
+    out
+}
+
+/// The levels stage's automation script (the title's developer automation, as `tools/tour.py`
+/// and `tools/areas.py` write the development tours) and its number of steps, from the title's
+/// own files: the screenshot positions of `misc/automation/demonssoulsscreenshots.txt` and the
+/// points of interest of `misc/dspointsofinterest.txt`.
+fn tour_script(app: &Path) -> Result<(String, u32), String> {
+    let misc = app.join("misc");
+    let src = misc.join("automation").join("demonssoulsscreenshots.txt");
+    let shots = std::fs::read_to_string(&src).map_err(|e| format!("{}: {e}", src.display()))?;
+    let poi_file = misc.join("dspointsofinterest.txt");
+    let poi = std::fs::read_to_string(&poi_file).unwrap_or_else(|e| {
+        crate::warn!("prepare-play: {}: {e} (the camera views only)", poi_file.display());
+        String::new()
+    });
+    levels_lines(&shots, &poi, &LevelOpts::from_env()).ok_or_else(|| format!("no positions in {}", src.display()))
+}
+
+/// The levels stage's script (None: no positions). Each level is loaded once and, in this
+/// order (the gameplay camera before the free one):
+/// - a walk and a fight where it starts (the camera turned, a few steps, the nearest enemy
+///   locked on and attacked; the player can be neither hurt nor killed, `cp11_characters_*`);
+/// - its boss: the player at its fog door's point, walking at it (the driver presses Cross at
+///   the "Enter fog" prompt, `Play::tour`), then fighting it;
+/// - every third of its area points that place the player (world 1's), each a walk and a fight;
+/// - the camera at its screenshot positions, `dirs` headings each;
+/// - the gameplay camera back (`ToggleDebugCamera`), every enemy's death at once
+///   (`cp11_allSuicideExceptPlayer`).
+/// Each step prints `dsport-tour: step <n> (<what>)`, each level `dsport-tour: level <w>-<l>`.
+fn levels_lines(text: &str, poi_text: &str, o: &LevelOpts) -> Option<(String, u32)> {
+    let (per_level, dirs) = (o.per_level, o.dirs);
     // (level, camera words) in the file's order.
     let mut locs: Vec<((u32, u32), Vec<(String, f64)>)> = Vec::new();
     for line in text.lines() {
@@ -627,37 +798,117 @@ fn tour_lines(text: &str, per_level: usize, dirs: u32) -> Option<(String, u32)> 
             locs.push(((w, lv), cam));
         }
     }
-    if locs.is_empty() {
+    let points = pois(poi_text);
+    if locs.is_empty() && points.is_empty() {
         return None;
     }
+    // The levels in the screenshots' order, then those with only a boss.
     let mut levels: Vec<(u32, u32)> = Vec::new();
-    for (lv, _) in &locs {
-        if !levels.contains(lv) {
-            levels.push(*lv);
+    for lv in locs.iter().map(|(l, _)| *l).chain(points.iter().filter(|p| p.group == "Boss Fog Doors").map(|p| p.level)) {
+        if !levels.contains(&lv) {
+            levels.push(lv);
         }
     }
-    // (The automation counts game time from the title's boot, and the title ignores level loads
+    if !o.only.is_empty() {
+        levels.retain(|l| o.only.contains(l));
+    }
+    // (The automation counts frames from the title's boot, and the title ignores level loads
     // until it is in the game: its first wait covers the self-play's way through the title, the
     // main menu and the save's load, ~50-80 s.)
-    let mut out = vec![
-        "// The shader preparation's tour (written by the game's self-play from misc/automation/demonssoulsscreenshots.txt)".to_string(),
-        "wait 120.0".to_string(),
-        "waitForLevelLoading".to_string(),
-        "waitForResourceLoading".to_string(),
-        "print \"dsport-tour: start\"".to_string(),
-    ];
-    let mut views = 0u32;
+    let mut out: Vec<String> = [
+        "// The shader preparation's levels (written by the game's self-play from misc/automation/demonssoulsscreenshots.txt and misc/dspointsofinterest.txt)",
+        "wait 120.0",
+        "waitForLevelLoading",
+        "waitForResourceLoading",
+        "print \"dsport-tour: start\"",
+        "+cp11_characters_playerNoDead 1",
+        "+cp11_characters_playerNoDamage 1",
+        "+cp11_characters_playerNoHit 1",
+    ]
+    .map(String::from)
+    .to_vec();
+    let mut steps = 0u32;
+    let ctl = |c: &str| format!("print \"dsport-control: {c}\"");
+    // Waits and holds of the walks and fights at the game's speed (the game time they cover
+    // stays; the waits count frames, `gamestep`).
+    let sp = o.speed.clamp(0.25, 4.0);
+    let w = |s: f64| format!("wait {:.2}", s / sp);
+    let ms = |m: f64| ((m / sp).round() as u64).max(60);
+    // The nearest enemy locked on and attacked `n` times, a step in after each.
+    let fight = |out: &mut Vec<String>, n: u32| {
+        out.push(ctl("press r3 200ms"));
+        out.push(w(0.5));
+        for _ in 0..n {
+            out.extend([ctl("press r1 200ms"), w(0.8), ctl(&format!("stick l 0 -127 {}", ms(300.0))), w(0.45)]);
+        }
+        out.push(ctl("press r3 200ms"));
+        out.push(w(0.3));
+    };
+    // The camera turned, a few steps forward, a fight, the camera turned back.
+    let walk = |out: &mut Vec<String>, attacks: u32| {
+        out.extend([ctl(&format!("stick r 127 0 {}", ms(1500.0))), w(2.0), ctl(&format!("stick l 0 -127 {}", ms(2000.0))), w(2.5)]);
+        if attacks > 0 {
+            fight(out, attacks);
+        }
+        out.extend([ctl(&format!("stick r -127 0 {}", ms(1500.0))), w(2.0)]);
+    };
+    let shot = |out: &mut Vec<String>, name: String| {
+        if o.shots {
+            out.push(format!("print \"dsport-shot: {name}\""));
+            out.push("wait 0.3".into());
+        }
+    };
     for lv in &levels {
+        let tag = format!("{}-{}", lv.0, lv.1);
+        let ftag = format!("{}_{}", lv.0, lv.1);
+        out.push(format!("print \"dsport-tour: level {tag}\""));
+        out.push(format!("+cp11_loadLevel {} {}", lv.0, lv.1));
+        out.extend(["wait 5.0", "waitForLevelLoading", "waitForResourceLoading", "wait 2.0"].map(String::from));
+        // Where the level starts (no fight in the Nexus: its people are not enemies).
+        steps += 1;
+        out.push(format!("print \"dsport-tour: step {steps} (walk {tag} start)\""));
+        shot(&mut out, format!("lv{ftag}_start"));
+        walk(&mut out, if *lv == (0, 1) { 0 } else { 4 });
+        // The boss through its fog door (its point is at the fog: the prompt comes at once, and
+        // the driver presses it), then three rounds of a lock-on and attacks with the camera
+        // turned between them (the door's way in may face a wall: -211521).
+        for b in points.iter().filter(|p| p.level == *lv && p.group == "Boss Fog Doors") {
+            steps += 1;
+            out.push("print \"dsport-textreset\"".into());
+            out.push(format!("print \"dsport-tour: step {steps} (boss {tag} {})\"", b.name));
+            out.push(format!("+{}", b.pos));
+            out.extend(["wait 3.0", "waitForResourceLoading", "wait 1.0"].map(String::from));
+            shot(&mut out, format!("lv{ftag}_door"));
+            out.push(ctl(&format!("stick l 0 -127 {}", ms(1000.0))));
+            out.push(w(5.0));
+            shot(&mut out, format!("lv{ftag}_boss"));
+            for _ in 0..3 {
+                fight(&mut out, 4);
+                out.extend([ctl(&format!("stick r 127 0 {}", ms(800.0))), w(1.2)]);
+            }
+            shot(&mut out, format!("lv{ftag}_fight"));
+        }
+        // World 1's area points (every third one).
+        let areas: Vec<&Poi> = points.iter().filter(|p| p.level == *lv && !["NPC", "Cutscenes", "Boss Fog Doors"].contains(&p.group.as_str()) && !p.group.starts_with("Tutorial")).collect();
+        for (k, p) in areas.iter().enumerate().filter(|(k, _)| k % 3 == 0) {
+            steps += 1;
+            out.push(format!("print \"dsport-tour: step {steps} (walk {tag} {})\"", p.name));
+            out.push(format!("+{}", p.pos));
+            out.extend(["wait 2.0", "waitForResourceLoading", "wait 0.5"].map(String::from));
+            if k == 0 {
+                shot(&mut out, format!("lv{ftag}_area"));
+            }
+            walk(&mut out, 4);
+        }
+        // The camera at the screenshot positions (`per_level` spread over the level's list, 0
+        // all), `dirs` headings each.
         let here: Vec<&Vec<(String, f64)>> = locs.iter().filter(|(l, _)| l == lv).map(|(_, c)| c).collect();
-        // `per_level` positions spread over the level's list (0: all).
         let picked: Vec<&Vec<(String, f64)>> = if per_level == 0 || here.len() <= per_level {
             here
         } else {
             (0..per_level).map(|i| here[i * here.len() / per_level]).collect()
         };
-        out.push(format!("+cp11_loadLevel {} {}", lv.0, lv.1));
-        let mut first = true;
-        for cam in picked {
+        for (i, cam) in picked.iter().enumerate() {
             for d in 0..dirs {
                 let words: Vec<String> = cam
                     .iter()
@@ -666,25 +917,31 @@ fn tour_lines(text: &str, per_level: usize, dirs: u32) -> Option<(String, u32)> 
                         format!("{k}={v:.2}")
                     })
                     .collect();
-                views += 1;
-                out.push(format!("print \"dsport-tour: view {views} (level {}-{})\"", lv.0, lv.1));
+                steps += 1;
+                out.push(format!("print \"dsport-tour: step {steps} (view {tag})\""));
                 out.push(format!("+SetCameraPos {}", words.join(" ")));
-                if first {
-                    // The level's load (the camera moves the area loader).
-                    out.extend(["wait 5.0", "waitForLevelLoading", "waitForResourceLoading", "wait 3.0", "waitForResourceLoading"].map(String::from));
-                    first = false;
-                } else if d == 0 {
-                    // Another position: its areas streamed in.
-                    out.extend(["wait 2.0", "waitForResourceLoading", "wait 1.5"].map(String::from));
+                if d == 0 {
+                    // A new position: its areas streamed in (the camera moves the area loader).
+                    out.extend(["wait 1.0", "waitForResourceLoading", format!("wait {:.1}", o.dwell).as_str()].map(String::from));
+                    if i == 0 {
+                        shot(&mut out, format!("lv{ftag}_view"));
+                    }
                 } else {
-                    out.push("wait 1.5".to_string());
+                    out.push(format!("wait {:.1}", o.dwell));
                 }
             }
         }
+        // The gameplay camera back (`SetCameraPos` turns the debug camera on, and it stays on
+        // through level loads: the next level's walk looked into the void, -211521).
+        out.extend(["+ToggleDebugCamera", "wait 0.5"].map(String::from));
+        // Every enemy's death at once (its boss's too: "Demon Vanquished").
+        out.push("+cp11_allSuicideExceptPlayer".into());
+        out.push(w(4.0));
+        shot(&mut out, format!("lv{ftag}_deaths"));
     }
-    out.push("print \"dsport-tour: done\"".to_string());
+    out.push("print \"dsport-tour: done\"".into());
     out.push(String::new());
-    Some((out.join("\n"), views))
+    Some((out.join("\n"), steps))
 }
 
 #[cfg(test)]
@@ -696,24 +953,38 @@ mod tests {
         assert!(super::matches("committed [\"SAVEDATA0PlayerProfile0\"] ok", "committed [\"SAVEDATA0PlayerProfile0\"]"));
     }
 
-    /// The tour from an automation text of the title's shape (made-up positions): each level
-    /// loaded once, its positions spread, four yaws a position, the macro's own lines skipped.
+    /// The levels from texts of the title's shapes (made-up positions and names): each level
+    /// loaded once, a walk where it starts, its boss, every third area point, its camera
+    /// positions with their headings, the macro's own lines and unplaced points skipped.
     #[test]
-    fn tour() {
+    fn levels() {
         let text = "*macro doAreaInternal areaName screenshotName world level camX camY camZ camRotX camRotY camRotZ\n\
             \x20   *callmacro doAreaInternal areaName screenshotName world level camX camY camZ camRotX camRotY camRotZ\n\
             *callmacro doArea \"Area A\" \"#/a/A_0.png\" 1 1 posX=1.00 posY=2.00 posZ=3.00 eulerX=-5.00 eulerY=300.00 eulerZ=0.00\n\
             *callmacro doAreaStats \"Area A\" \"#/a/A_1.png\" 1 1 posX=4.00 posY=5.00 posZ=6.00 eulerX=0.00 eulerY=10.00 eulerZ=0.00\n\
             *callmacro doArea \"Area B\" \"#/b/B_0.png\" 2 1 posX=7.00 posY=8.00 posZ=9.00 eulerX=0.00 eulerY=90.00 eulerZ=0.00\n";
-        let (s, views) = super::tour_lines(text, 0, 4).unwrap();
-        assert_eq!(views, 12);
-        assert_eq!(s.matches("+cp11_loadLevel").count(), 2);
-        assert!(s.contains("+cp11_loadLevel 1 1") && s.contains("+cp11_loadLevel 2 1"));
+        let poi = "+poi group=\"Boss Fog Doors\" name=\"Boss A\" script=\"$/a.script\" command=\"+cp11_loadLevel 1 1\" commandIfNoSpawnLocation=\"SetPlayerPos posX=1.00 posY=0.00 posZ=0.00 eulerX=0.00 eulerY=0.00 eulerZ=0.00 camEulerX=0.00 camEulerY=0.00 camEulerZ=0.00\"\n\
+            +poi group=\"Test 1-1\" name=\"P0\" script=\"$/p.script\" command=\"+cp11_loadLevel 1 1\" commandIfNoSpawnLocation=\"SetPlayerPos posX=2.00 posY=0.00 posZ=0.00\"\n\
+            +poi group=\"Test 1-1\" name=\"P1\" script=\"$/p.script\" command=\"+cp11_loadLevel 1 1\" commandIfNoSpawnLocation=\"SetPlayerPos posX=3.00 posY=0.00 posZ=0.00\"\n\
+            +poi group=\"Test 1-1\" name=\"P2\" script=\"$/p.script\" command=\"+cp11_loadLevel 1 1\" commandIfNoSpawnLocation=\"+SetPlayerPos posX=4.00 posY=0.00 posZ=0.00\"\n\
+            +poi group=\"Test 2-1\" name=\"Q0\" script=\"$/q.script\" command=\"+cp11_loadLevel 2 1\"\n\
+            +poi group=\"NPC\" name=\"N0\" script=\"$/n.script\" command=\"+cp11_loadLevel 2 1\" commandIfNoSpawnLocation=\"SetPlayerPos posX=5.00 posY=0.00 posZ=0.00\"\n\
+            +poi group=\"Boss Fog Doors\" name=\"Boss C\" script=\"$/c.script\" command=\"+cp11_loadLevel 3 1\" commandIfNoSpawnLocation=\"SetPlayerPos posX=6.00 posY=0.00 posZ=0.00\"\n";
+        let o = |per_level, dirs, only: Vec<(u32, u32)>| super::LevelOpts { per_level, dirs, dwell: 0.5, only, shots: false, speed: 2.0 };
+        let (s, steps) = super::levels_lines(text, poi, &o(0, 4, Vec::new())).unwrap();
+        // 1-1: start, boss, area P0, 2 x 4 views; 2-1: start, 4 views; 3-1: start, boss.
+        assert_eq!(steps, 18);
+        assert_eq!(s.matches("+cp11_loadLevel").count(), 3);
+        assert!(s.contains("+SetPlayerPos posX=1.00") && s.contains("+SetPlayerPos posX=2.00") && !s.contains("SetPlayerPos posX=4.00"));
+        assert!(!s.contains("posX=3.00") && !s.contains("posX=5.00") && s.contains("+SetPlayerPos posX=6.00"));
         // 300 + 90 wraps to 30.
         assert!(s.contains("posX=1.00 posY=2.00 posZ=3.00 eulerX=-5.00 eulerY=30.00 eulerZ=0.00"));
-        assert!(s.contains("dsport-tour: view 12 (level 2-1)") && s.ends_with("print \"dsport-tour: done\"\n"));
-        let (_, one) = super::tour_lines(text, 1, 2).unwrap();
-        assert_eq!(one, 4);
-        assert!(super::tour_lines("nothing here", 0, 4).is_none());
+        assert!(s.contains("dsport-tour: step 18 (boss 3-1 Boss C)") && s.ends_with("print \"dsport-tour: done\"\n"));
+        assert_eq!(s.matches("dsport-textreset").count(), 2);
+        // The gameplay camera back after each level's views.
+        assert_eq!(s.matches("+ToggleDebugCamera").count(), 3);
+        let (_, one) = super::levels_lines(text, poi, &o(1, 2, vec![(2, 1)])).unwrap();
+        assert_eq!(one, 3);
+        assert!(super::levels_lines("nothing here", "", &o(0, 4, Vec::new())).is_none());
     }
 }

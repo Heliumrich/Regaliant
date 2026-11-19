@@ -1,10 +1,11 @@
-//! The Shaders page: the game's shaders prepared ahead, in three steps: every compute program of
-//! the game's shader files compiled into the player's own pipeline store (`dsport
-//! --precompile-all`), then the game plays by itself in the background to learn the graphics
-//! shaders (`dsport --prepare-play newgame`, then `tour`: no window, no sound, the player's
-//! controllers, keyboard and mouse left alone; its saves and settings its own). Its progress, a
-//! stop that lets the current step end, and the option to prepare them when Play is pressed the
-//! first time. Prepared shaders hold for one graphics card and driver (prepared.txt records them,
+//! The Shaders page: the game's shaders prepared ahead, in two steps: the game plays by itself in
+//! the background to learn them (`dsport --prepare-play newgame`, then `tour`: a new game, then
+//! every level with its walks, fights and boss; no window, no sound, the player's controllers,
+//! keyboard and mouse left alone; its saves and settings its own), and beside the play, on the
+//! CPU it leaves idle, every compute program of the game's shader files is compiled into the
+//! player's own pipeline store (`--precompile-all` on its own when the new game cannot be
+//! played). Its progress, a stop that lets the current step end, and the option to prepare them
+//! when Play is pressed the first time. Prepared shaders hold for one graphics card and driver (prepared.txt records them,
 //! played.txt the self-play's stages) and for the game's translation of them: a new driver, or a
 //! version of the port that translates the shaders differently (`dsport
 //! --translation-fingerprint`, checked once at start on a thread of its own), asks for another
@@ -75,10 +76,10 @@ pub fn check_tick(app: &mut App) {
     }
 }
 
-/// The preparation's steps, in order.
+/// The preparation's steps, in order (the compute step only when the new game failed).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Step {
-    /// The compute programs compiled (`--precompile-all`).
+    /// The compute programs compiled on their own (`--precompile-all`).
     Compute,
     /// The game plays a new game by itself (`--prepare-play newgame`).
     NewGame,
@@ -87,14 +88,6 @@ pub enum Step {
 }
 
 impl Step {
-    fn number(self) -> u32 {
-        match self {
-            Step::Compute => 1,
-            Step::NewGame => 2,
-            Step::Tour => 3,
-        }
-    }
-
     /// The self-play stage (None: the compute step).
     fn stage(self) -> Option<&'static str> {
         match self {
@@ -258,7 +251,7 @@ pub fn build(app: &mut App) {
     let b: Builder = app.builder();
     unsafe {
         let r = (16, 62, 748, 62);
-        app.put(2, b.label("The game compiles each shader the first time it needs it, which makes play stutter. Preparing them here compiles the compute shaders, then the game plays a new game and visits every level by itself to learn the graphics shaders. Nothing of it shows or sounds, but the graphics card is busy. It takes one to two hours, once.", r, -1), r);
+        app.put(2, b.label("The game compiles each shader the first time it needs it, which makes play stutter. Preparing them here lets the game play by itself in the background: a new game, then every level with its enemies and bosses. Nothing of it shows or sounds, but the graphics card is busy. It takes about 30 to 60 minutes, once.", r, -1), r);
         let r = (16, 134, 748, 40);
         app.shaders.status = app.put(2, b.label("", r, -1), r) as usize;
         let r = (16, 178, 748, 20);
@@ -329,14 +322,11 @@ pub fn start(app: &mut App, play_after: bool) {
     }
     let _ = std::fs::create_dir_all(&dir);
     wait_check();
-    let first = if !compute_state(app).0 {
-        Step::Compute
-    } else {
-        match played(app) {
-            (Some(0), Some(0)) => Step::Compute,
-            (Some(0), _) => Step::Tour,
-            _ => Step::NewGame,
-        }
+    // (The levels when the new game was played for the compute shaders prepared now; else, and
+    // when everything is done, the new game.)
+    let first = match (compute_state(app).0, played(app)) {
+        (true, (Some(0), t)) if t != Some(0) => Step::Tour,
+        _ => Step::NewGame,
     };
     app.shaders.play_after = play_after;
     app.shaders.stopping = None;
@@ -366,7 +356,7 @@ fn begin(app: &mut App, step: Step) -> bool {
     let mut cmd = std::process::Command::new(&exe);
     match step.stage() {
         None => cmd.arg("--precompile-all").arg(sys::prepare_threads().to_string()),
-        Some(s) => cmd.arg("--prepare-play").arg(s).arg("--seconds").arg(step.seconds().to_string()),
+        Some(s) => cmd.arg("--prepare-play").arg(s).arg("--seconds").arg(step.seconds().to_string()).arg("--prepare-threads").arg(sys::prepare_threads().to_string()),
     };
     cmd.arg("--progress").arg(&progress).current_dir(&app.paths.exe_dir).creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
     match cmd.spawn() {
@@ -375,9 +365,9 @@ fn begin(app: &mut App, step: Step) -> bool {
             app.shaders.step = Some(step);
             app.shaders.started = Some(Instant::now());
             let text = match step {
-                Step::Compute => "Preparing the shaders, step 1 of 3: reading the game's shader files...",
-                Step::NewGame => "Preparing the shaders, step 2 of 3: the game starts a new game in the background...",
-                Step::Tour => "Preparing the shaders, step 3 of 3: the game loads its save in the background...",
+                Step::Compute => "Preparing the compute shaders: reading the game's shader files...",
+                Step::NewGame => "Preparing the shaders, step 1 of 2: the game starts a new game in the background...",
+                Step::Tour => "Preparing the shaders, step 2 of 2: the game loads its save in the background...",
             };
             unsafe { ui::set_text(h(app.shaders.status), text) };
             true
@@ -455,8 +445,9 @@ pub fn tick(app: &mut App) {
                 finish(app, Some(format!("Preparation ended with an error (code {code}). Open logs shows its log.")));
                 return;
             }
-            Step::Compute => Some(Step::NewGame),
             Step::NewGame if code == 0 => Some(Step::Tour),
+            // (The new game could not be played: the compute shaders on their own, as before.)
+            Step::NewGame if !compute_state(app).0 => Some(Step::Compute),
             _ => None,
         };
         if let Some(n) = next {
@@ -475,21 +466,27 @@ pub fn tick(app: &mut App) {
     if app.shaders.stopping.is_some() {
         return;
     }
-    // Progress: "<done> <of>" and "<code done> <code>" (the self-play: its steps twice).
+    // Progress: "<done> <of>" and "<code done> <code>" (the self-play: its steps twice, then the
+    // background compute shaders made and listed).
     let Ok(t) = std::fs::read_to_string(progress_file(app)) else { return };
     let nums: Vec<u64> = t.split_whitespace().filter_map(|w| w.parse().ok()).collect();
-    if let [done, total, wdone, wtotal] = nums[..] {
+    if nums.len() >= 4 {
+        let (done, total, wdone, wtotal) = (nums[0], nums[1], nums[2], nums[3]);
         let frac = if wtotal > 0 { wdone as f64 / wtotal as f64 } else { 0.0 };
         let el = app.shaders.started.map_or(0.0, |s| s.elapsed().as_secs_f64());
         let left = if frac > 0.02 { el * (1.0 - frac) / frac } else { 0.0 };
         let eta = if frac > 0.02 && step != Step::NewGame { format!(" About {} minutes left in this step.", (left / 60.0).ceil().max(1.0) as u64) } else { String::new() };
-        let what = match step {
-            Step::Compute => format!("the compute shaders, {done} of {total} ({:.0}%)", frac * 100.0),
-            Step::NewGame => format!("the game plays a new game in the background, {done} of {total}"),
-            Step::Tour => format!("the game visits its levels in the background, {done} of {total}"),
+        let compute = match nums.get(4..6) {
+            Some(&[c, all]) if all > 0 => format!(" Compute shaders: {c} of {all}."),
+            _ => String::new(),
+        };
+        let text = match step {
+            Step::Compute => format!("Preparing the compute shaders: {done} of {total} ({:.0}%).{eta}", frac * 100.0),
+            Step::NewGame => format!("Preparing the shaders, step 1 of 2: the game plays a new game in the background, {done} of {total}.{compute}"),
+            Step::Tour => format!("Preparing the shaders, step 2 of 2: the game visits its levels in the background, {done} of {total}.{eta}{compute}"),
         };
         unsafe {
-            ui::set_text(h(app.shaders.status), &format!("Preparing the shaders, step {} of 3: {what}.{eta}", step.number()));
+            ui::set_text(h(app.shaders.status), &text);
             ui::set_progress(h(app.shaders.bar), (frac * 1000.0) as u32);
         }
     }

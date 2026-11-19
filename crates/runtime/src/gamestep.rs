@@ -66,6 +66,12 @@ const PHYS_MAX: f32 = 2.0 / 59.94;
 /// loads it): the game's step, at most the title's 1/59.94 s.
 static FIXED_STEP: AtomicU32 = AtomicU32::new(0x3C88_AB85);
 
+/// The game's speed in hundredths (100: real time). Only the shader preparation's self-play sets
+/// another (`prepplay`): its levels play at twice the speed, each frame's step twice the time
+/// between its flips (the title's own 30 fps mode's step at 60 frames a second), so its walks and
+/// fights take half the time.
+pub static SPEED_X100: AtomicU32 = AtomicU32::new(100);
+
 /// The code inserted at eboot+0xe6f1f9 (`titlefix`): the run counted (`lock inc qword ptr
 /// [counter]`), then `mov rax, &FIXED_STEP; vmovss xmm0, [rax]` in place of the title's
 /// 1/refresh rate in xmm0. rax is loaded by the displaced instruction next, and the flags the
@@ -387,8 +393,9 @@ pub extern "sysv64" fn after_step(regs: *const u64, _arg: u32) {
     let (fed, exact) = s.clock.step(interval, max, crate::gpu::tune::pace_smooth() as usize, pace);
     let feed = crate::gpu::tune::pace_step() && !forced && s.total_frames >= 8;
     let (step, phys) = if feed {
-        // (Never zero: the title divides by its step.)
-        let step = (fed as f32).clamp(0.001, max as f32);
+        // (Never zero: the title divides by its step. The self-play's speed, `SPEED_X100`.)
+        let speed = SPEED_X100.load(Relaxed).clamp(25, 400) as f64 / 100.0;
+        let step = ((fed * speed) as f32).clamp(0.001, max as f32);
         wrf(timer + T_STEP, step);
         wrf(timer + T_LAST, step);
         wrf(timer + T_ERROR, 0.0);

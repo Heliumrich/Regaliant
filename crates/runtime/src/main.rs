@@ -92,6 +92,9 @@ pub struct Config {
     pub dispatch_bench: bool,
     /// `--prepare-play <newgame|tour>`: the shader preparation's self-play (`prepplay`).
     pub prepare_play: Option<prepplay::Stage>,
+    /// `--prepare-threads <n>`: the self-play's background compute preparation's threads (0: half
+    /// the logical CPUs).
+    pub prepare_threads: usize,
     pub trace: bool,
     pub lenient: bool,
     pub debug: bool,
@@ -212,6 +215,7 @@ fn parse_args() -> Config {
     let mut dispatch_bench = false;
     let mut record_bench = None;
     let mut prepare_play = None;
+    let mut prepare_threads = 0usize;
     let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -242,6 +246,7 @@ fn parse_args() -> Config {
                     std::process::exit(2);
                 }));
             }
+            "--prepare-threads" => prepare_threads = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
             "--pb-test" => std::process::exit(gpu::pcache::pb_test()),
             "--compile-bench" => {
                 let min = args.next().expect("--compile-bench needs <min instructions> <max programs>");
@@ -316,6 +321,7 @@ fn parse_args() -> Config {
         safe_mode,
         dispatch_bench,
         prepare_play,
+        prepare_threads,
     }
 }
 
