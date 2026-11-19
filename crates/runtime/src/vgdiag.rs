@@ -233,6 +233,39 @@ pub extern "sysv64" fn keep_hook(regs: *const u64, _arg: u32) {
     }
 }
 
+/// Diagnosis (`DS_VG_DIAG`): the spawn grid's centre (eboot+0xa5c37d, the branch of the
+/// per-frame update that stores a new centre position and hexagonal cell and marks the frame's
+/// spawn data for a rebuild; rdi its state, the cell stored last at [rdi+0x2C] (two ints) and
+/// the position at [rdi+0x20], rcx the double buffer's index times 9). The branch also runs
+/// every frame when the grid follows the camera; a line when the stored cell differs from the
+/// last one seen, and the count of branches taken.
+static CELL_BRANCHES: AtomicU64 = AtomicU64::new(0);
+static LAST_CELL: AtomicU64 = AtomicU64::new(u64::MAX);
+pub extern "sysv64" fn cell_hook(regs: *const u64, _arg: u32) {
+    let r = |i: usize| unsafe { *regs.add(i) };
+    let (rcx, rdi) = (r(1), r(7));
+    CELL_BRANCHES.fetch_add(1, Ordering::Relaxed);
+    let cell = rd64(rdi + 0x2c);
+    if LAST_CELL.swap(cell, Ordering::Relaxed) == cell {
+        return;
+    }
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < diag_limit() {
+        let f = |o: u64| f32::from_bits(rd32(rdi + o));
+        crate::info!(
+            "vg spawn grid: rebuild marked at flip {} (the cell stored before: {},{}; buffer {}; the position stored before {:.2} {:.2} {:.2}; {} branches so far)",
+            flip(),
+            cell as u32 as i32,
+            (cell >> 32) as u32 as i32,
+            rcx / 9,
+            f(0x20),
+            f(0x24),
+            f(0x28),
+            CELL_BRANCHES.load(Ordering::Relaxed)
+        );
+    }
+}
+
 /// The status report's line.
 pub fn status() -> String {
     let v = |i: usize| KEEP[i].load(Ordering::Relaxed);

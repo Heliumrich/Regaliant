@@ -244,6 +244,17 @@ const FIXES: &[Fix] = &[
         why: "an entity at the view's edge left and re-entered the scene's list as the camera moved by a pixel, and each change renumbered the models after it: their plants (the tutorial courtyard's dry leaves) vanished and grew back",
         only_with: None,
     },
+    // Diagnosis: the VG spawn grid's new centre stored (`vmovss [rdi+20h],xmm2; vmovss
+    // [rdi+24h],xmm1`), the rebuild of the frame's spawn data marked after it.
+    Fix {
+        name: "VG spawn grid's centre changes logged",
+        offset: 0xa5c37d,
+        from: (10, 0xc67eedbe37e67377),
+        change: Change::Hook { at: 0, handler: crate::vgdiag::cell_hook },
+        kind: "diagnosis",
+        why: "the spawn grid's centre cell changes, with the camera's position (DS_VG_DIAG)",
+        only_with: Some("DS_VG_DIAG"),
+    },
     // The TAA's per-view jitter (`jitter`): its function's entry, `mov rax,[rdi+68h]; cmp
     // dword ptr [rax+0AACh],0` (the forced index's test).
     Fix {
