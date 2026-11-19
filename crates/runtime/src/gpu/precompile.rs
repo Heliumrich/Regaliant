@@ -431,7 +431,13 @@ pub fn created(addr: u64, rsrc2: u32, local: [u32; 3], modifier: u32) {
     }
     CREATED.lock().get_or_insert_with(HashMap::new).insert(addr, Created { rsrc2, local, modifier });
     if super::tune::precompile() >= 2 {
-        QUEUE.lock().fresh.push_back(addr);
+        // (A program in a loaded module's image first: its guess is made at once, `run`; the
+        // title creates ~6,600 objects at its start, looked at in ~4 s.)
+        if in_module(addr) {
+            QUEUE.lock().fresh.push_front(addr);
+        } else {
+            QUEUE.lock().fresh.push_back(addr);
+        }
         CV.notify_one();
         ensure_workers();
     }
@@ -550,6 +556,12 @@ fn worker() {
         let (fresh, job) = {
             let mut q = QUEUE.lock();
             loop {
+                // (A job of rank 0 first: a module's guess, `classify`.)
+                if matches!(q.ready.peek(), Some(std::cmp::Reverse((0, _)))) {
+                    if let Some(std::cmp::Reverse((r, j))) = q.ready.pop() {
+                        break (None, Some((r, j)));
+                    }
+                }
                 if let Some(a) = q.fresh.pop_front() {
                     break (Some(a), None);
                 } else if let Some(std::cmp::Reverse((r, j))) = q.ready.pop() {
@@ -588,10 +600,14 @@ fn classify(addr: u64) {
     HASH_ADDR.lock().get_or_insert_with(HashMap::new).insert(code_hash, addr);
     let compute = CREATED.lock().as_ref().is_some_and(|m| m.contains_key(&addr));
     if compute {
-        match rank(code_hash) {
+        // (A program in a loaded module's image without learned specs: its guess, first.)
+        let learned_rank = rank(code_hash);
+        match learned_rank.or_else(|| in_module(addr).then_some(0)) {
             Some(r) => {
                 // Learned: its code kept for the next session's start.
-                keep_code(addr, code_hash);
+                if learned_rank.is_some() {
+                    keep_code(addr, code_hash);
+                }
                 if QUEUED_HASHES.lock().get_or_insert_with(Default::default).insert(code_hash) || super::tune::precompile() >= 3 {
                     QUEUE.lock().ready.push(std::cmp::Reverse((r, Job::Addr(addr))));
                     CV.notify_one();
@@ -787,8 +803,17 @@ fn rank(code_hash: u64) -> Option<u32> {
     }
 }
 
+/// Whether a compute object's program lies in a loaded module's image (the executable's own
+/// programs: outside the game's shader files, so never in the launcher's preparation; 58 of a
+/// first 1-1 walk's 6,614 compute objects, 2026-11-19): its object's guess is made at its
+/// creation when its program has no learned specs (`run`).
+fn in_module(addr: u64) -> bool {
+    crate::loader::module_at(addr).is_some()
+}
+
 /// Makes the pipelines of the program at `addr`: for the specs its
-/// dispatches used before, and (`precompile` 3) for its object's guess.
+/// dispatches used before, and for its object's guess (`precompile` 3, or a
+/// program in a loaded module's image without learned specs: `in_module`).
 fn run(addr: u64) {
     let Some(c) = CREATED.lock().as_ref().and_then(|m| m.get(&addr).copied()) else { return };
     let Ok(code_hash) = super::shaders::program_hash(addr) else {
@@ -797,6 +822,12 @@ fn run(addr: u64) {
     };
     let seen = learned(|m| m.get(&code_hash).map(|e| e.1.clone())).unwrap_or_default();
     super::shaders::seed_formats(code_hash, &seen.iter().map(|s| s.resources.as_slice()).collect::<Vec<_>>());
+    let module_guess = seen.is_empty() && in_module(addr);
+    // (A module guess's first variant, the one its dispatches use: kept alive, so that a
+    // dispatch or a scan's compile meeting it in flight waits for it instead of compiling it
+    // again; 2026-11-19: made through the store and let go, the face encoder was compiled
+    // twice at once and its dispatch still waited 2.3 s.)
+    let mut keep_alive: Option<Spec> = None;
     let mut specs: Vec<Spec> = Vec::new();
     for mut s in seen {
         // (Keyed as a preparation keys them now.)
@@ -811,12 +842,38 @@ fn run(addr: u64) {
             }
         }
     }
-    if super::tune::precompile() >= 3 {
+    // The guess's dispatch variants, the LOD-rotated one first, as for learned specs (the guess
+    // alone was the measuring variant: the face encoder cs 0x8026f4100 waited 2.8 s at a new
+    // player's first load for its plain one, compiled by a scan 280 ms before its dispatch,
+    // its object made 6.9 s before; 2026-11-19).
+    if super::tune::precompile() >= 3 || module_guess {
         let user_sgprs = ((c.rsrc2 >> 1) & 0x1F).min(16) as u16;
         if let Ok((insts, plan, _)) = super::shaders::stage_plan(addr, user_sgprs, 0) {
             let g = super::shaders::guess_compute_spec(addr, &insts, &plan, code_hash, c.rsrc2, c.local);
-            if !specs.contains(&g) {
-                specs.push(g);
+            // (A module's guess with a multisampled image is left out: its translation declares
+            // multisampled storage images, which spirv-val refuses without the
+            // StorageImageMultisample capability (8 such modules under the validation layer,
+            // 2026-11-19); no dispatch of such a program was seen.)
+            let ms = g.resources.iter().any(|r| matches!(r, ResSpec::Image { dim: rdna::translate::ImageDim::D2Msaa | rdna::translate::ImageDim::D2MsaaArray, .. }));
+            // (A module's guess: its first variant only, the one its first dispatches use; both
+            // cost 15 compiles and 44 s of these threads at a first session's start, 2026-11-19.)
+            let variants = if module_guess && super::tune::precompile() < 3 {
+                if ms {
+                    Vec::new()
+                } else {
+                    super::shaders::dispatch_variants(g).into_iter().take(1).collect()
+                }
+            } else {
+                super::shaders::dispatch_variants(g)
+            };
+            if module_guess && !variants.is_empty() {
+                MODULE_GUESSES.fetch_add(1, Ordering::Relaxed);
+                keep_alive = variants.first().cloned();
+            }
+            for g in variants {
+                if !specs.contains(&g) {
+                    specs.push(g);
+                }
             }
         }
     }
@@ -826,7 +883,10 @@ fn run(addr: u64) {
     }
     for spec in specs {
         let t = std::time::Instant::now();
-        let r = super::shaders::translate_for_spec(addr, spec).and_then(|tr| super::exec::precompile_or_warm(&tr, addr, true).ok_or_else(|| "pipeline creation failed".to_string()));
+        // (Alive only while the store lacks it: later sessions find it there, and most of these
+        // programs never run.)
+        let alive = keep_alive.as_ref() == Some(&spec);
+        let r = super::shaders::translate_for_spec(addr, spec).and_then(|tr| if alive && !super::exec::compute_pipe_stored(&tr) { super::exec::precompile_translation(&tr, addr) } else { super::exec::precompile_or_warm(&tr, addr, true) }.ok_or_else(|| "pipeline creation failed".to_string()));
         match r {
             Ok(true) => {
                 DONE[0].fetch_add(1, Ordering::Relaxed);
@@ -927,6 +987,9 @@ fn run_code(h: u64) {
         }
     }
 }
+
+/// Compute objects in a loaded module's image whose guess was made (`run`, `in_module`).
+static MODULE_GUESSES: AtomicU64 = AtomicU64::new(0);
 
 /// Format-accessed buffers of first translations by (V# format, dst_sel).
 static FORMATS: Mutex<Option<HashMap<(u8, u16), u64>>> = Mutex::new(None);
@@ -1254,12 +1317,13 @@ pub fn status() -> String {
     let d: Vec<u64> = DONE.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let made = if super::tune::precompile() >= 2 {
         format!(
-            "; made from objects ({} of them done, {} waiting): {} pipelines ({:.1} s), {} present already, {} objects with no spec to make, {} failed, {} raised for a waiting thread",
+            "; made from objects ({} of them done, {} waiting, {} guessed in a module's image): {} pipelines ({:.1} s), {} present already, {} objects with no spec to make, {} failed, {} raised for a waiting thread",
             d[5],
             {
                 let q = QUEUE.lock();
                 q.fresh.len() + q.ready.len()
             },
+            MODULE_GUESSES.load(Ordering::Relaxed),
             d[0],
             d[1] as f64 / 1e9,
             d[2],

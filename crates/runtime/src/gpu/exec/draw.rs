@@ -908,6 +908,226 @@ fn gfx_known(hkey: u64) -> bool {
     gfx_pipe(hkey).is_some() || GFX_FLIGHTS.lock().as_ref().is_some_and(|m| m.contains_key(&hkey))
 }
 
+/// The registers a draw's baked pipeline state is made of, as a scan of the commands ahead
+/// saw them (`gfx_key_ahead`): context registers and the primitive type (a uconfig register).
+/// (The October compile-ahead's, removed 2026-11-01 and revived 2026-11-19 for the draws
+/// that wait for their pipeline: `gpu::compile::submit_draws`.)
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct GfxRegs {
+    cb_color_control: u32,
+    clip: u32,
+    col_format: u32,
+    target_mask: u32,
+    zinfo: u32,
+    sinfo: u32,
+    dctl: u32,
+    db_render: u32,
+    sctl: u32,
+    refm: u32,
+    refm_bf: u32,
+    cb_info: [u32; MAX_RT],
+    blend: [u32; MAX_RT],
+    prim: u32,
+    /// An indexed indirect draw drawn with its start instance as Vulkan's first instance
+    /// (`Cp::cpu_args_base_ok`): its vertex stage's start-instance slot, read from
+    /// gl_BaseInstance (`shaders::with_base_instance`; 17 of 21 keys made ahead differed from
+    /// their draws' without it, 2026-11-19).
+    base_inst: Option<u16>,
+}
+
+impl GfxRegs {
+    /// From a context register reader (`ctx(0x28xxx)`) and VGT_PRIMITIVE_TYPE.
+    pub(crate) fn capture(ctx: &dyn Fn(u32) -> u32, prim: u32) -> GfxRegs {
+        GfxRegs {
+            cb_color_control: ctx(0x28808),
+            clip: ctx(0x28810),
+            col_format: ctx(0x28714),
+            target_mask: ctx(0x28238) & ctx(0x2823C),
+            zinfo: ctx(0x28040),
+            sinfo: ctx(0x28044),
+            dctl: ctx(0x28800),
+            db_render: ctx(0x28000),
+            sctl: ctx(0x2842C),
+            refm: ctx(0x28430),
+            refm_bf: ctx(0x28434),
+            cb_info: std::array::from_fn(|n| ctx(0x28C60 + 0x3C * n as u32 + 0x10)),
+            blend: std::array::from_fn(|n| ctx(0x28780 + 4 * n as u32)),
+            prim,
+            base_inst: None,
+        }
+    }
+
+    /// With the vertex stage's start-instance slot of an indirect draw (`base_inst`).
+    pub(crate) fn with_base_inst(mut self, slot: Option<u16>) -> GfxRegs {
+        self.base_inst = slot;
+        self
+    }
+
+    pub(crate) fn base_inst(&self) -> Option<u16> {
+        self.base_inst
+    }
+
+    pub(crate) fn hash64(&self) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.hash(&mut h);
+        h.finish()
+    }
+}
+
+/// The pipeline key, its cache hash (with the push-descriptor mode) and the mode of a draw with
+/// these registers and stages as `draw_inner` makes them, and whether such a draw waits for
+/// its pipeline whatever its targets (memory writes, a depth or stencil clear); None when such
+/// a draw records nothing or is not supported. A key that differs at execution only costs a
+/// compile (the October check: 0 differences).
+fn gfx_key_ahead(g: &GfxRegs, vs: &Prepared, ps: Option<&Prepared>) -> Option<(GfxKey, u64, bool, bool)> {
+    let cb_mode = (g.cb_color_control >> 4) & 7;
+    if cb_mode > 1 || g.clip & (1 << 22) != 0 {
+        return None;
+    }
+    let (class, rect) = match g.prim & 0x3F {
+        1 => (0u8, false),
+        2 | 3 => (1, false),
+        4..=6 => (2, false),
+        7 | 0x11 => (2, true),
+        _ => return None,
+    };
+    let mrt_mask = ps.map(|p| p.tr.out.mrt_mask).unwrap_or(0);
+    let mut colors = [vk::Format::UNDEFINED.as_raw(); MAX_RT];
+    let mut blend = [0u32; MAX_RT];
+    let mut masks = [0u8; MAX_RT];
+    let mut any_color = false;
+    if cb_mode == 1 {
+        for i in 0..MAX_RT {
+            let m = (g.target_mask >> (4 * i)) & 0xF;
+            if m == 0 || mrt_mask & (1 << i) == 0 || (g.col_format >> (4 * i)) & 0xF == 0 {
+                continue;
+            }
+            let info = g.cb_info[i];
+            let fmt = (info >> 2) & 0x1F;
+            if fmt == 0 {
+                continue;
+            }
+            colors[i] = images::cb_format(fmt, (info >> 8) & 7, (info >> 11) & 3)?.as_raw();
+            blend[i] = g.blend[i];
+            masks[i] = m as u8;
+            any_color = true;
+        }
+    }
+    let dformat = match (g.zinfo & 3, g.sinfo & 1) {
+        (0, 0) => None,
+        (1, 0) => Some(vk::Format::D16_UNORM),
+        (3, 0) => Some(vk::Format::D32_SFLOAT),
+        (_, 1) => Some(vk::Format::D32_SFLOAT_S8_UINT),
+        _ => None,
+    };
+    let (has_z, has_s) = match dformat {
+        Some(f) => (images::aspects(f).contains(vk::ImageAspectFlags::DEPTH) && g.zinfo & 3 != 0, images::has_stencil(f)),
+        None => (false, false),
+    };
+    let z_test = has_z && g.dctl & 2 != 0;
+    let z_write = z_test && g.dctl & 4 != 0;
+    let s_test = has_s && g.dctl & 1 != 0;
+    let s_write = s_test && (g.refm | g.refm_bf) & 0x00FF_0000 != 0 && g.sctl & 0xFF_FFFF != 0;
+    let clear_z = has_z && g.db_render & 1 != 0;
+    let clear_s = has_s && g.db_render & 2 != 0;
+    let depth = if z_test || s_test || clear_z || clear_s { dformat } else { None };
+    let mem_writes = vs.tr.plan.resources.iter().any(|r| r.written) || ps.is_some_and(|p| p.tr.plan.resources.iter().any(|r| r.written));
+    if !any_color && !z_write && !s_write && !clear_z && !clear_s && !mem_writes {
+        return None;
+    }
+    if !any_color && depth.is_none() && !super::super::tune::attachless_draws() {
+        return None;
+    }
+    let key = GfxKey {
+        vs: vs.tr.key,
+        ps: ps.map(|p| p.tr.key).unwrap_or(0),
+        rect_gs: rect.then(|| rect_gs_mask(vs.tr.out.param_mask, ps.map_or(0, |p| p.tr.out.in_mask))),
+        colors,
+        blend,
+        masks,
+        depth: depth.map(|d| d.as_raw()).unwrap_or(vk::Format::UNDEFINED.as_raw()),
+        topology_class: class,
+        depth_clamp: g.clip & (3 << 26) != 0,
+    };
+    let push_mode = match ps {
+        Some(p) => super::push_fits(&[vs, p]),
+        None => super::push_fits(&[vs]),
+    };
+    Some((key, super::push_key(hash_gfx_key(&key), push_mode), push_mode, mem_writes || clear_z || clear_s))
+}
+
+/// A draw a scan ahead saw (`gpu::compile` workers, its stages prepared from the scan's
+/// registers): its pipeline queued for the background graphics workers when missing, ahead of
+/// the others when such a draw always waits for it (`gfx_key_ahead`). Some(true): queued;
+/// Some(false): made, in flight or queued already; None: such a draw records nothing.
+pub(crate) fn queue_gfx_ahead(g: &GfxRegs, vs: &Prepared, ps: Option<&Prepared>) -> Option<bool> {
+    let (key, hkey, push_mode, waits) = gfx_key_ahead(g, vs, ps)?;
+    // (`DS_COMPILE_TRACE=1`: the keys made ahead by program pair, with their stages' specs, for
+    // a first use under another key: `ahead_gfx_diff`.)
+    if compile_trace() {
+        let mut m = AHEAD_GFX.lock();
+        let v = m.get_or_insert_with(HashMap::new).entry((vs.addr, ps.map_or(0, |p| p.addr))).or_default();
+        if v.len() < 8 {
+            v.push((key, vs.tr.spec.clone(), ps.map(|p| p.tr.spec.clone())));
+        }
+    }
+    if gfx_known(hkey) {
+        return Some(false);
+    }
+    Some(async_gfx_queue(&key, hkey, vs, ps, push_mode, Some(waits)))
+}
+
+/// `DS_COMPILE_TRACE`: the pipeline keys scans ahead made, by (vertex, pixel program address),
+/// with the stages' specs (at most 8 a pair).
+#[allow(clippy::type_complexity)]
+static AHEAD_GFX: parking_lot::Mutex<Option<HashMap<(u64, u64), Vec<(GfxKey, rdna::translate::Spec, Option<rdna::translate::Spec>)>>>> = parking_lot::Mutex::new(None);
+
+/// What differs between a first use's key and the closest key a scan made ahead for the same
+/// programs (None: none made for them, or one equal).
+fn ahead_gfx_diff(key: &GfxKey, vs: &Prepared, ps: Option<&Prepared>) -> Option<String> {
+    let g = AHEAD_GFX.lock();
+    let v = g.as_ref()?.get(&(vs.addr, ps.map_or(0, |p| p.addr)))?;
+    if v.iter().any(|(k, _, _)| k == key) {
+        return None;
+    }
+    let diff = |k: &GfxKey, s: &rdna::translate::Spec, p: &Option<rdna::translate::Spec>| {
+        let mut d: Vec<String> = Vec::new();
+        if k.vs != key.vs {
+            d.push(format!("vs spec: {}", super::spec_diff(s, &vs.tr.spec)));
+        }
+        if k.ps != key.ps {
+            match (p, ps) {
+                (Some(p), Some(q)) => d.push(format!("ps spec: {}", super::spec_diff(p, &q.tr.spec))),
+                _ => d.push("ps presence".into()),
+            }
+        }
+        if k.rect_gs != key.rect_gs {
+            d.push(format!("rect_gs {:?} -> {:?}", k.rect_gs, key.rect_gs));
+        }
+        if k.colors != key.colors {
+            d.push(format!("colors {:?} -> {:?}", k.colors, key.colors));
+        }
+        if k.blend != key.blend {
+            d.push(format!("blend {:x?} -> {:x?}", k.blend, key.blend));
+        }
+        if k.masks != key.masks {
+            d.push(format!("masks {:?} -> {:?}", k.masks, key.masks));
+        }
+        if k.depth != key.depth {
+            d.push(format!("depth {} -> {}", k.depth, key.depth));
+        }
+        if k.topology_class != key.topology_class {
+            d.push(format!("topology {} -> {}", k.topology_class, key.topology_class));
+        }
+        if k.depth_clamp != key.depth_clamp {
+            d.push(format!("depth clamp {} -> {}", k.depth_clamp, key.depth_clamp));
+        }
+        d
+    };
+    let best = v.iter().map(|(k, s, p)| diff(k, s, p)).min_by_key(|d| d.len())?;
+    Some(format!("{} made ahead for these programs, the closest differs in: {}", v.len(), best.join("; ")))
+}
+
 /// The graphics pipeline of `key` (created on first use; one in flight on
 /// another thread is waited for).
 /// A stage of a graphics pipeline: its translation and program address.
@@ -940,12 +1160,14 @@ fn rect_gs_mask(vs_mask: u32, ps_inputs: u32) -> u32 {
 /// Graphics pipelines compiled in the background (`tune async_gfx`): the
 /// keys queued or being made, those whose creation failed there (their draws
 /// wait as before and report the error), and the jobs (pipelines the store
-/// holds first: made in milliseconds).
+/// holds first: made in milliseconds), after those of scans ahead (`queue_gfx_ahead`: served
+/// first, in the order the scans met their draws).
 #[derive(Default)]
 struct AsyncGfx {
     pending: std::collections::HashSet<u64>,
     failed: std::collections::HashSet<u64>,
     jobs: std::collections::VecDeque<GfxJob>,
+    ahead: std::collections::VecDeque<GfxJob>,
 }
 
 struct GfxJob {
@@ -1001,7 +1223,16 @@ fn inline_spent(frame: u64, ns: u64) {
 /// it is (queued now or before), false when the draw must make or wait for
 /// it itself (its creation failed in the background, or it is made now).
 fn async_gfx_submit(key: &GfxKey, hkey: u64, vs: &Prepared, ps: Option<&Prepared>, push_mode: bool) -> bool {
+    async_gfx_queue(key, hkey, vs, ps, push_mode, None)
+}
+
+/// `async_gfx_submit` for a draw left out (`ahead` None), or for one a scan ahead saw
+/// (`queue_gfx_ahead`: Some(whether such a draw always waits for it); the job goes first when
+/// it does). Returns whether the key is queued (now or before); for a scan's draw, whether it
+/// was queued now.
+fn async_gfx_queue(key: &GfxKey, hkey: u64, vs: &Prepared, ps: Option<&Prepared>, push_mode: bool, ahead: Option<bool>) -> bool {
     let stored = crate::gpu::pcache::stored_cheap('g', hkey);
+    let mut queued_now = false;
     {
         let mut g = ASYNC_GFX.lock();
         let st = g.get_or_insert_with(AsyncGfx::default);
@@ -1015,22 +1246,31 @@ fn async_gfx_submit(key: &GfxKey, hkey: u64, vs: &Prepared, ps: Option<&Prepared
             }
             st.pending.insert(hkey);
             let job = GfxJob { key: *key, hkey, vs: (vs.tr.0.clone(), vs.addr), ps: ps.map(|p| (p.tr.0.clone(), p.addr)), push_mode, stored, queued: std::time::Instant::now() };
-            if stored {
+            if ahead.is_some() {
+                st.ahead.push_back(job);
+            } else if stored {
                 st.jobs.push_front(job);
             } else {
                 st.jobs.push_back(job);
             }
+            queued_now = true;
             ASYNC_GFX_STATS[1].fetch_add(1, Ordering::Relaxed);
             if stored {
                 ASYNC_GFX_STATS[2].fetch_add(1, Ordering::Relaxed);
             }
             if compile_trace() {
-                crate::info!("first use: vs {:#x} ps {:#x} key {hkey:#x} left out while its pipeline is made in the background{}", vs.addr, ps.map_or(0, |p| p.addr), if stored { " (from the store)" } else { "" });
+                match ahead {
+                    None => crate::info!("first use: vs {:#x} ps {:#x} key {hkey:#x} left out while its pipeline is made in the background{}", vs.addr, ps.map_or(0, |p| p.addr), if stored { " (from the store)" } else { "" }),
+                    Some(w) => crate::info!("compile ahead: vs {:#x} ps {:#x} key {hkey:#x} queued{}{}", vs.addr, ps.map_or(0, |p| p.addr), if w { " first (its draws wait)" } else { "" }, if stored { " (from the store)" } else { "" }),
+                }
             }
         }
     }
     ensure_async_gfx_workers();
     ASYNC_GFX_CV.notify_one();
+    if ahead.is_some() {
+        return queued_now;
+    }
     ASYNC_GFX_STATS[0].fetch_add(1, Ordering::Relaxed);
     true
 }
@@ -1076,12 +1316,19 @@ fn async_gfx_worker() {
         let job = {
             let mut g = ASYNC_GFX.lock();
             loop {
-                if let Some(j) = g.as_mut().and_then(|s| s.jobs.pop_front()) {
+                if let Some(j) = g.as_mut().and_then(|s| s.ahead.pop_front().or_else(|| s.jobs.pop_front())) {
                     break j;
                 }
                 ASYNC_GFX_CV.wait(&mut g);
             }
         };
+        // Made meanwhile, or being made by a draw that waits for it: not waited for here.
+        if gfx_known(job.hkey) {
+            if let Some(st) = ASYNC_GFX.lock().as_mut() {
+                st.pending.remove(&job.hkey);
+            }
+            continue;
+        }
         let t = std::time::Instant::now();
         let created = std::cell::Cell::new(false);
         // A panic must not leave the key pending (its draws left out forever).
@@ -2380,6 +2627,11 @@ impl Exec {
                                 }
                                 Some(w) => {
                                     ASYNC_GFX_WAITED[w].fetch_add(1, Ordering::Relaxed);
+                                    // The draws after this one: their pipelines queued
+                                    // meanwhile (`Cp::prefetch_gfx`).
+                                    if crate::gpu::compile::gfx_ahead() {
+                                        cp.prefetch_gfx();
+                                    }
                                 }
                             }
                         }
@@ -2393,6 +2645,9 @@ impl Exec {
                         }
                         if compile_trace() {
                             crate::info!("first use: vs {:#x} ps {ps_addr:#x} key {hkey:#x} after {} ms{}", vs.addr, t.elapsed().as_millis(), if created.get() { "" } else { " (made by another thread)" });
+                            if let Some(d) = ahead_gfx_diff(&key, &vs, ps.as_ref()) {
+                                crate::info!("first use: vs {:#x} ps {ps_addr:#x} key {hkey:#x}: {d}", vs.addr);
+                            }
                         }
                         GFX_FIRST_USES[0].fetch_add(1, Ordering::Relaxed);
                         GFX_FIRST_USES[1].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);

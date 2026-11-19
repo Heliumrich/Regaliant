@@ -3232,7 +3232,7 @@ pub(crate) fn compute_pipe_in_flight(tr: &super::shaders::Translated) -> bool {
 }
 
 /// The graphics pipeline of a draw scanned ahead of its use (`draw`).
-pub(crate) use draw::{precompile_gfx_translations, GfxState};
+pub(crate) use draw::{precompile_gfx_translations, queue_gfx_ahead, GfxRegs, GfxState};
 
 /// Creates the compute pipeline of a stage prepared ahead of its use
 /// (`gpu::compile` workers): Some(true) when it was created here,

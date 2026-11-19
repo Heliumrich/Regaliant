@@ -1075,6 +1075,8 @@ fn is_state(op: u32) -> bool {
 struct AheadCmd {
     at: u64,
     stages: [Option<Arc<super::ahead::Slot>>; 2],
+    /// A draw's baked-state registers (scans for `prefetch_gfx` only).
+    gfx: Option<super::exec::GfxRegs>,
 }
 
 
@@ -2645,7 +2647,7 @@ impl Cp {
             // it a chunk compiled its new programs one after another (a 5-3
             // first visit froze 11.1 s, ~15 particle programs of ~0.7 s on
             // one of queue 0x50's workers, 2026-11-01 night).
-            if command && matches!(opcode, op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT) && super::compile::at_first_uses() {
+            if command && ((matches!(opcode, op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT) && super::compile::at_first_uses()) || (matches!(opcode, op::DRAW_INDEX_2 | op::DRAW_INDEX_AUTO | op::DRAW_INDEX_OFFSET_2 | op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT | op::DRAW_INDEX_INDIRECT_MULTI | op::DRAW_INDIRECT_MULTI) && super::compile::gfx_ahead())) {
                 self.compile_ctx.set(Some((f.base, next, to)));
             }
             let flow = self.packet(opcode, h, cur, n, &p);
@@ -4764,7 +4766,7 @@ impl Cp {
     /// command (they prepare their own). The stages are prepared by this
     /// command processor while it waits (`wait`), not handed to workers.
     fn scan_through(&mut self, f: &Fetched, from: u64, end: u64) -> Vec<AheadCmd> {
-        let (cmds, why, ns) = self.scan_commands(f, from, end, false);
+        let (cmds, why, ns) = self.scan_commands(f, from, end, false, false);
         super::ahead::note_wait_scan(cmds.len(), why, ns);
         cmds
     }
@@ -4777,10 +4779,43 @@ impl Cp {
         let Some((base, from, end)) = self.compile_ctx.take() else { return };
         // Read in place (the scan does not copy the buffer).
         let f = Fetched { base, words: Vec::new(), live: false };
-        let (cmds, why, ns) = self.scan_commands(&f, from, end, true);
+        let (cmds, why, ns) = self.scan_commands(&f, from, end, true, false);
         super::compile::note_scan_end(why, cmds.len());
         let slots: Vec<Arc<super::ahead::Slot>> = cmds.into_iter().filter_map(|c| c.stages[0].clone()).collect();
         super::compile::submit(slots, ns);
+    }
+
+    /// A draw waits for its missing pipeline (`exec::draw`, `compile::gfx_ahead`): the commands
+    /// after it in its buffer (a parallel worker's: in its chunk) are scanned as for a
+    /// dispatch's first use, and their draws handed to the compile workers, which prepare their
+    /// stages from the registers the scan saw and queue the pipelines missing for the
+    /// background graphics workers (`compile::submit_draws`), those of draws that always wait
+    /// first: the draws after it find theirs made or in flight instead of compiling them one
+    /// after another (2026-11-19: a new player's first walk waited 13.1 s at 125 draws, 73 of
+    /// them on the graphics command processor in bursts of 10-21).
+    pub fn prefetch_gfx(&self) {
+        let Some((base, from, end)) = self.compile_ctx.take() else { return };
+        let f = Fetched { base, words: Vec::new(), live: false };
+        let (cmds, why, ns) = self.scan_commands(&f, from, end, true, true);
+        let found = cmds.len();
+        let draws: Vec<_> = cmds
+            .into_iter()
+            .filter_map(|c| {
+                let [vs, ps] = c.stages;
+                match (vs, c.gfx) {
+                    (Some(vs), Some(g)) if vs.regs().kind == super::shaders::StageKind::Vertex => Some((vs, ps, g)),
+                    _ => None,
+                }
+            })
+            .collect();
+        // (`DS_COMPILE_TRACE=1`: the first scans, what they found and why they ended.)
+        if super::exec::compile_trace_on() {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 40 {
+                crate::info!("compile ahead: scan at a waiting draw on {}: {found} commands, {} draws (ended by {why:#x}, {} bytes to the end)", self.name, draws.len(), end.saturating_sub(from));
+            }
+        }
+        super::compile::submit_draws(draws, ns);
     }
 
     /// Direct dispatches of program `addr` of 1 to `small` workgroups right
@@ -4880,7 +4915,7 @@ impl Cp {
 
     /// The scan of `scan_through` (`whole`: also through runs the parallel
     /// workers would record): the commands, why it ended, its nanoseconds.
-    fn scan_commands(&self, f: &Fetched, from: u64, end: u64, whole: bool) -> (Vec<AheadCmd>, usize, u64) {
+    fn scan_commands(&self, f: &Fetched, from: u64, end: u64, whole: bool, want_gfx: bool) -> (Vec<AheadCmd>, usize, u64) {
         use super::ahead::{END_ARGS, END_BUFFER, END_HEADER, END_INVALID, END_MAX, END_PREDICATED};
         const WAIT_SCAN_MAX: usize = 1024;
         let t0 = Instant::now();
@@ -4897,6 +4932,10 @@ impl Cp {
         ctx.clear();
         ctx.extend_from_slice(&self.regs.ctx);
         let mut draw_base = self.draw_indirect_base;
+        // VGT_PRIMITIVE_TYPE, for the draws' baked-state registers (`want_gfx`), and the
+        // context-state stack a graphics scan follows (`pop::CONTEXT_STATE`, as `walk_state`).
+        let mut prim = self.reg(Space::Uc, 0x242);
+        let mut stack: Vec<Vec<u32>> = if want_gfx { self.ctx_stack.clone() } else { Vec::new() };
         let mut cmds: Vec<AheadCmd> = Vec::new();
         // The synchronization-free run being scanned: its first command's
         // index and its commands.
@@ -4956,15 +4995,63 @@ impl Cp {
                 }
             };
             let mut command: Option<[Option<super::shaders::StageRegs>; 2]> = None;
+            let mut gfx: Option<super::exec::GfxRegs> = None;
+            // (An indexed indirect draw drawn with its start instance as Vulkan's first instance,
+            // as `cpu_args_base_ok` decides: its vertex stage's slot, `want_gfx`.)
+            let mut base_inst: Option<u16> = None;
             let mut wave64 = true;
             let mut sync = false;
             match opcode {
                 op::NOP => {
                     // Private packets (flips, branches, draws, state) end
-                    // the scan; debug markers do not.
+                    // the scan; debug markers do not. A graphics scan
+                    // (`want_gfx`) follows the context-state stack and passes
+                    // the display-buffer wait and workload notes, as
+                    // `walk_state` does (its scans ended at them after 9-33
+                    // commands with 3-13 KiB of their buffer left, 2026-11-19).
                     if n >= 2 && p(0) == DS_MAGIC && !matches!(p(1), pop::PUSH_MARKER | pop::SET_MARKER | pop::POP_MARKER) {
-                        why = 0x100 + (p(1) as usize).min(0x2F);
-                        break;
+                        let passed = want_gfx
+                            && match p(1) {
+                                pop::WAIT_SAFE_FOR_RENDERING | pop::WORKLOADS_ACTIVE | pop::WORKLOAD_COMPLETE | pop::LOD_STATS => true,
+                                pop::CONTEXT_STATE if n >= 3 => {
+                                    let clear = |c: &mut Vec<u32>| {
+                                        c.fill(0);
+                                        for &(i, val) in context_defaults() {
+                                            if let Some(r) = c.get_mut(i as usize) {
+                                                *r = val;
+                                            }
+                                        }
+                                    };
+                                    match p(2) {
+                                        0 => {
+                                            clear(&mut ctx);
+                                            true
+                                        }
+                                        1 => {
+                                            stack.push(ctx.clone());
+                                            true
+                                        }
+                                        2 => match stack.pop() {
+                                            Some(c) => {
+                                                ctx = c;
+                                                true
+                                            }
+                                            None => false,
+                                        },
+                                        3 => {
+                                            stack.push(ctx.clone());
+                                            clear(&mut ctx);
+                                            true
+                                        }
+                                        _ => false,
+                                    }
+                                }
+                                _ => false,
+                            };
+                        if !passed {
+                            why = 0x100 + (p(1) as usize).min(0x2F);
+                            break;
+                        }
                     }
                 }
                 // GPU-side synchronization, CP writes and label waits:
@@ -4973,7 +5060,14 @@ impl Cp {
                 op::RELEASE_MEM | op::WAIT_REG_MEM | op::WAIT_REG_MEM64 if self.run_pass_here(opcode, &p).is_some() => {}
                 op::DRAW_INDEX_INDIRECT_MULTI | op::DRAW_INDIRECT_MULTI if self.run_multi(opcode) => {}
                 op::EVENT_WRITE | op::ACQUIRE_MEM | op::RELEASE_MEM | op::WRITE_DATA | op::WAIT_REG_MEM | op::WAIT_REG_MEM64 => sync = true,
-                op::SET_UCONFIG_REG | op::SET_UCONFIG_REG_INDEX | op::LOAD_UCONFIG_REG | op::INDEX_TYPE | op::INDEX_BASE | op::INDEX_BUFFER_SIZE | op::NUM_INSTANCES | op::CONTEXT_CONTROL => {}
+                op::SET_UCONFIG_REG | op::SET_UCONFIG_REG_INDEX => {
+                    // (VGT_PRIMITIVE_TYPE: the draws' baked state, `want_gfx`.)
+                    let first = p(0) & 0xFFFF;
+                    if n >= 2 && (first..first + (n as u32 - 1)).contains(&0x242) {
+                        prim = p(1 + (0x242 - first) as u64);
+                    }
+                }
+                op::LOAD_UCONFIG_REG | op::INDEX_TYPE | op::INDEX_BASE | op::INDEX_BUFFER_SIZE | op::NUM_INSTANCES | op::CONTEXT_CONTROL => {}
                 op::SET_CONTEXT_REG | op::SET_CONTEXT_REG_INDEX => set(&mut ctx, p(0) & 0xFFFF),
                 op::SET_SH_REG | op::SET_SH_REG_INDEX => set(&mut sh, p(0) & 0xFFFF),
                 op::LOAD_CONTEXT_REG_INDEX | op::LOAD_SH_REG_INDEX => {
@@ -5008,18 +5102,17 @@ impl Cp {
                         }
                         let (bv, si) = unsafe { (rd32(a + 4 * k), rd32(a + 4 * (k + 1))) };
                         let (vtx_loc, inst_loc) = (p(1) & 0xFFFF, p(1) >> 16);
-                        let inst_loc = if inst_loc != 0 {
-                            inst_loc
-                        } else {
-                            let ngg = super::shaders::ngg_addr_of(&ScanRegs { sh: &sh, ctx: &ctx });
-                            crate::hle::libs::agc::instance_offset_slot(ngg).map_or(0, |s| 0x8C + s)
-                        };
+                        let ngg = super::shaders::ngg_addr_of(&ScanRegs { sh: &sh, ctx: &ctx });
+                        let inst_loc = if inst_loc != 0 { inst_loc } else { crate::hle::libs::agc::instance_offset_slot(ngg).map_or(0, |s| 0x8C + s) };
+                        if want_gfx && opcode == op::DRAW_INDEX_INDIRECT && vtx_loc == 0 && (0x8C..0x8C + 32).contains(&inst_loc) && super::tune::cpu_args_base() && super::vk::try_ctx().is_some_and(|c| c.draw_parameters) && !super::shaders::cpu_args_program(ngg) {
+                            base_inst = Some((inst_loc - 0x8C) as u16);
+                        }
                         if vtx_loc != 0 {
                             if let Some(r) = sh.get_mut(vtx_loc as usize) {
                                 *r = bv;
                             }
                         }
-                        if inst_loc != 0 {
+                        if inst_loc != 0 && base_inst.is_none() {
                             if let Some(r) = sh.get_mut(inst_loc as usize) {
                                 *r = si;
                             }
@@ -5031,6 +5124,9 @@ impl Cp {
                         Some(super::shaders::StageRegs::capture(super::shaders::StageKind::Vertex, &view)),
                         (ps != 0).then(|| super::shaders::StageRegs::capture(super::shaders::StageKind::Pixel, &view)),
                     ]);
+                    if want_gfx {
+                        gfx = Some(super::exec::GfxRegs::capture(&|a| ctx.get(((a - 0x28000) / 4) as usize).copied().unwrap_or(0), prim).with_base_inst(base_inst));
+                    }
                 }
                 op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT => {
                     let initiator = if opcode == op::DISPATCH_DIRECT { p(3) } else if n >= 3 { p(2) } else { p(1) };
@@ -5067,7 +5163,7 @@ impl Cp {
                 }
                 run_len += 1;
                 let stages = stages.map(|r| r.map(|r| super::ahead::Slot::new(r, wave64)));
-                cmds.push(AheadCmd { at, stages });
+                cmds.push(AheadCmd { at, stages, gfx });
             }
             cur = next;
         }
@@ -6282,7 +6378,8 @@ impl Cp {
             }
             // A dispatch whose pipeline turns out missing scans the commands
             // after it for more first uses (`tune compile_ahead`).
-            if command && !f.live && dispatch && super::compile::at_first_uses() {
+            // (And a draw whose pipeline turns out missing and waits for it: `prefetch_gfx`.)
+            if command && !f.live && ((dispatch && super::compile::at_first_uses()) || (matches!(opcode, op::DRAW_INDEX_2 | op::DRAW_INDEX_AUTO | op::DRAW_INDEX_OFFSET_2 | op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT | op::DRAW_INDEX_INDIRECT_MULTI | op::DRAW_INDIRECT_MULTI) && super::compile::gfx_ahead())) {
                 self.compile_ctx.set(Some((f.base, next, end)));
             }
             if self.held.is_some() {

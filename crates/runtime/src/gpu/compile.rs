@@ -20,7 +20,12 @@
 //! compile: execution prepares its stages itself.
 //!
 //! (Graphics pipelines the same way, `tune compile_gfx`, saw too little in
-//! their scans: removed on 2026-11-01.)
+//! their scans: removed on 2026-11-01.) Since 2026-11-19 a draw that waits for its
+//! missing pipeline (one that writes memory, clears depth or stencil, or draws into a target
+//! not drawn lately: the rest are left out while theirs is made in the background) scans the
+//! commands after it (`Cp::prefetch_gfx`): their draws' stages are prepared here and their
+//! pipelines queued for the background graphics workers (`submit_draws`, `DS_GFX_AHEAD=0`
+//! off).
 
 use super::ahead::Slot;
 use super::shaders::{self, Prepared, RegRead, StageKind};
@@ -35,6 +40,8 @@ enum Job {
     Regs(Arc<Slot>),
     Prepared(Box<Prepared>),
     Batched(Arc<Slot>),
+    /// A scanned draw: its stages and baked-state registers (`submit_draws`).
+    Draw(Box<(Arc<Slot>, Option<Arc<Slot>>, super::exec::GfxRegs)>),
 }
 
 struct Pool {
@@ -158,8 +165,128 @@ fn worker() {
                 QUEUED.lock().retain(|&k| k != p.tr.key);
             }
             Job::Batched(slot) => run_batched(&slot),
+            Job::Draw(d) => run_draw(&d.0, d.1.as_deref(), &d.2),
         }));
     }
+}
+
+/// Whether a draw that waits for its missing pipeline scans the draws after it
+/// (`Cp::prefetch_gfx`; `DS_GFX_AHEAD=0` off; needs the workers, `enabled`).
+pub fn gfx_ahead() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    enabled() && *ON.get_or_init(|| std::env::var("DS_GFX_AHEAD").ok().as_deref() != Some("0"))
+}
+
+/// Scanned draws handed over once each per (vertex stage's registers, pixel stage's registers,
+/// baked-state registers), by hash: the same programs with other descriptors are other
+/// translations and pipelines (keyed by their programs' addresses, a first walk's worker waited
+/// ~140 ms each for five pipelines of two program pairs one after another, 2026-11-19). At most
+/// `DRAWS_SEEN_MAX` (then forgotten).
+static DRAWS_SEEN: Mutex<Option<std::collections::HashSet<(u64, u64, u64)>>> = Mutex::new(None);
+const DRAWS_SEEN_MAX: usize = 200_000;
+
+/// A stage snapshot's registers by hash (`DRAWS_SEEN`).
+fn regs_hash(r: &shaders::StageRegs) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    r.sh.hash(&mut h);
+    r.ctx.hash(&mut h);
+    h.finish()
+}
+/// At most this many new draws a scan (64 left 89 of 305 out in a first boot's 240 s).
+const MAX_DRAW_JOBS: usize = 128;
+/// [scans, draws found, handed over, prepared, pipelines queued, made or queued already,
+/// recording nothing, not prepared, over the per-scan limit, scan ns].
+static GFX: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+
+/// Hands the draws of a scan at a draw that waits (`Cp::prefetch_gfx`, after `ns` of
+/// scanning) to the workers: each (programs, state) once.
+pub fn submit_draws(draws: Vec<(Arc<Slot>, Option<Arc<Slot>>, super::exec::GfxRegs)>, ns: u64) {
+    GFX[0].fetch_add(1, Ordering::Relaxed);
+    GFX[1].fetch_add(draws.len() as u64, Ordering::Relaxed);
+    GFX[9].fetch_add(ns, Ordering::Relaxed);
+    let mut jobs = Vec::new();
+    {
+        let mut g = DRAWS_SEEN.lock();
+        let seen = g.get_or_insert_with(Default::default);
+        if seen.len() > DRAWS_SEEN_MAX {
+            seen.clear();
+        }
+        for (vs, ps, regs) in draws {
+            if shaders::ngg_addr_of(vs.regs()) == 0 || !seen.insert((regs_hash(vs.regs()), ps.as_ref().map_or(0, |p| regs_hash(p.regs())), regs.hash64())) {
+                continue;
+            }
+            if jobs.len() >= MAX_DRAW_JOBS {
+                GFX[8].fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            jobs.push(Job::Draw(Box::new((vs, ps, regs))));
+        }
+    }
+    if jobs.is_empty() {
+        return;
+    }
+    GFX[2].fetch_add(jobs.len() as u64, Ordering::Relaxed);
+    ensure_workers();
+    POOL.jobs.lock().extend(jobs);
+    POOL.cv.notify_all();
+}
+
+/// A scanned draw: its stages prepared from the registers the scan saw, then its pipeline
+/// queued when missing (`exec::queue_gfx_ahead`).
+fn run_draw(vs: &Slot, ps: Option<&Slot>, g: &super::exec::GfxRegs) {
+    let prep = |s: &Slot| {
+        let r = s.regs();
+        let p = match r.kind {
+            StageKind::Vertex => shaders::prepare_ngg(r),
+            StageKind::Pixel => shaders::prepare_ps(r),
+            StageKind::Compute => return None,
+        };
+        // (`DS_COMPILE_TRACE=1`: the first stages not prepared and why.)
+        if super::exec::compile_trace_on() && (p.is_err() || r.missed.load(Ordering::Relaxed)) {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 24 {
+                let why = match &p {
+                    Err(e) => e.clone(),
+                    Ok(_) => format!("register {:#x} outside the snapshot", r.missed_reg.load(Ordering::Relaxed)),
+                };
+                crate::info!("compile ahead: a scanned draw's {:?} stage not prepared: {why}", r.kind);
+            }
+        }
+        p.ok().filter(|_| !r.missed.load(Ordering::Relaxed))
+    };
+    let v = match g.base_inst() {
+        Some(slot) => shaders::with_base_instance(slot, || prep(vs)),
+        None => prep(vs),
+    };
+    let Some(v) = v else {
+        GFX[7].fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let p = match ps {
+        Some(s) => match prep(s) {
+            Some(p) => Some(p),
+            None => {
+                GFX[7].fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        },
+        None => None,
+    };
+    GFX[3].fetch_add(1, Ordering::Relaxed);
+    let q = super::exec::queue_gfx_ahead(g, &v, p.as_ref());
+    if q.is_none() && super::exec::compile_trace_on() {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 12 {
+            crate::info!("compile ahead: a scanned draw of vs {:#x} ps {:#x} records nothing (as its registers read)", v.addr, p.as_ref().map_or(0, |p| p.addr));
+        }
+    }
+    let k = match q {
+        Some(true) => 4,
+        Some(false) => 5,
+        None => 6,
+    };
+    GFX[k].fetch_add(1, Ordering::Relaxed);
 }
 
 /// Prepares a program's batched form from `slot`'s registers and makes its
@@ -342,8 +469,26 @@ pub fn note_scan_end(why: usize, n: usize) {
 /// One status line ("" before any scan).
 pub fn status() -> String {
     let s: Vec<u64> = STATS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let g: Vec<u64> = GFX.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let gfx = if g[0] > 0 {
+        format!(
+            "    graphics pipelines queued ahead at draws that waited: {} scans ({} ms), {} draws found, {} handed over ({} over the per-scan limit), {} prepared, {} pipelines queued, {} made or queued already, {} recording nothing, {} not prepared\n",
+            g[0],
+            g[9] / 1_000_000,
+            g[1],
+            g[2],
+            g[8],
+            g[3],
+            g[4],
+            g[5],
+            g[6],
+            g[7]
+        )
+    } else {
+        String::new()
+    };
     if s[SCANS] == 0 && s[AT_WAITS] == 0 {
-        return String::new();
+        return gfx;
     }
     let (waits, wait_ns, dups) = super::exec::inflight_stats();
     let mut stops: Vec<(usize, u64)> = SCAN_STOPS.iter().enumerate().map(|(k, c)| (k, c.load(Ordering::Relaxed))).filter(|x| x.1 > 0).collect();
@@ -374,5 +519,5 @@ pub fn status() -> String {
         super::exec::BATCHABLE_AHEAD.load(Ordering::Relaxed),
         s[BATCHED_MADE],
         s[BATCHED]
-    )
+    ) + &gfx
 }
