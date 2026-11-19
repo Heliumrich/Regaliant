@@ -1256,6 +1256,40 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     _ => Err("usage: imgpng <hex address> <name>".into()),
                 }
             }
+            "imgprobe" => {
+                // Diagnosis: `imgprobe <flips> <u> <v>`: at each of the next flips, a 4x4 block's
+                // means at (u, v) of every GPU-written image used in the last two frames.
+                // (`taa` last: at the TAA's dispatch, the frame's work before it completed.)
+                let n = parts.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(60).clamp(1, 600);
+                let u = parts.next().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.5);
+                let v = parts.next().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.5);
+                if parts.next() == Some("taa") {
+                    *gpu::exec::TAA_IMG_PROBE.lock() = Some((n, u, v));
+                } else {
+                    *hle::libs::videoout::PROBE.lock() = Some((n, u, v));
+                }
+                Ok(())
+            }
+            "metamap" => {
+                // Diagnosis: `metamap` logs every fast-clear metadata address and its surface.
+                let lines = gpu::images::with(|im| im.meta_report());
+                info!("control: metamap: {} metadata address(es)\n    {}", lines.len(), lines.join("\n    "));
+                Ok(())
+            }
+            "metadrop" => {
+                // Diagnosis: `metadrop <hex address>[,...]` forgets the surfaces of those metadata
+                // addresses (their writes then clear nothing).
+                let list: Vec<u64> = parts.next().unwrap_or("").split(',').filter_map(|a| u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()).collect();
+                if list.is_empty() {
+                    Err("usage: metadrop <hex address>[,...]".into())
+                } else {
+                    for m in list {
+                        let r = gpu::images::with(|im| im.meta_drop(m));
+                        info!("control: metadrop {}", r.unwrap_or_else(|| format!("{m:#x}: no surface")));
+                    }
+                    Ok(())
+                }
+            }
             "imgstat" => {
                 // Diagnosis: `imgstat <hex address>` logs value statistics of
                 // the cached images at that guest address.

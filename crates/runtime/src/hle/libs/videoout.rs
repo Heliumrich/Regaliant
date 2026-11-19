@@ -804,7 +804,28 @@ pub fn wait_shots() {
     }
 }
 
+/// `imgprobe <flips> <u> <v>` (diagnosis): flips left, and where every GPU-written image is read
+/// at each of them (`Images::probe_used`).
+pub static PROBE: Mutex<Option<(u32, f32, f32)>> = Mutex::new(None);
+
 fn maybe_screenshot(b: &DisplayBuffer, flip: u64) {
+    let probe = {
+        let mut g = PROBE.lock();
+        let r = *g;
+        if let Some(p) = g.as_mut() {
+            p.0 = p.0.saturating_sub(1);
+            if p.0 == 0 {
+                *g = None;
+            }
+        }
+        r
+    };
+    if let Some((_, u, v)) = probe {
+        if crate::gpu::vk::try_ctx().is_some() && crate::gpu::exec::enabled() {
+            let lines = crate::gpu::images::with(|im| im.probe_used(u, v));
+            crate::info!("probe flip {flip}: {} image(s)\n    {}", lines.len(), lines.join("\n    "));
+        }
+    }
     let mut requested = SHOT_REQUEST.lock().take();
     let mut crop = None;
     let mut half = false;

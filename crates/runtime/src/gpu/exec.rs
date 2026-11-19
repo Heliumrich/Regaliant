@@ -310,6 +310,8 @@ pub static FAST_CLEARS_KNOWN: AtomicU64 = AtomicU64::new(0);
 /// a clear; `Exec::record_fast_clears`): refused, and applied with the value of the fill
 /// whose clear an unknown write had replaced (`images::PendingClear`'s kept value).
 pub static FAST_CLEARS_NOT_UNIFORM: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Fast clears of some layers of a layered depth surface alone (`images::meta_layer_bytes`).
+pub static FAST_CLEARS_LAYERED: AtomicU64 = AtomicU64::new(0);
 /// Block-compressed textures refreshed from GPU-written block views.
 pub static BLOCK_COPIES: AtomicU64 = AtomicU64::new(0);
 /// Of those, with the mip tail from a view of the tail block (`tune block_tails`).
@@ -12554,6 +12556,8 @@ const TAA_RES: [usize; 4] = [1, 2, 4, 9];
 /// `n` frames: its resources and its constant buffer's words (the jitter's source).
 /// `taadump <name>`: the TAA's input colour at its next dispatch, as `<name>.raw` (diagnosis).
 pub static TAA_DUMP: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
+/// `imgprobe <n> <u> <v> taa` (diagnosis): dispatches of the TAA left to probe at, and where.
+pub static TAA_IMG_PROBE: parking_lot::Mutex<Option<(u32, f32, f32)>> = parking_lot::Mutex::new(None);
 
 fn taa_probe(p: &Prepared) {
     if p.addr == TAA_CS {
@@ -15788,7 +15792,7 @@ impl Exec {
                 self.stop("fast clear (the current frame's)");
                 return;
             }
-            let mine: Vec<(super::images::ImageKey, u64, Option<u32>, Option<u32>)> = keys.iter().filter_map(|k| self.held_clears.get(k).map(|&(m, v, kept)| (*k, m, v, kept))).collect();
+            let mine: Vec<(super::images::ImageKey, u64, Option<u32>, Option<u32>, u128)> = keys.iter().filter_map(|k| self.held_clears.get(k).map(|&(m, v, kept, layers)| (*k, m, v, kept, layers))).collect();
             if mine.is_empty() {
                 return;
             }
@@ -15799,7 +15803,7 @@ impl Exec {
             for x in &mine {
                 self.held_clears.remove(&x.0);
             }
-            let clears = super::images::with(|im| mine.iter().filter_map(|&(k, m, v, kept)| im.fast_clear_of(k, m, v, kept)).collect::<Vec<_>>());
+            let clears = super::images::with(|im| mine.iter().filter_map(|&(k, m, v, kept, layers)| im.fast_clear_of(k, m, v, kept, layers)).collect::<Vec<_>>());
             self.end_rendering();
             self.record_fast_clears(clears, false);
             return;
@@ -15830,7 +15834,33 @@ impl Exec {
         if !clears.is_empty() {
             self.xq_image_work();
         }
+        // A layered depth surface whose metadata is laid out a layer after another
+        // (`images::meta_layer_bytes`): each run of the layers its metadata writes reached is
+        // cleared alone, its value read from its own first layer's metadata.
+        let mut runs: Vec<(super::images::FastClear, Option<(u32, u32)>)> = Vec::with_capacity(clears.len());
         for c in clears {
+            match (c.layers, super::images::meta_layer_bytes(&c.key)) {
+                (0, _) | (_, None) => runs.push((c, None)),
+                (mask, Some(per)) => {
+                    let top = c.key.layers.min(128);
+                    let mut j = 0u32;
+                    while j < top {
+                        if mask >> j & 1 == 0 {
+                            j += 1;
+                            continue;
+                        }
+                        let start = j;
+                        while j < top && mask >> j & 1 == 1 {
+                            j += 1;
+                        }
+                        let mut part = c;
+                        part.meta = c.meta + start as u64 * per;
+                        runs.push((part, Some((start, j - start))));
+                    }
+                }
+            }
+        }
+        for (c, run) in runs {
             let v = match c.known {
                 Some(v) => {
                     FAST_CLEARS_KNOWN.fetch_add(1, Ordering::Relaxed);
@@ -15876,9 +15906,13 @@ impl Exec {
             };
             let k = c.key;
             if super::images::trace_clears() {
-                crate::info!("trace clears: {:#x} ({:?}) applied, metadata {:#x} = {v:#x}{} (for flip {}, [{}] before programs {:#x}/{:#x})", k.base, k.format, c.meta, if c.known.is_some() { " (from the fill)" } else { " (read)" }, crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1, self.name, self.sync_readers[0], self.sync_readers[1]);
+                crate::info!("trace clears: {:#x} ({:?} {}x{}) applied, metadata {:#x} = {v:#x}{} (for flip {}, [{}] before programs {:#x}/{:#x})", k.base, k.format, k.width, k.height, c.meta, if c.known.is_some() { " (from the fill)" } else { " (read)" }, crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1, self.name, self.sync_readers[0], self.sync_readers[1]);
             }
-            let full = vk::ImageSubresourceRange { aspect_mask: super::images::aspects(k.format), base_mip_level: 0, level_count: vk::REMAINING_MIP_LEVELS, base_array_layer: 0, layer_count: vk::REMAINING_ARRAY_LAYERS };
+            let (first, count) = run.unwrap_or((0, vk::REMAINING_ARRAY_LAYERS));
+            if run.is_some() {
+                FAST_CLEARS_LAYERED.fetch_add(1, Ordering::Relaxed);
+            }
+            let full = vk::ImageSubresourceRange { aspect_mask: super::images::aspects(k.format), base_mip_level: 0, level_count: vk::REMAINING_MIP_LEVELS, base_array_layer: first, layer_count: count };
             let what = if super::images::is_depth(k.format) {
                 // HTILE: 0 = depth and stencil cleared; all ones = expanded.
                 if v == u32::MAX {
@@ -18355,8 +18389,8 @@ impl Exec {
     /// the bounded ones) and of a fill (`Images::notes_for`).
     fn held_note(&mut self, writes: &[(u64, u64)], sized: &[(u64, u64)], fill: Option<((u64, u64), u32)>) {
         let (clears, over) = super::images::with(|im| im.notes_for(writes, sized, fill));
-        for (k, meta, v) in clears {
-            super::images::merge_clear(&mut self.held_clears, k, meta, v);
+        for (k, meta, v, layers) in clears {
+            super::images::merge_clear(&mut self.held_clears, k, meta, v, layers);
         }
         self.held_over.extend(over);
     }
@@ -18370,8 +18404,8 @@ impl Exec {
             let (c, o) = im.notes_for(&r, if zero { &[] } else { &r }, Some(((base, len), v)));
             (c, o, if zero { im.zero_fill_targets(base, len) } else { Vec::new() })
         });
-        for (k, meta, v) in clears {
-            super::images::merge_clear(&mut self.held_clears, k, meta, v);
+        for (k, meta, v, layers) in clears {
+            super::images::merge_clear(&mut self.held_clears, k, meta, v, layers);
         }
         self.held_over.extend(over);
         for z in &zeroed {
@@ -20342,6 +20376,26 @@ impl Exec {
             None => shaders::prepare_compute(cp, wave64)?,
         };
         taa_probe(&p);
+        // (`imgprobe <n> <u> <v> taa`: every image probed before the TAA, the frame's work
+        // before it completed first.)
+        if p.addr == TAA_CS && !self.held {
+            let take = {
+                let mut g = TAA_IMG_PROBE.lock();
+                let r = *g;
+                if let Some(q) = g.as_mut() {
+                    q.0 = q.0.saturating_sub(1);
+                    if q.0 == 0 {
+                        *g = None;
+                    }
+                }
+                r
+            };
+            if let Some((_, u, v)) = take {
+                self.flush_for("image probe");
+                let lines = super::images::with(|im| im.probe_used(u, v));
+                crate::info!("probe at the TAA for flip {}: {} image(s)\n    {}", crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1, lines.len(), lines.join("\n    "));
+            }
+        }
         // LOD statistics in rotation (`tune lod_cs` >= 2): a stage prepared
         // without them measures in one dispatch in N (prepared again with
         // them); the others carry their textures' recent measurements.
@@ -21373,7 +21427,7 @@ impl Drop for Exec {
 /// One status line for hang reports.
 pub fn status() -> String {
     format!(
-        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them from a resident shadow, {} of them behind a barrier of their own; {} render passes ended into the next full barrier; draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU, {} title timestamps written by the CPU, left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges ({} before an in-place use), {} skipped; {} draws executed ({} reading their arguments on the GPU, {} repeating the draw before (chains ended by opcode: {}), {} barriers before a dispatch rewrote them), {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait; read from memory and not one code throughout: {} refused, {} with the value of the fill an unknown write had replaced), {} fill-kernel dispatches recorded as buffer fills ({} of them only clearing the GPU-written images they cover, {} MiB not stored), {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
+        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them from a resident shadow, {} of them behind a barrier of their own; {} render passes ended into the next full barrier; draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU, {} title timestamps written by the CPU, left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges ({} before an in-place use), {} skipped; {} draws executed ({} reading their arguments on the GPU, {} repeating the draw before (chains ended by opcode: {}), {} barriers before a dispatch rewrote them), {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait; read from memory and not one code throughout: {} refused, {} with the value of the fill an unknown write had replaced; {} of layers alone), {} fill-kernel dispatches recorded as buffer fills ({} of them only clearing the GPU-written images they cover, {} MiB not stored), {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
         EXECUTED.load(Ordering::Relaxed),
         GPU_INDIRECT.load(Ordering::Relaxed),
         SHADOW_ARGS.load(Ordering::Relaxed),
@@ -21409,6 +21463,7 @@ pub fn status() -> String {
         FAST_CLEARS_KNOWN.load(Ordering::Relaxed),
         FAST_CLEARS_NOT_UNIFORM[0].load(Ordering::Relaxed),
         FAST_CLEARS_NOT_UNIFORM[1].load(Ordering::Relaxed),
+        FAST_CLEARS_LAYERED.load(Ordering::Relaxed),
         FILLS_IN_PLACE.load(Ordering::Relaxed),
         FILL_SKIPS[0].load(Ordering::Relaxed),
         FILL_SKIPS[1].load(Ordering::Relaxed) >> 20,

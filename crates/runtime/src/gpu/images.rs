@@ -97,32 +97,74 @@ pub fn trace_clears() -> bool {
 /// is other data over the block, and the kept fill's clear stands (2026-11-18 night: the title
 /// reuses metadata blocks an image no longer uses). The kept value lives in the entry, so it
 /// moves and ends with it (2026-11-19: a table of its own outlived entries dropped elsewhere).
-pub type PendingClear = (u64, Option<u32>, Option<u32>);
+/// The fourth field: the layers whose metadata the writes covered, a bit a layer, for a layered
+/// depth surface whose HTILE is laid out layer by layer (`meta_layer_bytes`); 0: the whole image.
+pub type PendingClear = (u64, Option<u32>, Option<u32>, u128);
+
+/// Two pending clears' layers together (0, the whole image, wins).
+fn union_layers(a: u128, b: u128) -> u128 {
+    if a == 0 || b == 0 { 0 } else { a | b }
+}
 
 /// Notes a pending fast clear of `key` (its metadata at `meta`; `v` the value a fill gave,
-/// None: a write of unknown data), replacing the one pending; a fill's value an unknown write
-/// replaces at the same metadata is kept aside in the entry for its use.
-pub fn merge_clear<S: std::hash::BuildHasher>(map: &mut std::collections::HashMap<ImageKey, PendingClear, S>, key: ImageKey, meta: u64, v: Option<u32>) {
+/// None: a write of unknown data; `layers` the layers it covers, 0 all), replacing the one
+/// pending but for its layers, which add up; a fill's value an unknown write replaces at the
+/// same metadata is kept aside in the entry for its use.
+pub fn merge_clear<S: std::hash::BuildHasher>(map: &mut std::collections::HashMap<ImageKey, PendingClear, S>, key: ImageKey, meta: u64, v: Option<u32>, layers: u128) {
     let kept = match (v, map.get(&key)) {
-        (None, Some(&(m, Some(old), _))) if m == meta => Some(old),
-        (None, Some(&(m, None, kept))) if m == meta => kept,
+        (None, Some(&(m, Some(old), _, _))) if m == meta => Some(old),
+        (None, Some(&(m, None, kept, _))) if m == meta => kept,
         _ => None,
     };
-    map.insert(key, (meta, v, kept));
+    let layers = map.get(&key).map_or(layers, |e| union_layers(e.3, layers));
+    map.insert(key, (meta, v, kept, layers));
 }
 
 /// Merges a pending clear `e` noted later (a held stretch's, a chunk's) into `map`: its own
-/// fill or kept fill wins; with neither, it is an unknown write over what `map` holds.
+/// fill or kept fill wins; with neither, it is an unknown write over what `map` holds. The
+/// layers add up.
 pub fn merge_pending<S: std::hash::BuildHasher>(map: &mut std::collections::HashMap<ImageKey, PendingClear, S>, key: ImageKey, e: PendingClear) {
     match e {
-        (meta, None, None) => merge_clear(map, key, meta, None),
-        (meta, Some(v), _) => {
-            map.insert(key, (meta, Some(v), None));
+        (meta, None, None, layers) => merge_clear(map, key, meta, None, layers),
+        (meta, Some(v), _, layers) => {
+            let layers = map.get(&key).map_or(layers, |p| union_layers(p.3, layers));
+            map.insert(key, (meta, Some(v), None, layers));
         }
-        (meta, None, kept) => {
-            map.insert(key, (meta, None, kept));
+        (meta, None, kept, layers) => {
+            let layers = map.get(&key).map_or(layers, |p| union_layers(p.3, layers));
+            map.insert(key, (meta, None, kept, layers));
         }
     }
+}
+
+/// The HTILE bytes a layer of a layered depth image takes (4 bytes an 8x8 tile), when its
+/// layers' metadata is laid out one after another from the surface's metadata address: the
+/// hardware addresses a slice's HTILE past the ones before it. The title binds every layer of
+/// its shadow atlas (1024x1024, 80 layers) with the atlas's one address and clears a layer by
+/// filling that layer's 64 KiB (2026-11-19: a fill of layer 0's cleared all 80 here, the
+/// cached shadows of the others with it, and fills of the others cleared nothing: lights lost
+/// their shadows for a frame, the menu's preview view making it happen often). Sizes whose
+/// layers are whole 64 KiB blocks only (the ones measured); others keep whole-image clears.
+pub fn meta_layer_bytes(k: &ImageKey) -> Option<u64> {
+    // (`tune layer_clears 0` / `DS_LAYER_CLEARS=0`: whole-image clears, as before.)
+    if !is_depth(k.format) || k.layers <= 1 || k.layers > 128 || k.ty3d || !super::tune::layer_clears() {
+        return None;
+    }
+    let s = k.width.div_ceil(8) as u64 * k.height.div_ceil(8) as u64 * 4;
+    (s > 0 && s % (64 << 10) == 0).then_some(s)
+}
+
+/// The layers of a layered surface (metadata at `meta`, `per` bytes a layer, `layers`) whose
+/// metadata starts inside [b, e) (`fill`: with its first dword inside), a bit a layer; 0: none.
+fn layers_reached(meta: u64, per: u64, layers: u32, b: u64, e: u64, fill: bool) -> u128 {
+    let mut mask = 0u128;
+    for j in 0..layers.min(128) {
+        let at = meta + j as u64 * per;
+        if at >= b && at < e && (!fill || at + 4 <= e) {
+            mask |= 1u128 << j;
+        }
+    }
+    mask
 }
 
 /// The word of a metadata block whose first dwords `words` hold one byte value throughout, as
@@ -158,26 +200,26 @@ mod clear_tests {
         let mut m: HashMap<ImageKey, PendingClear> = HashMap::default();
         let k = key(0x7_0000_0000);
         // A fill, then other data over the block: the write replaces it, the fill's value kept.
-        merge_clear(&mut m, k, 0x2000, Some(0));
-        merge_clear(&mut m, k, 0x2000, None);
-        assert_eq!(m.get(&k), Some(&(0x2000, None, Some(0))));
+        merge_clear(&mut m, k, 0x2000, Some(0), 0);
+        merge_clear(&mut m, k, 0x2000, None, 0);
+        assert_eq!(m.get(&k), Some(&(0x2000, None, Some(0), 0)));
         // More unknown writes keep it.
-        merge_clear(&mut m, k, 0x2000, None);
-        assert_eq!(m.get(&k), Some(&(0x2000, None, Some(0))));
+        merge_clear(&mut m, k, 0x2000, None, 0);
+        assert_eq!(m.get(&k), Some(&(0x2000, None, Some(0), 0)));
         // A later fill takes the place of the one kept aside.
-        merge_clear(&mut m, k, 0x2000, Some(u32::MAX));
-        assert_eq!(m.get(&k), Some(&(0x2000, Some(u32::MAX), None)));
+        merge_clear(&mut m, k, 0x2000, Some(u32::MAX), 0);
+        assert_eq!(m.get(&k), Some(&(0x2000, Some(u32::MAX), None, 0)));
         // An unknown write with no fill before keeps nothing aside; nor does one at other
         // metadata (the image rendered with another block).
         let k2 = key(0x7_0010_0000);
-        merge_clear(&mut m, k2, 0x3000, None);
-        assert_eq!(m.get(&k2), Some(&(0x3000, None, None)));
-        merge_clear(&mut m, k, 0x2800, None);
-        assert_eq!(m.get(&k), Some(&(0x2800, None, None)));
+        merge_clear(&mut m, k2, 0x3000, None, 0);
+        assert_eq!(m.get(&k2), Some(&(0x3000, None, None, 0)));
+        merge_clear(&mut m, k, 0x2800, None, 0);
+        assert_eq!(m.get(&k), Some(&(0x2800, None, None, 0)));
         // Taken (used or dropped), nothing stays behind for a later unknown write.
         m.remove(&k);
-        merge_clear(&mut m, k, 0x2000, None);
-        assert_eq!(m.get(&k), Some(&(0x2000, None, None)));
+        merge_clear(&mut m, k, 0x2000, None, 0);
+        assert_eq!(m.get(&k), Some(&(0x2000, None, None, 0)));
     }
 
     #[test]
@@ -185,20 +227,46 @@ mod clear_tests {
         let k = key(0x7_0020_0000);
         // A stretch that filled v1 and then wrote other data, over a committed fill v0: v1 kept.
         let mut c: HashMap<ImageKey, PendingClear> = HashMap::default();
-        merge_clear(&mut c, k, 0x4000, Some(0x40));
+        merge_clear(&mut c, k, 0x4000, Some(0x40), 0);
         let mut h: HashMap<ImageKey, PendingClear> = HashMap::default();
-        merge_clear(&mut h, k, 0x4000, Some(0x80));
-        merge_clear(&mut h, k, 0x4000, None);
+        merge_clear(&mut h, k, 0x4000, Some(0x80), 0);
+        merge_clear(&mut h, k, 0x4000, None, 0);
         merge_pending(&mut c, k, h[&k]);
-        assert_eq!(c.get(&k), Some(&(0x4000, None, Some(0x80))));
+        assert_eq!(c.get(&k), Some(&(0x4000, None, Some(0x80), 0)));
         // A stretch that only wrote other data over a committed fill: the committed one kept.
         let mut c: HashMap<ImageKey, PendingClear> = HashMap::default();
-        merge_clear(&mut c, k, 0x4000, Some(0x40));
-        merge_pending(&mut c, k, (0x4000, None, None));
-        assert_eq!(c.get(&k), Some(&(0x4000, None, Some(0x40))));
+        merge_clear(&mut c, k, 0x4000, Some(0x40), 0);
+        merge_pending(&mut c, k, (0x4000, None, None, 0));
+        assert_eq!(c.get(&k), Some(&(0x4000, None, Some(0x40), 0)));
         // A stretch's own fill wins.
-        merge_pending(&mut c, k, (0x4000, Some(0xC0), None));
-        assert_eq!(c.get(&k), Some(&(0x4000, Some(0xC0), None)));
+        merge_pending(&mut c, k, (0x4000, Some(0xC0), None, 0));
+        assert_eq!(c.get(&k), Some(&(0x4000, Some(0xC0), None, 0)));
+    }
+
+    #[test]
+    fn layer_clears() {
+        // The shadow atlas: 1024x1024 D32, 80 layers, 64 KiB of HTILE a layer.
+        let atlas = ImageKey { base: 0x10_ab90_0000, format: vk::Format::D32_SFLOAT, width: 1024, height: 1024, layers: 80, levels: 1, ty3d: false, cube: false };
+        let per = meta_layer_bytes(&atlas).unwrap();
+        assert_eq!(per, 0x10000);
+        let m = 0x10_0820_0000u64;
+        // Layer 0's fill reaches layer 0 alone, layer 5's layer 5, the 4 layers of a cascade map
+        // all 4.
+        assert_eq!(layers_reached(m, per, 80, m, m + per, true), 1);
+        assert_eq!(layers_reached(m, per, 80, m + 5 * per, m + 6 * per, true), 1 << 5);
+        assert_eq!(layers_reached(m, per, 4, m, m + 4 * per, true), 0xF);
+        // A fill ending inside a layer's first dword does not reach it.
+        assert_eq!(layers_reached(m, per, 80, m + per - 8, m + per + 2, true), 0);
+        // One layer image and colour images: whole-image clears.
+        assert_eq!(meta_layer_bytes(&ImageKey { layers: 1, ..atlas }), None);
+        assert_eq!(meta_layer_bytes(&ImageKey { format: vk::Format::R16G16B16A16_SFLOAT, ..atlas }), None);
+        // Pending layers add up; a whole-image clear wins.
+        let mut c: HashMap<ImageKey, PendingClear> = HashMap::default();
+        merge_clear(&mut c, atlas, m, Some(0), 1);
+        merge_clear(&mut c, atlas, m, Some(0), 1 << 5);
+        assert_eq!(c[&atlas].3, 1 | 1 << 5);
+        merge_pending(&mut c, atlas, (m, Some(0), None, 0));
+        assert_eq!(c[&atlas].3, 0);
     }
 }
 
@@ -925,6 +993,7 @@ pub struct Surface {
 }
 
 /// A fast clear found pending for an image: its metadata and clear values.
+#[derive(Clone, Copy)]
 pub struct FastClear {
     pub key: ImageKey,
     pub image: vk::Image,
@@ -935,6 +1004,8 @@ pub struct FastClear {
     pub known: Option<u32>,
     /// A fill's value a later write of unknown data replaced (`PendingClear`).
     pub kept: Option<u32>,
+    /// The layers to clear, a bit a layer (`PendingClear`'s fourth field); 0: the whole image.
+    pub layers: u128,
 }
 
 /// Blocks of a block-compressed texture that GPU work stored through an
@@ -1707,6 +1778,9 @@ pub struct Images {
     /// Fast-clear metadata address -> (image, clear value); ordered for the
     /// range lookups of `note_meta_writes`.
     meta_of: std::collections::BTreeMap<u64, (ImageKey, [u32; 2])>,
+    /// Each surface's metadata address at its last bind as a target (0: none) and that
+    /// frame (`metamap`).
+    meta_now: HashMap<ImageKey, (u64, u64)>,
     /// The writes `note_writes` last applied, with LOOKUP_GEN and note_gen
     /// then: the per-item culls report the same two ranges thousands of
     /// times per frame, and noting them again changes nothing until a
@@ -2908,7 +2982,7 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
             let cmd = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).expect("image cmd")[0];
             let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).expect("image fence");
             let qp = upload_stamps();
-            *g = Some(Images { qp, map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), last_note: None, note_gen: 0, view_memo: memo_map(), key_memo: memo_map(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, inflight: Default::default(), spare_cmds: Vec::new(), detile_free: Vec::new(), copy_pool: vk::CommandPool::null(), copy_spare: Vec::new(), copy_timeline: vk::Semaphore::null(), copy_value: 0, reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwritten_keys: Default::default(), pending_change: 0, pending_published: 0, scrub_keys: Vec::new(), scrub_gen: 0, scrub_at: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), depth_grows: 0, depth_feeds: Default::default(), refreshing: HashMap::default() });
+            *g = Some(Images { qp, map: HashMap::default(), by_base: HashMap::default(), gpu_bases: Default::default(), stencil_of: HashMap::default(), meta_of: Default::default(), meta_now: HashMap::default(), last_note: None, note_gen: 0, view_memo: memo_map(), key_memo: memo_map(), pending_clears: HashMap::default(), samplers: HashMap::default(), pool, cmd, fence, inflight: Default::default(), spare_cmds: Vec::new(), detile_free: Vec::new(), copy_pool: vk::CommandPool::null(), copy_spare: Vec::new(), copy_timeline: vk::Semaphore::null(), copy_value: 0, reported: HashMap::default(), uploads: 0, reuploads: 0, upload_bytes: 0, upload_ns: 0, write_seq: 0, owned: Default::default(), max_span: 0, pending_overwrites: 0, overwritten_keys: Default::default(), pending_change: 0, pending_published: 0, scrub_keys: Vec::new(), scrub_gen: 0, scrub_at: 0, overwrite_clears: 0, overwrite_uploads: 0, partial_seen: Default::default(), dummies: HashMap::default(), depth_grows: 0, depth_feeds: Default::default(), refreshing: HashMap::default() });
         }
     }
     let im = g.as_mut().unwrap();
@@ -4469,17 +4543,46 @@ impl Images {
         self.last_note = Some((writes.to_vec(), sized.to_vec(), lookup, self.note_gen));
     }
 
+    /// The fast-clear metadata a write (`fill`: a fill, which must cover a block's first dword)
+    /// over [b, e) reaches: (the surface's metadata address, its image, the layers reached; 0 the
+    /// whole image). A layered depth surface's later layers' metadata lies past its address
+    /// (`meta_layer_bytes`), so the entries just below `b` are looked at too.
+    fn meta_reach(&self, b: u64, e: u64, fill: bool) -> Vec<(u64, ImageKey, u128)> {
+        let mut out = Vec::new();
+        for (&m, &(k, _)) in self.meta_of.range(..b).rev().take(8) {
+            if let Some(per) = meta_layer_bytes(&k) {
+                let mask = layers_reached(m, per, k.layers, b, e, fill);
+                if mask != 0 {
+                    out.push((m, k, mask));
+                }
+            }
+        }
+        for (&m, &(k, _)) in self.meta_of.range(b..e) {
+            match meta_layer_bytes(&k) {
+                Some(per) => {
+                    let mask = layers_reached(m, per, k.layers, b, e, fill);
+                    if mask != 0 {
+                        out.push((m, k, mask));
+                    }
+                }
+                None if !fill || m + 4 <= e => out.push((m, k, 0)),
+                None => {}
+            }
+        }
+        out
+    }
+
     pub fn note_meta_writes(&mut self, writes: &[(u64, u64)]) {
         if self.meta_of.is_empty() {
             return;
         }
         for &(b, n) in writes {
-            for (&meta, &(key, _)) in self.meta_of.range(b..b.saturating_add(n)) {
+            for (meta, key, layers) in self.meta_reach(b, b.saturating_add(n), false) {
                 // (A fill's value it replaces is kept for the use: `merge_clear`.)
-                merge_clear(&mut self.pending_clears, key, meta, None);
+                merge_clear(&mut self.pending_clears, key, meta, None, layers);
                 self.pending_change += 1;
                 if trace_clears() {
-                    crate::info!("trace clears: {:#x} ({:?}) pending: write {b:#x}+{n:#x} covers its metadata {meta:#x} (for flip {}, {})", key.base, key.format, crate::hle::libs::videoout::QUEUED_FLIP.load(std::sync::atomic::Ordering::Relaxed) + 1, std::thread::current().name().unwrap_or("?"));
+                    crate::info!("trace clears: {:#x} ({:?} {}x{}) pending: write {b:#x}+{n:#x} covers its metadata {meta:#x} (layers {layers:#x}) (for flip {}, {})", key.base, key.format, key.width, key.height, crate::hle::libs::videoout::QUEUED_FLIP.load(std::sync::atomic::Ordering::Relaxed) + 1, std::thread::current().name().unwrap_or("?"));
                 }
             }
         }
@@ -4490,20 +4593,17 @@ impl Images {
     /// own: `Exec::held_note`): the fast clears made pending (image,
     /// metadata address, the value when the fill gives it; later entries
     /// win) and the GPU-owned images overwritten.
-    pub fn notes_for(&self, writes: &[(u64, u64)], sized: &[(u64, u64)], fill: Option<((u64, u64), u32)>) -> (Vec<(ImageKey, u64, Option<u32>)>, Vec<ImageKey>) {
+    pub fn notes_for(&self, writes: &[(u64, u64)], sized: &[(u64, u64)], fill: Option<((u64, u64), u32)>) -> (Vec<(ImageKey, u64, Option<u32>, u128)>, Vec<ImageKey>) {
         let mut clears = Vec::new();
         if !self.meta_of.is_empty() {
             for &(b, n) in writes {
-                for (&meta, &(key, _)) in self.meta_of.range(b..b.saturating_add(n)) {
-                    clears.push((key, meta, None));
+                for (meta, key, layers) in self.meta_reach(b, b.saturating_add(n), false) {
+                    clears.push((key, meta, None, layers));
                 }
             }
             if let Some(((base, len), v)) = fill {
-                let end = base.saturating_add(len);
-                for (&meta, &(key, _)) in self.meta_of.range(base..end) {
-                    if meta + 4 <= end {
-                        clears.push((key, meta, Some(v)));
-                    }
+                for (meta, key, layers) in self.meta_reach(base, base.saturating_add(len), true) {
+                    clears.push((key, meta, Some(v), layers));
                 }
             }
         }
@@ -4574,9 +4674,9 @@ impl Images {
 
     /// The fast clear of image `k` with metadata at `meta` (`take_clears`'s
     /// entry for a clear a held executor noted itself).
-    pub fn fast_clear_of(&self, k: ImageKey, meta: u64, known: Option<u32>, kept: Option<u32>) -> Option<FastClear> {
+    pub fn fast_clear_of(&self, k: ImageKey, meta: u64, known: Option<u32>, kept: Option<u32>, layers: u128) -> Option<FastClear> {
         let (Some(img), Some(&(_, clear))) = (self.map.get(&k), self.meta_of.get(&meta)) else { return None };
-        Some(FastClear { key: k, image: img.image, meta, clear, known, kept })
+        Some(FastClear { key: k, image: img.image, meta, clear, known, kept, layers })
     }
 
     /// The fill kernel stored `v` in every word of [base, base+len): the fast
@@ -4586,24 +4686,21 @@ impl Images {
         if self.meta_of.is_empty() {
             return;
         }
-        let end = base.saturating_add(len);
-        for (&meta, &(key, _)) in self.meta_of.range(base..end) {
-            if meta + 4 <= end {
-                if trace_clears() {
-                    crate::info!("trace clears: {:#x} ({:?}) pending: fill {base:#x}+{len:#x} of {v:#x} covers its metadata {meta:#x} (for flip {}, {})", key.base, key.format, crate::hle::libs::videoout::QUEUED_FLIP.load(std::sync::atomic::Ordering::Relaxed) + 1, std::thread::current().name().unwrap_or("?"));
-                }
-                merge_clear(&mut self.pending_clears, key, meta, Some(v));
-                // A write noted again over it makes it unknown again: not a
-                // repeat for the memos of `note_writes` and `Exec::last_notes`.
-                self.note_gen += 1;
-                NOTE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+        for (meta, key, layers) in self.meta_reach(base, base.saturating_add(len), true) {
+            if trace_clears() {
+                crate::info!("trace clears: {:#x} ({:?} {}x{}) pending: fill {base:#x}+{len:#x} of {v:#x} covers its metadata {meta:#x} (layers {layers:#x}) (for flip {}, {})", key.base, key.format, key.width, key.height, crate::hle::libs::videoout::QUEUED_FLIP.load(std::sync::atomic::Ordering::Relaxed) + 1, std::thread::current().name().unwrap_or("?"));
             }
+            merge_clear(&mut self.pending_clears, key, meta, Some(v), layers);
+            // A write noted again over it makes it unknown again: not a
+            // repeat for the memos of `note_writes` and `Exec::last_notes`.
+            self.note_gen += 1;
+            NOTE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
         }
     }
 
     /// Whether every pending fast clear among `keys` has a known value.
     pub fn clears_known(&self, keys: &[ImageKey]) -> bool {
-        keys.iter().all(|k| self.pending_clears.get(k).is_none_or(|&(_, v, _)| v.is_some()))
+        keys.iter().all(|k| self.pending_clears.get(k).is_none_or(|&(_, v, _, _)| v.is_some()))
     }
 
     /// The images with a fast clear pending.
@@ -4620,7 +4717,7 @@ impl Images {
     pub fn take_clears(&mut self, keys: &[ImageKey]) -> Vec<FastClear> {
         let mut out = Vec::new();
         for k in keys {
-            let Some((meta, known, kept)) = self.pending_clears.remove(k) else { continue };
+            let Some((meta, known, kept, layers)) = self.pending_clears.remove(k) else { continue };
             self.pending_change += 1;
             self.note_gen += 1;
             NOTE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -4628,7 +4725,7 @@ impl Images {
             if out.iter().any(|c: &FastClear| c.key == *k) {
                 continue;
             }
-            out.push(FastClear { key: *k, image: img.image, meta, clear, known, kept });
+            out.push(FastClear { key: *k, image: img.image, meta, clear, known, kept, layers });
         }
         out
     }
@@ -5471,6 +5568,15 @@ impl Images {
         if s.meta != 0 {
             mark_note_pages(s.meta, 4);
         }
+        self.meta_now.insert(k, (s.meta, super::FRAMES.load(std::sync::atomic::Ordering::Relaxed)));
+        // `DS_TRACE_LAYER_BINDS=1` (diagnosis): binds of layered depth surfaces, each distinct
+        // (base, slice, layers, metadata) once, with the flip.
+        if k.layers > 1 && is_depth(k.format) && std::env::var("DS_TRACE_LAYER_BINDS").ok().as_deref() == Some("1") {
+            static SEEN: Mutex<Option<std::collections::HashSet<(u64, u32, u32, u64)>>> = Mutex::new(None);
+            if SEEN.lock().get_or_insert_with(Default::default).insert((s.base, s.slice, s.layers, s.meta)) {
+                crate::info!("layer bind: {:#x} {}x{} {:?} slice {} of {} (image {} layers), metadata {:#x}, flip {}", s.base, s.width, s.height, s.format, s.slice, s.layers, k.layers, s.meta, super::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
+            }
+        }
         if s.meta != 0 && self.meta_of.insert(s.meta, (k, s.clear)) != Some((k, s.clear)) {
             self.note_gen += 1;
             NOTE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -5519,6 +5625,139 @@ impl Images {
             .collect();
         v.sort();
         v.join("; ")
+    }
+
+    /// Every fast-clear metadata address and its surface (`metamap`, diagnosis): the image's
+    /// key, whether GPU-written, its last use, the metadata it was last bound with and when.
+    pub fn meta_report(&self) -> Vec<String> {
+        self.meta_of
+            .iter()
+            .map(|(&meta, &(k, clear))| {
+                let (used, gpu) = self.map.get(&k).map(|i| (i.used.get(), i.gpu_written)).unwrap_or((0, false));
+                let (now, at) = self.meta_now.get(&k).copied().unwrap_or((0, 0));
+                format!(
+                    "{meta:#x} -> {:#x} {}x{}x{} {:?} gpu {gpu} used {used}; bound last with {now:#x} at flip {at}{}; clear {:#x}/{:#x}",
+                    k.base, k.width, k.height, k.layers, k.format, if now != meta { " (another)" } else { "" }, clear[0], clear[1]
+                )
+            })
+            .collect()
+    }
+
+    /// Removes the surface of a metadata address and its pending clear (`metadrop`, diagnosis).
+    pub fn meta_drop(&mut self, meta: u64) -> Option<String> {
+        let (k, _) = self.meta_of.remove(&meta)?;
+        if self.pending_clears.get(&k).is_some_and(|c| c.0 == meta) {
+            self.pending_clears.remove(&k);
+        }
+        self.pending_change += 1;
+        self.note_gen += 1;
+        NOTE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+        Some(format!("{meta:#x}: {:#x} {}x{} {:?}", k.base, k.width, k.height, k.format))
+    }
+
+    /// `imgprobe` (diagnosis): the mean of each channel of a 4x4 block at (u, v) (0-1 of the
+    /// image's size) in every GPU-written 2D image used in the last two frames, read in one copy
+    /// (depth images: their depth plane). One line per image: base, size, format, the means.
+    pub fn probe_used(&mut self, u: f32, v: f32) -> Vec<String> {
+        use vk::Format as F;
+        let frame = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+        // (Bytes a texel takes in the copy, channels, decoder kind.)
+        let shape = |f: vk::Format| -> Option<(u64, usize, u8)> {
+            Some(match f {
+                F::R16G16B16A16_SFLOAT => (8, 4, 1),
+                F::R16G16_SFLOAT => (4, 2, 1),
+                F::R16_SFLOAT => (2, 1, 1),
+                F::R32G32B32A32_SFLOAT => (16, 4, 2),
+                F::R32G32_SFLOAT => (8, 2, 2),
+                F::R32_SFLOAT | F::D32_SFLOAT | F::D32_SFLOAT_S8_UINT => (4, 1, 2),
+                F::R8G8B8A8_UNORM | F::B8G8R8A8_UNORM | F::R8G8B8A8_SRGB | F::B8G8R8A8_SRGB => (4, 4, 3),
+                F::R8G8_UNORM => (2, 2, 3),
+                F::R8_UNORM | F::R8_UINT => (1, 1, 3),
+                F::R16_UNORM => (2, 1, 4),
+                F::R16G16_UNORM => (4, 2, 4),
+                F::B10G11R11_UFLOAT_PACK32 => (4, 3, 5),
+                F::A2B10G10R10_UNORM_PACK32 => (4, 4, 6),
+                F::R32_UINT => (4, 1, 7),
+                F::R32G32_UINT => (8, 2, 7),
+                _ => return None,
+            })
+        };
+        // (Each of the first 16 layers of a layered image: `layer` the eighth field.)
+        let mut picks: Vec<(ImageKey, vk::Image, u32, u32, u32, u32, u64, (u64, usize, u8), u32)> = Vec::new();
+        let mut size = 0u64;
+        let mut keys: Vec<&Image> = self.map.values().filter(|i| i.gpu_written && !i.key.ty3d && frame.saturating_sub(i.used.get()) <= 1).collect();
+        keys.sort_by_key(|i| (i.key.base, i.key.format.as_raw(), i.key.width));
+        for i in keys {
+            let k = i.key;
+            let Some(sh) = shape(k.format) else { continue };
+            let (bw, bh) = (4u32.min(k.width), 4u32.min(k.height));
+            let x = ((u.clamp(0.0, 1.0) * k.width as f32) as u32).min(k.width - bw);
+            let y = ((v.clamp(0.0, 1.0) * k.height as f32) as u32).min(k.height - bh);
+            for layer in 0..k.layers.clamp(1, 16) {
+                picks.push((k, i.image, x, y, bw, bh, size, sh, layer));
+                size += (sh.0 * (bw * bh) as u64 + 15) & !15;
+            }
+        }
+        if picks.is_empty() {
+            return Vec::new();
+        }
+        let c = ctx();
+        let Ok((buf, mem, ptr)) = c.host_buffer(size, vk::BufferUsageFlags::TRANSFER_DST) else { return vec!["no staging buffer".into()] };
+        self.one_shot(|cmd| unsafe {
+            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+            for p in &picks {
+                let aspect = if is_depth(p.0.format) { vk::ImageAspectFlags::DEPTH } else { vk::ImageAspectFlags::COLOR };
+                let region = vk::BufferImageCopy::default()
+                    .buffer_offset(p.6)
+                    .image_subresource(vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: 0, base_array_layer: p.8, layer_count: 1 })
+                    .image_offset(vk::Offset3D { x: p.2 as i32, y: p.3 as i32, z: 0 })
+                    .image_extent(vk::Extent3D { width: p.4, height: p.5, depth: 1 });
+                c.device.cmd_copy_image_to_buffer(cmd, p.1, vk::ImageLayout::GENERAL, buf, &[region]);
+            }
+            let hb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[hb], &[], &[]);
+        });
+        let raw = unsafe { std::slice::from_raw_parts(ptr, size as usize).to_vec() };
+        unsafe {
+            c.device.destroy_buffer(buf, None);
+            c.device.unmap_memory(mem);
+            c.device.free_memory(mem, None);
+        }
+        let mut out = Vec::with_capacity(picks.len());
+        for (k, _, _, _, bw, bh, off, (tb, ch, kind), layer) in picks {
+            let n = (bw * bh) as usize;
+            let mut sum = [0f64; 4];
+            for t in 0..n {
+                let p = &raw[off as usize + t * tb as usize..off as usize + (t + 1) * tb as usize];
+                let word = |o: usize| u32::from_le_bytes([p[o], p[o + 1], p[o + 2], p[o + 3]]);
+                for (c, s) in sum.iter_mut().enumerate().take(ch) {
+                    *s += match kind {
+                        1 => half_to_f32(u16::from_le_bytes([p[2 * c], p[2 * c + 1]])) as f64,
+                        2 => f32::from_le_bytes([p[4 * c], p[4 * c + 1], p[4 * c + 2], p[4 * c + 3]]) as f64,
+                        3 => p[c] as f64 / 255.0,
+                        4 => u16::from_le_bytes([p[2 * c], p[2 * c + 1]]) as f64 / 65535.0,
+                        5 => {
+                            // B10G11R11: R 11 bits, G 11, B 10 (5-bit exponents, no sign).
+                            let w = word(0);
+                            let (bits, shift, mant) = [(11u32, 0u32, 6u32), (11, 11, 6), (10, 22, 5)][c];
+                            let x = (w >> shift) & ((1 << bits) - 1);
+                            let (e, m) = (x >> mant, x & ((1 << mant) - 1));
+                            if e == 0 { (m as f64 / (1u64 << mant) as f64) * 2f64.powi(-14) } else { (1.0 + m as f64 / (1u64 << mant) as f64) * 2f64.powi(e as i32 - 15) }
+                        }
+                        6 => {
+                            let w = word(0);
+                            if c < 3 { ((w >> (10 * c)) & 1023) as f64 / 1023.0 } else { (w >> 30) as f64 / 3.0 }
+                        }
+                        _ => word(4 * c) as f64,
+                    };
+                }
+            }
+            let means: Vec<String> = sum.iter().take(ch).map(|s| format!("{:.4}", s / n as f64)).collect();
+            let at = if k.layers > 1 { format!(" layer {layer}") } else { String::new() };
+            out.push(format!("{:#x} {}x{}x{}{at} {:?}: {}", k.base, k.width, k.height, k.layers, k.format, means.join(" ")));
+        }
+        out
     }
 
     /// The GPU image last rendered at `base` (display buffers).

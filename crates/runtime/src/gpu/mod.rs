@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 188] = [
+    static ALL: [Tunable; 189] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -221,6 +221,7 @@ pub mod tune {
         Tunable { name: "pace_phys", env: "DS_PACE_PHYS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "vrr", env: "DS_VRR", default: 2, value: AtomicU64::new(UNSET) },
         Tunable { name: "tick_lead", env: "DS_TICK_LEAD", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "layer_clears", env: "DS_LAYER_CLEARS", default: 1, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1418,6 +1419,14 @@ pub mod tune {
     #[inline]
     pub fn held_runs() -> bool {
         get(172) != 0
+    }
+
+    /// Fast clears of a layered depth surface whose HTILE is laid out a layer after another clear
+    /// the layers its metadata writes reach (`images::meta_layer_bytes`); 0: the whole image, as
+    /// before 2026-11-19 (a fill of the shadow atlas's layer 0 cleared all 80 layers).
+    #[inline]
+    pub fn layer_clears() -> bool {
+        get(188) != 0
     }
 
     /// A stretch past a label wait whose check at its label (`Exec::past_current_for`) finds
