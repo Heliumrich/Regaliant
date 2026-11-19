@@ -57,6 +57,8 @@ pub struct Config {
     pub paths: dsconfig::paths::Paths,
     /// Why the game folder cannot be used (told to the player at start), if so.
     pub game_problem: Option<String>,
+    /// No game folder chosen yet (`game_problem` says so): a player's start opens the launcher.
+    pub game_unset: bool,
     /// Application root (`PPSA01341-app0`): read-only assets mounted at /app0.
     pub app: PathBuf,
     /// Directory holding the decrypted executable and `sce_module/`.
@@ -276,6 +278,7 @@ fn parse_args() -> Config {
         }
         None => (PathBuf::new(), PathBuf::new(), Some(format!("The game folder is not set. Start {} and choose it.", dsconfig::paths::LAUNCHER_EXE))),
     };
+    let game_unset = chosen.is_none();
     let run_dir = paths.logs().join(utc_stamp());
     Config {
         code,
@@ -283,6 +286,7 @@ fn parse_args() -> Config {
         run_dir,
         paths,
         game_problem,
+        game_unset,
         seconds,
         trace,
         lenient,
@@ -1821,6 +1825,17 @@ This happens when other software takes that range. Restart the PC and try again.
     info!("files: {:?} layout, settings and saves in {}, logs and caches in {}", cfg.paths.layout, cfg.paths.user.display(), cfg.paths.cache.display());
     if let Some(p) = &cfg.game_problem {
         error!("game files: {}", p.replace('\n', " "));
+        // No game folder chosen yet: a new player who opened the game rather than its launcher.
+        // The launcher opens, where choosing the folder is the first step, instead of an error
+        // to click away (2026-11-19).
+        if cfg.game_unset && !cfg.headless && cfg.paths.layout != dsconfig::paths::Layout::Dev {
+            let launcher = cfg.paths.exe_dir.join(dsconfig::paths::LAUNCHER_EXE);
+            if launcher.is_file() && std::process::Command::new(&launcher).current_dir(&cfg.paths.exe_dir).spawn().is_ok() {
+                info!("game files: no game folder chosen; the launcher opens");
+                log::flush();
+                std::process::exit(EXIT_GAME_FILES as i32);
+            }
+        }
         player_error(p);
         log::flush();
         std::process::exit(EXIT_GAME_FILES as i32);

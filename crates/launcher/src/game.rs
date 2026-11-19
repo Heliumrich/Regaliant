@@ -117,6 +117,15 @@ pub fn check(app: &mut App, dir: &Path, keep: bool) {
     };
     app.game.ok = ok;
     unsafe { ui::set_text(h(app.game.status), &text) };
+    // (A folder chosen now: the prepared shaders' check, which needs the game's files, begins;
+    // the Shaders page says what it can do now.)
+    if keep {
+        if ok {
+            crate::shaders::start_check(app);
+            unsafe { windows_sys::Win32::UI::WindowsAndMessaging::SetTimer(app.hwnd, crate::shaders::CHECK_TIMER, 500, None) };
+        }
+        crate::shaders::refresh(app);
+    }
     app.update_play();
     crate::saves::refresh(app);
     unsafe { ui::redraw(app.hwnd) };
@@ -138,6 +147,7 @@ fn check_field(app: &mut App) {
     if t.is_empty() {
         app.game.ok = false;
         unsafe { ui::set_text(h(app.game.status), "Choose the game's folder.") };
+        crate::shaders::refresh(app);
         app.update_play();
         return;
     }

@@ -126,6 +126,11 @@ impl App {
                 unsafe { ui::show(h, i == n) };
             }
         }
+        // (The Shaders page's progress bar shows only while preparing: showing the page showed
+        // it empty, hidden again only by the start-up check's refresh.)
+        if n == 2 {
+            shaders::refresh(self);
+        }
         unsafe { ui::redraw(self.hwnd) };
     }
 
@@ -492,8 +497,11 @@ fn main() {
         app.show_page(first);
         app.update_play();
         startup_status(&mut app);
-        // (The prepared shaders checked against this build's translation; `--shot` runs skip it.)
-        if arg("--shot").is_none() {
+        // (The prepared shaders checked against this build's translation, once a game folder
+        // passes its check: the check reads the game's shader files, and without one it ran the
+        // game only to fail and log an error at every start of a new player's launcher
+        // (`game::check` begins it when a folder is chosen); `--shot` runs skip it.)
+        if arg("--shot").is_none() && app.game.ok {
             shaders::start_check(&app);
             SetTimer(hwnd, shaders::CHECK_TIMER, 500, None);
         }

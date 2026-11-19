@@ -100,6 +100,10 @@ fn marker(app: &App) -> PathBuf {
 
 /// Whether the shaders are prepared for this graphics card and driver; the status line.
 pub fn state(app: &App) -> (bool, String) {
+    // (They are prepared from the game's files: nothing to do before a folder is chosen.)
+    if !app.game.ok {
+        return (false, "Choose the game's folder on the Game page first.".into());
+    }
     let kv = read_kv(&marker(app));
     if kv.is_empty() {
         return (false, "The shaders are not prepared on this PC yet.".into());
@@ -180,7 +184,7 @@ pub fn refresh(app: &mut App) {
     unsafe {
         ui::set_text(h(app.shaders.status), &text);
         ui::show(h(app.shaders.bar), false);
-        ui::enable(h(app.shaders.prepare), true);
+        ui::enable(h(app.shaders.prepare), app.game.ok);
         ui::enable(h(app.shaders.stop), false);
     }
 }
@@ -196,7 +200,8 @@ pub fn stopping(app: &App) -> bool {
 
 /// Starts the preparation (`play_after`: the game starts when it is done).
 pub fn start(app: &mut App, play_after: bool) {
-    if app.shaders.child.is_some() || app.running.is_some() {
+    // (Not without the game's files: it ended with "an error (code 3)", 2026-11-19.)
+    if app.shaders.child.is_some() || app.running.is_some() || !app.game.ok {
         return;
     }
     let exe = dsconfig::paths::game_exe_in(&app.paths.exe_dir);
