@@ -1057,9 +1057,10 @@ fn gfx_key_ahead(g: &GfxRegs, vs: &Prepared, ps: Option<&Prepared>) -> Option<(G
 }
 
 /// A draw a scan ahead saw (`gpu::compile` workers, its stages prepared from the scan's
-/// registers): its pipeline queued for the background graphics workers when missing, ahead of
-/// the others when such a draw always waits for it (`gfx_key_ahead`). Some(true): queued;
-/// Some(false): made, in flight or queued already; None: such a draw records nothing.
+/// registers): its pipeline queued for the background graphics workers when missing, after the
+/// pipelines the store holds and ahead of the left-out draws' compiles (`async_gfx_worker`).
+/// Some(true): queued; Some(false): made, in flight or queued already; None: such a draw
+/// records nothing.
 pub(crate) fn queue_gfx_ahead(g: &GfxRegs, vs: &Prepared, ps: Option<&Prepared>) -> Option<bool> {
     let (key, hkey, push_mode, waits) = gfx_key_ahead(g, vs, ps)?;
     // (`DS_COMPILE_TRACE=1`: the keys made ahead by program pair, with their stages' specs, for
@@ -1227,9 +1228,9 @@ fn async_gfx_submit(key: &GfxKey, hkey: u64, vs: &Prepared, ps: Option<&Prepared
 }
 
 /// `async_gfx_submit` for a draw left out (`ahead` None), or for one a scan ahead saw
-/// (`queue_gfx_ahead`: Some(whether such a draw always waits for it); the job goes first when
-/// it does). Returns whether the key is queued (now or before); for a scan's draw, whether it
-/// was queued now.
+/// (`queue_gfx_ahead`: Some(whether such a draw always waits for it), logged; its job goes to
+/// the scans' queue). Returns whether the key is queued (now or before); for a scan's draw,
+/// whether it was queued now.
 fn async_gfx_queue(key: &GfxKey, hkey: u64, vs: &Prepared, ps: Option<&Prepared>, push_mode: bool, ahead: Option<bool>) -> bool {
     let stored = crate::gpu::pcache::stored_cheap('g', hkey);
     let mut queued_now = false;
@@ -1316,7 +1317,9 @@ fn async_gfx_worker() {
         let job = {
             let mut g = ASYNC_GFX.lock();
             loop {
-                if let Some(j) = g.as_mut().and_then(|s| s.ahead.pop_front().or_else(|| s.jobs.pop_front())) {
+                // (Pipelines the store holds first (milliseconds each: left-out draws come back
+                // at once), then the scans' jobs, then the left-out draws' compiles.)
+                if let Some(j) = g.as_mut().and_then(|s| if s.jobs.front().is_some_and(|j| j.stored) { s.jobs.pop_front() } else { s.ahead.pop_front().or_else(|| s.jobs.pop_front()) }) {
                     break j;
                 }
                 ASYNC_GFX_CV.wait(&mut g);

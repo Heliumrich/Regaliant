@@ -215,13 +215,16 @@ pub fn submit_draws(draws: Vec<(Arc<Slot>, Option<Arc<Slot>>, super::exec::GfxRe
             seen.clear();
         }
         for (vs, ps, regs) in draws {
-            if shaders::ngg_addr_of(vs.regs()) == 0 || !seen.insert((regs_hash(vs.regs()), ps.as_ref().map_or(0, |p| regs_hash(p.regs())), regs.hash64())) {
+            let key = (regs_hash(vs.regs()), ps.as_ref().map_or(0, |p| regs_hash(p.regs())), regs.hash64());
+            if shaders::ngg_addr_of(vs.regs()) == 0 || seen.contains(&key) {
                 continue;
             }
+            // (Over the limit: not marked seen, so a later scan hands it over.)
             if jobs.len() >= MAX_DRAW_JOBS {
                 GFX[8].fetch_add(1, Ordering::Relaxed);
                 continue;
             }
+            seen.insert(key);
             jobs.push(Job::Draw(Box::new((vs, ps, regs))));
         }
     }

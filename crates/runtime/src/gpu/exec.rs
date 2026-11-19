@@ -14264,6 +14264,10 @@ impl Exec {
                 }
                 return Some(m.result);
             }
+            // (The generations of the range's words before its check, `memo_gens`: read before
+            // the page memo too, so that an invalidation between its check and the placement
+            // memo's note cannot be noted as current (the release review, 2026-11-19).)
+            let gens = memo_gens(base, size);
             // The page memo: a range on pages this batch placed under the same key.
             let pm = super::tune::lane() && watch_range().is_none();
             if pm {
@@ -14292,15 +14296,13 @@ impl Exec {
                     }
                     self.fe2_memo_answer(base, size, written, want);
                     place_memo_count(1);
-                    // (The range itself into the placement memo, with its words' generations
-                    // now: unchanged since its pages' notes.)
+                    // (The range itself into the placement memo, with its words' generations from
+                    // before the check.)
                     let k = self.place_memo_slot(set, found);
-                    self.place_memo[k] = PlaceMemo { base, size, batch: self.batch_count, ep, want, written, map_gen, result, gens: memo_gens(base, size) };
+                    self.place_memo[k] = PlaceMemo { base, size, batch: self.batch_count, ep, want, written, map_gen, result, gens };
                     return Some(result);
                 }
             }
-            // (The generations of the range's words before its check: `memo_gens`.)
-            let gens = memo_gens(base, size);
             // The lean check: a small read-only range whose pages are current as they stand.
             if pm && !written {
                 if let Some(result) = self.fe2_place_quick(base, size, want) {
