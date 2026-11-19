@@ -233,6 +233,17 @@ const FIXES: &[Fix] = &[
         why: "spawning waits until the scene's model numbering has held for a few frames",
         only_with: None,
     },
+    // The per-frame update's step to the next VG entity after its view test (`add r14,8;
+    // cmp r14,rbx`), reached passed or not.
+    Fix {
+        name: "VG entities kept active briefly after their view test",
+        offset: 0xa55170,
+        from: (7, 0x45e5731eed15fdc1),
+        change: Change::Hook { at: 0, handler: crate::vgdiag::keep_hook },
+        kind: "title timing",
+        why: "an entity at the view's edge left and re-entered the scene's list as the camera moved by a pixel, and each change renumbered the models after it: their plants (the tutorial courtyard's dry leaves) vanished and grew back",
+        only_with: None,
+    },
     // The TAA's per-view jitter (`jitter`): its function's entry, `mov rax,[rdi+68h]; cmp
     // dword ptr [rax+0AACh],0` (the forced index's test).
     Fix {
@@ -741,5 +752,5 @@ pub fn status() -> String {
         .map(|(i, f)| format!("'{}' ran {} times", f.name, RUNS[i].load(Ordering::Relaxed)))
         .collect();
     let fixes = if runs.is_empty() { String::new() } else { format!("    title fixes: {}\n", runs.join(", ")) };
-    fixes + &crate::cullread::status() + &crate::cpudraw::status() + &crate::jobidle::status() + &crate::gamestep::status() + &crate::camhook::status() + &crate::dispmode::status() + &crate::pcsettings::store::status()
+    fixes + &crate::cullread::status() + &crate::cpudraw::status() + &crate::jobidle::status() + &crate::gamestep::status() + &crate::camhook::status() + &crate::vgdiag::status() + &crate::dispmode::status() + &crate::pcsettings::store::status()
 }
