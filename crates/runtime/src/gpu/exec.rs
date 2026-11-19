@@ -1341,6 +1341,41 @@ pub fn lod_stats_words(slot: usize) -> Vec<u32> {
     unsafe { std::slice::from_raw_parts(p, n).to_vec() }
 }
 
+/// Diagnosis (`DS_IMM_STATE=1`, 2026-11-19, with `DS_IMM_SNAP=0`): every binding of the
+/// immediate-mode program's vertex buffers from the mirror is noted as recorded (its address,
+/// the executor, batch, epoch and wanted state, how the placement was answered, front end 2's
+/// state of its first page, the first positions in guest memory); the vertex outlier census's
+/// samples of the program name their draw by its vertex buffer's address (user data 0-1), and
+/// `outlier_note` logs that draw's note (`imm state:`).
+fn imm_state_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_IMM_STATE").ok().as_deref() == Some("1"))
+}
+
+/// `DS_IMM_STATE`'s notes: (address, ms, the note), the newest last (at most `IMM_NOTES`).
+static IMM_NOTES_RING: Mutex<Option<std::collections::VecDeque<(u64, f64, String)>>> = Mutex::new(None);
+const IMM_NOTES: usize = 8192;
+static IMM_NOTED: AtomicU64 = AtomicU64::new(0);
+
+fn imm_note(base: u64, note: String) {
+    let k = IMM_NOTED.fetch_add(1, Ordering::Relaxed);
+    let ms = crate::log::elapsed_ms();
+    if k < 4 || k % 20000 == 0 {
+        crate::info!("imm state: sample note {k}: {base:#x} {note}");
+    }
+    let mut g = IMM_NOTES_RING.lock();
+    let r = g.get_or_insert_with(std::collections::VecDeque::new);
+    if r.len() >= IMM_NOTES {
+        r.pop_front();
+    }
+    r.push_back((base, ms, note));
+}
+
+/// The newest note of the binding at `base` (`DS_IMM_STATE`).
+fn imm_note_of(base: u64) -> Option<(f64, String)> {
+    IMM_NOTES_RING.lock().as_ref().and_then(|r| r.iter().rev().find(|e| e.0 == base).map(|e| (e.1, e.2.clone())))
+}
+
 /// The vertex outlier census's counts at the last `outlier_note` (`shaders::vs_outlier`).
 static OUTLIER_LAST: Mutex<Option<(Vec<u32>, Option<std::fs::File>)>> = Mutex::new(None);
 
@@ -1368,7 +1403,16 @@ pub fn outlier_note(ms: f64, flip: u64) {
         let w: Vec<u32> = (0..OUTLIER_STRIDE as usize).map(|k| unsafe { std::ptr::read_volatile(p.add(base + k)) }).collect();
         let tag = (w[1] as u64) << 32 | w[0] as u64;
         let f = |x: u32| f32::from_bits(x);
-        out += &format!("{ms:.1} {flip} {tag:#018x} {d} {:.3e} {:.3e} {:.3e} {:.3e} {:.3e}\n", f(w[3]), f(w[4]), f(w[5]), f(w[6]), f(w[7]));
+        out += &format!("{ms:.1} {flip} {tag:#018x} {d} {:.3e} {:.3e} {:.3e} {:.3e} {:.3e} {:08x} {:08x}\n", f(w[3]), f(w[4]), f(w[5]), f(w[6]), f(w[7]), w[8], w[9]);
+        // (`DS_IMM_STATE`: the immediate-mode program's sample names its draw by its vertex
+        // buffer's address, V# words 0-1.)
+        if imm_state_on() && (IMM_PROGS.contains(&tag) || IMM_PROGS.contains(&(tag ^ 1))) {
+            let vb = ((w[9] & 0xFFFF) as u64) << 32 | w[8] as u64;
+            match imm_note_of(vb) {
+                Some((at, note)) => crate::info!("imm state: census flip {flip} ({ms:.1} ms): the draw at {vb:#x}, recorded at {at:.1} ms: {note}"),
+                None => crate::info!("imm state: census flip {flip} ({ms:.1} ms): the draw at {vb:#x}: no note"),
+            }
+        }
     }
     if let (Some(fl), false) = (file.as_mut(), out.is_empty()) {
         let _ = fl.write_all(out.as_bytes());
@@ -3987,8 +4031,8 @@ pub(super) fn push_line() -> String {
         + &place_memo_cycles_line()
         + &super::fe2::work_parts_line()
         + &super::fe2::big_runs_line()
-        + &format!("    front end 2's placement memo: {} repeats answered, {} by the page memo, {} by the lean check, {} placements made
-", PLACE_MEMO[0].load(Ordering::Relaxed), PLACE_MEMO[2].load(Ordering::Relaxed), PLACE_MEMO[3].load(Ordering::Relaxed), PLACE_MEMO[1].load(Ordering::Relaxed))
+        + &format!("    front end 2's placement memo: {} repeats answered, {} by the page memo, {} by the lean check, {} placements made; turned away for an invalidation since: {} repeats, {} page memo answers
+", PLACE_MEMO[0].load(Ordering::Relaxed), PLACE_MEMO[2].load(Ordering::Relaxed), PLACE_MEMO[3].load(Ordering::Relaxed), PLACE_MEMO[1].load(Ordering::Relaxed), MEMO_GEN_MISS[0].load(Ordering::Relaxed), MEMO_GEN_MISS[1].load(Ordering::Relaxed))
         + &if page_memo_check_on() {
             let c: Vec<u64> = PAGE_MEMO_CHECKS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
             format!("    page memo checked (`DS_PAGE_MEMO_CHECK`): {} answers, {} results differed, {} full placements had work to do; the placement memo's answers: {}, {} differed, {} with work; the lean check's answers: {}, {} differed, {} with work; the lean sync's answers: {}, {} where the full sync waited
@@ -9565,12 +9609,30 @@ struct PlaceMemo {
     written: bool,
     map_gen: u64,
     result: (vk::Buffer, u64, u64),
+    /// The invalidation generations of the words of its first and last pages, read before its
+    /// placement's check (`fe2::word_gen`); None for ranges over `PAGE_MEMO_RANGE` pages
+    /// (answered without it, as before 2026-11-19).
+    gens: Option<(u32, u32)>,
 }
 
 impl Default for PlaceMemo {
     fn default() -> PlaceMemo {
-        PlaceMemo { base: 0, size: 0, batch: 0, ep: 0, want: 0, written: false, map_gen: 0, result: (vk::Buffer::null(), 0, 0) }
+        PlaceMemo { base: 0, size: 0, batch: 0, ep: 0, want: 0, written: false, map_gen: 0, result: (vk::Buffer::null(), 0, 0), gens: None }
     }
+}
+
+/// The invalidation generations of the words holding the first and last pages of [base, base +
+/// size) (`fe2::word_gen`) when it spans at most `PAGE_MEMO_RANGE` pages (then at most two
+/// words). A page memo's or placement memo's answer stands only while they stay: another
+/// thread's take finding a page written since invalidates it and uploads it in its own batch,
+/// which this batch may run before (2026-11-19: the immediate-mode quads' pages, the player's
+/// Nexus triangles).
+#[inline]
+fn memo_gens(base: u64, size: u64) -> Option<(u32, u32)> {
+    use super::resident::PAGE;
+    let first = base & !(PAGE - 1);
+    let last = (base + size.max(1) - 1) & !(PAGE - 1);
+    ((last - first) / PAGE < PAGE_MEMO_RANGE).then(|| (super::fe2::word_gen(first), super::fe2::word_gen(last)))
 }
 
 /// Front end 2's page memo (`tune page_memo`; the lean lane's placement part, 2026-11-16
@@ -9591,6 +9653,9 @@ struct PageMemo {
     page: u64,
     /// `Exec::pm_gen` it was placed under (0: none).
     stamp: u64,
+    /// The invalidation generation of the page's word, read before the placement's check
+    /// (`memo_gens`): the entry answers only while it stays.
+    wgen: u32,
 }
 
 /// The lane's answers checked (`DS_PAGE_MEMO_CHECK=1`, diagnosis): each answer placed again by
@@ -9622,6 +9687,9 @@ fn place_memo_set(base: u64, size: u64, written: bool) -> usize {
 /// The placement memo's [hits, misses, page memo answers, lean checks' answers]
 /// (`Exec::fe2_place`), added per thread every 4,096.
 pub static PLACE_MEMO: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Answers the placement memo and the page memo turned away for an invalidation in their words
+/// since their placement's check (`memo_gens`): [placement memo, page memo].
+pub static MEMO_GEN_MISS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Batch starts' census (`DS_PLACE_CENSUS=1`, diagnosis): placements the memo did not answer,
 /// [the batch's first command, later ones] x [the memo's slot holds the same range, epoch,
@@ -14022,23 +14090,31 @@ impl Exec {
             if e.stamp != stamp || e.page & !1 != p || (written && e.page & 1 == 0) {
                 return None;
             }
+            if e.wgen != super::fe2::word_gen(p) {
+                MEMO_GEN_MISS[1].fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
             p += PAGE;
         }
         Some(hi)
     }
 
     /// Notes pages [lo, hi) (page-aligned) placed under `stamp` in the page memo.
-    fn page_memo_note(&mut self, lo: u64, hi: u64, written: bool, stamp: u64) {
+    fn page_memo_note(&mut self, lo: u64, hi: u64, written: bool, stamp: u64, gens: Option<(u32, u32)>) {
         use super::resident::PAGE;
+        // (No generations, over `PAGE_MEMO_RANGE` pages: nothing noted.)
+        let Some((g0, g1)) = gens else { return };
         if hi <= lo || hi - lo > PAGE_MEMO_RANGE * PAGE {
             return;
         }
+        // (At most two words: the first page's and the last one's, 64 pages each.)
+        let w0 = lo >> 18;
         let mut p = lo;
         while p < hi {
             let e = &mut self.page_memo[(p / PAGE) as usize & (PAGE_MEMO_SLOTS - 1)];
             // (A written range's mark stays for the same page and number.)
             let kept = e.stamp == stamp && e.page == p | 1;
-            *e = PageMemo { page: p | (written || kept) as u64, stamp };
+            *e = PageMemo { page: p | (written || kept) as u64, stamp, wgen: if p >> 18 == w0 { g0 } else { g1 } };
             p += PAGE;
         }
     }
@@ -14164,7 +14240,12 @@ impl Exec {
             let set = place_memo_set(base, size, written);
             let found = self.place_memo_way(set, base, size, written);
             let m = found.map_or_else(PlaceMemo::default, |k| self.place_memo[k]);
-            if found.is_some() && m.batch == self.batch_count && m.ep == ep && m.want == want && m.map_gen == map_gen {
+            let same = found.is_some() && m.batch == self.batch_count && m.ep == ep && m.want == want && m.map_gen == map_gen;
+            let gens_ok = m.gens.is_none() || m.gens == memo_gens(base, size);
+            if same && !gens_ok {
+                MEMO_GEN_MISS[0].fetch_add(1, Ordering::Relaxed);
+            }
+            if same && gens_ok {
                 if page_memo_check_on() {
                     // (Diagnosis: the placement memo's answers checked the same way.)
                     let full = self.fe2_place_timed(base, size, written);
@@ -14211,12 +14292,15 @@ impl Exec {
                     }
                     self.fe2_memo_answer(base, size, written, want);
                     place_memo_count(1);
-                    // (The range itself into the placement memo.)
+                    // (The range itself into the placement memo, with its words' generations
+                    // now: unchanged since its pages' notes.)
                     let k = self.place_memo_slot(set, found);
-                    self.place_memo[k] = PlaceMemo { base, size, batch: self.batch_count, ep, want, written, map_gen, result };
+                    self.place_memo[k] = PlaceMemo { base, size, batch: self.batch_count, ep, want, written, map_gen, result, gens: memo_gens(base, size) };
                     return Some(result);
                 }
             }
+            // (The generations of the range's words before its check: `memo_gens`.)
+            let gens = memo_gens(base, size);
             // The lean check: a small read-only range whose pages are current as they stand.
             if pm && !written {
                 if let Some(result) = self.fe2_place_quick(base, size, want) {
@@ -14237,10 +14321,10 @@ impl Exec {
                     self.fe2_memo_answer(base, size, false, want);
                     place_memo_count(3);
                     let k = self.place_memo_slot(set, found);
-                    self.place_memo[k] = PlaceMemo { base, size, batch: self.batch_count, ep, want, written, map_gen, result };
+                    self.place_memo[k] = PlaceMemo { base, size, batch: self.batch_count, ep, want, written, map_gen, result, gens };
                     use super::resident::PAGE;
                     let stamp = self.pm_gen_for(ep, want, map_gen);
-                    self.page_memo_note(base & !(PAGE - 1), (base + result.2).next_multiple_of(PAGE), false, stamp);
+                    self.page_memo_note(base & !(PAGE - 1), (base + result.2).next_multiple_of(PAGE), false, stamp, gens);
                     return Some(result);
                 }
             }
@@ -14251,11 +14335,11 @@ impl Exec {
                 // none is being recorded.)
                 if self.recording && !self.stopped && !self.past_grow && crate::mem::MAP_GEN.load(Ordering::Acquire) == map_gen && super::precache::epoch() as u32 == ep {
                     let k = self.place_memo_slot(set, found);
-                    self.place_memo[k] = PlaceMemo { base, size, batch: self.batch_count, ep, want, written, map_gen, result };
+                    self.place_memo[k] = PlaceMemo { base, size, batch: self.batch_count, ep, want, written, map_gen, result, gens };
                     if pm {
                         use super::resident::PAGE;
                         let stamp = self.pm_gen_for(ep, want, map_gen);
-                        self.page_memo_note(base & !(PAGE - 1), (base + result.2).next_multiple_of(PAGE), written, stamp);
+                        self.page_memo_note(base & !(PAGE - 1), (base + result.2).next_multiple_of(PAGE), written, stamp, gens);
                     }
                 }
             }
@@ -18757,6 +18841,15 @@ impl Exec {
                         };
                         if tiny_ok && tiny.is_none() && home.is_none() {
                             tiny = self.snapshot_as(base, size, 4096, false);
+                        }
+                        if imm_state_on() && home.is_some() && tiny.is_none() && read_only && IMM_PROGS.contains(&p.code_hash) && matches!(*res_i, Resolved::Buffer(_)) {
+                            let ep = super::precache::epoch() as u32;
+                            let want = self.fe2_want(ep);
+                            let how = ["placement memo", "page memo", "full", "lean check"].get(PLACE_HOW.with(|c| c.get()) as usize).copied().unwrap_or("?");
+                            let fine = ["range cache", "nothing to do", "takes or uploads"].get(super::fe2::last_fine() as usize).copied().unwrap_or("?");
+                            let n = size.min(48);
+                            let pos: Vec<String> = if super::cp::guest_readable(base, n) { (0..n / 4).map(|j| format!("{:.3}", f32::from_bits(unsafe { std::ptr::read_volatile((base + 4 * j) as *const u32) }))).collect() } else { vec!["unreadable".into()] };
+                            imm_note(base, format!("[{}] batch {} epoch {ep} want {want} past {} held {}; placed by the {how} ({fine}); page {:#x}: {}; positions {}", self.name, self.batch_count, self.past_grow as u8, self.held as u8, base & !4095, super::fe2::page_state(base, want), pos.join(",")));
                         }
                         BindClock::mark(&mut clk, 1);
                         // Inside a resident shadow: its working copy is newer.

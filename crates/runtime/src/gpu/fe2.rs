@@ -459,9 +459,45 @@ thread_local! {
     static LAST_FINE: std::cell::Cell<u8> = const { std::cell::Cell::new(2) };
 }
 
+/// The invalidation generation of the 64-page word holding page `p` (`Chunk::wgen`, bumped by
+/// every invalidation of a page of it; 0 outside the span or before its chunk exists): the
+/// executors' placement and page memos keep it from before their placement's check and answer
+/// only while it stays (`Exec::fe2_place_memo`).
+#[inline]
+pub fn word_gen(p: u64) -> u32 {
+    chunk(p, false).map_or(0, |c| c.wgen[idx(p) / 64].load(Ordering::Acquire))
+}
+
 /// How the last `ensure` on this thread was answered (`LAST_FINE`).
 pub fn last_fine() -> u8 {
     LAST_FINE.with(|c| c.get())
+}
+
+/// Diagnosis (`DS_IMM_STATE`, 2026-11-19): page `a`'s state here, for logs: valid, armed by us,
+/// the host's bit, armed and taken since, GPU-written, its clean stamp, its word's clean and
+/// newest stamps against `want`, the flip (plus one) a CPU write to it was last found and the
+/// flip now, its write generation and its arming level.
+pub fn page_state(a: u64, want: u32) -> String {
+    let Some(c) = chunk(a, false) else { return "no chunk".into() };
+    let i = idx(a);
+    let w = i / 64;
+    let m = 1u64 << (i % 64);
+    let bit = |x: &AtomicU64| (x.load(Ordering::Acquire) & m != 0) as u8;
+    let host = (crate::hosted::armed_word(a & !(64 * PAGE - 1)) & m != 0) as u8;
+    format!(
+        "valid {} armed {} host {host} varmed {} gpu {} clean {} wclean {} wmax {} want {want} wrote {} flip {} pgen {} level {}",
+        bit(&c.valid[w]),
+        bit(&c.armed[w]),
+        bit(&c.varmed[w]),
+        bit(&c.gpu[w]),
+        c.clean[i].load(Ordering::Acquire),
+        c.wclean[w].load(Ordering::Acquire),
+        c.wmax[w].load(Ordering::Acquire),
+        c.wrote[i].load(Ordering::Relaxed),
+        super::FRAMES.load(Ordering::Relaxed),
+        c.pgen[i].load(Ordering::Relaxed),
+        c.level[i].load(Ordering::Relaxed)
+    )
 }
 
 /// The flip, plus one, a CPU write to the page of `a` was last found (`Chunk::wrote`; 0: never

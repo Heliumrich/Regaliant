@@ -3514,10 +3514,14 @@ pub fn export(tr: &mut T, ins: &Inst) -> R<()> {
                 let fin = e(tr.b.logical_not(bt, None, bad))?;
                 let live = e(tr.b.logical_and(bt, None, fin, act))?;
                 let mu = tr.to_u(m)?;
-                let mut raw = Vec::with_capacity(4);
+                let mut raw = Vec::with_capacity(6);
                 for &c in &cs {
                     raw.push(tr.to_u(c)?);
                 }
+                // (The first two user-data SGPRs: which draw, e.g. its vertex buffer's address.)
+                let ub = tr.spec.user_base as u32;
+                raw.push(tr.sreg(ub)?);
+                raw.push(tr.sreg(ub + 1)?);
                 for (class_tag, c) in [(tag, over), (tag ^ 1, wz)] {
                     let cond = e(tr.b.logical_and(bt, None, c, live))?;
                     let base = super::outlier_slot(class_tag) * super::OUTLIER_STRIDE;

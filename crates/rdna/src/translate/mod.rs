@@ -695,9 +695,9 @@ pub const DUMP_POS_VERTICES: u32 = 64;
 
 /// The vertex outlier census (`Spec::outlier`): slots of the debug binding, `OUTLIER_STRIDE`
 /// dwords each: [code hash low, high, vertices counted, the largest magnitude (f32 bits), a
-/// sample position x, y, z, w (f32 bits)].
+/// sample position x, y, z, w (f32 bits), the sample's first two user-data SGPRs, 0, 0].
 pub const OUTLIER_SLOTS: u32 = 32768;
-pub const OUTLIER_STRIDE: u32 = 8;
+pub const OUTLIER_STRIDE: u32 = 12;
 
 /// The census slot of a program's code hash (`Spec::outlier`).
 pub fn outlier_slot(tag: u64) -> u32 {
