@@ -274,6 +274,11 @@ pub static WRITE_FAILS: AtomicU64 = AtomicU64::new(0);
 /// Writes a pipeline file (temporary name first: two threads may make the
 /// same pipeline).
 fn write_file(p: &Path, bytes: &[u8]) -> bool {
+    // (The launcher's probe writes nothing: a refused pipeline it makes again must stay refused in
+    // the store, or the next probe would find the store sound while the rest of it is not.)
+    if READ_ONLY.load(Ordering::Relaxed) {
+        return false;
+    }
     let tmp = p.with_extension(format!("{:x}.tmp", std::thread::current().id().as_u64_compat()));
     let write = || {
         if sim_disk_full() {
@@ -301,6 +306,14 @@ fn write_file(p: &Path, bytes: &[u8]) -> bool {
 
 /// Pipeline files written (`write_file`).
 pub static WRITES_OK: AtomicU64 = AtomicU64::new(0);
+/// The store is only read (`--pb-check probe`, set before the store opens: `set_read_only`):
+/// `write_file` writes nothing.
+static READ_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The store only read from now on (the launcher's probe), set before it opens.
+pub fn set_read_only() {
+    READ_ONLY.store(true, Ordering::Relaxed);
+}
 
 /// The store's folder refuses writes (not for lack of space: a folder whose permissions or a
 /// security program block them): at least 16 writes failed and none was written. The steps of
@@ -425,6 +438,9 @@ pub fn set_dir(dir: PathBuf) {
 /// Removes the files (extension `ext`) used longest ago while the directory
 /// is over `budget`.
 fn prune(dir: &Path, ext: &str, budget: u64) {
+    if READ_ONLY.load(Ordering::Relaxed) {
+        return;
+    }
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = rd
         .flatten()
@@ -653,7 +669,9 @@ pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result
     // (Under the validation layer the driver refuses some graphics
     // pipelines' binaries that it takes without the layer (2026-11-08
     // night): such a boot keeps the files as they are.)
-    let keep = ctx().validation;
+    // (Nor does the launcher's probe change them: a refused binary stays, the pipeline made without
+    // capturing.)
+    let keep = ctx().validation || READ_ONLY.load(Ordering::Relaxed);
     if let Some(p) = &path {
         let t = std::time::Instant::now();
         let stored = std::fs::read(p).ok().and_then(|b| decode_pb(&b, &pb.global, fp));
@@ -781,8 +799,10 @@ fn load_shared(key: &[u8]) -> Option<Vec<u8>> {
     }
     let tail = b.split_off(b.len() - 8);
     if fnv64(&b) != u64::from_le_bytes(tail.try_into().ok()?) {
-        // (Damaged: removed, so the next capture stores it again.)
-        let _ = std::fs::remove_file(shared_path(key)?);
+        // (Damaged: removed, so the next capture stores it again; not by the launcher's probe.)
+        if !READ_ONLY.load(Ordering::Relaxed) {
+            let _ = std::fs::remove_file(shared_path(key)?);
+        }
         return None;
     }
     Some(b)

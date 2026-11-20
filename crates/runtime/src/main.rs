@@ -2294,6 +2294,10 @@ This happens when other software takes that range. Restart the PC and try again.
         hle::kernel::fs::ensure_dir(&cache_root);
         info!("pipeline and shader-spec cache: {}", cache_root.display());
     }
+    // (The launcher's probe only reads the store: nothing written from its opening on.)
+    if cfg.pb_check.as_deref() == Some("probe") {
+        gpu::pcache::set_read_only();
+    }
     // DS_PIPELINE_DIR=<directory name under the cache>: another pipeline
     // store (experiments that start without compiled pipelines).
     let pipe_dir = std::env::var("DS_PIPELINE_DIR").ok().filter(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
