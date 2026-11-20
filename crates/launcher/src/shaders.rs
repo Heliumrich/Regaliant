@@ -147,6 +147,12 @@ pub struct Page {
     then_play: bool,
     /// When the preparation's time is up (`BUDGET` from its start).
     deadline: Option<std::time::SystemTime>,
+    /// A step begun again at this time: it met its own previous step's session still ending
+    /// (the one-session lock), `retries` times so far.
+    retry: Option<(Step, Instant)>,
+    retries: u32,
+    /// When the last step's child ended.
+    ended: Option<Instant>,
 }
 
 fn h(v: usize) -> HWND {
@@ -361,7 +367,7 @@ pub fn build(app: &mut App) {
 
 /// The page's state when nothing runs.
 pub fn refresh(app: &mut App) {
-    if app.shaders.child.is_some() {
+    if running(app) {
         return;
     }
     let (_, text) = state(app);
@@ -374,7 +380,7 @@ pub fn refresh(app: &mut App) {
 }
 
 pub fn running(app: &App) -> bool {
-    app.shaders.child.is_some()
+    app.shaders.child.is_some() || app.shaders.retry.is_some()
 }
 
 /// Whether a stop was asked for (the preparation ends on its own).
@@ -387,7 +393,7 @@ pub fn stopping(app: &App) -> bool {
 /// (all three again when everything is done: Prepare now).
 pub fn start(app: &mut App, play_after: bool) {
     // (Not without the game's files: it ended with "an error (code 3)", 2026-11-19.)
-    if app.shaders.child.is_some() || app.running.is_some() || !app.game.ok {
+    if running(app) || app.running.is_some() || !app.game.ok {
         return;
     }
     let exe = dsconfig::paths::game_exe_in(&app.paths.exe_dir);
@@ -395,6 +401,9 @@ pub fn start(app: &mut App, play_after: bool) {
         unsafe { ui::message(app.hwnd, &format!("{} was not found next to the launcher.", dsconfig::paths::GAME_EXE), crate::TITLE, windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONERROR) };
         return;
     }
+    app.shaders.retry = None;
+    app.shaders.retries = 0;
+    app.shaders.ended = None;
     let dir = app.paths.shaders();
     if let Some(free) = sys::free_space(&dir) {
         if free < 3 << 30 {
@@ -476,12 +485,23 @@ fn begin(app: &mut App, step: Step) -> bool {
 
 /// Stops the preparation, then starts the game.
 pub fn stop_then_play(app: &mut App) {
+    let between = app.shaders.child.is_none() && app.shaders.retry.is_some();
     stop(app);
-    app.shaders.then_play = true;
+    if between {
+        crate::start_game(app);
+    } else {
+        app.shaders.then_play = true;
+    }
 }
 
 /// Asks the preparation to stop (its current shaders finish first).
 pub fn stop(app: &mut App) {
+    // (Between a step and its new start: nothing runs, it ends at once.)
+    if app.shaders.child.is_none() && app.shaders.retry.take().is_some() {
+        app.shaders.play_after = false;
+        finish(app, Some("Preparation stopped. The next one goes on where it left off.".into()));
+        return;
+    }
     if app.shaders.child.is_none() || app.shaders.stopping.is_some() {
         return;
     }
@@ -507,6 +527,18 @@ fn finish(app: &mut App, note: Option<String>) {
 
 /// The timer: progress, and the end of each step.
 pub fn tick(app: &mut App) {
+    // (A step begun again: see `retry`.)
+    if app.shaders.child.is_none() {
+        if let Some((step, at)) = app.shaders.retry {
+            if Instant::now() >= at {
+                app.shaders.retry = None;
+                if !begin(app, step) {
+                    finish(app, None);
+                }
+            }
+        }
+        return;
+    }
     let Some(child) = app.shaders.child.as_mut() else { return };
     let exited = match child.try_wait() {
         Ok(Some(s)) => Some(s.code().unwrap_or(-1)),
@@ -525,10 +557,20 @@ pub fn tick(app: &mut App) {
         let code = if stopped && code != 0 { STAGE_STOPPED } else { code };
         // (Another game session held the player's folder: the step did not run.)
         if code == GAME_RUNNING {
+            // (Its own previous step's session still ending: the step again 3 s later, 10 times
+            // at most. The host waits for the game's process to end since 2026-11-20, so this
+            // is a fallback: before, the levels' first part met the new game's lock.)
+            if app.shaders.ended.is_some_and(|t| t.elapsed().as_secs() < 90) && app.shaders.retries < 10 {
+                app.shaders.retries += 1;
+                app.shaders.retry = Some((step, Instant::now() + std::time::Duration::from_secs(3)));
+                return;
+            }
             app.shaders.play_after = false;
             finish(app, Some("The game is running, so the shaders cannot be prepared now. Close the game and press Prepare now.".into()));
             return;
         }
+        app.shaders.ended = Some(Instant::now());
+        app.shaders.retries = 0;
         // (Levels left: the self-play's marker says so, `levels_cut`; the clock alone would also
         // count a last part whose compute tail ended at the deadline after every level.)
         let cut = read_kv(&marker(app)).iter().any(|(k, v)| k == "levels_cut" && v == "1");

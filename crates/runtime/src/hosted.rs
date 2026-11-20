@@ -1065,6 +1065,12 @@ pub fn run_host() -> ! {
         s.event_ns[kind].fetch_add(t_event.elapsed().as_nanos() as u64, Ordering::Relaxed);
         unsafe { ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, status) };
     }
+    // The game's process goes on ending after its exit event: its memory is freed and its
+    // handles closed (the one-session lock among them) only then. The host ends after it, so
+    // that whoever waits for the host finds the session gone: the launcher's next shader
+    // preparation step, started at the host's exit, met the lock still held and ended
+    // ("another game session runs", 2026-11-20). At most a minute.
+    unsafe { WaitForSingleObject(pi.hProcess, 60_000) };
     std::process::exit(code as i32);
 }
 
