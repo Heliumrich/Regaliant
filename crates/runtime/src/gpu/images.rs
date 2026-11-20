@@ -138,12 +138,18 @@ pub fn merge_clear<S: std::hash::BuildHasher>(map: &mut std::collections::HashMa
 pub fn merge_pending<S: std::hash::BuildHasher>(map: &mut std::collections::HashMap<ImageKey, PendingClear, S>, key: ImageKey, e: PendingClear) {
     match e {
         (meta, None, None, layers) => merge_clear(map, key, meta, None, layers),
-        (meta, Some(v), _, layers) => {
-            let layers = map.get(&key).map_or(layers, |p| union_layers(p.3, layers));
-            map.insert(key, (meta, Some(v), None, layers));
-        }
+        // (The stretch's fill: with `merge_clear`'s layer rules, so that one value never answers
+        // for layers another value filled: the release review of 2026-11-20.)
+        (meta, Some(v), _, layers) => merge_clear(map, key, meta, Some(v), layers),
         (meta, None, kept, layers) => {
-            let layers = map.get(&key).map_or(layers, |p| union_layers(p.3, layers));
+            let prev = map.get(&key).copied();
+            // (The stretch's kept value answers only for its own layers: the map's layers pending
+            // at that metadata must lie inside them.)
+            let kept = match prev {
+                Some((m, _, _, pl)) if m == meta && !(layers == 0 || (pl != 0 && pl & !layers == 0)) => None,
+                _ => kept,
+            };
+            let layers = prev.map_or(layers, |p| union_layers(p.3, layers));
             map.insert(key, (meta, None, kept, layers));
         }
     }
@@ -313,6 +319,29 @@ mod clear_tests {
         assert_eq!(c[&atlas], (m, Some(0), None, 1 << 3 | 1 << 5));
         merge_clear(&mut c, atlas, m, Some(u32::MAX), 1 << 3 | 1 << 5 | 1 << 7);
         assert_eq!(c[&atlas], (m, Some(u32::MAX), None, 1 << 3 | 1 << 5 | 1 << 7));
+        // As callers note a fill (its range an unknown write first, then the fill): another
+        // layer's fill of the same value leaves no one value (each run reads its own back when
+        // recorded: a flush at the use, never another layer's value).
+        c.clear();
+        merge_clear(&mut c, atlas, m, None, 1 << 3);
+        merge_clear(&mut c, atlas, m, Some(0), 1 << 3);
+        merge_clear(&mut c, atlas, m, None, 1 << 5);
+        merge_clear(&mut c, atlas, m, Some(0), 1 << 5);
+        assert_eq!(c[&atlas], (m, None, None, 1 << 3 | 1 << 5));
+        // A held stretch's fill of another value over another layer: no one value either.
+        c.clear();
+        merge_clear(&mut c, atlas, m, Some(0), 1 << 3);
+        merge_pending(&mut c, atlas, (m, Some(u32::MAX), None, 1 << 5));
+        assert_eq!(c[&atlas], (m, None, None, 1 << 3 | 1 << 5));
+        // A stretch's kept value answers only where it covers the map's pending layers.
+        c.clear();
+        merge_clear(&mut c, atlas, m, Some(0), 1 << 3);
+        merge_pending(&mut c, atlas, (m, None, Some(u32::MAX), 1 << 5));
+        assert_eq!(c[&atlas], (m, None, None, 1 << 3 | 1 << 5));
+        c.clear();
+        merge_clear(&mut c, atlas, m, Some(0), 1 << 3);
+        merge_pending(&mut c, atlas, (m, None, Some(u32::MAX), 1 << 3 | 1 << 5));
+        assert_eq!(c[&atlas], (m, None, Some(u32::MAX), 1 << 3 | 1 << 5));
     }
 }
 

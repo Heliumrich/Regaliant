@@ -90,6 +90,9 @@ struct Setup {
     deadline: Option<std::time::SystemTime>,
     /// The player's own folders (the settings copied from them, `prepare_files`).
     player_paths: dsconfig::paths::Paths,
+    /// The self-play's own folders (`prepare_files` clears and fills them: never through the
+    /// global `paths()`, which would be the player's had anything read it before `setup`).
+    own_paths: dsconfig::paths::Paths,
 }
 
 /// The longest the last levels session waits at its end for the background compute preparation
@@ -111,6 +114,29 @@ static SETUP: OnceLock<Setup> = OnceLock::new();
 
 /// The background compute preparation was started (`compute_tail` waits for it only then).
 static BACKGROUND_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Levels were left: this part's deadline ended it before its last level, or it began after
+/// the deadline (`prepared.txt`'s `levels_cut = 1`, the launcher's note).
+static LEVELS_CUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The store marked prepared (`compbench::write_marker`, with `levels_cut` when levels were
+/// left), once the device exists (none: nothing written, the launcher marks it).
+fn mark_prepared(app: &Path, store: &Path, seconds: f64) {
+    if crate::gpu::vk::try_ctx().is_none() {
+        crate::warn!("prepare-play: no graphics device: the store is not marked here");
+        return;
+    }
+    crate::gpu::compbench::background_stop();
+    let b = &crate::gpu::compbench::BACKGROUND;
+    let marker = store.join("prepared.txt");
+    crate::gpu::compbench::write_marker(app, &marker, b[1].load(Relaxed) as usize, b[0].load(Relaxed) as usize, b[2].load(Relaxed) as usize, seconds);
+    if LEVELS_CUT.load(Relaxed) {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&marker) {
+            let _ = writeln!(f, "levels_cut = 1");
+        }
+    }
+}
 
 /// The player's settings folder, whose one-session lock a self-play run takes.
 pub fn player_user() -> Option<&'static Path> {
@@ -144,12 +170,13 @@ pub fn setup(stage: Stage, cfg: &mut crate::Config) {
         crate::gamestep::SPEED_X100.store((level_speed() * 100.0).round() as u32, Relaxed);
     }
     let runtime = paths.runtime();
+    let own_paths = paths.clone();
     cfg.paths = paths;
     cfg.cache = Some(store.clone());
     cfg.headless = true;
     let threads = if cfg.prepare_threads > 0 { cfg.prepare_threads } else { std::thread::available_parallelism().map_or(4, |n| n.get() / 2).max(2) };
     let deadline = cfg.prepare_deadline.map(|s| std::time::UNIX_EPOCH + Duration::from_secs(s));
-    let _ = SETUP.set(Setup { stage, player_user: player.user.clone(), player_paths: player, progress: cfg.progress.clone(), runtime, store, threads, chunk: cfg.prepare_chunk, deadline });
+    let _ = SETUP.set(Setup { stage, player_user: player.user.clone(), player_paths: player, own_paths, progress: cfg.progress.clone(), runtime, store, threads, chunk: cfg.prepare_chunk, deadline });
 }
 
 /// The self-play's own files made ready (`start`: after the one-session lock, before the settings
@@ -157,7 +184,7 @@ pub fn setup(stage: Stage, cfg: &mut crate::Config) {
 /// Visual Mode), display choices and game folder copied, never their saves, key bindings or
 /// trophies; for a new game, no saves, trophies or title folders of an earlier one.
 fn prepare_files(s: &Setup) {
-    let paths = crate::paths();
+    let paths = &s.own_paths;
     let player = &s.player_paths;
     let user = &paths.user;
     let _ = std::fs::create_dir_all(user);
@@ -210,9 +237,8 @@ pub fn start(app: &Path) {
                 std::thread::sleep(Duration::from_millis(100));
             }
             crate::info!("prepare-play: the preparation's time was up before this part of the levels: the store is marked prepared");
-            if crate::gpu::vk::try_ctx().is_some() {
-                crate::gpu::compbench::write_marker(&app, &store.join("prepared.txt"), 0, 0, 0, 0.0);
-            }
+            LEVELS_CUT.store(true, Relaxed);
+            mark_prepared(&app, &store, 0.0);
             end(0);
         });
         return;
@@ -268,13 +294,11 @@ pub fn start(app: &Path) {
                 // made).
                 let last = SETUP.get().and_then(|s| s.chunk).is_none_or(|(i, n)| i == n) || past_deadline();
                 if stage == Stage::Tour && last {
-                    let r = p.compute_tail();
-                    crate::gpu::compbench::background_stop();
-                    let b = &crate::gpu::compbench::BACKGROUND;
-                    crate::gpu::compbench::write_marker(&app, &store.join("prepared.txt"), b[1].load(Relaxed) as usize, b[0].load(Relaxed) as usize, b[2].load(Relaxed) as usize, p.t0.elapsed().as_secs_f64());
-                    if r.is_err() {
-                        end(EXIT_STOPPED);
+                    // (A stop during the tail leaves the levels played: status 0 all the same.)
+                    if p.compute_tail().is_err() {
+                        crate::info!("prepare-play: stopped during the compute tail (the levels were played)");
                     }
+                    mark_prepared(&app, &store, p.t0.elapsed().as_secs_f64());
                 }
                 p.done();
                 crate::info!("prepare-play: stage {} played to its end in {:.0} s", stage.name(), p.t0.elapsed().as_secs_f64());
@@ -289,9 +313,7 @@ pub fn start(app: &Path) {
                 p.drain(60);
                 let last = SETUP.get().and_then(|s| s.chunk).is_none_or(|(i, n)| i == n) || past_deadline();
                 if stage == Stage::Tour && last {
-                    crate::gpu::compbench::background_stop();
-                    let b = &crate::gpu::compbench::BACKGROUND;
-                    crate::gpu::compbench::write_marker(&app, &store.join("prepared.txt"), b[1].load(Relaxed) as usize, b[0].load(Relaxed) as usize, b[2].load(Relaxed) as usize, p.t0.elapsed().as_secs_f64());
+                    mark_prepared(&app, &store, p.t0.elapsed().as_secs_f64());
                 }
                 EXIT_FAILED
             }
@@ -700,6 +722,7 @@ impl Play {
                 // levels before it were played; the rest are left to the player's first visits).
                 if past_deadline() {
                     crate::info!("prepare-play: the preparation's time is up at this part's level {l}: the levels from it on are left");
+                    LEVELS_CUT.store(true, Relaxed);
                     return Ok(());
                 }
             }

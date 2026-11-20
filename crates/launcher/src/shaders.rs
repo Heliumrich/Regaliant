@@ -265,6 +265,20 @@ fn write_marker(app: &App) {
     let _ = std::fs::write(marker(app), t);
 }
 
+/// Whether `dir` holds a character's save within `depth` levels (a `SAVEDATA...PlayerProfile...`
+/// folder with its `USR-DATA` file: the saves folder itself is made at every session's start,
+/// and the options' save at the first boot, before any character).
+fn has_save(dir: &std::path::Path, depth: u32) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else { return false };
+    rd.flatten().any(|e| {
+        let p = e.path();
+        if !p.is_dir() {
+            return false;
+        }
+        (e.file_name().to_string_lossy().contains("PlayerProfile") && p.join("USR-DATA").is_file()) || (depth > 0 && has_save(&p, depth - 1))
+    })
+}
+
 /// Now as `YYYYMMDD-HHMMSS` (UTC).
 fn utc_stamp() -> String {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()) as i64;
@@ -397,7 +411,7 @@ pub fn start(app: &mut App, play_after: bool) {
     let p = played(app);
     let save = app.paths.cache.join("prepare").join("user").join("saves");
     let first = match p {
-        Played { newgame: Some(0), parts, tour, .. } if parts < LEVEL_PARTS && tour != Some(0) && save.is_dir() => Step::Levels(parts + 1),
+        Played { newgame: Some(0), parts, tour, .. } if parts < LEVEL_PARTS && tour != Some(0) && has_save(&save, 4) => Step::Levels(parts + 1),
         _ => Step::NewGame,
     };
     app.shaders.deadline = Some(std::time::SystemTime::now() + BUDGET);
@@ -515,7 +529,9 @@ pub fn tick(app: &mut App) {
             finish(app, Some("The game is running, so the shaders cannot be prepared now. Close the game and press Prepare now.".into()));
             return;
         }
-        let cut = app.shaders.deadline.is_some_and(|d| std::time::SystemTime::now() >= d);
+        // (Levels left: the self-play's marker says so, `levels_cut`; the clock alone would also
+        // count a last part whose compute tail ended at the deadline after every level.)
+        let cut = read_kv(&marker(app)).iter().any(|(k, v)| k == "levels_cut" && v == "1");
         match step {
             // (A new game played again makes a new save: the levels are played again too. One
             // stopped leaves the record as it was: a store prepared before stays prepared.)
