@@ -395,13 +395,38 @@ fn spans_write() -> parking_lot::RwLockWriteGuard<'static, Vec<Span>> {
 /// pages carried to the GPU) and the guest words there when a guarded
 /// indirect draw's record is read (`Cp::checked_index_args`).
 pub fn watch_range() -> Option<(u64, u64)> {
-    static W: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
-    *W.get_or_init(|| {
-        let v = std::env::var("DS_WATCH_WRITES").ok()?;
-        let (a, b) = v.split_once(':')?;
-        let p = |x: &str| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok();
-        Some((p(a)?, p(b)?))
-    })
+    let mut lo = WATCH_LO.load(Ordering::Relaxed);
+    if lo == u64::MAX {
+        let r = std::env::var("DS_WATCH_WRITES").ok().and_then(|v| {
+            let (a, b) = v.split_once(':')?;
+            let p = |x: &str| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok();
+            Some((p(a)?, p(b)?))
+        });
+        let (a, b) = r.unwrap_or((0, 0));
+        WATCH_HI.store(b, Ordering::Relaxed);
+        let _ = WATCH_LO.compare_exchange(u64::MAX, a, Ordering::Relaxed, Ordering::Relaxed);
+        lo = WATCH_LO.load(Ordering::Relaxed);
+    }
+    let hi = WATCH_HI.load(Ordering::Relaxed);
+    (hi > lo).then_some((lo, hi))
+}
+
+/// `watch_range`'s bounds (u64::MAX: not read from `DS_WATCH_WRITES` yet; hi <= lo: none).
+static WATCH_LO: AtomicU64 = AtomicU64::new(u64::MAX);
+static WATCH_HI: AtomicU64 = AtomicU64::new(0);
+/// Watch notes logged, and per writer (`watch_note`'s caps).
+static WATCH_N: AtomicU64 = AtomicU64::new(0);
+static WATCH_PER: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
+
+/// Control `watchwrites <hex lo>:<hex hi>|off` (diagnosis): `watch_range` set while running, its
+/// caps counted afresh (for ranges known only once the title runs, e.g. a per-frame block).
+pub fn set_watch_range(r: Option<(u64, u64)>) {
+    let _ = watch_range();
+    let (a, b) = r.unwrap_or((0, 0));
+    WATCH_LO.store(a, Ordering::Relaxed);
+    WATCH_HI.store(b, Ordering::Relaxed);
+    WATCH_N.store(0, Ordering::Relaxed);
+    *WATCH_PER.lock() = None;
 }
 
 /// A write (or upload) of guest [base, base+size) for `watch_range`.
@@ -415,22 +440,20 @@ pub fn watch_note(what: impl FnOnce() -> String, base: u64, size: u64) {
     if (super::FRAMES.load(Ordering::Relaxed) as u64) < *FROM.get_or_init(|| std::env::var("DS_WATCH_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(0)) {
         return;
     }
-    static N: AtomicU64 = AtomicU64::new(0);
-    static PER: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
     let what = what();
     // (At most 12 a writer logged at once: the key is its text up to its
     // first parenthesis.)
     let key = what.split(" (").next().unwrap_or(&what).to_string();
     watch_ring_push(&key, format!("  flip {} {} {what} writes {base:#x}+{size:#x}", super::FRAMES.load(Ordering::Relaxed), crate::log::thread_name()));
     {
-        let mut g = PER.lock();
+        let mut g = WATCH_PER.lock();
         let c = g.get_or_insert_with(HashMap::new).entry(key).or_insert(0);
         *c += 1;
         if *c > 12 {
             return;
         }
     }
-    if N.fetch_add(1, Ordering::Relaxed) < 1500 {
+    if WATCH_N.fetch_add(1, Ordering::Relaxed) < 1500 {
         crate::info!("watch: {what} writes {base:#x}+{size:#x} at flip {} on {}", super::FRAMES.load(Ordering::Relaxed), crate::log::thread_name());
     }
 }
@@ -4847,6 +4870,44 @@ fn tap_from() -> u64 {
     *F.get_or_init(|| std::env::var("DS_TAP_FROM").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
 }
 
+/// `DS_TAP_ARGS=<hex>[;...]` (diagnosis): those programs' indirect dispatches' arguments as the GPU
+/// read them, copied after the dispatch and logged 32 taps later (`tap args` lines).
+fn tap_args_list() -> &'static [u64] {
+    static L: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    L.get_or_init(|| std::env::var("DS_TAP_ARGS").unwrap_or_default().split([',', ';']).filter_map(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()).collect())
+}
+
+/// `DS_TAP_ARGS` (diagnosis): an indirect dispatch whose arguments the command processor read
+/// itself from guest memory (`tap args cpu` lines, the same program list).
+pub(super) fn note_cpu_args(cp: &Cp, g: [u32; 3]) {
+    let list = tap_args_list();
+    if list.is_empty() {
+        return;
+    }
+    let a = cs_addr(cp);
+    if list.contains(&a) {
+        crate::info!("tap args cpu cs {a:#x} for flip {}: {} {} {}", crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1, g[0], g[1], g[2]);
+    }
+}
+
+/// `DS_TAG_CS=<hex>[;...]` (diagnosis): programs whose dispatches tag their batch (`watch batch` lines).
+fn tag_cs() -> &'static [u64] {
+    static L: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    L.get_or_init(|| std::env::var("DS_TAG_CS").unwrap_or_default().split([',', ';']).filter_map(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()).collect())
+}
+
+fn tap_recheck() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DS_TAP_RECHECK").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The last tap of each (program, resource) for `DS_TAP_RECHECK`: its base, the guest words it was
+/// recorded with, the flip and the executor's state then.
+#[allow(clippy::type_complexity)]
+static TAP_LAST: Mutex<Option<HashMap<(u64, usize), (u64, Vec<u32>, u64, String)>>> = Mutex::new(None);
+/// Rechecks made, and those that found words changed.
+static TAP_RECHECKS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
 impl Exec {
     fn tap_cs(&mut self, p: &Prepared, bound: &Bound) {
         let list = tap_list();
@@ -4884,6 +4945,27 @@ impl Exec {
                     }
                     let n = info.range.min(want);
                     let mut cpu: Vec<u32> = (0..n / 4).map(|k| v.base + 4 * k).map(|a| if super::cp::guest_readable(a, 4) { unsafe { std::ptr::read_volatile(a as *const u32) } } else { 0xdead_beef }).collect();
+                    // `DS_TAP_RECHECK=1` (diagnosis): the previous tap of this resource read again
+                    // from guest memory now (about a frame later) and compared with the words it
+                    // was recorded with: a title write after the GPU's use (a read before the
+                    // title wrote the data, as the menu flicker's light records showed).
+                    if tap_recheck() {
+                        let flip = crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1;
+                        let state = format!("{}{}{}", if self.held { " held" } else { "" }, if self.past { " past" } else { "" }, if self.past_grow { " grow" } else { "" });
+                        let mut g = TAP_LAST.lock();
+                        let m = g.get_or_insert_with(HashMap::new);
+                        if let Some((pb, pw, pf, ps)) = m.get(&(addr, res)) {
+                            let now: Vec<u32> = (0..pw.len() as u64).map(|k| pb + 4 * k).map(|a| if super::cp::guest_readable(a, 4) { unsafe { std::ptr::read_volatile(a as *const u32) } } else { 0xdead_beef }).collect();
+                            let diff: Vec<usize> = (0..pw.len()).filter(|&i| pw[i] != now[i]).collect();
+                            TAP_RECHECKS[0].fetch_add(1, Ordering::Relaxed);
+                            if !diff.is_empty() {
+                                TAP_RECHECKS[1].fetch_add(1, Ordering::Relaxed);
+                                let i = diff[0];
+                                crate::info!("tap recheck cs {addr:#x} res {res} flip {pf} (base {pb:#x}, recorded{ps}): {} of {} words changed by flip {flip} (first word {i}: {:#010x} -> {:#010x})", diff.len(), pw.len(), pw[i], now[i]);
+                            }
+                        }
+                        m.insert((addr, res), (v.base, cpu.clone(), flip, state));
+                    }
                     // The whole buffer's guest words: how many are not zero (per mille), the
                     // last word's index that is, and their count (appended to the guest words).
                     let len = (v.stride.max(4) as u64 * v.num_records as u64).min(64 << 20);
@@ -4980,6 +5062,199 @@ impl Exec {
                     crate::info!("tap cs {a:#x} res {r} for flip {f}: image {}x{} mean {mean:.5} texels [{}]", cpu.first().copied().unwrap_or(0), cpu.get(1).copied().unwrap_or(0), lum.iter().map(|l| format!("{l:.4}")).collect::<Vec<_>>().join(" "));
                 }
             }
+        }
+    }
+}
+
+/// `DS_TAP_RECS=<hex cs>:<res>` (diagnosis): after each dispatch of that program, its buffer
+/// resource whole (up to 128 KiB) as the GPU holds it, copied to a host slot and logged 16 taps
+/// later as 384-byte records (`tap recs` lines: per record its first word, third word, words
+/// 28-30 as floats and an FNV hash of the rest; records all zero end the list).
+struct RecsTap {
+    buf: vk::Buffer,
+    ptr: *mut u8,
+    next: u64,
+    pending: std::collections::VecDeque<(u64, u64, u64, u64)>,
+}
+unsafe impl Send for RecsTap {}
+static RECS_TAP: Mutex<Option<RecsTap>> = Mutex::new(None);
+const RECS_SLOT: u64 = 128 << 10;
+const RECS_SLOTS: u64 = 32;
+
+fn tap_recs_spec() -> Option<(u64, usize)> {
+    static S: std::sync::OnceLock<Option<(u64, usize)>> = std::sync::OnceLock::new();
+    *S.get_or_init(|| {
+        let v = std::env::var("DS_TAP_RECS").ok()?;
+        let (a, r) = v.split_once(':')?;
+        Some((u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()?, r.trim().parse().ok()?))
+    })
+}
+
+/// `DS_TAP_HIST=<hex cs>:<res>` (diagnosis): after each dispatch of that program, its buffer
+/// resource whole (up to 1 MiB) as the GPU holds it, logged 8 taps later as a histogram of its
+/// 32-bit words below 256 (`tap hist` lines: value:count, and the count of other words).
+struct HistTap {
+    buf: vk::Buffer,
+    ptr: *mut u8,
+    next: u64,
+    pending: std::collections::VecDeque<(u64, u64, u64, u64)>,
+}
+unsafe impl Send for HistTap {}
+static HIST_TAP: Mutex<Option<HistTap>> = Mutex::new(None);
+const HIST_SLOT: u64 = 1 << 20;
+const HIST_SLOTS: u64 = 12;
+
+fn tap_hist_spec() -> Option<(u64, usize)> {
+    static S: std::sync::OnceLock<Option<(u64, usize)>> = std::sync::OnceLock::new();
+    *S.get_or_init(|| {
+        let v = std::env::var("DS_TAP_HIST").ok()?;
+        let (a, r) = v.split_once(':')?;
+        Some((u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()?, r.trim().parse().ok()?))
+    })
+}
+
+impl Exec {
+    fn tap_hist(&mut self, p: &Prepared, bound: &Bound) {
+        let Some((addr, res)) = tap_hist_spec() else { return };
+        if p.addr != addr {
+            return;
+        }
+        let Some(Resolved::Buffer(_)) = p.resources.get(res) else { return };
+        let Some(bn) = p.tr.out.bindings.iter().find(|b| matches!(b.kind, BindingKind::Buffer(i) if i == res)).map(|b| b.binding) else { return };
+        let Some(info) = bound.bufs.iter().find(|(x, _)| *x == bn).map(|(_, i)| *i) else { return };
+        if info.buffer == vk::Buffer::null() {
+            return;
+        }
+        let n = info.range.min(HIST_SLOT);
+        let mut g = HIST_TAP.lock();
+        if g.is_none() {
+            match ctx().host_buffer(HIST_SLOT * HIST_SLOTS, vk::BufferUsageFlags::TRANSFER_DST) {
+                Ok((b, _mem, ptr)) => *g = Some(HistTap { buf: b, ptr, next: 0, pending: Default::default() }),
+                Err(e) => {
+                    crate::warn!("tap hist: no host buffer ({e})");
+                    return;
+                }
+            }
+        }
+        let t = g.as_mut().unwrap();
+        let slot = t.next % HIST_SLOTS;
+        t.next += 1;
+        let cmd = self.cmd();
+        self.barrier();
+        unsafe { ctx().device.cmd_copy_buffer(cmd, info.buffer, t.buf, &[vk::BufferCopy { src_offset: info.offset, dst_offset: slot * HIST_SLOT, size: n }]) };
+        self.barrier();
+        let flip = crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1;
+        t.pending.push_back((slot, addr, flip, n));
+        while t.pending.len() > 8 {
+            let (s, a, f, n) = t.pending.pop_front().unwrap();
+            let words = unsafe { std::slice::from_raw_parts(t.ptr.add((s * HIST_SLOT) as usize) as *const u32, (n / 4) as usize) };
+            let mut hist = [0u32; 256];
+            let mut other = 0u64;
+            for &x in words {
+                if x < 256 {
+                    hist[x as usize] += 1;
+                } else {
+                    other += 1;
+                }
+            }
+            let items: Vec<String> = hist.iter().enumerate().filter(|(_, c)| **c > 0).map(|(v, c)| format!("{v}:{c}")).collect();
+            crate::info!("tap hist cs {a:#x} res {res} for flip {f}: [{}] other {other}", items.join(" "));
+        }
+    }
+}
+
+impl Exec {
+    fn tap_recs(&mut self, p: &Prepared, bound: &Bound) {
+        let Some((addr, res)) = tap_recs_spec() else { return };
+        if p.addr != addr {
+            return;
+        }
+        let Some(Resolved::Buffer(_)) = p.resources.get(res) else { return };
+        let Some(bn) = p.tr.out.bindings.iter().find(|b| matches!(b.kind, BindingKind::Buffer(i) if i == res)).map(|b| b.binding) else { return };
+        let Some(info) = bound.bufs.iter().find(|(x, _)| *x == bn).map(|(_, i)| *i) else { return };
+        if info.buffer == vk::Buffer::null() {
+            return;
+        }
+        let n = info.range.min(RECS_SLOT);
+        let mut g = RECS_TAP.lock();
+        if g.is_none() {
+            match ctx().host_buffer(RECS_SLOT * RECS_SLOTS, vk::BufferUsageFlags::TRANSFER_DST) {
+                Ok((b, _mem, ptr)) => *g = Some(RecsTap { buf: b, ptr, next: 0, pending: Default::default() }),
+                Err(e) => {
+                    crate::warn!("tap recs: no host buffer ({e})");
+                    return;
+                }
+            }
+        }
+        let t = g.as_mut().unwrap();
+        let slot = t.next % RECS_SLOTS;
+        t.next += 1;
+        let cmd = self.cmd();
+        self.barrier();
+        unsafe { ctx().device.cmd_copy_buffer(cmd, info.buffer, t.buf, &[vk::BufferCopy { src_offset: info.offset, dst_offset: slot * RECS_SLOT, size: n }]) };
+        self.barrier();
+        let flip = crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1;
+        t.pending.push_back((slot, addr, flip, n));
+        while t.pending.len() > 16 {
+            let (s, a, f, n) = t.pending.pop_front().unwrap();
+            let w = |k: u64| unsafe { std::ptr::read_volatile(t.ptr.add((s * RECS_SLOT + 4 * k) as usize) as *const u32) };
+            let mut items = Vec::new();
+            for r in 0..n / 384 {
+                let b = r * 96;
+                if (0..96).all(|k| w(b + k) == 0) {
+                    break;
+                }
+                let mut h: u32 = 0x811c_9dc5;
+                for k in 3..96 {
+                    h = (h ^ w(b + k)).wrapping_mul(0x0100_0193);
+                }
+                let fl = |k: u64| f32::from_bits(w(b + k));
+                items.push(format!("{}:{:x}:{:x}:{:.3}/{:.3}/{:.3}:{h:08x}", r, w(b), w(b + 2), fl(28), fl(29), fl(30)));
+            }
+            crate::info!("tap recs cs {a:#x} for flip {f}: {} records [{}]", items.len(), items.join(" "));
+        }
+    }
+}
+
+/// `DS_TAP_ARGS` (diagnosis): a host buffer of 16-byte slots the indirect dispatches' arguments are
+/// copied into, and the copies not logged yet (slot, program, flip).
+struct ArgsTap {
+    buf: vk::Buffer,
+    ptr: *mut u8,
+    next: u64,
+    pending: std::collections::VecDeque<(u64, u64, u64)>,
+}
+unsafe impl Send for ArgsTap {}
+static ARGS_TAP: Mutex<Option<ArgsTap>> = Mutex::new(None);
+const ARGS_TAP_SLOTS: u64 = 4096;
+
+impl Exec {
+    /// `DS_TAP_ARGS`: copies the 12 bytes of an indirect dispatch's arguments at `(buf, off)`, as
+    /// the GPU read them, and logs those of dispatches recorded 64 taps earlier (`tap args` lines).
+    fn tap_args(&mut self, addr: u64, buf: vk::Buffer, off: u64) {
+        let mut g = ARGS_TAP.lock();
+        if g.is_none() {
+            match ctx().host_buffer(ARGS_TAP_SLOTS * 16, vk::BufferUsageFlags::TRANSFER_DST) {
+                Ok((b, _mem, ptr)) => *g = Some(ArgsTap { buf: b, ptr, next: 0, pending: Default::default() }),
+                Err(e) => {
+                    crate::warn!("tap args: no host buffer ({e})");
+                    return;
+                }
+            }
+        }
+        let t = g.as_mut().unwrap();
+        let slot = t.next % ARGS_TAP_SLOTS;
+        t.next += 1;
+        let cmd = self.cmd();
+        self.barrier();
+        unsafe { ctx().device.cmd_copy_buffer(cmd, buf, t.buf, &[vk::BufferCopy { src_offset: off, dst_offset: slot * 16, size: 12 }]) };
+        self.barrier();
+        let flip = crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1;
+        t.pending.push_back((slot, addr, flip));
+        while t.pending.len() > 64 {
+            let (s, a, f) = t.pending.pop_front().unwrap();
+            let at = |k: u64| unsafe { std::ptr::read_volatile(t.ptr.add((s * 16 + k) as usize) as *const u32) };
+            crate::info!("tap args cs {a:#x} for flip {f}: {} {} {}", at(0), at(4), at(8));
         }
     }
 }
@@ -10975,6 +11250,9 @@ pub struct Exec {
     ballast_kind: u8,
     /// Shaders recorded in the current batch (slow-batch reports).
     batch_shaders: Vec<u64>,
+    /// `watchwrites` (diagnosis): this batch's copy-kernel writes into and dispatch reads of
+    /// the watched range, logged with its sequence when it is queued.
+    watch_tags: Vec<String>,
     /// Active dynamic-rendering instance (draws).
     rendering: Option<draw::Rendering>,
     /// Graphics state recorded in the current command buffer (draws skip
@@ -12428,6 +12706,8 @@ struct Closed {
     writes: super::ranges::Ranges,
     checks: Vec<verify::Check>,
     shaders: Vec<u64>,
+    /// `Exec::watch_tags` of the batch.
+    watch_tags: Vec<String>,
     races: Vec<RaceCheck>,
     /// Checks of the buffer updates recorded in it (`forward::add_check`).
     forward_ids: Vec<u64>,
@@ -12598,6 +12878,85 @@ const TAA_RES: [usize; 4] = [1, 2, 4, 9];
 pub static TAA_DUMP: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
 /// `imgprobe <n> <u> <v> taa` (diagnosis): dispatches of the TAA left to probe at, and where.
 pub static TAA_IMG_PROBE: parking_lot::Mutex<Option<(u32, f32, f32)>> = parking_lot::Mutex::new(None);
+/// `atprobe <n> <hex cs> <hex base> <u> <v>` (diagnosis): dispatches left, the program, the image's
+/// base and the block's place.
+pub static AT_PROBE: parking_lot::Mutex<Option<(u32, Vec<u64>, u64, f32, f32)>> = parking_lot::Mutex::new(None);
+
+/// `DS_MEM_POLL=<hex address>:<bytes>` (diagnosis, 2026-11-20): from the first `atprobe` on, a
+/// thread reads that guest range as fast as it can (one core) and logs each change it sees
+/// (`mem poll` lines: the words that changed, old and new, the flip queued and the time), at most
+/// 4,000 changes, for 180 s: the title's writes of a range the GPU reads live, even brief ones.
+pub fn start_mem_poll() {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let Some((addr, len)) = std::env::var("DS_MEM_POLL").ok().and_then(|v| {
+        let (a, b) = v.split_once(':')?;
+        Some((u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()? & !3, b.trim().parse::<u64>().ok()?.clamp(4, 4096) & !3))
+    }) else {
+        return;
+    };
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("mem-poll".into()).spawn(move || {
+        let n = (len / 4) as usize;
+        let read = |out: &mut Vec<u32>| -> bool {
+            if !super::cp::guest_readable(addr, len) {
+                return false;
+            }
+            out.clear();
+            out.extend((0..n as u64).map(|k| unsafe { std::ptr::read_volatile((addr + 4 * k) as *const u32) }));
+            true
+        };
+        let mut last = Vec::with_capacity(n);
+        let mut now = Vec::with_capacity(n);
+        while !read(&mut last) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let t0 = std::time::Instant::now();
+        let (mut changes, mut polls) = (0u32, 0u64);
+        crate::info!("mem poll {addr:#x}+{len}: started at flip {}", crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1);
+        while changes < 4000 && t0.elapsed().as_secs() < 180 {
+            polls += 1;
+            if !read(&mut now) {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+                continue;
+            }
+            if now != last {
+                let d: Vec<String> = (0..n).filter(|&i| now[i] != last[i]).map(|i| format!("+{:#x}: {:08x}->{:08x}", 4 * i, last[i], now[i])).collect();
+                crate::info!("mem poll {addr:#x} at {:.3} ms, flip {}: {}", t0.elapsed().as_secs_f64() * 1000.0, crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1, d.join(" "));
+                std::mem::swap(&mut last, &mut now);
+                changes += 1;
+            }
+            std::hint::spin_loop();
+        }
+        crate::info!("mem poll {addr:#x}: ended after {polls} reads, {changes} changes");
+    });
+}
+/// `DS_ATPROBE_BOUND=1` with `DS_TRACE_PS_REC` (diagnosis): the traced draw's first buffer
+/// resource as last bound (guest address, bytes, buffer, flip), read at each `atprobe` through
+/// that buffer and through every import listed over it.
+pub static PROBE_BIND: parking_lot::Mutex<Option<(u64, u64, vk::Buffer, u64)>> = parking_lot::Mutex::new(None);
+
+/// `DS_ATPROBE_MEM=<hex address>:<bytes>` (diagnosis): `atprobe`'s guest range read through its import.
+fn atprobe_mem() -> Option<(u64, u64)> {
+    static D: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    *D.get_or_init(|| {
+        let v = std::env::var("DS_ATPROBE_MEM").ok()?;
+        let (a, b) = v.split_once(':')?;
+        Some((u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()?, b.trim().parse::<u64>().ok()?.clamp(4, 4096) & !3))
+    })
+}
+/// `DS_ATPROBE_DUMP=<layer>:<w>:<h>` (diagnosis): `atprobe`'s per-probe region dumps.
+fn atprobe_dump() -> Option<(u32, u32, u32)> {
+    static D: std::sync::OnceLock<Option<(u32, u32, u32)>> = std::sync::OnceLock::new();
+    *D.get_or_init(|| {
+        let v = std::env::var("DS_ATPROBE_DUMP").ok()?;
+        let mut it = v.split(':').map(|x| x.trim().parse::<u32>().ok());
+        Some((it.next()??, it.next()??, it.next()??))
+    })
+}
+/// `atlasprobe <flips> <hex base>` (diagnosis): flips left and the image's base (`Images::probe_layers`).
+pub static TAA_ATLAS_PROBE: parking_lot::Mutex<Option<(u32, u64)>> = parking_lot::Mutex::new(None);
 
 fn taa_probe(p: &Prepared) {
     if p.addr == TAA_CS {
@@ -12751,6 +13110,7 @@ impl Exec {
                 name: name.to_string(),
                 ballast_kind: ballast_kind(name),
                 batch_shaders: Vec::new(),
+                watch_tags: Vec::new(),
                 rendering: None,
                 dyncache: Default::default(),
                 bound_pool: Vec::new(),
@@ -13480,7 +13840,7 @@ impl Exec {
             let cpu = self.span_cpu();
             super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why}{cpu})", self.batch_shaders.len()));
             let lists = std::mem::take(&mut self.batch_lists).then(super::vk::defer::release);
-            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, cpu_wait: std::mem::take(&mut self.cpu_wait), kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises, fe2_up: Vec::new(), fe2_spans: Vec::new(), lists, xq: (self.xq_dep, self.xq_why, self.xq_img), on_c: self.batch_c, pre_on_c });
+            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, cpu_wait: std::mem::take(&mut self.cpu_wait), kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), watch_tags: std::mem::take(&mut self.watch_tags), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises, fe2_up: Vec::new(), fe2_spans: Vec::new(), lists, xq: (self.xq_dep, self.xq_why, self.xq_img), on_c: self.batch_c, pre_on_c });
             (self.xq_dep, self.xq_why, self.xq_img) = (0, 0, false);
             self.res_mine.clear();
             if let Some(b) = self.closed.last_mut() {
@@ -13550,6 +13910,9 @@ impl Exec {
             let _ = seq;
             Some(SubmitSpec { xpre, pre, cmd, lists, wait: copy_wait, on_c, pre_on_c, xwait: 0, cpu_wait, name })
         });
+        if !self.watch_tags.is_empty() {
+            crate::info!("watch batch #{seq} [{}]: {}", self.name, std::mem::take(&mut self.watch_tags).join("; "));
+        }
         let cpu = self.span_cpu();
         super::timeline::end(&self.name, self.begun_mark.take(), || format!("batch #{seq}, {commands} commands ({why}{cpu})"));
         if cpu_wait > 0 {
@@ -18606,6 +18969,9 @@ impl Exec {
                 // (Deferred recording: `submit_specs` plays the lists.)
                 Some(SubmitSpec { xpre: None, pre, cmd, lists, wait: copy_wait, on_c, pre_on_c, xwait: 0, cpu_wait, name })
             });
+            if !b.watch_tags.is_empty() {
+                crate::info!("watch batch #{seq} [{}] (closed): {}", self.name, b.watch_tags.join("; "));
+            }
             if cpu_wait > 0 {
                 let mut l = CPU_WAIT_LOG.lock();
                 if l.len() >= 64 {
@@ -20418,6 +20784,110 @@ impl Exec {
             None => shaders::prepare_compute(cp, wave64)?,
         };
         taa_probe(&p);
+        // (`atprobe <n> <hex cs> <hex image base> <u> <v>` (diagnosis): before each of the next n
+        // dispatches of that program, the frame's work before it completed, a 4x4 block of the
+        // image at that base.)
+        if !self.held {
+            let take = {
+                let mut g = AT_PROBE.lock();
+                match g.as_mut() {
+                    Some(q) if q.1.contains(&p.addr) => {
+                        let r = (q.2, q.3, q.4);
+                        q.0 = q.0.saturating_sub(1);
+                        if q.0 == 0 {
+                            *g = None;
+                        }
+                        Some(r)
+                    }
+                    _ => None,
+                }
+            };
+            if let Some((base, u, v)) = take {
+                self.flush_for("program probe");
+                let lines = super::images::with(|im| im.probe_used(u, v));
+                let want = format!("{base:#x} ");
+                let mine: Vec<&String> = lines.iter().filter(|l| base == 0 || l.starts_with(&want)).collect();
+                crate::info!("probe before cs {:#x} for flip {}: {}", p.addr, crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1, mine.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" | "));
+                // (`DS_ATPROBE_MEM=<hex address>:<bytes>`: that guest range as the GPU reads it
+                // through the import covering it now, against the CPU's view: `atprobe mem`.)
+                if let Some((addr, len)) = atprobe_mem() {
+                    let flip = crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1;
+                    let cpu: Vec<u8> = if super::cp::guest_readable(addr, len) { (0..len).map(|k| unsafe { std::ptr::read_volatile((addr + k) as *const u8) }).collect() } else { Vec::new() };
+                    match span(addr, len) {
+                        Some((buf, start, _)) => {
+                            use ash::vk::Handle;
+                            let gpu = super::images::with(|im| im.read_buffer(buf, addr - start, len)).unwrap_or_default();
+                            let words = |b: &[u8]| b.chunks_exact(4).map(|w| format!("{:08x}", u32::from_le_bytes([w[0], w[1], w[2], w[3]]))).collect::<Vec<_>>().join(" ");
+                            crate::info!("atprobe mem {addr:#x} for flip {flip}: import {:x} from {start:#x}: {} gpu [{}]{}", buf.as_raw(), if gpu == cpu { "same" } else { "DIFFERS" }, words(&gpu), if gpu == cpu { String::new() } else { format!(" cpu [{}]", words(&cpu)) });
+                        }
+                        None => crate::info!("atprobe mem {addr:#x} for flip {flip}: no import covers it"),
+                    }
+                }
+                // (`DS_DECAL_CHECK`: the decals' read-only buffers noted for this flip, read
+                // where they are bound (the mirror) and compared with the bytes they were
+                // recorded with: `decal check` lines.)
+                if draw::decal_check() != 0 {
+                    let flip = crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1;
+                    let list: Vec<(u64, u64, u64, Vec<u8>, vk::Buffer, u64)> = {
+                        let mut g = draw::DECAL_BUFS.lock();
+                        let mine: Vec<_> = g.iter().filter(|e| e.0 == flip).cloned().collect();
+                        g.retain(|e| e.0 > flip);
+                        mine
+                    };
+                    let mut diffs = Vec::new();
+                    for (_, prog, base, rec, buf, off) in &list {
+                        let gpu = super::images::with(|im| im.read_buffer(*buf, *off, rec.len() as u64)).unwrap_or_default();
+                        if &gpu != rec {
+                            let w = |b: &[u8], j: usize| u32::from_le_bytes([b[4 * j], b[4 * j + 1], b[4 * j + 2], b[4 * j + 3]]);
+                            let d: Vec<String> = (0..rec.len() / 4).filter(|&j| gpu.len() >= 4 * j + 4 && w(&gpu, j) != w(rec, j)).take(6).map(|j| format!("+{:#x}: rec {:08x} gpu {:08x}", 4 * j, w(rec, j), w(&gpu, j))).collect();
+                            diffs.push(format!("ps {prog:#x} {base:#x}: {}", d.join(" ")));
+                        }
+                    }
+                    crate::info!("decal check for flip {flip}: {} buffers, {} differ{}{}", list.len(), diffs.len(), if diffs.is_empty() { "" } else { ": " }, diffs.iter().take(12).cloned().collect::<Vec<_>>().join(" | "));
+                }
+                // (`DS_ATPROBE_BOUND=1`: the traced draw's buffer through its bound import and
+                // every listed import over it, against the CPU's view: `atprobe bound`.)
+                if std::env::var("DS_ATPROBE_BOUND").is_ok_and(|v| v == "1") {
+                    if let Some((addr, len, bound, at)) = *PROBE_BIND.lock() {
+                        use ash::vk::Handle;
+                        let flip = crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1;
+                        let cpu: Vec<u8> = if super::cp::guest_readable(addr, len) { (0..len).map(|k| unsafe { std::ptr::read_volatile((addr + k) as *const u8) }).collect() } else { Vec::new() };
+                        let over: Vec<(vk::Buffer, u64, u64, u64, bool)> = spans_read().iter().filter(|s| s.start <= addr && addr + len <= s.end).map(|s| (s.buffer, s.start, s.end, s.born, s.valid)).collect();
+                        let words = |b: &[u8]| b.chunks_exact(4).skip(24).take(8).map(|w| format!("{:08x}", u32::from_le_bytes([w[0], w[1], w[2], w[3]]))).collect::<Vec<_>>().join(" ");
+                        let mut parts = Vec::new();
+                        if !over.iter().any(|o| o.0 == bound) {
+                            // Front end 2's mirror (guest MIRROR_BASE's buffer): read there.
+                            match super::resident::mirror_buffer() {
+                                Some((mb, _)) if mb == bound && addr >= super::resident::MIRROR_BASE && addr + len <= super::resident::MIRROR_END => {
+                                    let gpu = super::images::with(|im| im.read_buffer(mb, addr - super::resident::MIRROR_BASE, len)).unwrap_or_default();
+                                    let full = |b: &[u8]| b.chunks_exact(4).map(|w| format!("{:08x}", u32::from_le_bytes([w[0], w[1], w[2], w[3]]))).collect::<Vec<_>>().join(" ");
+                                    parts.push(format!("BOUND mirror {:x}: {} [{}]{}", mb.as_raw(), if gpu == cpu { "same" } else { "DIFFERS" }, words(&gpu), if gpu == cpu { String::new() } else { format!(" whole gpu [{}] cpu [{}]", full(&gpu), full(&cpu)) }));
+                                }
+                                _ => parts.push(format!("bound buffer {:x} neither listed nor the mirror", bound.as_raw())),
+                            }
+                        }
+                        for (buf, st, en, born, valid) in over {
+                            let gpu = super::images::with(|im| im.read_buffer(buf, addr - st, len)).unwrap_or_default();
+                            parts.push(format!("{}import {:x} {st:#x}..{en:#x} born {born}{}: {} [{}]", if buf == bound { "BOUND " } else { "" }, buf.as_raw(), if valid { "" } else { " INVALID" }, if gpu == cpu { "same" } else { "DIFFERS" }, words(&gpu)));
+                        }
+                        crate::info!("atprobe bound {addr:#x} for flip {flip} (bound at flip {at}): cpu [{}] | {}", words(&cpu), parts.join(" | "));
+                    }
+                }
+                // (`DS_ATPROBE_DUMP=<layer>:<w>:<h>`: that region of the image at the probe, one
+                // record a probe in <run dir>/atprobe-<base>-l<layer>.raw: flip, w, h as u32,
+                // then the texels.)
+                if let (Some((layer, w, h)), true) = (atprobe_dump(), base != 0) {
+                    if let (Some(raw), Some(dir)) = (super::images::with(|im| im.dump_region(base, layer, u, v, w, h)), crate::run_dir()) {
+                        use std::io::Write;
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(format!("atprobe-{base:x}-l{layer}.raw"))) {
+                            let flip = crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) as u32 + 1;
+                            let side = (raw.len() as u32 / 4).checked_div(h.max(1)).unwrap_or(0);
+                            let _ = f.write_all(&flip.to_le_bytes()).and_then(|_| f.write_all(&side.to_le_bytes())).and_then(|_| f.write_all(&(raw.len() as u32 / 4 / side.max(1)).to_le_bytes())).and_then(|_| f.write_all(&raw));
+                        }
+                    }
+                }
+            }
+        }
         // (`imgprobe <n> <u> <v> taa`: every image probed before the TAA, the frame's work
         // before it completed first.)
         if p.addr == TAA_CS && !self.held {
@@ -20436,6 +20906,23 @@ impl Exec {
                 self.flush_for("image probe");
                 let lines = super::images::with(|im| im.probe_used(u, v));
                 crate::info!("probe at the TAA for flip {}: {} image(s)\n    {}", crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1, lines.len(), lines.join("\n    "));
+            }
+            // (`atlasprobe <n> <base>`: one layered image's layers sampled at the same point.)
+            let atlas = {
+                let mut g = TAA_ATLAS_PROBE.lock();
+                let r = *g;
+                if let Some(q) = g.as_mut() {
+                    q.0 = q.0.saturating_sub(1);
+                    if q.0 == 0 {
+                        *g = None;
+                    }
+                }
+                r
+            };
+            if let Some((_, base)) = atlas {
+                self.flush_for("atlas probe");
+                let line = super::images::with(|im| im.probe_layers(base));
+                crate::info!("atlas probe at the TAA for flip {}: {line}", crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1);
             }
         }
         // LOD statistics in rotation (`tune lod_cs` >= 2): a stage prepared
@@ -21285,6 +21772,11 @@ impl Exec {
         }
         trace_cs_images(&self.name, &p, &bound);
         self.tap_cs(&p, &bound);
+        self.tap_recs(&p, &bound);
+        self.tap_hist(&p, &bound);
+        if let Some((buf, off)) = args.filter(|_| tap_args_list().contains(&p.addr)) {
+            self.tap_args(p.addr, buf, off);
+        }
         cs_dump(&p);
         stamp(2);
         lap.mark(12);
@@ -21368,8 +21860,24 @@ impl Exec {
         lap.mark(15);
         // (Diagnostics of copies that did not land: every queue's copy
         // kernel dispatches, `forward::note_dispatch`.)
+        // `DS_TAG_CS=<hex>[;...]` (diagnosis): those programs' dispatches tagged on this batch,
+        // logged with its sequence when it is queued (the GPU order of producers and readers on
+        // several queues).
+        if tag_cs().contains(&p.addr) {
+            self.watch_tags.push(format!("cs {:#x} flip {}{}{}", p.addr, crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1, if indirect.is_some() { " indirect" } else { "" }, if self.held { " held" } else { "" }));
+        }
         if indirect.is_none() {
-            super::forward::note_dispatch(&p, groups, &self.name);
+            let copy = super::forward::note_dispatch(&p, groups, &self.name);
+            // `watchwrites` (diagnosis): copies into the watched range and reads of it, tagged on
+            // this batch (logged with its sequence when it is queued).
+            if let Some((lo, hi)) = watch_range() {
+                let flip = super::FRAMES.load(Ordering::Relaxed);
+                if let Some((d, n)) = copy.filter(|&(d, n)| d < hi && d + n > lo) {
+                    self.watch_tags.push(format!("copy cs {:#x} -> {d:#x}+{n:#x} flip {flip}{}{}", p.addr, if self.held { " held" } else { "" }, if self.past_grow { " past" } else { "" }));
+                } else if bound.reads.iter().any(|&(a, n)| a < hi && a + n > lo) {
+                    self.watch_tags.push(format!("read by cs {:#x} flip {flip}{}{}", p.addr, if self.held { " held" } else { "" }, if self.past_grow { " past" } else { "" }));
+                }
+            }
         }
         if forward_here {
             let busy = |r: &[(u64, u64)]| self.overlaps_pending_ro(r) || INFLIGHT.latest(r).is_some() || CP_WRITES.latest(r).is_some();

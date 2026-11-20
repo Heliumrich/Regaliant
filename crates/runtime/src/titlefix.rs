@@ -202,6 +202,18 @@ const FIXES: &[Fix] = &[
         why: "the draws walked the GPU's frustum culling masks before our GPU's writes landed",
         only_with: None,
     },
+    // ... and the static sections' decal draws (eboot+0xa20cae, `mov eax,[rdi+198h]`, past the
+    // walk's early out) wait for the GPU's writes of the section's decal mask (`cullread::
+    // decal_mask_wait`, 2026-11-20: the equipment menu's wall flicker).
+    Fix {
+        name: "decal masks walked after the GPU's writes",
+        offset: 0xa20cae,
+        from: (6, 0xa7d2d964b481f8b4),
+        change: Change::Hook { at: 0, handler: crate::cullread::decal_mask_wait },
+        kind: "title timing",
+        why: "the static decals' draws walked the GPU's decal visibility mask before our GPU's writes landed; walls lost their decals for a frame",
+        only_with: None,
+    },
     Fix {
         name: "VG spawning held after scene resets (per frame)",
         offset: 0xa553c7,

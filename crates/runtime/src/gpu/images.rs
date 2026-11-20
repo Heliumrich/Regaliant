@@ -5635,10 +5635,18 @@ impl Images {
         self.gpu_bases.insert(k.base);
         // Generations move only on a change (every draw with a depth/stencil
         // target came here: lookups cached by generation never hit).
-        if s.stencil_base != 0 && has_stencil(k.format) && self.stencil_of.insert(s.stencil_base, k) != Some(k) {
-            LOOKUP_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
-            gpu_images_changed();
-            self.gpu_bases.insert(s.stencil_base);
+        if s.stencil_base != 0 && has_stencil(k.format) {
+            let old = self.stencil_of.insert(s.stencil_base, k);
+            if old != Some(k) {
+                LOOKUP_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+                gpu_images_changed();
+                self.gpu_bases.insert(s.stencil_base);
+                // (Diagnosis: a stencil plane's owner changing; the first 400 logged.)
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 400 {
+                    crate::info!("images: stencil plane {:#x} now of {:#x} {}x{} {:?} (was {}) at flip {} on {}", s.stencil_base, k.base, k.width, k.height, k.format, old.map_or("none".to_string(), |o| format!("{:#x} {}x{}", o.base, o.width, o.height)), super::FRAMES.load(std::sync::atomic::Ordering::Relaxed), crate::log::thread_name());
+                }
+            }
         }
         if s.meta != 0 {
             mark_note_pages(s.meta, 4);
@@ -5734,6 +5742,128 @@ impl Images {
     /// `imgprobe` (diagnosis): the mean of each channel of a 4x4 block at (u, v) (0-1 of the
     /// image's size) in every GPU-written 2D image used in the last two frames, read in one copy
     /// (depth images: their depth plane). One line per image: base, size, format, the means.
+    /// `atlasprobe` (diagnosis): each layer of the largest GPU-written image with 4-byte texels at
+    /// `base`, every 16th row read in one copy: per layer its texels not zero and an FNV hash of
+    /// the words read (`L<k> <covered> <hash>`; layers with none covered counted, not listed).
+    pub fn probe_layers(&mut self, base: u64) -> String {
+        let pick = self
+            .map
+            .values()
+            .filter(|i| i.key.base == base && i.gpu_written && !i.key.ty3d && matches!(i.key.format, vk::Format::D32_SFLOAT | vk::Format::D32_SFLOAT_S8_UINT | vk::Format::R32_SFLOAT | vk::Format::R32_UINT))
+            .max_by_key(|i| (i.key.layers, i.key.width))
+            .map(|i| (i.key, i.image));
+        let Some((k, image)) = pick else { return "no such image".into() };
+        let layers = k.layers.clamp(1, 128);
+        let rows: Vec<u32> = (0..k.height).step_by(16).collect();
+        let row_bytes = 4 * k.width as u64;
+        let per_layer = row_bytes * rows.len() as u64;
+        let size = per_layer * layers as u64;
+        let c = ctx();
+        let Ok((buf, mem, ptr)) = c.host_buffer(size, vk::BufferUsageFlags::TRANSFER_DST) else { return "no staging buffer".into() };
+        let aspect = if is_depth(k.format) { vk::ImageAspectFlags::DEPTH } else { vk::ImageAspectFlags::COLOR };
+        let mut regions = Vec::with_capacity(rows.len() * layers as usize);
+        for l in 0..layers {
+            for (r, &y) in rows.iter().enumerate() {
+                regions.push(
+                    vk::BufferImageCopy::default()
+                        .buffer_offset(l as u64 * per_layer + r as u64 * row_bytes)
+                        .image_subresource(vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: 0, base_array_layer: l, layer_count: 1 })
+                        .image_offset(vk::Offset3D { x: 0, y: y as i32, z: 0 })
+                        .image_extent(vk::Extent3D { width: k.width, height: 1, depth: 1 }),
+                );
+            }
+        }
+        self.one_shot(|cmd| unsafe {
+            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+            c.device.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::GENERAL, buf, &regions);
+            let hb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[hb], &[], &[]);
+        });
+        let raw = unsafe { std::slice::from_raw_parts(ptr, size as usize).to_vec() };
+        unsafe {
+            c.device.destroy_buffer(buf, None);
+            c.device.unmap_memory(mem);
+            c.device.free_memory(mem, None);
+        }
+        let mut items = Vec::new();
+        let mut empty = 0u32;
+        for l in 0..layers as u64 {
+            let s = &raw[(l * per_layer) as usize..((l + 1) * per_layer) as usize];
+            let mut covered = 0u32;
+            let mut h: u32 = 0x811c_9dc5;
+            for w in s.chunks_exact(4) {
+                let v = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+                covered += (v != 0) as u32;
+                h = (h ^ v).wrapping_mul(0x0100_0193);
+            }
+            if covered == 0 {
+                empty += 1;
+                continue;
+            }
+            items.push(format!("L{l} {covered} {h:08x}"));
+        }
+        format!("{:#x} {}x{}x{} {:?}: {} ({empty} layers empty)", k.base, k.width, k.height, k.layers, k.format, items.join(", "))
+    }
+
+    /// Diagnosis (`DS_ATPROBE_MEM`): `len` bytes of `buf` from `off` as the GPU reads them, copied
+    /// after the work submitted before.
+    pub fn read_buffer(&mut self, buf: vk::Buffer, off: u64, len: u64) -> Option<Vec<u8>> {
+        let c = ctx();
+        let (hb, mem, ptr) = c.host_buffer(len, vk::BufferUsageFlags::TRANSFER_DST).ok()?;
+        self.one_shot(|cmd| unsafe {
+            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+            c.device.cmd_copy_buffer(cmd, buf, hb, &[vk::BufferCopy { src_offset: off, dst_offset: 0, size: len }]);
+            let hm = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[hm], &[], &[]);
+        });
+        let raw = unsafe { std::slice::from_raw_parts(ptr, len as usize).to_vec() };
+        unsafe {
+            c.device.destroy_buffer(hb, None);
+            c.device.unmap_memory(mem);
+            c.device.free_memory(mem, None);
+        }
+        Some(raw)
+    }
+
+    /// `DS_ATPROBE_DUMP=<layer>:<w>:<h>` (diagnosis, 2026-11-20): a w x h region of one layer of
+    /// the GPU-written 4-byte-texel image at `base`, centred at (u, v), as the GPU holds it now
+    /// (texels row by row), for `atprobe`'s per-frame dumps.
+    pub fn dump_region(&mut self, base: u64, layer: u32, u: f32, v: f32, w: u32, h: u32) -> Option<Vec<u8>> {
+        use vk::Format as F;
+        let i = self.map.values().filter(|i| i.key.base == base && i.gpu_written && !i.key.ty3d && layer < i.key.layers.max(1)).max_by_key(|i| i.used.get())?;
+        let k = i.key;
+        if !matches!(k.format, F::R32_UINT | F::R32_SFLOAT | F::R8G8B8A8_UNORM | F::B8G8R8A8_UNORM | F::A2B10G10R10_UNORM_PACK32 | F::B10G11R11_UFLOAT_PACK32) {
+            return None;
+        }
+        let img = i.image;
+        let (w, h) = (w.clamp(1, k.width), h.clamp(1, k.height));
+        let x = ((u.clamp(0.0, 1.0) * k.width as f32) as u32).saturating_sub(w / 2).min(k.width - w);
+        let y = ((v.clamp(0.0, 1.0) * k.height as f32) as u32).saturating_sub(h / 2).min(k.height - h);
+        let size = 4 * w as u64 * h as u64;
+        let c = ctx();
+        let (buf, mem, ptr) = c.host_buffer(size, vk::BufferUsageFlags::TRANSFER_DST).ok()?;
+        self.one_shot(|cmd| unsafe {
+            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: layer, layer_count: 1 })
+                .image_offset(vk::Offset3D { x: x as i32, y: y as i32, z: 0 })
+                .image_extent(vk::Extent3D { width: w, height: h, depth: 1 });
+            c.device.cmd_copy_image_to_buffer(cmd, img, vk::ImageLayout::GENERAL, buf, &[region]);
+            let hb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[hb], &[], &[]);
+        });
+        let raw = unsafe { std::slice::from_raw_parts(ptr, size as usize).to_vec() };
+        unsafe {
+            c.device.destroy_buffer(buf, None);
+            c.device.unmap_memory(mem);
+            c.device.free_memory(mem, None);
+        }
+        Some(raw)
+    }
+
     pub fn probe_used(&mut self, u: f32, v: f32) -> Vec<String> {
         use vk::Format as F;
         let frame = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);

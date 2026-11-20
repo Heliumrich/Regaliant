@@ -548,6 +548,55 @@ fn draw_traces() -> bool {
     *ON.get_or_init(|| ["DS_TRACE_PS", "DS_TRACE_PS_BINS", "DS_TRACE_ARGS", "DS_TRACE_DEPTH"].iter().any(|v| std::env::var_os(v).is_some()))
 }
 
+/// `DS_DECAL_CHECK=<hex image base>` (diagnosis, 2026-11-20): see `note_decal_bufs`.
+pub fn decal_check() -> u64 {
+    static D: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *D.get_or_init(|| std::env::var("DS_DECAL_CHECK").ok().and_then(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()).unwrap_or(0))
+}
+
+/// The read-only buffers bound for draws whose pixel stage stores to `decal_check`'s image:
+/// (flip, program, guest base, the bytes as recorded (at most 256), buffer, offset of the base in
+/// it), compared at the next `atprobe` with what that buffer holds then (`decal check` lines).
+pub static DECAL_BUFS: parking_lot::Mutex<Vec<(u64, u64, u64, Vec<u8>, vk::Buffer, u64)>> = parking_lot::Mutex::new(Vec::new());
+
+fn note_decal_bufs(p: &Prepared, b: &Bound) {
+    let img = decal_check();
+    if !p.found.resources.iter().enumerate().any(|(i, r)| matches!(r, Resolved::Image(t) if t.base == img) && p.tr.plan.resources.get(i).is_some_and(|x| x.written)) {
+        return;
+    }
+    let flip = crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1;
+    let mirror = super::super::resident::mirror_buffer().map(|m| m.0);
+    let mut g = DECAL_BUFS.lock();
+    if g.len() > 4096 {
+        return;
+    }
+    for (i, r) in p.found.resources.iter().enumerate() {
+        let Resolved::Buffer(v) = r else { continue };
+        if p.tr.plan.resources.get(i).is_some_and(|x| x.written) {
+            continue;
+        }
+        let len = (v.stride.max(16) as u64 * v.num_records.max(1) as u64).min(256) & !3;
+        let Some(bn) = p.tr.out.bindings.iter().find(|bd| matches!(bd.kind, BindingKind::Buffer(j) if j == i)).map(|bd| bd.binding) else { continue };
+        let Some(inf) = b.bufs.iter().find(|(x, _)| *x == bn).map(|(_, inf)| *inf) else { continue };
+        // Only the mirror's placements: their offset is the guest address's.
+        if Some(inf.buffer) != mirror || v.base < super::super::resident::MIRROR_BASE || len == 0 || !super::super::cp::guest_readable(v.base, len) {
+            continue;
+        }
+        let bytes: Vec<u8> = (0..len).map(|k| unsafe { std::ptr::read_volatile((v.base + k) as *const u8) }).collect();
+        g.push((flip, p.addr, v.base, bytes, inf.buffer, v.base - super::super::resident::MIRROR_BASE));
+    }
+}
+
+/// `skiprw <hex base>` (diagnosis): draws whose pixel stage writes the image at that base are
+/// left out (0: none), and how many were.
+pub static SKIP_RW: AtomicU64 = AtomicU64::new(0);
+pub static SKIP_RW_N: AtomicU64 = AtomicU64::new(0);
+/// The ordinals among a flip's such draws left out ([lo, hi); all by default), the current
+/// flip's count, and the (ordinal, program)s logged.
+pub static SKIP_RW_RANGE: parking_lot::Mutex<(u64, u64)> = parking_lot::Mutex::new((0, u64::MAX));
+static SKIP_RW_ORD: parking_lot::Mutex<(u64, u64)> = parking_lot::Mutex::new((0, 0));
+static SKIP_RW_SEEN: parking_lot::Mutex<std::collections::BTreeSet<(u64, u64)>> = parking_lot::Mutex::new(std::collections::BTreeSet::new());
+
 /// Draws whose vertex shader is on this list are skipped (`skipvs` control
 /// command; diagnosis).
 static SKIP_VS: parking_lot::Mutex<Option<std::collections::HashSet<u64>>> = parking_lot::Mutex::new(None);
@@ -655,9 +704,64 @@ pub fn trace_args_addr() -> u64 {
     *A.get_or_init(|| std::env::var("DS_TRACE_ARGS").ok().and_then(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()).unwrap_or(0))
 }
 
-fn trace_ps_binding(p: &Prepared, b: &Bound, note: Option<([u64; 3], bool)>) {
+/// `DS_TRACE_PS_REC=<first word>:<count>` (diagnosis, 2026-11-20): with `DS_TRACE_PS` /
+/// `DS_TRACE_PS_BINS`, each traced draw logs one short line in place of the long ones (`trace
+/// rec`): the flip, the indices (guest address and count) and instances, the user words, and
+/// each buffer resource's base, stride and records with its guest words [first, first + count)
+/// as they are when the draw is recorded (the remaining flicker's wall: the per-object record's
+/// blend weight at word 28).
+fn trace_rec_words() -> Option<(u64, u64)> {
+    static W: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        let v = std::env::var("DS_TRACE_PS_REC").ok()?;
+        let (a, b) = v.split_once(':')?;
+        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    })
+}
+
+fn trace_ps_binding(p: &Prepared, b: &Bound, note: Option<([u64; 3], bool)>, a: &DrawArgs) {
     let addrs = trace_ps_addrs();
     if !addrs.contains(&p.addr) && !trace_bin_match(p.addr) && !TRACE_DRAW.with(|c| c.get()) {
+        return;
+    }
+    if let Some((first, n)) = trace_rec_words() {
+        // (`DS_TRACE_PS_REC_PROBE=1`: only while `atprobe` runs.)
+        if std::env::var("DS_TRACE_PS_REC_PROBE").is_ok_and(|v| v == "1") && super::AT_PROBE.lock().is_none() {
+            return;
+        }
+        let bufs: Vec<String> = p.found.resources.iter().enumerate().filter_map(|(i, r)| match r {
+            Resolved::Buffer(v) => {
+                let words: Vec<String> = (first..first + n).map(|k| v.base + 4 * k).map(|w| if super::super::cp::guest_readable(w, 4) { format!("{:08x}", unsafe { std::ptr::read_volatile(w as *const u32) }) } else { "-".into() }).collect();
+                Some(format!("{i}:{:#x}/{}x{} [{}]", v.base, v.stride, v.num_records, words.join(" ")))
+            }
+            _ => None,
+        }).collect();
+        // (`DS_ATPROBE_BOUND`: the first buffer resource's binding, for `atprobe bound`.)
+        if let Some((i, v)) = p.found.resources.iter().enumerate().find_map(|(i, r)| match r {
+            Resolved::Buffer(v) => Some((i, v)),
+            _ => None,
+        }) {
+            let bn = p.tr.out.bindings.iter().find(|bd| matches!(bd.kind, BindingKind::Buffer(j) if j == i)).map(|bd| bd.binding);
+            if let Some(inf) = bn.and_then(|bn| b.bufs.iter().find(|(x, _)| *x == bn).map(|(_, inf)| *inf)) {
+                *super::PROBE_BIND.lock() = Some((v.base, (v.stride.max(16) as u64 * v.num_records.max(1) as u64).min(4096), inf.buffer, crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1));
+            }
+        }
+        use ash::vk::Handle;
+        let places: Vec<String> = b.placements.iter().map(|(pl, n, w)| format!("{pl:?}/{n}{}", if *w { "w" } else { "" })).collect();
+        let bound: Vec<String> = b.bufs.iter().map(|(bn, inf)| format!("b{bn}={:x}+{:#x}/{:#x}", inf.buffer.as_raw(), inf.offset, inf.range)).collect();
+        crate::info!(
+            "trace rec {:#x} flip {}: idx {} count {} inst {} first {} user {:x?} {} places [{}] bound [{}]",
+            p.addr,
+            crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1,
+            a.index.map_or("-".into(), |(ib, sz)| format!("{ib:#x}/{sz}")),
+            a.count,
+            a.instances,
+            a.first_instance,
+            p.user,
+            bufs.join(" | "),
+            places.join(" "),
+            bound.join(" ")
+        );
         return;
     }
     use ash::vk::Handle;
@@ -2163,6 +2267,38 @@ impl Exec {
             }
         }
         lap.mark(1);
+        // Diagnosis (`skiprw <hex base>|off`, 2026-11-20): draws whose pixel stage writes the
+        // image at that base left out (the G-buffer's in-place decals).
+        let skip_rw = SKIP_RW.load(Ordering::Relaxed);
+        if skip_rw != 0 {
+            if let Some(p) = ps.as_ref() {
+                if p.found.resources.iter().enumerate().any(|(i, r)| matches!(r, Resolved::Image(t) if t.base == skip_rw) && p.tr.plan.resources.get(i).is_some_and(|x| x.written)) {
+                    // (The draw's ordinal among this flip's such draws: `skiprw <base> <lo> <hi>`
+                    // leaves out only those in [lo, hi).)
+                    let flip = crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed);
+                    let n = {
+                        let mut g = SKIP_RW_ORD.lock();
+                        if g.0 != flip {
+                            *g = (flip, 0);
+                        }
+                        g.1 += 1;
+                        g.1 - 1
+                    };
+                    let (lo, hi) = *SKIP_RW_RANGE.lock();
+                    if n >= lo && n < hi {
+                        SKIP_RW_N.fetch_add(1, Ordering::Relaxed);
+                        if hi - lo == 1 && SKIP_RW_SEEN.lock().insert((lo, p.addr)) {
+                            let rec = p.found.resources.iter().find_map(|r| match r {
+                                Resolved::Buffer(v) => Some(v.base),
+                                _ => None,
+                            });
+                            crate::info!("skiprw: draw {n} of flip {}: ps {:#x} record {:x?}", flip + 1, p.addr, rec);
+                        }
+                        return Ok(false);
+                    }
+                }
+            }
+        }
         // Batched stages that cannot run batched (memory writes, the varying's
         // location taken): the pair is refused and the stages prepared again.
         if batched {
@@ -2785,7 +2921,13 @@ impl Exec {
             let mut b = self.bind_stage(p, false)?;
             notes[k] = self.bind_note.take();
             if draw_traces() {
-                trace_ps_binding(p, &b, notes[k]);
+                trace_ps_binding(p, &b, notes[k], a);
+            }
+            // (`DS_DECAL_CHECK=<hex image base>`: the read-only buffers of draws whose pixel stage
+            // stores to that image, as the CPU holds them now and where they are bound, for
+            // `atprobe`'s comparison with what the GPU read.)
+            if k == 1 && decal_check() != 0 {
+                note_decal_bufs(p, &b);
             }
             // Menu & HUD Size: the composite samples our scaled copy of the interface layer.
             if k == 1 {

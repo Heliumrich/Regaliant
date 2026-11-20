@@ -163,19 +163,20 @@ pub fn is_copy_hash(code_hash: u64) -> bool {
     code_hash != 0 && COPY_HASH.load(Ordering::Relaxed) == code_hash
 }
 
-pub fn note_dispatch(p: &Prepared, groups: [u32; 3], queue: &str) {
+pub fn note_dispatch(p: &Prepared, groups: [u32; 3], queue: &str) -> Option<(u64, u64)> {
     let h = COPY_HASH.load(Ordering::Acquire);
     if h == 0 || p.code_hash != h {
-        return;
+        return None;
     }
-    let Some(r) = roles(p) else { return };
-    let Some(Resolved::Buffer(dst)) = p.found.resources.get(r.dst) else { return };
+    let r = roles(p)?;
+    let Some(Resolved::Buffer(dst)) = p.found.resources.get(r.dst) else { return None };
     let bytes = (groups[0] as u64 * 64).min(dst.num_records as u64) * 4;
     let mut g = RECENT_COPIES.lock();
     if g.len() >= 512 {
         g.pop_front();
     }
     g.push_back((Arc::from(queue), dst.base, bytes, super::FRAMES.load(Ordering::Relaxed)));
+    Some((dst.base, bytes))
 }
 
 /// The recent copies over [a, a+n) (`RECENT_COPIES`), newest first.

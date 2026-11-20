@@ -142,6 +142,11 @@ pub fn status() -> String {
     if m[0] > 0 {
         out += &format!("    view masks walked by the title: {} walks waited for the GPU's writes ({} ms in all, {} after 100 ms)\n", m[0], m[1] / 1000, m[2]);
     }
+    let d: Vec<u64> = DECAL_WAITS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    if d[0] > 0 {
+        out += &format!("    static sections' decal masks walked by the title: {} walks, {} waited for the GPU's writes ({} ms in all, {} after 100 ms), {} with no GPU write known, {} blank at the walk (`decalwait` {})
+", d[0], d[1], d[2] / 1000, d[3], d[4], d[5], DECAL_WAIT.load(Ordering::Relaxed));
+    }
     if c.iter().any(|&x| x > 0) {
         out += &format!("    view masks at the reads against the culls' walk: {} the same, {} changed\n", c[0], c[1]);
         out += &format!("    cull masks at the draws against the culls' walk, word for word: {} the same, {} changed\n", MASK_CMP_DRAW[0].load(Ordering::Relaxed), MASK_CMP_DRAW[1].load(Ordering::Relaxed));
@@ -212,6 +217,62 @@ fn wait_masks(masks: &[(u64, u64)]) {
     MASK_WAITS[1].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
     if !ok {
         MASK_WAITS[2].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The static sections' projected decals (2026-11-20, the equipment menu's wall flicker): each
+/// section's decal cull (eboot+0xa20ce0, the "XPR_ProjectedDecalCull" job) has the GPU write a
+/// visibility mask, one bit a decal, and stores its pointer at the section's block + 0x160 of the
+/// render context's table; the section's decal draws (eboot+0xa20ca0 -> eboot+0xadabb0) walk it on
+/// the CPU, unfenced as the meshes' masks are. Read before our GPU's write landed, the mask held
+/// none or part of the section's decals: the walls lost their decals for a frame (a flat roughness
+/// layer and the lighting with it).
+/// Walks: [seen, waited, us, waits given up after 100 ms, no GPU write known, mask blank at the walk].
+static DECAL_WAITS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// The decal walks' wait (`decalwait off|on|sub`): 0 none (diagnosis), 1 for the GPU's writes in
+/// flight (the default), 2 first for the graphics command processor to take up the title's earlier
+/// submissions too.
+pub static DECAL_WAIT: AtomicU64 = AtomicU64::new(1);
+
+/// The title's draws of one static section's decals (eboot+0xa20cae, past the walk's early out:
+/// rdi the section, rsi the render context): wait for the GPU's writes of the section's decal mask.
+pub extern "sysv64" fn decal_mask_wait(regs: *const u64, _arg: u32) {
+    let r = |i: usize| unsafe { *regs.add(i) };
+    let (set, ctx) = (r(7), r(6));
+    DECAL_WAITS[0].fetch_add(1, Ordering::Relaxed);
+    let mode = DECAL_WAIT.load(Ordering::Relaxed);
+    let (Some(tab), Some(idx), Some(info)) = (rd64(ctx + 0x58), rd32(set + 0x198), rd64(set + 0x40)) else { return };
+    if tab == 0 || info == 0 {
+        return;
+    }
+    let (Some(mask), Some(count)) = (rd64(tab + 0x160 + idx as u64 * 0x2d0), rd32(info)) else { return };
+    if mask == 0 || count == 0 {
+        return;
+    }
+    let bytes = (count as u64).div_ceil(32) * 4;
+    if mode >= 2 {
+        let _ = crate::gpu::wait_gfx_caught_up(std::time::Duration::from_millis(100));
+    }
+    if mode >= 1 {
+        match crate::gpu::exec::pending_writes(mask, bytes) {
+            Some(seq) if seq > crate::gpu::exec::done_now() => {
+                let t = std::time::Instant::now();
+                let ok = crate::gpu::exec::wait_done_for(seq, std::time::Duration::from_millis(100));
+                DECAL_WAITS[1].fetch_add(1, Ordering::Relaxed);
+                DECAL_WAITS[2].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+                if !ok {
+                    DECAL_WAITS[3].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Some(_) => {}
+            None => {
+                DECAL_WAITS[4].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    if mask_words(mask, count as u64).is_some_and(|w| w.iter().all(|&x| x == 0)) {
+        DECAL_WAITS[5].fetch_add(1, Ordering::Relaxed);
     }
 }
 

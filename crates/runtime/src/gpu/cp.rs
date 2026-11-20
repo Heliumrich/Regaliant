@@ -4231,6 +4231,7 @@ impl Cp {
     /// 2026-11-01).
     fn past_wait_ok(&self, a: u64) -> bool {
         self.main_gfx
+           
             && !self.settling
             && self.held.is_none()
             && self.past.is_none()
@@ -6755,6 +6756,7 @@ impl Cp {
                         }
                         if valid(a, 12) {
                             let g = unsafe { [rd32(a), rd32(a + 4), rd32(a + 8)] };
+                            super::exec::note_cpu_args(self, g);
                             indirect_groups = Some(g);
                             // Captures: the two dwords after the group counts
                             // (titles keep item counts there).

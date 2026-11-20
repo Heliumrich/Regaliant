@@ -890,6 +890,21 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     _ => Err("usage: watch <slot 0-3> <hex address>|off [w|rw] [1|2|4|8] [all|guest]".into()),
                 }
             }
+            "watchwrites" => {
+                // Diagnosis: `watchwrites <hex lo>:<hex hi>` / `watchwrites off`: the GPU-side
+                // writers of that guest range logged from now on (`DS_WATCH_WRITES`'s notes).
+                let arg = parts.next().unwrap_or("");
+                let p = |x: &str| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok();
+                let r = if arg == "off" { Some(None) } else { arg.split_once(':').and_then(|(a, b)| Some(Some((p(a)?, p(b)?)))) };
+                match r {
+                    Some(r) => {
+                        gpu::exec::set_watch_range(r);
+                        info!("control: watchwrites {}", r.map_or("off".to_string(), |(a, b)| format!("{a:#x}..{b:#x}")));
+                        Ok(())
+                    }
+                    None => Err("usage: watchwrites <hex lo>:<hex hi>|off".into()),
+                }
+            }
             "emucheck" => {
                 // Diagnosis: `emucheck <hex shader>[,...][:<groups>]` / `emucheck off`.
                 let rest = line.trim_start().strip_prefix("emucheck").unwrap_or("").trim();
@@ -1046,6 +1061,25 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 // each entry checked against the live import windows.
                 info!("control: ptaudit at flip {flip}: {}", gpu::exec::pt_audit());
                 Ok(())
+            }
+            "decalwait" => {
+                // `decalwait off|on|sub` (A/B, `cullread::DECAL_WAIT`): the title's walks of the
+                // static sections' decal masks wait for the GPU's writes (`sub`: first for the
+                // graphics CP to take up the title's earlier submissions too).
+                let v = match parts.next().unwrap_or("") {
+                    "off" | "0" => Some(0),
+                    "on" | "1" => Some(1),
+                    "sub" | "2" => Some(2),
+                    _ => None,
+                };
+                match v {
+                    Some(v) => {
+                        cullread::DECAL_WAIT.store(v, std::sync::atomic::Ordering::Relaxed);
+                        info!("control: decalwait {v} at flip {flip}");
+                        Ok(())
+                    }
+                    None => Err("decalwait: off, on or sub".into()),
+                }
             }
             "maskwait" => {
                 // `maskwait off|on` (A/B, `cullread`): the title's walks of
@@ -1305,6 +1339,55 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     *hle::libs::videoout::PROBE.lock() = Some((n, u, v));
                 }
                 Ok(())
+            }
+            "skiprw" => {
+                // Diagnosis: `skiprw <hex image base>|off`: draws whose pixel stage writes the image
+                // at that base left out from now on (the G-buffer's in-place decals).
+                let arg = parts.next().unwrap_or("");
+                let v = if arg == "off" { Some(0) } else { u64::from_str_radix(arg.trim_start_matches("0x"), 16).ok() };
+                let lo = parts.next().and_then(|x| x.parse::<u64>().ok()).unwrap_or(0);
+                let hi = parts.next().and_then(|x| x.parse::<u64>().ok()).unwrap_or(u64::MAX);
+                match v {
+                    Some(v) => {
+                        *gpu::exec::draw::SKIP_RW_RANGE.lock() = (lo, hi);
+                        let was = gpu::exec::draw::SKIP_RW.swap(v, std::sync::atomic::Ordering::Relaxed);
+                        info!("control: skiprw {v:#x} (was {was:#x}; {} draws left out so far)", gpu::exec::draw::SKIP_RW_N.load(std::sync::atomic::Ordering::Relaxed));
+                        Ok(())
+                    }
+                    None => Err("usage: skiprw <hex image base>|off".into()),
+                }
+            }
+            "atprobe" => {
+                // Diagnosis: `atprobe <n> <hex cs> <hex image base> <u> <v>`: before each of the
+                // next n dispatches of that program (its earlier work completed), a 4x4 block at
+                // (u, v) of the GPU-written image at that base.
+                let n = parts.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(60).clamp(1, 20000);
+                let h = |x: &str| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok();
+                let cs: Vec<u64> = parts.next().unwrap_or("").split(',').filter_map(h).collect();
+                let base = parts.next().and_then(|x| if x == "0" { Some(0) } else { h(x) });
+                let u = parts.next().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.5);
+                let v = parts.next().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.5);
+                match base {
+                    Some(base) if !cs.is_empty() => {
+                        *gpu::exec::AT_PROBE.lock() = Some((n, cs, base, u, v));
+                        gpu::exec::start_mem_poll();
+                        Ok(())
+                    }
+                    _ => Err("usage: atprobe <n> <hex cs>[,<hex cs>...] <hex image base> <u> <v>".into()),
+                }
+            }
+            "atlasprobe" => {
+                // Diagnosis: `atlasprobe <flips> <hex base>`: at each of the next flips' TAA
+                // dispatch, the frame's work before it completed, each layer of the GPU-written
+                // image at that base sampled every 16th row: its covered texels and a hash.
+                let n = parts.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(60).clamp(1, 1200);
+                match parts.next().and_then(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok()) {
+                    Some(b) => {
+                        *gpu::exec::TAA_ATLAS_PROBE.lock() = Some((n, b));
+                        Ok(())
+                    }
+                    None => Err("usage: atlasprobe <flips> <hex base>".into()),
+                }
             }
             "metamap" => {
                 // Diagnosis: `metamap` logs every fast-clear metadata address and its surface.
