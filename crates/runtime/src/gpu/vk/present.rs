@@ -486,13 +486,16 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
 /// flips/s where a run with a window makes 62 (FINDINGS.md 2026-11-17 night). `tune
 /// headless_present 0` (`DS_HEADLESS_PRESENT=0`): none, as until then.
 ///
-/// An image is asked for with a fence, not a semaphore, and its flip presents it only once the
-/// fence says it is free (a later flip if not yet): the main queue never waits for the window
-/// system. And at most one present in `HIDDEN_GAP`. (2026-11-20: in the shader preparation's
-/// fast-forward, ~90 flips a second, a present blocked in the driver while holding the queue,
-/// its submission having made the main queue wait for an image the window system had not given
-/// back: the submission thread waited for the queue, the GPU idled, the game hung, and the
-/// process could not end; every run before had presented 60 a second at most.)
+/// It runs on a thread of its own (`gpu-hidden`, woken by each flip; the vblank thread never
+/// waits for it) and a queue of its own (`Ctx::present_queue`, a second queue of the graphics
+/// family; none on a device with one: then nothing is presented). Its image is asked for with
+/// a fence and presented only once free (a later flip if not yet), at most one in `HIDDEN_GAP`.
+/// (2026-11-20: presented from the vblank thread on the main queue, a present twice blocked in
+/// the driver while holding the main queue's lock, its own submission queued behind the main
+/// queue's work, which waited for submissions the submission thread could not make without that
+/// lock: the GPU idled, the game hung, and the ended process kept the driver's threads and its
+/// video memory until a restart; once at ~90 flips a second, once at 59.94 beside 19 compile
+/// threads.)
 struct Hidden {
     swapchain: vk::SwapchainKHR,
     cmds: Vec<vk::CommandBuffer>,
@@ -573,14 +576,50 @@ unsafe fn hidden_make() -> Result<Hidden, String> {
     }
 }
 
-/// A flip of a run without a window (`Hidden`): skipped while the frame slot's last
-/// submission or a free image is not there yet, or the last present was less than `HIDDEN_GAP`
-/// ago (nothing here waits, on the CPU or on the GPU).
+/// Flips seen by the vblank thread (`headless_present`), for the hidden present's thread.
+static HIDDEN_KICK: (parking_lot::Mutex<u64>, parking_lot::Condvar) = (parking_lot::Mutex::new(0), parking_lot::Condvar::new());
+static HIDDEN_THREAD: std::sync::Once = std::sync::Once::new();
+
+/// A flip of a run without a window: the hidden present's thread woken (started at the first),
+/// nothing waited for here.
 fn headless_present() {
     if !crate::gpu::tune::headless_present() || HIDDEN_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    HIDDEN_THREAD.call_once(|| {
+        if ctx().present_queue.is_none() {
+            crate::info!("present: no window and no second queue of the graphics family: nothing presented (the driver may keep the GPU's clock low)");
+            HIDDEN_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        let _ = crate::thread::spawn_host("gpu-hidden", 4 << 20, Box::new(|| {
+            crate::log::set_thread_name("gpu-hidden");
+            let mut seen = 0u64;
+            loop {
+                {
+                    let mut k = HIDDEN_KICK.0.lock();
+                    while *k == seen {
+                        HIDDEN_KICK.1.wait(&mut k);
+                    }
+                    seen = *k;
+                }
+                hidden_present_once();
+                if HIDDEN_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+            }
+        }));
+    });
+    *HIDDEN_KICK.0.lock() += 1;
+    HIDDEN_KICK.1.notify_one();
+}
+
+/// The hidden present's work for a flip (its own thread): skipped while the frame slot's last
+/// submission or a free image is not there yet, or the last present was less than `HIDDEN_GAP`
+/// ago (nothing here waits, on the CPU or on the GPU).
+fn hidden_present_once() {
     let c = ctx();
+    let Some(pq) = c.present_queue.as_ref() else { return };
     let mut g = HIDDEN.lock();
     if g.is_none() {
         match unsafe { hidden_make() } {
@@ -646,7 +685,7 @@ fn headless_present() {
         let scs = [h.swapchain];
         let idxs = [idx];
         let pi = vk::PresentInfoKHR::default().wait_semaphores(&signal).swapchains(&scs).image_indices(&idxs);
-        let q = c.queue.lock();
+        let q = pq.lock();
         if c.device.queue_submit(*q, &[si], h.fences[f]).is_ok() {
             let _ = c.swapchain_d.queue_present(*q, &pi);
             h.presented += 1;

@@ -20,6 +20,10 @@ pub struct Ctx {
     pub device: ash::Device,
     pub queue: Mutex<vk::Queue>,
     pub queue_family: u32,
+    /// A second queue of the graphics family, for the hidden present of runs without a window
+    /// (`present::Hidden`) alone: its submissions never wait behind the main queue's work and
+    /// its presents never hold the main queue's lock (None: the family has one queue).
+    pub present_queue: Option<Mutex<vk::Queue>>,
     pub mem_props: vk::PhysicalDeviceMemoryProperties,
     pub limits: vk::PhysicalDeviceLimits,
     pub surface_i: ash::khr::surface::Instance,
@@ -386,7 +390,11 @@ fn init_inner() -> Result<(), String> {
         } else {
             None
         };
-        let mut qci = vec![vk::DeviceQueueCreateInfo::default().queue_family_index(qf).queue_priorities(&prio)];
+        // (Two queues of the graphics family when it has them: the second for the hidden
+        // present, `Ctx::present_queue`.)
+        let prio2 = [1.0f32, 0.5];
+        let gfx_queues = instance.get_physical_device_queue_family_properties(pdev).get(qf as usize).map_or(1, |q| q.queue_count);
+        let mut qci = vec![vk::DeviceQueueCreateInfo::default().queue_family_index(qf).queue_priorities(if gfx_queues >= 2 { &prio2[..] } else { &prio[..] })];
         if let Some(f) = copy_family {
             qci.push(vk::DeviceQueueCreateInfo::default().queue_family_index(f).queue_priorities(&prio));
         }
@@ -794,6 +802,7 @@ fn init_inner() -> Result<(), String> {
             r2_supported.null_descriptor != 0
         );
         let queue = device.get_device_queue(qf, 0);
+        let present_queue = (gfx_queues >= 2).then(|| Mutex::new(device.get_device_queue(qf, 1)));
         let timeline = || {
             let mut tci = vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE).initial_value(0);
             device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut tci), None).map_err(|e| format!("timeline semaphore: {e}"))
@@ -892,6 +901,7 @@ fn init_inner() -> Result<(), String> {
             device,
             queue: Mutex::new(queue),
             queue_family: qf,
+            present_queue,
             mem_props,
             limits: props.limits,
             device_name,

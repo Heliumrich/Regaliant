@@ -240,10 +240,8 @@ pub fn setup(stage: Stage, cfg: &mut crate::Config) {
                 std::env::set_var(k, v);
             }
         }
-        match stage {
-            Stage::NewGame if std::env::var_os("DS_FLIP_GRID").is_none() => std::env::set_var("DS_FLIP_GRID", "0"),
-            Stage::Tour if fast_forward() && std::env::var_os("DS_VBLANK_HZ").is_none() => std::env::set_var("DS_VBLANK_HZ", FAST_HZ),
-            _ => {}
+        if stage == Stage::NewGame && std::env::var_os("DS_FLIP_GRID").is_none() {
+            std::env::set_var("DS_FLIP_GRID", "0");
         }
     }
     // The levels at the self-play's game speed (`level_speed`; the new game's screens at their own).
@@ -814,6 +812,15 @@ impl Play {
         }
         let s = WAIT_SKIPPED_S.load(Relaxed);
         crate::info!("prepare-play: the tour began at {:.0} s ({})", self.t0.elapsed().as_secs_f64(), if s > 0 { format!("its opening wait ended with {s} s left") } else { "its opening wait had ended by itself".to_string() });
+        // The fast-forward's frame rate from here on, the game in play (not from the boot: the
+        // opening wait counts frames, and at 120 a second it would end before a slow PC had
+        // loaded the save, the release review of 2026-11-20): the vblank thread's uncapped
+        // timer, flips at most `FAST_FPS` a second.
+        if fast_forward() {
+            crate::gpu::tune::set("uncapped", 1);
+            crate::gpu::tune::set("frame_cap", FAST_FPS);
+            crate::info!("prepare-play: the levels as a fast-forward: up to {FAST_FPS} frames a second");
+        }
         self.step("the levels");
         let (mut seen, mut fogs, mut levels) = (0usize, 0usize, 0usize);
         let mut last = GameClock::new();
@@ -946,8 +953,8 @@ struct LevelOpts {
 
 /// Whether the levels play as a fast-forward (`DS_PREPARE_FAST=0`: not, a test): each frame the
 /// game time of a frame at 60 a second (`gamestep::FIXED_FEED`), the automation's waits and the
-/// self-play's presses and sticks counted in frames (`input::FLIP_TIMED`), the frames as fast
-/// as the PC makes them up to `FAST_HZ` a second (the title's vblanks at that rate). What a
+/// self-play's presses and sticks counted in frames (`input::FLIP_TIMED`), and once the tour
+/// has begun the frames as fast as the PC makes them up to `FAST_FPS` a second. What a
 /// frame does stays; a PC above 60 frames a second plays the levels in less time, one below
 /// it in the same frames as before (2026-11-20: the levels had run at ~30 frames a second,
 /// their frame-counted waits twice as long as written).
@@ -955,10 +962,10 @@ fn fast_forward() -> bool {
     std::env::var("DS_PREPARE_FAST").ok().as_deref() != Some("0")
 }
 
-/// The fast-forward's frame limit (the title's vblank rate meanwhile): game time up to 4 times
-/// real time at the levels' speed of 2, so that streaming and the pipelines compiled in the
-/// background keep up.
-const FAST_HZ: &str = "120";
+/// The fast-forward's frame limit (set once the tour has begun, `Play::tour`): game time up to 4
+/// times real time at the levels' speed of 2, so that streaming and the pipelines compiled in
+/// the background keep up.
+const FAST_FPS: u64 = 120;
 
 /// The levels stage's game speed (`DS_PREPARE_SPEED`, 0.25 to 4; default 2).
 fn level_speed() -> f64 {

@@ -1972,7 +1972,7 @@ This happens when other software takes that range. Restart the PC and try again.
     // A session in progress (the launcher's: one left behind did not end normally). Runs of no
     // game write none (the launcher's check left its marker behind, then read as a session that
     // did not end normally, or replaced a running game's).
-    if cfg.precompile_all.is_none() && cfg.compile_bench.is_none() && !cfg.translation_fingerprint && cfg.prepare_play.is_none() {
+    if cfg.precompile_all.is_none() && cfg.compile_bench.is_none() && !cfg.translation_fingerprint && cfg.prepare_play.is_none() && cfg.pb_check.is_none() {
         let _ = std::fs::write(cfg.paths.running_marker(), format!("pid {}\nlog {}\n", std::process::id(), cfg.run_dir.display()));
     }
     log::set_thread_name("host");
@@ -2066,6 +2066,28 @@ This happens when other software takes that range. Restart the PC and try again.
     hle::kernel::time::init();
     // (Its samples are timed by the process clock.)
     guestprof::start_trace();
+    // Compiled pipelines and learned shader specs: local-data, or the
+    // `--cache` directory (Play.bat: one next to the package folder, so a
+    // new package starts with what earlier ones learned on this machine).
+    // Before the window: its Vulkan device reads the store's binaries mode
+    // (`pcache::binaries_off_for`; a windowed session had made its device
+    // before the store's folder was known and kept the binaries on where the
+    // store check had turned them off, the release review of 2026-11-20).
+    let cache_root = cfg.cache.clone().unwrap_or_else(|| cfg.paths.shaders());
+    if cfg.cache.is_some() {
+        hle::kernel::fs::ensure_dir(&cache_root);
+        info!("pipeline and shader-spec cache: {}", cache_root.display());
+    }
+    // DS_PIPELINE_DIR=<directory name under the cache>: another pipeline
+    // store (experiments that start without compiled pipelines).
+    let pipe_dir = std::env::var("DS_PIPELINE_DIR").ok().filter(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    // A translator switch makes other SPIR-V under the same pipeline keys:
+    // no pipeline store then unless one is named for the experiment.
+    match (pipe_dir, gpu::trcache::translator_switch()) {
+        (Some(d), _) => gpu::pcache::set_dir(cache_root.join(d)),
+        (None, Some(v)) => info!("pipeline store: off while {v} is set (DS_PIPELINE_DIR=<name> keeps one)"),
+        (None, None) => gpu::pcache::set_dir(cache_root.join("pipelines")),
+    }
     if !cfg.headless {
         if let Err(e) = gpu::vk::present::init("Regaliant - Demon's Souls") {
             warn!("no presentation window: {e}");
@@ -2112,24 +2134,6 @@ This happens when other software takes that range. Restart the PC and try again.
     // (a game session's: the shader preparation leaves them as they are).
     if cfg.precompile_all.is_none() && cfg.compile_bench.is_none() {
         hle::libs::savedata::init(pcsettings::saves::start(&cfg.paths, &hle::libs::savedata::title_id()));
-    }
-    // Compiled pipelines and learned shader specs: local-data, or the
-    // `--cache` directory (Play.bat: one next to the package folder, so a
-    // new package starts with what earlier ones learned on this machine).
-    let cache_root = cfg.cache.clone().unwrap_or_else(|| cfg.paths.shaders());
-    if cfg.cache.is_some() {
-        hle::kernel::fs::ensure_dir(&cache_root);
-        info!("pipeline and shader-spec cache: {}", cache_root.display());
-    }
-    // DS_PIPELINE_DIR=<directory name under the cache>: another pipeline
-    // store (experiments that start without compiled pipelines).
-    let pipe_dir = std::env::var("DS_PIPELINE_DIR").ok().filter(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
-    // A translator switch makes other SPIR-V under the same pipeline keys:
-    // no pipeline store then unless one is named for the experiment.
-    match (pipe_dir, gpu::trcache::translator_switch()) {
-        (Some(d), _) => gpu::pcache::set_dir(cache_root.join(d)),
-        (None, Some(v)) => info!("pipeline store: off while {v} is set (DS_PIPELINE_DIR=<name> keeps one)"),
-        (None, None) => gpu::pcache::set_dir(cache_root.join("pipelines")),
     }
     // Translations kept across runs (`gpu::trcache`).
     gpu::trcache::set_dir(cache_root.join("translations"));

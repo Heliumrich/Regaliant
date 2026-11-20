@@ -227,6 +227,56 @@ fn played_file(app: &App) -> PathBuf {
     app.paths.shaders().join("played.txt")
 }
 
+/// The translation, card and driver the store's compiled pipelines were made for (written at
+/// each preparation's start, `retire_stale_store`).
+fn store_identity_file(app: &App) -> PathBuf {
+    app.paths.shaders().join("store-identity.txt")
+}
+
+/// At a preparation's start: the store's compiled pipelines set aside when they were made for
+/// another translation, card or driver (the identity recorded at the last preparation's start,
+/// else the prepared marker's, else the self-play record's). They are of no use then (each would
+/// be compiled again at its first use), and the preparation's steps take a pipeline the store
+/// holds as made (`compbench::work_list`: after a driver update or a new version nothing would
+/// have been made again, the release review of 2026-11-20). The folder is renamed (at once)
+/// and deleted on a thread of its own; its binaries mode file (the store check's) is kept.
+fn retire_stale_store(app: &App) {
+    let (translation, device, driver) = identity();
+    if translation.is_empty() || device.is_empty() {
+        return;
+    }
+    let shaders = app.paths.shaders();
+    let get = |kv: &[(String, String)], k: &str| kv.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone()).unwrap_or_default();
+    let recorded = [store_identity_file(app), marker(app), played_file(app)].into_iter().map(|f| read_kv(&f)).find(|kv| !kv.is_empty());
+    if let Some(kv) = recorded {
+        let same = get(&kv, "translation") == translation && get(&kv, "device") == device && get(&kv, "driver") == driver;
+        let dir = shaders.join("pipelines");
+        if !same && dir.is_dir() {
+            let mode = std::fs::read(dir.join("binaries-mode.txt")).ok();
+            let old = shaders.join(format!("pipelines-old-{}", utc_stamp()));
+            if std::fs::rename(&dir, &old).is_ok() {
+                if let Some(m) = mode {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::fs::write(dir.join("binaries-mode.txt"), m);
+                }
+            }
+        }
+    }
+    // (Folders set aside before, this one included: deleted in the background.)
+    let olds: Vec<PathBuf> = std::fs::read_dir(&shaders).map(|r| r.flatten().map(|e| e.path()).filter(|p| p.is_dir() && p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("pipelines-old-"))).collect()).unwrap_or_default();
+    if !olds.is_empty() {
+        let _ = std::thread::Builder::new().name("old-pipelines".into()).spawn(move || {
+            for o in olds {
+                let _ = std::fs::remove_dir_all(o);
+            }
+        });
+    }
+    let _ = std::fs::write(
+        store_identity_file(app),
+        format!("# The translation, graphics card and driver the stored pipelines are made for; written by the launcher at a preparation's start\ntranslation = {translation}\ndevice = {device}\ndriver = {driver}\n"),
+    );
+}
+
 /// Whether the compute shaders are prepared for this graphics card, driver and translation; the
 /// status line.
 fn compute_state(app: &App) -> (bool, String) {
@@ -497,6 +547,7 @@ pub fn start(app: &mut App, play_after: bool) {
     }
     let _ = std::fs::create_dir_all(&dir);
     wait_check();
+    retire_stale_store(app);
     // (The next part of the levels when the new game was played for this version, card and
     // driver and the levels are not done; else, and when everything is done, the new game.)
     let p = played(app);
