@@ -157,6 +157,29 @@ pub const EXIT_DISK_FULL: i32 = 15;
 /// The shader store's folder refuses writes (`pcache::store_unwritable`): the step ends, the
 /// launcher tells the player and stops preparing.
 pub const EXIT_UNWRITABLE: i32 = 16;
+/// The progress file and the driver's last text for it (`Play::write_progress`).
+static PROGRESS: std::sync::Mutex<Option<(PathBuf, String)>> = std::sync::Mutex::new(None);
+
+/// The session's movement as the hang watch counts it: flips and first uses ended.
+fn movement() -> (u64, u64, u64) {
+    (crate::gpu::FRAMES.load(Relaxed), crate::gpu::exec::FIRST_USES[0].load(Relaxed), crate::gpu::exec::draw::GFX_FIRST_USES[0].load(Relaxed))
+}
+
+/// The progress file written whole: the driver's text, then a fourth line, the session's
+/// movement (its flips and first uses ended), rewritten by the hang watch whenever it moved. The
+/// launcher ends a step whose file stays the same for 15 minutes, and the driver's text alone
+/// stays the same through a long step on a slow PC (the release review of 2026-11-20 night).
+fn write_progress_file() {
+    let g = PROGRESS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((p, t)) = g.as_ref() {
+        let (f, c, gfx) = movement();
+        let tmp = p.with_extension("tmp");
+        if std::fs::write(&tmp, format!("{t}{}\n", f + c + gfx)).is_ok() {
+            let _ = std::fs::rename(&tmp, p);
+        }
+    }
+}
+
 /// How long nothing may move (no flip, no pipeline made, no item of the compute list made)
 /// before a self-play session counts as hung; before its first flip (the boot) `HANG_BOOT_SECS`.
 const HANG_SECS: u64 = 180;
@@ -173,7 +196,7 @@ fn watch_hangs() {
         // (The game's own progress: its flips and the first uses its command processors waited
         // for, which end one by one while a slow PC compiles in place; not the background list's
         // items, which move on beside a frozen game.)
-        let moved = || (crate::gpu::FRAMES.load(Relaxed), crate::gpu::exec::FIRST_USES[0].load(Relaxed), crate::gpu::exec::draw::GFX_FIRST_USES[0].load(Relaxed));
+        let moved = movement;
         let (mut last, mut since) = (moved(), Instant::now());
         let mut tick = Instant::now();
         loop {
@@ -194,6 +217,7 @@ fn watch_hangs() {
             let now = moved();
             if now != last {
                 (last, since) = (now, Instant::now());
+                write_progress_file();
                 continue;
             }
             let limit = if now.0 == 0 { HANG_BOOT_SECS } else { HANG_SECS };
@@ -638,10 +662,8 @@ impl Play {
             let (made, all) = (b[1].load(Relaxed), b[0].load(Relaxed));
             let bar = if self.tail && all > 0 { (made, all) } else { (self.done_steps as u64, self.total as u64) };
             let t = format!("{} {}\n{} {}\n{made} {all}\n", self.done_steps, self.total, bar.0, bar.1);
-            let tmp = p.with_extension("tmp");
-            if std::fs::write(&tmp, t).is_ok() {
-                let _ = std::fs::rename(&tmp, p);
-            }
+            *PROGRESS.lock().unwrap_or_else(|e| e.into_inner()) = Some((p.clone(), t));
+            write_progress_file();
         }
     }
 

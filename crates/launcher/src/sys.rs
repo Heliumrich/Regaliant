@@ -211,16 +211,28 @@ pub fn compute_threads() -> usize {
     threads().saturating_sub(1).min(by_mem).clamp(2, 32)
 }
 
+/// Whether process `pid` runs and is the game (`regaliant.exe`, or `dsport.exe` in a checkout): a
+/// running marker left by a session that crashed can name a process id Windows gave another
+/// program since (the release review of 2026-11-20 night).
 pub fn process_alive(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
-    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if h.is_null() {
             return false;
         }
         let mut code = 0u32;
-        let ok = GetExitCodeProcess(h, &mut code) != 0 && code == STILL_ACTIVE as u32;
+        let mut ok = GetExitCodeProcess(h, &mut code) != 0 && code == STILL_ACTIVE as u32;
+        if ok {
+            let mut buf = [0u16; 1024];
+            let mut n = buf.len() as u32;
+            if QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut n) != 0 {
+                let path = String::from_utf16_lossy(&buf[..n as usize]).to_ascii_lowercase();
+                let name = path.rsplit('\\').next().unwrap_or("");
+                ok = name == "regaliant.exe" || name == "dsport.exe";
+            }
+        }
         CloseHandle(h);
         ok
     }

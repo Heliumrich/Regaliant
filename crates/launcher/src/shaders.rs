@@ -139,6 +139,12 @@ pub fn start_check(app: &App) {
     }
     let exe = dsconfig::paths::game_exe_in(&app.paths.exe_dir);
     let dir = app.paths.exe_dir.clone();
+    // (`DS_SIM_CHECK_FAIL=1`, a test: the check gives no answer, as one whose driver call did not
+    // return or that failed.)
+    if std::env::var("DS_SIM_CHECK_FAIL").ok().as_deref() == Some("1") {
+        *CHECK.lock().unwrap_or_else(|e| e.into_inner()) = Some(Err("no answer (DS_SIM_CHECK_FAIL, a test)".into()));
+        return;
+    }
     std::thread::spawn(move || {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
@@ -219,21 +225,36 @@ pub enum Step {
 /// The levels' parts (sessions).
 const LEVEL_PARTS: u8 = 3;
 
-/// The steps' times on the development PC (2026-11-20, a fresh store): the yardsticks of the
-/// whole preparation's estimate (`estimate`). The preparation has no deadline since 2026-11-20
-/// (the user: slower PCs get every level and every compute program too, warned of the time): it
-/// plays every level and makes the whole compute list. Since 2026-11-20 evening the compute
-/// step comes between the new game and the levels: the list's rest (what the new game's play
-/// left) on its own, so that the levels' first dispatches find their pipelines in the store.
-const REF_NEWGAME: f64 = 285.0;
-const REF_PART: f64 = 1010.0;
-const REF_COMPUTE: f64 = 1200.0;
+/// The steps' times on the development PC (2026-11-20 night: the whole preparation through the
+/// launcher on a fresh store, 52.6 minutes: the new game 401 s, the compute step 1,111 s on 23
+/// threads, the levels' parts 373, 684 and 585 s): the yardsticks of the whole preparation's
+/// estimate (`estimate`). The preparation has no deadline since 2026-11-20 (the user: slower PCs
+/// get every level and every compute program too, warned of the time): it plays every level and
+/// makes the whole compute list. Since 2026-11-20 evening the compute step comes between the new
+/// game and the levels: the list's rest (what the new game's play left) on its own, so that the
+/// levels' first dispatches find their pipelines in the store.
+const REF_NEWGAME: f64 = 401.0;
+const REF_PART: f64 = 547.0;
+const REF_COMPUTE: f64 = 1111.0;
 /// The aim for the whole preparation: past it (and a tenth) the page says this PC takes longer.
 const AIM_SECS: f64 = 3600.0;
 /// A step whose progress has not changed for this long is ended (a backstop: the steps end
 /// themselves sooner when nothing moves in them, `prepplay::watch_hangs` and the compute step's
 /// watch; 45 minutes until 2026-11-20).
 const STALL_SECS: u64 = 15 * 60;
+
+/// The no-progress limit (`STALL_SECS`; `DS_SIM_STALL_SECS=<s>`, a test: that many seconds).
+fn stall_secs() -> u64 {
+    std::env::var("DS_SIM_STALL_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(STALL_SECS)
+}
+
+/// Ends the step's process (`DS_SIM_UNKILLABLE=1`, a test: does nothing, as for a process the
+/// graphics driver holds).
+fn kill_step(c: &mut Child) {
+    if std::env::var("DS_SIM_UNKILLABLE").ok().as_deref() != Some("1") {
+        let _ = c.kill();
+    }
+}
 
 impl Step {
     /// The self-play stage (None: the compute step).
@@ -329,6 +350,9 @@ pub struct Page {
     /// The step before failed (hung, crashed, the graphics card lost, memory), after its one more
     /// try: one more failure ends the preparation (`tick`).
     last_failed: bool,
+    /// When the launcher ended the step's process (a stop past 90 s, no progress): one that has
+    /// not ended 30 s later is left behind (`tick`).
+    killed_at: Option<Instant>,
 }
 
 fn h(v: usize) -> HWND {
@@ -363,8 +387,13 @@ fn store_identity_file(app: &App) -> PathBuf {
 /// and deleted on a thread of its own; its binaries mode file (the store check's) is kept.
 fn retire_stale_store(app: &App) -> bool {
     let (translation, device, driver) = identity();
+    // (The game's check did not answer, or not yet: the store's pipelines cannot be told stale,
+    // so none is taken as made (each goes through the store's own check, which makes a stale one
+    // again; the release review of 2026-11-20 night: after a driver update a slow check had left
+    // the stale ones trusted).)
     if translation.is_empty() || device.is_empty() {
-        return true;
+        log(app, "the game's check gave no translation or graphics card: no stored pipeline taken as made");
+        return false;
     }
     let mut trusted = true;
     let shaders = app.paths.shaders();
@@ -666,7 +695,7 @@ pub fn build(app: &mut App) {
     let b: Builder = app.builder();
     unsafe {
         let r = (16, 62, 748, 62);
-        app.put(2, b.label("The game compiles each shader the first time it needs it, which makes play stutter. Preparing them here lets the game play by itself in the background: a new game, then every level with its enemies and bosses. Nothing of it shows or sounds, but the graphics card is busy. It takes about 30 to 60 minutes on most PCs, once. A slower PC takes longer, and this page then says how long.", r, -1), r);
+        app.put(2, b.label("The game compiles each shader the first time it needs it, which makes play stutter. Preparing them here lets the game play by itself in the background: a new game, then every level with its enemies and bosses. Nothing of it shows or sounds, but the graphics card is busy. It takes about an hour once on a fast PC, and longer on others. This page then says how long.", r, -1), r);
         let r = (16, 134, 748, 40);
         app.shaders.status = app.put(2, b.label("", r, -1), r) as usize;
         let r = (16, 178, 748, 20);
@@ -962,10 +991,28 @@ pub fn tick(app: &mut App) {
         Err(_) => Some(-1),
     };
     // (A stop that takes too long: the child is ended.)
-    if exited.is_none() && app.shaders.stopping.is_some_and(|t| t.elapsed().as_secs() > 90) {
-        let _ = child.kill();
+    if exited.is_none() && app.shaders.stopping.is_some_and(|t| t.elapsed().as_secs() > 90) && app.shaders.killed_at.is_none() {
+        kill_step(child);
+        app.shaders.killed_at = Some(Instant::now());
     }
     let step = app.shaders.step.unwrap_or(Step::Compute);
+    // (Ended, but its process does not go: a thread of it stuck in the graphics driver keeps it,
+    // and its video memory, until Windows restarts (seen 2026-11-20). Left behind after 30 s:
+    // the preparation ends, the player told to restart, and Play's game started (the release
+    // review of 2026-11-20 night: the launcher had waited for it for ever).)
+    if exited.is_none() && app.shaders.killed_at.is_some_and(|t| t.elapsed().as_secs() > 30) {
+        log(app, &format!("step {step:?}: its process did not end 30 s after it was ended (held by the graphics driver?): left behind"));
+        app.shaders.child = None;
+        app.shaders.killed_at = None;
+        app.shaders.stopping = None;
+        app.shaders.stalled = false;
+        record_outcome(app, "a step of it could not be ended (the graphics driver holds it). Restart the PC before you play");
+        finish(app, None);
+        if std::mem::take(&mut app.shaders.then_play) | std::mem::take(&mut app.shaders.play_after) {
+            crate::start_game(app);
+        }
+        return;
+    }
     // (A step whose progress has not changed for `STALL_SECS`: hung, ended. Its numbers, not the
     // file's time: the compute step writes the file every second, the review of 2026-11-20. A gap
     // of over 10 s between ticks, the PC asleep, starts that time again.)
@@ -975,11 +1022,12 @@ pub fn tick(app: &mut App) {
         let content = std::fs::read_to_string(progress_file(app)).unwrap_or_default();
         match &app.shaders.progress_seen {
             Some((seen, at)) if *seen == content && !slept => {
-                if at.elapsed().as_secs() > STALL_SECS && !app.shaders.stalled {
+                if at.elapsed().as_secs() > stall_secs() && !app.shaders.stalled {
                     app.shaders.stalled = true;
-                    log(app, &format!("step {step:?}: no progress for {} minutes: ended", STALL_SECS / 60));
+                    log(app, &format!("step {step:?}: no progress for {} s: ended", stall_secs()));
                     if let Some(c) = app.shaders.child.as_mut() {
-                        let _ = c.kill();
+                        kill_step(c);
+                        app.shaders.killed_at = Some(Instant::now());
                     }
                 }
             }
@@ -988,6 +1036,7 @@ pub fn tick(app: &mut App) {
     }
     if let Some(code) = exited {
         app.shaders.child = None;
+        app.shaders.killed_at = None;
         let secs = app.shaders.started.map_or(0.0, |s| s.elapsed().as_secs_f64());
         let _ = std::fs::remove_file(progress_file(app).with_extension("stop"));
         let asked = app.shaders.stopping.take().is_some();
@@ -998,7 +1047,7 @@ pub fn tick(app: &mut App) {
         let code = if stopped && code != 0 { STAGE_STOPPED } else { code };
         log(app, &format!("step {step:?} ended: status {} after {secs:.0} s{}", code_text(code), if app.shaders.stalled { " (ended: no progress)" } else if paused { " (stopped for a game started meanwhile)" } else if code == STAGE_HUNG { " (it found itself hung: its log has the threads' stacks)" } else { "" }));
         // (What happened, in the player's words: the outcome and the notes.)
-        let why = if std::mem::take(&mut app.shaders.stalled) { format!("it made no progress for {} minutes", STALL_SECS / 60) } else { reason(code) };
+        let why = if std::mem::take(&mut app.shaders.stalled) { format!("it made no progress for {} minutes", stall_secs() / 60) } else { reason(code) };
         // (Another game session held the player's folder: the step did not run.)
         if code == GAME_RUNNING {
             // (Its own previous step's session still ending: the step again 3 s later, 10 times
@@ -1139,6 +1188,11 @@ pub fn tick(app: &mut App) {
                 }
             }
             finish(app, None);
+            // (Play starts the game: the release review of 2026-11-20 night, the step after the
+            // check not begun had left Play doing nothing.)
+            if std::mem::take(&mut app.shaders.play_after) {
+                crate::start_game(app);
+            }
             return;
         }
         let next = match step {
@@ -1176,7 +1230,7 @@ pub fn tick(app: &mut App) {
         // (A stage that could not go on: what it learned is kept, and the game can be played.)
         let note = (code != 0 && step != Step::Compute).then(|| format!("The game's self-play could not finish: {why}. Some graphics shaders are learned only while you play. Open logs shows its log."));
         finish(app, note);
-        if std::mem::take(&mut app.shaders.play_after) && prepared(app) {
+        if std::mem::take(&mut app.shaders.play_after) {
             crate::start_game(app);
         }
         return;
@@ -1205,7 +1259,7 @@ pub fn tick(app: &mut App) {
         };
         let (budget, slow) = match estimate(app, step, frac, cl) {
             Some((left, all)) if all > AIM_SECS * 1.1 => (
-                format!(" This PC takes longer than most: about {} minutes in all, {} more. Stop keeps what is done, and Prepare now goes on from there.", (all / 60.0).ceil() as u64, (left / 60.0).ceil().max(1.0) as u64),
+                format!(" Preparing takes longer on this PC: about {} minutes in all, {} more. Stop keeps what is done, and Prepare now goes on from there.", (all / 60.0).ceil() as u64, (left / 60.0).ceil().max(1.0) as u64),
                 Some((left / 60.0).ceil().max(1.0) as u64),
             ),
             Some((left, _)) => (format!(" About {} minutes left in all.", (left / 60.0).ceil().max(1.0) as u64), None),
@@ -1222,7 +1276,7 @@ pub fn tick(app: &mut App) {
         if let Some(m) = slow {
             if !app.shaders.slow_noted {
                 app.shaders.slow_noted = true;
-                app.set_status(&format!("This PC prepares the shaders more slowly than most: about {m} more minutes. The Shaders page shows the progress."));
+                app.set_status(&format!("Preparing the shaders takes longer on this PC: about {m} more minutes. The Shaders page shows the progress."));
             }
         }
         unsafe {

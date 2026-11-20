@@ -38,7 +38,8 @@ Getting started
    "More info", then "Run anyway". The programs are not code-signed.
 3. On the Game page, choose the game folder. The launcher checks it and says what is missing.
 4. Click Play. The first time, the launcher prepares the game's shaders before the game
-   starts. This takes about 20 to 60 minutes once. You can turn it off on the Shaders page.
+   starts. This takes about an hour once on a fast PC, longer on others (the Shaders page
+   says how long). You can turn it off on the Shaders page.
 
 
 Controls
@@ -118,8 +119,9 @@ The launcher
 - Shaders: prepares the game's shaders ahead. Without them the game compiles each shader the
   first time it needs it. An object can then be missing for a moment, and some compiles make
   play stutter. Prepared shaders make the stutters much shorter, but some remain on first
-  visits. They hold for one graphics card and driver. After a driver update, or a port update
-  that needs it, the launcher asks to prepare them again.
+  visits. They hold for one graphics card and driver. After a graphics driver update or a port
+  update, the launcher compiles them again without the game playing again. If preparing cannot
+  finish on your PC, the Shaders page says why, and Play starts the game.
 - Saves: the save folder and the backups the game makes. The game copies each save before a
   session first changes it. "Restore..." puts a backup back. The save as it is now is kept
   as a backup first.
@@ -142,7 +144,9 @@ When something goes wrong
 The game tells you when it cannot go on, for example when the graphics card stops responding.
 It then closes and names its log folder. Please report the problem on the project's GitHub
 issues page and attach that session's log folder (dsport.log, and crash.txt when there is
-one). If the game does not start at all, try safe mode in the launcher.
+one). If the game does not start at all, try safe mode in the launcher. For a problem with the
+shader preparation, attach the whole logs folder (Open logs): launcher.log and a folder for
+each of its steps.
 
 
 System requirements

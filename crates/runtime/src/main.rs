@@ -1376,6 +1376,7 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 match base {
                     Some(base) if !cs.is_empty() => {
                         *gpu::exec::AT_PROBE.lock() = Some((n, cs, base, u, v));
+                        gpu::exec::AT_PROBE_ON.store(true, std::sync::atomic::Ordering::Relaxed);
                         gpu::exec::start_mem_poll();
                         Ok(())
                     }
@@ -1895,6 +1896,21 @@ fn system_line() -> String {
 /// One game session at a time for a data folder (two would share saves, settings and the
 /// shader store): a second start is told and ends. Modes that run no game are not counted.
 fn single_instance(cfg: &Config) {
+    // (The launcher's compute step and store check take no lock (a game started meanwhile asks
+    // them to stop, `ask_preparation_to_stop`), but do not begin beside a game session: a game
+    // started on its own during the store check (which writes no progress file) found nothing to
+    // stop, and the compute step after it ran on all CPUs beside the player's game; the release
+    // review of 2026-11-20 night. They end with EXIT_RUNNING, which the launcher handles.)
+    if (cfg.precompile_all.is_some() && cfg.progress.is_some()) || cfg.pb_check.is_some() {
+        use windows_sys::Win32::System::Threading::{OpenMutexW, SYNCHRONIZE};
+        let h = unsafe { OpenMutexW(SYNCHRONIZE, 0, instance_name(cfg).as_ptr()) };
+        if !h.is_null() {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(h) };
+            info!("a game session runs with this data folder: this step does not begin");
+            log::flush();
+            std::process::exit(EXIT_RUNNING as i32);
+        }
+    }
     // (The launcher's translation check runs no game either and ends before any part of a
     // session's start-up: holding the lock, it turned away a Play pressed while it ran,
     // 2026-11-14.)
@@ -1903,11 +1919,7 @@ fn single_instance(cfg: &Config) {
     }
     use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
     use windows_sys::Win32::System::Threading::CreateMutexW;
-    // (Named by the data folder: a checkout and a player's install do not exclude each other. The
-    // shader preparation's self-play takes the player's: it shares their shader store.)
-    let user = prepplay::player_user().unwrap_or(&cfg.paths.user);
-    let key: String = user.display().to_string().chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).collect();
-    let name: Vec<u16> = format!("Local\\Regaliant_{key}").encode_utf16().chain(std::iter::once(0)).collect();
+    let name = instance_name(cfg);
     // A game started while the shader preparation runs (hidden: from the launcher, or started
     // on its own beside it): the preparation is asked to stop, as the launcher's Stop asks (its
     // stop file; it goes on from there the next time), and its hold on the data folder waited
@@ -1930,12 +1942,19 @@ fn single_instance(cfg: &Config) {
     }
     if !h.is_null() && unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         error!("another game session runs with the same data folder: this start ends");
-        // (Its running marker, written before this check, is this start's: removed.)
-        session_ended();
         player_error("The game is already running.");
         log::flush();
         std::process::exit(EXIT_RUNNING as i32);
     }
+}
+
+/// The one-session lock's name (`single_instance`): named by the data folder, so a checkout and a
+/// player's install do not exclude each other. The shader preparation's self-play takes the
+/// player's: it shares their shader store.
+fn instance_name(cfg: &Config) -> Vec<u16> {
+    let user = prepplay::player_user().unwrap_or(&cfg.paths.user);
+    let key: String = user.display().to_string().chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).collect();
+    format!("Local\\Regaliant_{key}").encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// A shader preparation step seems to run (its progress file written in the last 2 minutes): its
@@ -2146,12 +2165,6 @@ This happens when other software takes that range. Restart the PC and try again.
         std::process::exit(1);
     }
     RUN_DIR.set(cfg.run_dir.clone()).ok();
-    // A session in progress (the launcher's: one left behind did not end normally). Runs of no
-    // game write none (the launcher's check left its marker behind, then read as a session that
-    // did not end normally, or replaced a running game's).
-    if cfg.precompile_all.is_none() && cfg.compile_bench.is_none() && !cfg.translation_fingerprint && cfg.prepare_play.is_none() && cfg.pb_check.is_none() {
-        let _ = std::fs::write(cfg.paths.running_marker(), format!("pid {}\nlog {}\n", std::process::id(), cfg.run_dir.display()));
-    }
     log::set_thread_name("host");
     // Panics (host threads abort the process) are logged with the thread
     // that panicked: the run log is what post-mortems read.
@@ -2187,6 +2200,14 @@ This happens when other software takes that range. Restart the PC and try again.
     }
     cpucheck::check();
     single_instance(&cfg);
+    // A session in progress (the launcher's: one left behind did not end normally), written once
+    // this start holds the data folder (written before the check, a second start replaced the
+    // running game's marker and then deleted it: the release review of 2026-11-20 night). Runs
+    // of no game write none (the launcher's check left its marker behind, then read as a session
+    // that did not end normally, or replaced a running game's).
+    if cfg.precompile_all.is_none() && cfg.compile_bench.is_none() && !cfg.translation_fingerprint && cfg.prepare_play.is_none() && cfg.pb_check.is_none() {
+        let _ = std::fs::write(cfg.paths.running_marker(), format!("pid {}\nlog {}\n", std::process::id(), cfg.run_dir.display()));
+    }
     // (Its driver reads the log from here on; the title reads the tour's automation at its boot.)
     prepplay::start(&cfg.app);
     exception::install();
@@ -2326,7 +2347,10 @@ This happens when other software takes that range. Restart the PC and try again.
     pcsettings::init(cfg.paths.settings_file(), cfg.safe_mode);
     // The saves: the PC tab's Save Folder (the port's own by default), a PS5 import asked for
     // (a game session's: the shader preparation leaves them as they are).
-    if cfg.precompile_all.is_none() && cfg.compile_bench.is_none() {
+    // (Not the store check either: it runs without the one-session lock, and a pending Save
+    // Folder move or PS5 import applied there would run beside a game started on its own; the
+    // release review of 2026-11-20 night.)
+    if cfg.precompile_all.is_none() && cfg.compile_bench.is_none() && cfg.pb_check.is_none() {
         hle::libs::savedata::init(pcsettings::saves::start(&cfg.paths, &hle::libs::savedata::title_id()));
     }
     // Translations kept across runs (`gpu::trcache`).

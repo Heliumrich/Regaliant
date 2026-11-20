@@ -10,7 +10,7 @@ player's own game files on Windows.
 - A launcher checks the game files and their version, sets the display (window mode, monitor,
   resolution, refresh rate, render scale, frame rate limit), prepares the shaders ahead (the game
   plays a new game and then its levels, enemies, bosses and cutscenes by itself in the background,
-  hidden and silent, within an hour), lists save backups and restores them, and starts the game. It also offers a safe mode, a settings reset and
+  hidden and silent: about an hour once on a fast PC, longer on others), lists save backups and restores them, and starts the game. It also offers a safe mode, a settings reset and
   a button that opens the Discord invite.
 - PC settings inside the game's own menus (SETTINGS > PC): window mode with monitor, resolution and
   refresh rate, HDR, aspect ratios up to 32:9, render scale, sharpening, quality presets,
@@ -28,5 +28,10 @@ player's own game files on Windows.
   refresh rate, with G-SYNC and FreeSync in borderless and exclusive fullscreen.
 - Shaders the launcher did not prepare compile in the background where that is safe: an object
   can be missing for a moment instead of the game pausing.
+- The shader preparation looks after itself: a step that stops responding or crashes runs once
+  more, and when preparing cannot finish on a PC (no usable graphics card, a full drive, steps
+  that keep failing) the launcher says why and Play starts the game. An interrupted preparation
+  goes on where it stopped, and after a graphics driver or port update only the compile is done
+  again.
 - Trophies as achievements with a pop-up and a list.
 - Saves are backed up before each session changes them.

@@ -12881,6 +12881,9 @@ pub static TAA_IMG_PROBE: parking_lot::Mutex<Option<(u32, f32, f32)>> = parking_
 /// `atprobe <n> <hex cs> <hex base> <u> <v>` (diagnosis): dispatches left, the program, the image's
 /// base and the block's place.
 pub static AT_PROBE: parking_lot::Mutex<Option<(u32, Vec<u64>, u64, f32, f32)>> = parking_lot::Mutex::new(None);
+/// A probe is armed (`AT_PROBE`): every compute dispatch looks only then (it took the lock each
+/// time, across the recording threads; the release review of 2026-11-20 night).
+pub static AT_PROBE_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `DS_MEM_POLL=<hex address>:<bytes>` (diagnosis, 2026-11-20): from the first `atprobe` on, a
 /// thread reads that guest range as fast as it can (one core) and logs each change it sees
@@ -20787,7 +20790,7 @@ impl Exec {
         // (`atprobe <n> <hex cs> <hex image base> <u> <v>` (diagnosis): before each of the next n
         // dispatches of that program, the frame's work before it completed, a 4x4 block of the
         // image at that base.)
-        if !self.held {
+        if !self.held && AT_PROBE_ON.load(Ordering::Relaxed) {
             let take = {
                 let mut g = AT_PROBE.lock();
                 match g.as_mut() {
@@ -20796,6 +20799,7 @@ impl Exec {
                         q.0 = q.0.saturating_sub(1);
                         if q.0 == 0 {
                             *g = None;
+                            AT_PROBE_ON.store(false, Ordering::Relaxed);
                         }
                         Some(r)
                     }

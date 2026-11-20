@@ -271,9 +271,24 @@ pub extern "sysv64" fn decal_mask_wait(regs: *const u64, _arg: u32) {
             }
         }
     }
-    if mask_words(mask, count as u64).is_some_and(|w| w.iter().all(|&x| x == 0)) {
+    // (Read in place: an allocation a walk, in normal play, for this counter only, and a count
+    // read from guest memory unbounded; the release review of 2026-11-20 night.)
+    if mask_blank(mask, count as u64) {
         DECAL_WAITS[5].fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Whether the first `count` bits at `m` (at most 65,536) are all clear, read in place.
+fn mask_blank(m: u64, count: u64) -> bool {
+    if count == 0 || count > 1 << 16 {
+        return false;
+    }
+    let words = count.div_ceil(64) as usize;
+    if !crate::gpu::cp::guest_readable(m, 8 * words as u64) {
+        return false;
+    }
+    let w = unsafe { std::slice::from_raw_parts(m as *const u64, words) };
+    w.iter().enumerate().all(|(k, &x)| x & if (k as u64 + 1) * 64 <= count { u64::MAX } else { (1u64 << (count % 64)) - 1 } == 0)
 }
 
 /// Diagnosis (`DS_CULLREAD_DIAG`): per view mask (its address), the bits the culls' walk found;
