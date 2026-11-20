@@ -99,6 +99,43 @@ struct Setup {
 /// (never past the deadline).
 const COMPUTE_TAIL: Duration = Duration::from_secs(300);
 
+/// A wait's time as the stages count it: it runs only while the game flips. A game frozen (a
+/// shader compiled in place for seconds on a slow PC, a load from a slow disk) extends every
+/// wait and sleep by as long, at most `FROZEN_MAX` a wait (the other PC's first sessions froze
+/// 3-21 s at a time in the menus, 2026-11-19: fixed waits would have given up there).
+struct GameClock {
+    start: Instant,
+    last: Instant,
+    flip: u64,
+    frozen: Duration,
+}
+
+/// The longest a frozen game extends one wait.
+const FROZEN_MAX: Duration = Duration::from_secs(900);
+
+impl GameClock {
+    fn new() -> GameClock {
+        let now = Instant::now();
+        GameClock { start: now, last: now, flip: crate::hle::libs::videoout::QUEUED_FLIP.load(Relaxed), frozen: Duration::ZERO }
+    }
+
+    /// The wait's time so far, without the spans in which the game flipped nothing.
+    fn elapsed(&mut self) -> Duration {
+        let now = Instant::now();
+        let f = crate::hle::libs::videoout::QUEUED_FLIP.load(Relaxed);
+        if f == self.flip {
+            self.frozen += now - self.last;
+        } else {
+            self.flip = f;
+        }
+        self.last = now;
+        (now - self.start).saturating_sub(self.frozen.min(FROZEN_MAX))
+    }
+}
+
+/// Spans of the stages' waits the game spent frozen, in all (the stage's summary line).
+static FROZEN_TOTAL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Whether the preparation's deadline has passed.
 fn past_deadline() -> bool {
     SETUP.get().and_then(|s| s.deadline).is_some_and(|d| std::time::SystemTime::now() >= d)
@@ -326,7 +363,13 @@ pub fn start(app: &Path) {
     }
 }
 
+/// A finished wait's frozen spans into the total (the stage's summary line).
+fn note_frozen(c: &GameClock) {
+    FROZEN_TOTAL_MS.fetch_add(c.frozen.as_millis() as u64, Relaxed);
+}
+
 fn end(code: i32) -> ! {
+    crate::info!("prepare-play: the game was frozen for {:.0} s of the stage's waits in all (their time ran on)", FROZEN_TOTAL_MS.load(Relaxed) as f64 / 1000.0);
     crate::shutdown(code)
 }
 
@@ -444,27 +487,33 @@ impl Play {
         Ok(())
     }
 
+    /// Sleeps `secs` of the game's time (`GameClock`: a frozen game's spans not counted).
     fn sleep(&mut self, secs: f64) -> Result<(), End> {
-        let until = Instant::now() + Duration::from_secs_f64(secs);
+        let want = Duration::from_secs_f64(secs);
+        let mut c = GameClock::new();
         loop {
             self.check_stop()?;
-            let now = Instant::now();
-            if now >= until {
+            let e = c.elapsed();
+            if e >= want {
+                note_frozen(&c);
                 return Ok(());
             }
-            std::thread::sleep((until - now).min(Duration::from_millis(250)));
+            std::thread::sleep((want - e).min(Duration::from_millis(100)));
         }
     }
 
     /// Waits up to `secs` for a line matching `pat` from line `at` on.
     fn wait_for(&mut self, pat: &str, at: usize, secs: f64) -> Result<bool, End> {
-        let until = Instant::now() + Duration::from_secs_f64(secs);
+        let want = Duration::from_secs_f64(secs);
+        let mut c = GameClock::new();
         loop {
             if self.w.found(pat, at) {
+                note_frozen(&c);
                 return Ok(true);
             }
             self.check_stop()?;
-            if Instant::now() >= until {
+            if c.elapsed() >= want {
+                note_frozen(&c);
                 return Ok(false);
             }
             std::thread::sleep(Duration::from_millis(250));
@@ -494,7 +543,8 @@ impl Play {
     /// In the game: HUD scenes up and no menu open (`uistate`), for two seconds running, or
     /// `hud_text` logged since `at`.
     fn wait_in_game(&mut self, at: usize, hud_text: &str, secs: f64) -> Result<bool, End> {
-        let until = Instant::now() + Duration::from_secs_f64(secs);
+        let want = Duration::from_secs_f64(secs);
+        let mut c = GameClock::new();
         let mut since: Option<Instant> = None;
         loop {
             if self.w.found(hud_text, at) {
@@ -508,7 +558,8 @@ impl Play {
                 _ => {}
             }
             self.check_stop()?;
-            if Instant::now() >= until {
+            if c.elapsed() >= want {
+                note_frozen(&c);
                 return Ok(false);
             }
             std::thread::sleep(Duration::from_millis(250));
@@ -517,13 +568,27 @@ impl Play {
 
     /// The pipelines queued for the background graphics workers made (at most `secs`): they are
     /// kept as they are made, and this session ends after them.
+    /// (`secs`: at least that long a wait; past it the wait goes on while a pipeline is made at
+    /// least every 5 minutes: a slower PC's queue made whole.)
     fn drain(&mut self, secs: u64) {
         let s = &crate::gpu::exec::draw::ASYNC_GFX_STATS;
         // (The workers' own state: their statistics leave out jobs dropped as made meanwhile, and
         // the arithmetic of them never reached 0, the whole limit waited at every end.)
         let idle = crate::gpu::exec::draw::async_gfx_idle;
         let t = Instant::now();
-        while !idle() && t.elapsed() < Duration::from_secs(secs) && self.check_stop().is_ok() {
+        let (mut made, mut moved, mut shown) = (s[3].load(Relaxed), Instant::now(), Instant::now());
+        while !idle() && self.check_stop().is_ok() {
+            let m = s[3].load(Relaxed);
+            if m != made {
+                (made, moved) = (m, Instant::now());
+            }
+            if t.elapsed() >= Duration::from_secs(secs) && moved.elapsed() >= Duration::from_secs(300) {
+                break;
+            }
+            if shown.elapsed() >= Duration::from_secs(5) {
+                self.write_progress();
+                shown = Instant::now();
+            }
             std::thread::sleep(Duration::from_millis(250));
         }
         crate::info!("prepare-play: {} graphics pipelines queued, {} made, {} failed; the workers {} ({:.0} s waited)", s[1].load(Relaxed), s[3].load(Relaxed), s[7].load(Relaxed), if idle() { "idle" } else { "still busy" }, t.elapsed().as_secs_f64());
@@ -531,13 +596,16 @@ impl Play {
 
     /// Waits up to `secs` for a line matching any of `pats` from line `at` on.
     fn wait_any(&mut self, pats: &[&str], at: usize, secs: f64) -> Result<bool, End> {
-        let until = Instant::now() + Duration::from_secs_f64(secs);
+        let want = Duration::from_secs_f64(secs);
+        let mut c = GameClock::new();
         loop {
             if pats.iter().any(|p| self.w.found(p, at)) {
+                note_frozen(&c);
                 return Ok(true);
             }
             self.check_stop()?;
-            if Instant::now() >= until {
+            if c.elapsed() >= want {
+                note_frozen(&c);
                 return Ok(false);
             }
             std::thread::sleep(Duration::from_millis(250));
@@ -683,7 +751,7 @@ impl Play {
         }
         self.step("the levels");
         let (mut seen, mut fogs, mut levels) = (0usize, 0usize, 0usize);
-        let mut last = Instant::now();
+        let mut last = GameClock::new();
         // Presses of Cross still to come at a fog door (a press while the player still moves
         // may not take: -214433's 2-2 door kept its prompt).
         let mut fog_presses: Vec<Instant> = Vec::new();
@@ -699,7 +767,8 @@ impl Play {
                 }
                 self.write_progress();
                 seen = n;
-                last = Instant::now();
+                note_frozen(&last);
+                last = GameClock::new();
             }
             // A boss's fog door: its prompt pressed (the script prints `dsport-textreset` before
             // each door, so each prompt is logged again).
@@ -728,6 +797,7 @@ impl Play {
             }
             // (A level load and its resources take ~10-60 s; a step that never ends is a stall.)
             if last.elapsed() > Duration::from_secs(600) {
+                note_frozen(&last);
                 return Err(End::Failed(format!("the levels stopped after {seen} steps")));
             }
             self.sleep(0.25)?;
@@ -744,8 +814,22 @@ impl Play {
         let t = Instant::now();
         let left = || b[0].load(Relaxed).saturating_sub(b[1].load(Relaxed));
         crate::info!("prepare-play: the background compute preparation has {} of {} items left", left(), b[0].load(Relaxed));
-        let tail = time_left().map_or(COMPUTE_TAIL, |l| l.min(COMPUTE_TAIL));
-        while (b[0].load(Relaxed) == 0 || left() > 0) && t.elapsed() < tail {
+        // (No deadline: until every item is made, while one is made at least every 10 minutes:
+        // a slower PC gets them all. With a deadline: at most `COMPUTE_TAIL`, never past it.)
+        let tail = time_left().map(|l| l.min(COMPUTE_TAIL));
+        let (mut made, mut moved) = (b[1].load(Relaxed) + b[2].load(Relaxed), Instant::now());
+        while b[0].load(Relaxed) == 0 || left() > 0 {
+            if tail.is_some_and(|tl| t.elapsed() >= tl) {
+                break;
+            }
+            let m = b[1].load(Relaxed) + b[2].load(Relaxed);
+            if m != made {
+                (made, moved) = (m, Instant::now());
+            }
+            if moved.elapsed() >= Duration::from_secs(600) {
+                crate::warn!("prepare-play: the background compute preparation made nothing for 10 minutes: its rest is left");
+                break;
+            }
             self.sleep(1.0)?;
             self.write_progress();
         }

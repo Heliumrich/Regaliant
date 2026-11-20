@@ -715,12 +715,22 @@ fn init_inner() -> Result<(), String> {
             instance.get_physical_device_features2(pdev, &mut f2);
             f.private_data != 0
         };
-        let mut f13 = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true).synchronization2(true).maintenance4(true).subgroup_size_control(!subgroup32.is_empty()).private_data(private_data);
+        // (pipelineCreationCacheControl, required in 1.3: `pcache::pb_check` asks the driver to
+        // serve a pipeline from cache data or fail.)
+        let mut f13 = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true).synchronization2(true).maintenance4(true).subgroup_size_control(!subgroup32.is_empty()).private_data(private_data).pipeline_creation_cache_control(true);
         // Pipeline binaries (`pipeline_binaries`): VK_KHR_maintenance5 (for
         // the capture flag) and VK_KHR_pipeline_binary with its feature.
         let has_m5 = instance.enumerate_device_extension_properties(pdev).unwrap_or_default().iter().any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == ash::khr::maintenance5::NAME);
-        let pbins = pipeline_binaries() && has_m5 && pbin::supported(&instance, pdev);
-        if pipeline_binaries() && !pbins {
+        // (The store's mode file may turn them off for this card and driver: its driver refused
+        // binaries another process made, `pcache::binaries_off_for`.)
+        let cache_id: String = props.pipeline_cache_uuid.iter().map(|b| format!("{b:02x}")).collect();
+        crate::gpu::pcache::set_identity(&device_name, &cache_id);
+        let store_off = crate::gpu::pcache::binaries_off_for(&device_name, &cache_id);
+        if let Some(why) = &store_off {
+            crate::info!("Vulkan pipeline binaries: off for this store's card and driver (binaries-mode.txt: {why}): the store keeps cache data, the driver's own cache on");
+        }
+        let pbins = pipeline_binaries() && store_off.is_none() && has_m5 && pbin::supported(&instance, pdev);
+        if pipeline_binaries() && store_off.is_none() && !pbins {
             crate::warn!("Vulkan: pipeline binaries asked for but not available (maintenance5 {has_m5}): the pipeline store keeps cache data only");
         }
         if pbins {

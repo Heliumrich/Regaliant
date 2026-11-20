@@ -219,8 +219,15 @@ pub fn press_now(names: &str, hold: u64) -> Result<(), String> {
 
 /// Presses held for a wall-clock duration (control channel `press <b> 4s`):
 /// frame rates differ about sixfold between runs with and without GPU
-/// execution, so holds counted in flips do not transfer between them.
-static LIVE_TIMED: parking_lot::Mutex<Vec<(std::time::Instant, Step)>> = parking_lot::Mutex::new(Vec::new());
+/// execution, so holds counted in flips do not transfer between them. Each
+/// is held until its time is up and the game has read it in `MIN_FLIPS`
+/// flips (the flip it was first read at, u64::MAX before): a game frozen
+/// for the whole hold (a shader compiled in place on a slow PC, seconds)
+/// still sees it.
+static LIVE_TIMED: parking_lot::Mutex<Vec<(std::time::Instant, Step, u64)>> = parking_lot::Mutex::new(Vec::new());
+
+/// The flips a timed press stays held at least, from the first the game read it at.
+const MIN_FLIPS: u64 = 3;
 
 /// The menu pointer's presses (`press_quiet`): the game's alone (the system text box takes the
 /// pad's and the control channel's, never these: a click or a hover step there would cancel
@@ -243,8 +250,9 @@ pub fn press_for(names: &str, dur: std::time::Duration) -> Result<(), String> {
     note_device(DEVICE_PAD);
     let now = std::time::Instant::now();
     let mut live = LIVE_TIMED.lock();
-    live.retain(|x| x.0 > now);
-    live.extend(steps.into_iter().map(|s| (now + dur, s)));
+    let flip = crate::gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+    live.retain(|x| x.0 > now || x.2 == u64::MAX || flip < x.2 + MIN_FLIPS);
+    live.extend(steps.into_iter().map(|s| (now + dur, s, u64::MAX)));
     Ok(())
 }
 
@@ -288,8 +296,11 @@ fn scripted(st: &mut PadState, flip: u64, quiet: bool) {
             }
         }
     }
-    for (until, step) in LIVE_TIMED.lock().iter() {
-        if now < *until {
+    for (until, step, first) in LIVE_TIMED.lock().iter_mut() {
+        if now < *until || *first == u64::MAX || flip < *first + MIN_FLIPS {
+            if *first == u64::MAX {
+                *first = flip;
+            }
             st.buttons |= step.buttons;
             for &s in &step.sticks {
                 apply_stick(st, s);

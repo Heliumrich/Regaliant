@@ -428,6 +428,9 @@ pub fn with_cache<T>(kind: char, key: u64, create: impl FnOnce(vk::PipelineCache
     lap(1, &mut t);
     CREATING.fetch_add(1, Ordering::Relaxed);
     let tc = std::time::Instant::now();
+    if file.is_empty() {
+        sim_compile_delay();
+    }
     let r = create(cache);
     let slow = !file.is_empty() && tc.elapsed() >= SLOW_CREATION;
     CREATING.fetch_sub(1, Ordering::Relaxed);
@@ -600,6 +603,9 @@ pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result
                 super::vk::pbin::Part::Shared(k) => pb.has_shared(k) || load_shared(k).is_some_and(|d| pb.share(k, &d).is_ok()),
                 super::vk::pbin::Part::Own(..) => true,
             });
+            // (`DS_SIM_PB_REFUSE=1`, a test: every stored binary refused, as the other PC's
+            // driver refused the preparation's.)
+            let shared_ok = shared_ok && !sim_refuse();
             let r = match shared_ok.then(|| pb.from_parts(&stored)) {
                 Some(Ok((handles, own))) => {
                     PB[8].fetch_add(tb.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -614,6 +620,7 @@ pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result
                     r
                 }
                 Some(Err(e)) => Err(format!("binaries from their data: {e}")),
+                None if sim_refuse() => Err("refused (DS_SIM_PB_REFUSE)".to_string()),
                 None => Err("a shared binary is missing".to_string()),
             };
             match r {
@@ -626,6 +633,9 @@ pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result
                 Err(e) => {
                     if PB[2].fetch_add(1, Ordering::Relaxed) < 8 {
                         crate::warn!("pipeline cache: the binaries of {kind}{key:016x} were not used ({e}); made anew");
+                    }
+                    if !keep {
+                        note_refusal();
                     }
                     if keep {
                         CREATING.fetch_add(1, Ordering::Relaxed);
@@ -642,6 +652,7 @@ pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result
     // binaries then captured from it: what the driver's internal cache holds,
     // when it holds it, `pbin::Fns::probe`, gives the same.)
     CREATING.fetch_add(1, Ordering::Relaxed);
+    sim_compile_delay();
     let r = create(Via { cache: vk::PipelineCache::null(), capture: true, binaries: None });
     CREATING.fetch_sub(1, Ordering::Relaxed);
     if let (Ok(pipe), Some(p)) = (&r, &path) {
@@ -912,6 +923,176 @@ mod tests {
 /// driver's internal cache, then made with CAPTURE_DATA and its binaries
 /// captured, each step logged before its call (the driver faulted in both
 /// in runs, never under the validation layer).
+/// `DS_SIM_COMPILE_DELAY_MS=<ms>[:<every>:<long ms>]` (a test, 2026-11-20): every pipeline the
+/// driver compiles (not one from the store) takes that much longer, and every `every`-th one
+/// `long ms` instead: a slower PC's driver (the other PC's took ~0.3 s a compute pipeline in its
+/// menus, 3-21 s for its largest, 2026-11-19).
+pub fn sim_compile_delay() {
+    static D: OnceLock<Option<(u64, u64, u64)>> = OnceLock::new();
+    static N: AtomicU64 = AtomicU64::new(0);
+    let d = *D.get_or_init(|| {
+        let v = std::env::var("DS_SIM_COMPILE_DELAY_MS").ok()?;
+        let mut it = v.split(':').map(|x| x.trim().parse::<u64>().ok());
+        let ms = it.next()??;
+        Some((ms, it.next().flatten().unwrap_or(0), it.next().flatten().unwrap_or(ms)))
+    });
+    if let Some((ms, every, long)) = d {
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        let w = if every > 0 && n % every == 0 { long } else { ms };
+        std::thread::sleep(std::time::Duration::from_millis(w));
+    }
+}
+
+/// `DS_SIM_PB_REFUSE=1` (a test of the fallback): stored binaries are treated as refused.
+fn sim_refuse() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_SIM_PB_REFUSE").ok().as_deref() == Some("1"))
+}
+
+/// This device's name and pipeline cache id (`vk::init`): the store's binary mode is theirs.
+static IDENTITY: OnceLock<(String, String)> = OnceLock::new();
+
+pub fn set_identity(device: &str, cache_id: &str) {
+    let _ = IDENTITY.set((device.to_string(), cache_id.to_string()));
+}
+
+/// The store's pipeline-binary mode (`binaries-mode.txt` in the store, 2026-11-20): `binaries =
+/// off` for this device and pipeline cache id when its driver refused binaries another process
+/// made (a session's own count, `note_refusal`, or the launcher's check, `pb_check`). The store
+/// then keeps cache data with the driver's own cache on, as before 2026-11-08 (the other PC's
+/// driver refused 259 of the 262 binaries its preparation had made, 2026-11-19).
+fn mode_file() -> Option<PathBuf> {
+    DIR.get().map(|d| d.join("binaries-mode.txt"))
+}
+
+/// Why the store's binaries are off for this device and cache id (None: they are not).
+pub fn binaries_off_for(device: &str, cache_id: &str) -> Option<String> {
+    let t = std::fs::read_to_string(mode_file()?).ok()?;
+    let get = |k: &str| t.lines().find_map(|l| l.split_once('=').filter(|(a, _)| a.trim() == k).map(|(_, b)| b.trim().to_string()));
+    (get("binaries").as_deref() == Some("off") && get("device").as_deref() == Some(device) && get("cache_id").as_deref() == Some(cache_id)).then(|| get("why").unwrap_or_default())
+}
+
+/// Writes the mode file: binaries off for this device and cache id, and why.
+pub fn turn_binaries_off(why: &str) -> bool {
+    let (Some(p), Some((dev, id))) = (mode_file(), IDENTITY.get()) else { return false };
+    let t = format!("# The pipeline store keeps cache data, not binaries, for this graphics card and driver (written by the game)\nbinaries = off\ndevice = {dev}\ncache_id = {id}\nwhy = {why}\n");
+    std::fs::write(p, t).is_ok()
+}
+
+/// A session's own count of refused binaries: once 24 were refused and at most a quarter as many
+/// used, the next sessions keep cache data (`turn_binaries_off`).
+fn note_refusal() {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let (made, refused) = (PB[0].load(Ordering::Relaxed), PB[2].load(Ordering::Relaxed));
+    if refused >= 24 && made * 4 <= refused && !DONE.swap(true, Ordering::Relaxed) {
+        let why = format!("a session's driver refused {refused} of its stored binaries and took {made}");
+        if turn_binaries_off(&why) {
+            crate::warn!("pipeline cache: the driver refused {refused} stored binaries and took {made}: the next sessions keep cache data instead (binaries-mode.txt)");
+        }
+    }
+}
+
+/// `--pb-check write|read` (the launcher's check before a preparation, 2026-11-20): whether this
+/// PC's driver takes what another process stored, as a game session must take the preparation's.
+/// `write` makes the check's four compute pipelines through the store (their binaries, or with
+/// binaries off their cache data, kept as any pipeline's); `read`, in the next process, makes
+/// them again. Exit status of `read`: 0 when at least three came from the store without a
+/// compile, 20 when the driver compiled them again (binaries refused, or cache data that did not
+/// serve), 21 when nothing was stored; 1 Vulkan failed.
+pub fn pb_check(phase: &str) -> i32 {
+    if let Err(e) = super::vk::init() {
+        crate::error!("pb-check: Vulkan: {e}");
+        return 1;
+    }
+    let c = ctx();
+    let read = phase == "read";
+    let binaries = c.pbin.is_some();
+    let code = rdna::kernels::timestamp_store_many();
+    let Ok(module) = (unsafe { c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None) }) else { return 1 };
+    let (mut served, mut compiled, mut missing) = (0u32, 0u32, 0u32);
+    for k in 0..4u32 {
+        // (Four pipelines: the kernel's two buffers and k unused ones, so four layouts.)
+        let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..2 + k)
+            .map(|b| vk::DescriptorSetLayoutBinding::default().binding(b).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE))
+            .collect();
+        let Ok(set_layout) = (unsafe { c.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None) }) else { return 1 };
+        let layouts = [set_layout];
+        let ranges = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 4 * (4 + 2 * rdna::kernels::TS_MANY) }];
+        let Ok(layout) = (unsafe { c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(&ranges), None) }) else { return 1 };
+        let key = 0x5042_4348_4b00_0000u64 | k as u64;
+        let fp = fingerprint(&[&code, &[k]]);
+        let stored_before = stored('q', key);
+        let pb = [PB[0].load(Ordering::Relaxed), PB[2].load(Ordering::Relaxed)];
+        let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
+        // (Cache data read: the driver must serve it without compiling, else the pipeline is not
+        // made at all: pipelineCreationCacheControl.)
+        let fail = read && !binaries;
+        let flags = if fail { vk::PipelineCreateFlags::FAIL_ON_PIPELINE_COMPILE_REQUIRED } else { vk::PipelineCreateFlags::empty() };
+        let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout).flags(flags);
+        let make = |via: Via| -> Result<vk::Pipeline, String> {
+            let mut ci = ci;
+            let mut f2 = vk::PipelineCreateFlags2CreateInfoKHR::default().flags(vk::PipelineCreateFlags2KHR::from_raw(ci.flags.as_raw() as u64 | super::vk::pbin::CAPTURE_DATA));
+            if via.capture {
+                ci = ci.push_next(&mut f2);
+            }
+            let bi;
+            if let Some(b) = via.binaries {
+                bi = super::vk::pbin::BinaryInfo { s_type: super::vk::pbin::ST_BINARY_INFO, p_next: ci.p_next, binary_count: b.len() as u32, p_binaries: b.as_ptr() };
+                ci.p_next = &bi as *const super::vk::pbin::BinaryInfo as *const std::ffi::c_void;
+            }
+            unsafe { c.device.create_compute_pipelines(via.cache, &[ci], None) }.map(|v| v[0]).map_err(|(_, e)| format!("{e}"))
+        };
+        let r = create_with('q', key, fp, make);
+        let from_bins = PB[0].load(Ordering::Relaxed) > pb[0];
+        let refused = PB[2].load(Ordering::Relaxed) > pb[1];
+        let outcome = match (&r, binaries) {
+            _ if !read => "made",
+            (Ok(_), true) if from_bins => "from its binaries",
+            (Ok(_), true) if refused => "its binaries refused, compiled again",
+            (Ok(_), true) => "no binaries stored, compiled",
+            (Ok(_), false) => "served by its cache data",
+            (Err(e), false) if e.contains("COMPILE_REQUIRED") && stored_before => "its cache data did not serve it",
+            (Err(_), false) => "no cache data stored",
+            (Err(_), true) => "failed",
+        };
+        crate::info!("pb-check {phase}: pipeline {k} ({}): {outcome}", if binaries { "binaries" } else { "cache data" });
+        if read {
+            match outcome {
+                "from its binaries" | "served by its cache data" => served += 1,
+                "no binaries stored, compiled" | "no cache data stored" => missing += 1,
+                _ => compiled += 1,
+            }
+        }
+        if let Ok(p) = r {
+            unsafe { c.device.destroy_pipeline(p, None) };
+        }
+        unsafe {
+            c.device.destroy_pipeline_layout(layout, None);
+            c.device.destroy_descriptor_set_layout(set_layout, None);
+        }
+    }
+    unsafe { c.device.destroy_shader_module(module, None) };
+    if !read {
+        crate::info!("pb-check write: done ({})", if binaries { "binaries" } else { "cache data" });
+        return 0;
+    }
+    let code = if served >= 3 {
+        0
+    } else if compiled > 0 {
+        20
+    } else {
+        21
+    };
+    // (Binaries refused across processes: the store keeps cache data from now on, the mode file
+    // written here, where the driver's cache id is known; the launcher checks that way next.)
+    if code == 20 && binaries && turn_binaries_off(&format!("the launcher's check: the driver refused {compiled} of 4 binaries another process made")) {
+        crate::warn!("pb-check read: binaries refused across processes: the store keeps cache data from now on (binaries-mode.txt)");
+    }
+    crate::info!("pb-check read: {served} served from the store, {compiled} compiled again, {missing} not stored ({}): exit {code}", if binaries { "binaries" } else { "cache data" });
+    println!("pb-check = {code}");
+    code
+}
+
 pub fn pb_test() -> i32 {
     if let Err(e) = super::vk::init() {
         crate::error!("pb-test: Vulkan: {e}");

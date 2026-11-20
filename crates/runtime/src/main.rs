@@ -80,6 +80,9 @@ pub struct Config {
     pub compile_bench: Option<Vec<String>>,
     /// `--precompile-all [threads]` (`gpu::compbench::precompile_all`).
     pub precompile_all: Option<usize>,
+    /// `--pb-check write|read` (`gpu::pcache::pb_check`: the launcher's check that the store's
+    /// pipelines reach from one process to the next on this PC).
+    pub pb_check: Option<String>,
     /// `--translation-fingerprint`: prints `translation = <fingerprint>` (the launcher's check
     /// that the prepared shaders match this build: `gpu::compbench::translation_fingerprint`).
     pub translation_fingerprint: bool,
@@ -215,6 +218,7 @@ fn parse_args() -> Config {
     let mut pipeline_test = None;
     let mut compile_bench: Option<Vec<String>> = None;
     let mut precompile_all: Option<usize> = None;
+    let mut pb_check: Option<String> = None;
     let mut translation_fingerprint = false;
     let mut progress = None;
     let mut safe_mode = false;
@@ -264,6 +268,7 @@ fn parse_args() -> Config {
             }
             "--prepare-deadline" => prepare_deadline = args.next().and_then(|v| v.parse().ok()),
             "--pb-test" => std::process::exit(gpu::pcache::pb_test()),
+            "--pb-check" => pb_check = Some(args.next().unwrap_or_default()),
             "--compile-bench" => {
                 let min = args.next().expect("--compile-bench needs <min instructions> <max programs>");
                 let max = args.next().expect("--compile-bench needs <min instructions> <max programs>");
@@ -325,13 +330,14 @@ fn parse_args() -> Config {
         debug,
         // The launcher's translation check and shader preparation (and the compile bench) run
         // no game: no window (each showed an empty one until 2026-11-14) and no message boxes.
-        headless: headless || translation_fingerprint || precompile_all.is_some() || compile_bench.is_some() || prepare_play.is_some(),
+        headless: headless || translation_fingerprint || precompile_all.is_some() || compile_bench.is_some() || prepare_play.is_some() || pb_check.is_some(),
         control,
         cache,
         pipeline_test,
         record_bench,
         compile_bench,
         precompile_all,
+        pb_check,
         translation_fingerprint,
         progress,
         safe_mode,
@@ -1783,7 +1789,7 @@ fn single_instance(cfg: &Config) {
     // (The launcher's translation check runs no game either and ends before any part of a
     // session's start-up: holding the lock, it turned away a Play pressed while it ran,
     // 2026-11-14.)
-    if cfg.precompile_all.is_some() || cfg.compile_bench.is_some() || cfg.translation_fingerprint {
+    if cfg.precompile_all.is_some() || cfg.compile_bench.is_some() || cfg.translation_fingerprint || cfg.pb_check.is_some() {
         return;
     }
     use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
@@ -2147,6 +2153,11 @@ This happens when other software takes that range. Restart the PC and try again.
     }
     if let Some(n) = cfg.precompile_all {
         let code = gpu::compbench::precompile_all(&cfg.app, n, cfg.progress.as_deref(), Some(&cache_root.join("prepared.txt")));
+        log::flush();
+        std::process::exit(code);
+    }
+    if let Some(phase) = &cfg.pb_check {
+        let code = gpu::pcache::pb_check(phase);
         log::flush();
         std::process::exit(code);
     }
