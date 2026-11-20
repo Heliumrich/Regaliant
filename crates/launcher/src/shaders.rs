@@ -181,6 +181,121 @@ pub fn start_check(app: &App) {
     });
 }
 
+/// The prepared shaders' probe (`dsport --pb-check probe`: the store check's pipelines made again
+/// from the store, nothing changed): its exit status once it has one (0 the driver takes them, 20
+/// it refuses them now, else unknown). Run at the launcher's start once a store is prepared
+/// (2026-11-20 night: this PC's driver refused ~3,400 stored pipelines, binaries and cache data
+/// alike, after a Windows session event, with the same driver version and cache id, and the other
+/// player's, an RTX 4070 SUPER, refused hundreds every session; the launcher had gone on saying
+/// "prepared" while the game compiled as if nothing was).
+static PROBE: std::sync::Mutex<Option<i32>> = std::sync::Mutex::new(None);
+static PROBE_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The probe's answer handled (or no probe needed).
+static PROBE_HANDLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The translation check's line logged (`check_tick`).
+static CHECK_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Starts the probe on a thread of its own (after the translation check: one game process at a
+/// time), waited for 60 s at most.
+fn start_probe(app: &App) {
+    if PROBE_STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let exe = dsconfig::paths::game_exe_in(&app.paths.exe_dir);
+    let dir = app.paths.exe_dir.clone();
+    std::thread::spawn(move || {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("--pb-check").arg("probe").current_dir(&dir).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        let code = sys::spawn_in_job(&mut cmd, CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS).ok().and_then(|mut c| {
+            let t = Instant::now();
+            loop {
+                match c.try_wait() {
+                    Ok(Some(s)) => break s.code(),
+                    Ok(None) if t.elapsed().as_secs() < 60 => std::thread::sleep(std::time::Duration::from_millis(50)),
+                    _ => {
+                        let _ = c.kill();
+                        break None;
+                    }
+                }
+            }
+        });
+        *PROBE.lock().unwrap_or_else(|e| e.into_inner()) = Some(code.unwrap_or(-1));
+    });
+}
+
+/// Waits for the probe to end (20 s at most): Play starts the game only once it is known
+/// whether the store still holds.
+fn wait_probe() {
+    let t = Instant::now();
+    while PROBE_STARTED.load(std::sync::atomic::Ordering::Relaxed) && PROBE.lock().unwrap_or_else(|e| e.into_inner()).is_none() && t.elapsed().as_secs() < 20 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// The store's refusals (`store-refused.txt`): the times (Unix seconds, UTC stamps) the probe
+/// found the driver refusing the prepared shaders, the last three.
+fn refused_file(app: &App) -> PathBuf {
+    app.paths.shaders().join("store-refused.txt")
+}
+
+fn refusals(app: &App) -> Vec<(u64, String)> {
+    read_kv(&refused_file(app))
+        .into_iter()
+        .filter(|(k, _)| k == "refused")
+        .filter_map(|(_, v)| {
+            let mut w = v.split_whitespace();
+            Some((w.next()?.parse().ok()?, w.next()?.to_string()))
+        })
+        .collect()
+}
+
+/// Whether the driver refused the prepared shaders after the marker's date (a `YYYYMMDD-HHMMSS`
+/// stamp): the store is stale until a preparation makes it again.
+fn refused_after(app: &App, date: &str) -> bool {
+    !date.is_empty() && refusals(app).iter().any(|(_, d)| d.as_str() > date)
+}
+
+/// The probe's answer: a refusal is recorded, the store check's record dropped (the check runs
+/// again before the next preparation and stores its pipelines again), and the page says the
+/// shaders must be prepared again; a second refusal within three days ends preparing on this PC
+/// for now (the outcome record: Play starts the game).
+fn handle_probe(app: &mut App, code: i32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if PROBE_HANDLED.swap(true, Relaxed) {
+        return;
+    }
+    let what = match code {
+        0 => "the driver takes them",
+        20 => "the driver refuses them now",
+        9 => "a game session runs",
+        _ => "no answer",
+    };
+    log(app, &format!("the prepared shaders' probe: status {} ({what})", code_text(code)));
+    if code != 20 {
+        return;
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let mut r = refusals(app);
+    let again = r.iter().any(|(t, _)| now.saturating_sub(*t) < 3 * 24 * 3600);
+    r.push((now, utc_stamp()));
+    let keep = &r[r.len().saturating_sub(3)..];
+    let lines: String = keep.iter().map(|(t, d)| format!("refused = {t} {d}\n")).collect();
+    write_record(
+        &refused_file(app),
+        &format!("# When the graphics driver refused the prepared shaders (the launcher's probe at its start: the store check's pipelines made again from the store); written by the launcher\n{lines}"),
+    );
+    let _ = std::fs::remove_file(check_file(app));
+    if again {
+        record_outcome(app, "its graphics driver discarded the prepared shaders twice in three days, so preparing them again would not last");
+    } else {
+        log(app, "the prepared shaders are stale: the next preparation compiles them again, without the game playing again");
+    }
+    refresh(app);
+    app.update_play();
+}
+
 /// The check's answer once it has one.
 fn checked_translation() -> Option<Result<String, String>> {
     CHECK.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -188,8 +303,20 @@ fn checked_translation() -> Option<Result<String, String>> {
 
 /// The check timer: the page shows the check's outcome once it has one.
 pub fn check_tick(app: &mut App) {
+    use std::sync::atomic::Ordering::Relaxed;
+    // (The probe's answer, once the check's line is logged; the timer stops when both are done.)
+    if CHECK_LOGGED.load(Relaxed) {
+        let probe = *PROBE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(code) = probe {
+            handle_probe(app, code);
+        }
+        if PROBE_HANDLED.load(Relaxed) {
+            unsafe { windows_sys::Win32::UI::WindowsAndMessaging::KillTimer(app.hwnd, CHECK_TIMER) };
+        }
+        return;
+    }
     if let Some(r) = checked_translation() {
-        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::KillTimer(app.hwnd, CHECK_TIMER) };
+        CHECK_LOGGED.store(true, Relaxed);
         let id = GAME_ID.lock().unwrap_or_else(|e| e.into_inner()).clone();
         log(app, &format!("launcher {} started; the game's check: translation {}; game {}", dsconfig::VERSION, r.as_deref().unwrap_or_else(|e| e), id.map_or("unknown".to_string(), |(v, d, r)| if d.is_empty() { format!("{v}, no graphics card reported") } else { format!("{v} on {d}, driver {r}") })));
         if let Some(t) = version_mismatch() {
@@ -198,6 +325,12 @@ pub fn check_tick(app: &mut App) {
         }
         refresh(app);
         app.update_play();
+        // (The store's probe when it holds prepared shaders the driver should take; else none.)
+        if version_mismatch().is_none() && compute_state(app).0 && matches!(check_state(app).as_deref(), Some("binaries" | "cache")) && outcome(app).is_none() {
+            start_probe(app);
+        } else {
+            PROBE_HANDLED.store(true, Relaxed);
+        }
     }
 }
 
@@ -399,14 +532,16 @@ fn retire_stale_store(app: &App) -> bool {
     let shaders = app.paths.shaders();
     let get = |kv: &[(String, String)], k: &str| kv.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone()).unwrap_or_default();
     let recorded = [store_identity_file(app), marker(app), played_file(app)].into_iter().map(|f| read_kv(&f)).find(|kv| !kv.is_empty());
+    // (Refused by the driver since the marker was written: stale whatever the identity says.)
+    let refused = refused_after(app, &get(&read_kv(&marker(app)), "date"));
     if let Some(kv) = recorded {
-        let same = get(&kv, "translation") == translation && get(&kv, "device") == device && get(&kv, "driver") == driver;
+        let same = get(&kv, "translation") == translation && get(&kv, "device") == device && get(&kv, "driver") == driver && !refused;
         let dir = shaders.join("pipelines");
         if !same && dir.is_dir() {
             let mode = std::fs::read(dir.join("binaries-mode.txt")).ok();
             let old = shaders.join(format!("pipelines-old-{}", utc_stamp()));
             if std::fs::rename(&dir, &old).is_ok() {
-                log(app, "the stored pipelines were made for another translation, card or driver: set aside");
+                log(app, if refused { "the stored pipelines are refused by the graphics driver now: set aside" } else { "the stored pipelines were made for another translation, card or driver: set aside" });
                 if let Some(m) = mode {
                     let _ = std::fs::create_dir_all(&dir);
                     let _ = std::fs::write(dir.join("binaries-mode.txt"), m);
@@ -468,6 +603,10 @@ fn compute_state(app: &App) -> (bool, String) {
     let (_, device, driver) = identity();
     if device.is_empty() {
         return (false, sys::gpu().err().unwrap_or_else(|| "The graphics card could not be read.".into()));
+    }
+    // (The driver refused them since they were made: `handle_probe`.)
+    if refused_after(app, &get("date")) {
+        return (false, "The graphics driver no longer takes the prepared shaders. Prepare them again.".into());
     }
     if device == get("device") && driver == get("driver") {
         (true, format!("The shaders are prepared (on {date}, for this graphics card and driver)."))
@@ -675,8 +814,16 @@ pub fn state(app: &App) -> (bool, String) {
     }
 }
 
-pub fn prepared(app: &App) -> bool {
+pub fn prepared(app: &mut App) -> bool {
     wait_check();
+    // (The probe's answer, before Play decides: a store the driver refuses is prepared again.)
+    if CHECK_LOGGED.load(std::sync::atomic::Ordering::Relaxed) {
+        wait_probe();
+        let probe = *PROBE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(code) = probe {
+            handle_probe(app, code);
+        }
+    }
     state(app).0
 }
 
@@ -1006,7 +1153,7 @@ pub fn tick(app: &mut App) {
         app.shaders.killed_at = None;
         app.shaders.stopping = None;
         app.shaders.stalled = false;
-        record_outcome(app, "a step of it could not be ended (the graphics driver holds it). Restart the PC before you play");
+        record_outcome(app, "one of its steps is stuck in the graphics driver, so restart the PC before you play");
         finish(app, None);
         if std::mem::take(&mut app.shaders.then_play) | std::mem::take(&mut app.shaders.play_after) {
             crate::start_game(app);

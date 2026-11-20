@@ -1902,7 +1902,8 @@ fn single_instance(cfg: &Config) {
     // stop, and the compute step after it ran on all CPUs beside the player's game; the release
     // review of 2026-11-20 night. They end with EXIT_RUNNING, which the launcher handles.)
     if (cfg.precompile_all.is_some() && cfg.progress.is_some()) || cfg.pb_check.is_some() {
-        use windows_sys::Win32::System::Threading::{OpenMutexW, SYNCHRONIZE};
+        use windows_sys::Win32::System::Threading::OpenMutexW;
+        const SYNCHRONIZE: u32 = 0x0010_0000;
         let h = unsafe { OpenMutexW(SYNCHRONIZE, 0, instance_name(cfg).as_ptr()) };
         if !h.is_null() {
             unsafe { windows_sys::Win32::Foundation::CloseHandle(h) };

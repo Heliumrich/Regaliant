@@ -1069,7 +1069,11 @@ pub fn pb_check(phase: &str) -> i32 {
         return crate::EXIT_NO_GPU as i32;
     }
     let c = ctx();
-    let read = phase == "read";
+    // (`probe`, the launcher's at its start once a store is prepared: a read that changes nothing,
+    // to find a store whose pipelines the driver no longer takes; 2026-11-20 night: this PC's
+    // driver refused ~3,400 stored pipelines, binaries and cache data alike, after a Windows
+    // session event, with the same driver and cache id.)
+    let read = phase == "read" || phase == "probe";
     let binaries = c.pbin.is_some();
     let code = rdna::kernels::timestamp_store_many();
     let Ok(module) = (unsafe { c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None) }) else { return 1 };
@@ -1175,10 +1179,10 @@ pub fn pb_check(phase: &str) -> i32 {
     };
     // (Binaries refused across processes: the store keeps cache data from now on, the mode file
     // written here, where the driver's cache id is known; the launcher checks that way next.)
-    if code == 20 && binaries && turn_binaries_off(&format!("the launcher's check: the driver refused {compiled} of 4 binaries another process made")) {
+    if code == 20 && binaries && phase == "read" && turn_binaries_off(&format!("the launcher's check: the driver refused {compiled} of 4 binaries another process made")) {
         crate::warn!("pb-check read: binaries refused across processes: the store keeps cache data from now on (binaries-mode.txt)");
     }
-    crate::info!("pb-check read: {served} served from the store, {compiled} compiled again, {missing} not stored ({}): exit {code}", if binaries { "binaries" } else { "cache data" });
+    crate::info!("pb-check {phase}: {served} served from the store, {compiled} compiled again, {missing} not stored ({}): exit {code}", if binaries { "binaries" } else { "cache data" });
     println!("pb-check = {code}");
     code
 }
