@@ -72,6 +72,14 @@ static FIXED_STEP: AtomicU32 = AtomicU32::new(0x3C88_AB85);
 /// fights take half the time.
 pub static SPEED_X100: AtomicU32 = AtomicU32::new(100);
 
+/// The shader preparation's levels as a fast-forward (`prepplay`): every frame steps by the
+/// title's 1/59.94 s times the speed whatever the time between its flips, the physics by the
+/// title's step, so that each frame does what a frame at 60 a second does (the automation's
+/// waits count frames, and the self-play's presses and sticks too, `input::FLIP_TIMED`) while
+/// the frames come as fast as the PC makes them (2026-11-20: the levels at ~30 frames a second
+/// had stretched every frame-counted wait to twice its time).
+pub static FIXED_FEED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The code inserted at eboot+0xe6f1f9 (`titlefix`): the run counted (`lock inc qword ptr
 /// [counter]`), then `mov rax, &FIXED_STEP; vmovss xmm0, [rax]` in place of the title's
 /// 1/refresh rate in xmm0. rax is loaded by the displaced instruction next, and the flags the
@@ -391,6 +399,8 @@ pub extern "sysv64" fn after_step(regs: *const u64, _arg: u32) {
     let max = if max.is_finite() && max > 0.001 { max as f64 } else { 0.1 };
     let pace = crate::hle::libs::videoout::PACE_NS.load(Relaxed) as f64 * 1e-9;
     let (fed, exact) = s.clock.step(interval, max, crate::gpu::tune::pace_smooth() as usize, pace);
+    let fixed = FIXED_FEED.load(Relaxed);
+    let fed = if fixed { TITLE_STEP as f64 } else { fed };
     let feed = crate::gpu::tune::pace_step() && !forced && s.total_frames >= 8;
     let (step, phys) = if feed {
         // (Never zero: the title divides by its step. The self-play's speed, `SPEED_X100`.)
@@ -405,6 +415,7 @@ pub extern "sysv64" fn after_step(regs: *const u64, _arg: u32) {
         // The physics' fixed step: the frame limit's time a frame, so that a frame at the
         // limit is one physics step (uncapped, and with `tune pace_phys` 2: the game's step).
         let phys = match crate::gpu::tune::pace_phys() {
+            _ if fixed => TITLE_STEP,
             0 => TITLE_STEP,
             2 => step.min(PHYS_MAX),
             // The limit's time a frame while the limit is held, and for a limit of 60 frames

@@ -618,10 +618,20 @@ pub fn write_marker(app: &std::path::Path, m: &std::path::Path, done: usize, all
 /// A compute program's variant to prepare: (code hash, code, spec, code words).
 type Prog = (u64, std::sync::Arc<Vec<u32>>, rdna::translate::Spec, usize);
 
+/// Work items the store held already (their translation skipped).
+pub static STORED_SKIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Item `i` of a work list (`work_list`) made: its pipeline translated and made through the
 /// store (compute), or the learned graphics recipe prepared; (ns, code words, made).
 fn work_item(progs: &[Prog], recipes: &[(usize, usize)], i: usize) -> (u64, u64, bool) {
     if let Some((h, code, spec, n)) = progs.get(i) {
+        // (One the store holds, as an earlier stage of the shader preparation left it: its key
+        // looked up before translating, `shaders::translate_code_unkept`'s.)
+        let plan_key = h ^ (spec.user_sgprs as u64) << 48 ^ (spec.user_base as u64) << 56;
+        if super::exec::compute_key_stored(plan_key ^ spec_hash(spec).rotate_left(1)) {
+            STORED_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return (0, *n as u64, true);
+        }
         let t = Instant::now();
         let r = super::shaders::translate_code_unkept(code, *h, spec.clone()).and_then(|tr| super::exec::store_compute_pipeline(&tr));
         match r {
@@ -664,41 +674,107 @@ pub fn background(app: std::path::PathBuf, threads: usize) {
         BACKGROUND[3].store(total_words as u64, Relaxed);
         crate::info!("background preparation: {all} items on {threads} threads of the lowest priority (listed in {:.1} s)", t0.elapsed().as_secs_f64());
         let list = std::sync::Arc::new((progs, recipes, std::sync::atomic::AtomicUsize::new(0)));
-        for n in 0..threads.max(1) {
-            let list = list.clone();
-            let name = format!("gpu-prep{n}");
-            let _ = std::thread::Builder::new().name(name.clone()).stack_size(8 << 20).spawn(move || {
-                crate::log::set_thread_name(&name);
-                unsafe {
-                    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
-                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
-                }
-                let (progs, recipes, next) = (&list.0, &list.1, &list.2);
-                let all = progs.len() + recipes.len();
-                loop {
-                    if BACKGROUND_STOP.load(Relaxed) {
-                        break;
-                    }
-                    let i = next.fetch_add(1, Relaxed);
-                    if i >= all {
-                        break;
-                    }
-                    let (_, words, ok) = work_item(progs, recipes, i);
-                    if !ok {
-                        BACKGROUND[2].fetch_add(1, Relaxed);
-                    }
-                    BACKGROUND[4].fetch_add(words, Relaxed);
-                    let d = BACKGROUND[1].fetch_add(1, Relaxed) + 1;
-                    if d as usize == all {
-                        crate::info!("background preparation: all {all} items done in {:.0} s", t0.elapsed().as_secs_f64());
-                    }
-                }
-            });
+        let _ = LIST.set((list.clone(), t0));
+        for _ in 0..threads.max(1) {
+            spawn_list_worker(list.clone(), t0);
+        }
+        if FULL_START.load(Relaxed) {
+            TAIL.store(true, Relaxed);
+            let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+            add_workers(cpus.saturating_sub(2), "beside the new game");
         }
     });
     if let Err(e) = r {
         crate::warn!("background preparation: not started ({e})");
     }
+}
+
+/// The background list (items, recipes, the next item in order) and when it began, for workers
+/// added later (`tail_mode`).
+type List = (Vec<Prog>, Vec<(usize, usize)>, std::sync::atomic::AtomicUsize);
+static LIST: std::sync::OnceLock<(std::sync::Arc<List>, Instant)> = std::sync::OnceLock::new();
+static LIST_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The list's rest after the self-play's levels (`tail_mode`), or the new game's whole list
+/// (`full_from_start`): every item at normal priority.
+static TAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static FULL_START: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The new game's list at full speed from its start (`prepplay`: the new game's waits run in
+/// real time, so the play keeps its length while the list takes the CPU; the compute step after
+/// it has that much less to make): its workers at normal priority and more of them, as
+/// `tail_mode` adds them, up to all logical CPUs but two. Called before `background`.
+pub fn full_from_start() {
+    FULL_START.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn set_priority(normal: bool) {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL};
+    unsafe { SetThreadPriority(GetCurrentThread(), if normal { THREAD_PRIORITY_NORMAL } else { THREAD_PRIORITY_LOWEST }) };
+}
+
+fn spawn_list_worker(list: std::sync::Arc<List>, t0: Instant) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let n = LIST_WORKERS.fetch_add(1, Relaxed);
+    let name = format!("gpu-prep{n}");
+    let _ = std::thread::Builder::new().name(name.clone()).stack_size(8 << 20).spawn(move || {
+        crate::log::set_thread_name(&name);
+        let (progs, recipes, next) = (&list.0, &list.1, &list.2);
+        let all = progs.len() + recipes.len();
+        loop {
+            if BACKGROUND_STOP.load(Relaxed) {
+                break;
+            }
+            let i = next.fetch_add(1, Relaxed);
+            if i >= all {
+                break;
+            }
+            // (In the tail at normal priority: the game waits for the list.)
+            set_priority(TAIL.load(Relaxed));
+            let (_, words, ok) = work_item(progs, recipes, i);
+            if !ok {
+                BACKGROUND[2].fetch_add(1, Relaxed);
+            }
+            BACKGROUND[4].fetch_add(words, Relaxed);
+            let d = BACKGROUND[1].fetch_add(1, Relaxed) + 1;
+            if d as usize == all {
+                crate::info!("background preparation: all {all} items done in {:.0} s", t0.elapsed().as_secs_f64());
+            }
+        }
+    });
+}
+
+/// The self-play only waits for the list now (`prepplay`'s compute tail, the game at 10 frames a
+/// second): its workers at normal priority, and more of them up to the PC's logical CPUs while
+/// the memory free now allows one more per 1.5 GiB beyond 2 (each compile holds the driver's
+/// memory, as the launcher's thread count allows for; 2026-11-20: the list's rest had run on
+/// half the CPUs at the lowest priority beside a game still drawing its frames).
+pub fn tail_mode() {
+    use std::sync::atomic::Ordering::Relaxed;
+    if TAIL.swap(true, Relaxed) {
+        return;
+    }
+    let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+    add_workers(cpus, "the rest");
+}
+
+/// More list workers up to `max` in all while the memory free now allows one per 1.5 GiB beyond
+/// 2 (each compile holds the driver's memory; ~110 MB each measured, the game's own growth kept
+/// in reserve), logged with `what`.
+fn add_workers(max: usize, what: &str) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some((list, t0)) = LIST.get() else { return };
+    let have = LIST_WORKERS.load(Relaxed);
+    let free_gib = {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 { 0.0 } else { m.ullAvailPhys as f64 / (1u64 << 30) as f64 }
+    };
+    let extra = (((free_gib - 2.0) / 1.5).floor().max(0.0) as usize).min(max.saturating_sub(have));
+    for _ in 0..extra {
+        spawn_list_worker(list.clone(), *t0);
+    }
+    crate::info!("background preparation: {what} at normal priority on {} threads ({extra} added; {free_gib:.1} GiB of memory free)", have + extra);
 }
 
 /// Stops the background compute preparation (the items being made finish).
@@ -765,10 +841,15 @@ fn work_list(app: &std::path::Path, threads: usize) -> (Vec<Prog>, Vec<(usize, u
         progs.extend(extra);
     }
     let learned_n = progs.len() - guessed;
+    // (Those the store holds, as an earlier step of the shader preparation left them, out: the
+    // list and its progress are the work left. `work_item` looks again for those made since.)
+    let listed = progs.len();
+    progs.retain(|(h, _, spec, _)| !super::exec::compute_key_stored(h ^ (spec.user_sgprs as u64) << 48 ^ (spec.user_base as u64) << 56 ^ spec_hash(spec).rotate_left(1)));
+    let held = listed - progs.len();
     let gfx_words: usize = recipes.iter().map(|r| r.1).sum();
     let total_words: usize = progs.iter().map(|p| p.3).sum::<usize>() + gfx_words;
     crate::info!(
-        "precompile all: {} compute pipelines ({} code words; the engine's image variants {} of them, {} words; the player's learned specs {learned_n}) and {} learned graphics pipelines on {threads} threads",
+        "precompile all: {} compute pipelines left to make ({} code words; {held} of the {listed} listed held by the store already; the engine's image variants {} of the listed, {} words; the player's learned specs {learned_n}) and {} learned graphics pipelines on {threads} threads",
         progs.len(),
         total_words - gfx_words,
         variants[0],

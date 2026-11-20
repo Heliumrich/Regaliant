@@ -97,6 +97,16 @@ pub fn prepare_threads() -> usize {
     threads().saturating_sub(2).min(by_mem).clamp(2, 12)
 }
 
+/// The compute step's threads (`--precompile-all`, no game running beside it): all logical
+/// processors but one, at most one per 0.75 GB of memory beyond 4 GB, 2 to 32 (2026-11-20:
+/// 17 compiles at once held 1.8 GB in all, ~110 MB each, among the largest programs, and left a
+/// quarter of the CPUs idle).
+pub fn compute_threads() -> usize {
+    let gb = memory() as f64 / (1u64 << 30) as f64;
+    let by_mem = ((gb - 4.0) / 0.75).floor().max(2.0) as usize;
+    threads().saturating_sub(1).min(by_mem).clamp(2, 32)
+}
+
 pub fn process_alive(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
     use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};

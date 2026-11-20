@@ -136,6 +136,32 @@ impl GameClock {
 /// Spans of the stages' waits the game spent frozen, in all (the stage's summary line).
 static FROZEN_TOTAL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The levels' tour opens with `wait 120.0` (the title ignores level loads until it is in the
+/// game, and its automation starts at boot); set once the self-play sees the game in play, the
+/// next automation wait with more than a minute left ends at once (`automation_wait_hook`; on
+/// this PC each part's tour began ~148 s after the game was in play, 2026-11-20).
+static SKIP_FIRST_WAIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static WAIT_SKIPPED_S: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The title's automation wait step (eboot+0xaf7bf0, title fix 'the self-play's opening wait
+/// ended once in play': `vmovss xmm0,[rdi]; vsubss xmm0,xmm0,[rsi+8]`, the seconds left less the
+/// frame's time, waiting while above 0): with `SKIP_FIRST_WAIT` set and more than 60 s left, the
+/// seconds left become 0 (once). Inert in every other session (the flag is the self-play's).
+pub extern "sysv64" fn automation_wait_hook(regs: *const u64, _arg: u32) {
+    if !SKIP_FIRST_WAIT.load(Relaxed) {
+        return;
+    }
+    let rdi = unsafe { *regs.add(7) };
+    if rdi < 0x1000 || !crate::mem::readable(rdi, 4) {
+        return;
+    }
+    let left = f32::from_bits(unsafe { std::ptr::read_volatile(rdi as *const u32) });
+    if left > 60.0 && SKIP_FIRST_WAIT.swap(false, Relaxed) {
+        unsafe { std::ptr::write_volatile(rdi as *mut u32, 0f32.to_bits()) };
+        WAIT_SKIPPED_S.store(left as u32, Relaxed);
+    }
+}
+
 /// Whether the preparation's deadline has passed.
 fn past_deadline() -> bool {
     SETUP.get().and_then(|s| s.deadline).is_some_and(|d| std::time::SystemTime::now() >= d)
@@ -202,9 +228,31 @@ pub fn setup(stage: Stage, cfg: &mut crate::Config) {
     }
     crate::audio::SILENT.store(true, Relaxed);
     crate::input::SYSTEM_OFF.store(true, Relaxed);
+    // The self-play's own pacing, whatever the player's Frame Rate Limit (their PC settings are
+    // copied: at 30 FPS the levels' frame-counted waits took twice their time, Uncapped would
+    // shorten them under what the script asks for). The new game: the title's 59.94 frames a
+    // second at most, a frame shown once it is ready (off the vblank grid: frames of 17-33 ms
+    // had waited for the second vblank). The levels: a fast-forward (`fast_forward`).
+    // SAFETY: still the only thread.
+    unsafe {
+        for (k, v) in [("DS_FRAME_CAP", "0"), ("DS_UNCAPPED", "0")] {
+            if std::env::var_os(k).is_none() {
+                std::env::set_var(k, v);
+            }
+        }
+        match stage {
+            Stage::NewGame if std::env::var_os("DS_FLIP_GRID").is_none() => std::env::set_var("DS_FLIP_GRID", "0"),
+            Stage::Tour if fast_forward() && std::env::var_os("DS_VBLANK_HZ").is_none() => std::env::set_var("DS_VBLANK_HZ", FAST_HZ),
+            _ => {}
+        }
+    }
     // The levels at the self-play's game speed (`level_speed`; the new game's screens at their own).
     if stage == Stage::Tour {
         crate::gamestep::SPEED_X100.store((level_speed() * 100.0).round() as u32, Relaxed);
+        if fast_forward() {
+            crate::gamestep::FIXED_FEED.store(true, Relaxed);
+            crate::input::FLIP_TIMED.store(true, Relaxed);
+        }
     }
     let runtime = paths.runtime();
     let own_paths = paths.clone();
@@ -310,6 +358,12 @@ pub fn start(app: &Path) {
     // made beside the play on threads of the lowest priority: the CPU the play leaves idle
     // (`DS_PREPARE_BACKGROUND=0`: none, a test).
     if std::env::var("DS_PREPARE_BACKGROUND").ok().as_deref() != Some("0") {
+        // (The new game's waits run in real time: its list at full speed meanwhile, the
+        // launcher's compute step after it then has that much less to make. `DS_PREPARE_NG_FULL=0`:
+        // at the lowest priority as in the levels, a test.)
+        if s.stage == Stage::NewGame && std::env::var("DS_PREPARE_NG_FULL").ok().as_deref() != Some("0") {
+            crate::gpu::compbench::full_from_start();
+        }
         crate::gpu::compbench::background(app.to_path_buf(), s.threads);
         BACKGROUND_ON.store(true, Relaxed);
     }
@@ -439,6 +493,9 @@ struct Play {
     done_steps: u32,
     total: u32,
     t0: Instant,
+    /// The compute list's rest is being made (`compute_tail`): the progress file's second line
+    /// (the launcher's bar) is the list's items made and listed.
+    tail: bool,
 }
 
 /// The new game's steps (progress): the title, character creation, its menus, the character
@@ -451,7 +508,7 @@ impl Play {
     fn new(progress: Option<PathBuf>, total: u32) -> Play {
         // (The launcher's stop file, as the precompile reads it.)
         let stop = progress.as_ref().map(|p| p.with_extension("stop"));
-        let p = Play { w: Watch { lines: VecDeque::new(), first: 0, cursor: 0 }, progress, stop, done_steps: 0, total: total.max(1), t0: Instant::now() };
+        let p = Play { w: Watch { lines: VecDeque::new(), first: 0, cursor: 0 }, progress, stop, done_steps: 0, total: total.max(1), t0: Instant::now(), tail: false };
         p.write_progress();
         p
     }
@@ -460,7 +517,9 @@ impl Play {
         if let Some(p) = &self.progress {
             // (A third line: the background compute preparation's items made and listed.)
             let b = &crate::gpu::compbench::BACKGROUND;
-            let t = format!("{} {}\n{} {}\n{} {}\n", self.done_steps, self.total, self.done_steps, self.total, b[1].load(Relaxed), b[0].load(Relaxed));
+            let (made, all) = (b[1].load(Relaxed), b[0].load(Relaxed));
+            let bar = if self.tail && all > 0 { (made, all) } else { (self.done_steps as u64, self.total as u64) };
+            let t = format!("{} {}\n{} {}\n{made} {all}\n", self.done_steps, self.total, bar.0, bar.1);
             let tmp = p.with_extension("tmp");
             if std::fs::write(&tmp, t).is_ok() {
                 let _ = std::fs::rename(&tmp, p);
@@ -746,15 +805,22 @@ impl Play {
             return Err(End::Failed("the tour started before the game was loaded".into()));
         }
         let m = self.w.mark();
-        if !self.wait_for("dsport-tour: start", m, 300.0)? {
+        // (The tour's opening wait ended now that the game is in play: `automation_wait_hook`.)
+        SKIP_FIRST_WAIT.store(true, Relaxed);
+        let started = self.wait_for("dsport-tour: start", m, 300.0);
+        SKIP_FIRST_WAIT.store(false, Relaxed);
+        if !started? {
             return Err(End::Failed("the tour did not start".into()));
         }
+        let s = WAIT_SKIPPED_S.load(Relaxed);
+        crate::info!("prepare-play: the tour began at {:.0} s ({})", self.t0.elapsed().as_secs_f64(), if s > 0 { format!("its opening wait ended with {s} s left") } else { "its opening wait had ended by itself".to_string() });
         self.step("the levels");
         let (mut seen, mut fogs, mut levels) = (0usize, 0usize, 0usize);
         let mut last = GameClock::new();
-        // Presses of Cross still to come at a fog door (a press while the player still moves
-        // may not take: -214433's 2-2 door kept its prompt).
-        let mut fog_presses: Vec<Instant> = Vec::new();
+        // Presses of Cross still to come at a fog door, at these flips (a press while the player
+        // still moves may not take: -214433's 2-2 door kept its prompt). Flips, not time: the
+        // fast-forward's frames are each a frame at 60 a second.
+        let mut fog_presses: Vec<u64> = Vec::new();
         loop {
             if self.w.found("dsport-tour: done", m) {
                 self.coverage("the end");
@@ -775,11 +841,11 @@ impl Play {
             let f = self.w.count("Enter fog", m);
             if f > fogs {
                 fogs = f;
-                let now = Instant::now();
-                fog_presses = vec![now, now + Duration::from_millis(1500), now + Duration::from_millis(3000)];
+                let now = crate::gpu::FRAMES.load(Relaxed);
+                fog_presses = vec![now, now + 90, now + 180];
                 crate::info!("prepare-play: a fog door's prompt ({fogs} so far): Cross now and twice after");
             }
-            if fog_presses.first().is_some_and(|t| Instant::now() >= *t) {
+            if fog_presses.first().is_some_and(|&t| crate::gpu::FRAMES.load(Relaxed) >= t) {
                 fog_presses.remove(0);
                 self.press("cross", 200);
             }
@@ -812,8 +878,15 @@ impl Play {
             return Ok(());
         }
         let t = Instant::now();
+        self.tail = true;
         let left = || b[0].load(Relaxed).saturating_sub(b[1].load(Relaxed));
         crate::info!("prepare-play: the background compute preparation has {} of {} items left", left(), b[0].load(Relaxed));
+        // (The game only waits now: its frames at 10 a second, the list's workers at normal
+        // priority and more of them as the CPUs and the free memory allow, `tail_mode`.)
+        if left() > 0 {
+            crate::gpu::tune::set("frame_cap", 10);
+            crate::gpu::compbench::tail_mode();
+        }
         // (No deadline: until every item is made, while one is made at least every 10 minutes:
         // a slower PC gets them all. With a deadline: at most `COMPUTE_TAIL`, never past it.)
         let tail = time_left().map(|l| l.min(COMPUTE_TAIL));
@@ -841,11 +914,15 @@ impl Play {
     fn coverage(&self, at: &str) {
         use crate::gpu::exec::{FIRST_USES, draw};
         crate::info!(
-            "prepare-play: at {at} ({:.0} s): {} graphics pipelines queued for the background, {} graphics and {} compute pipelines missing at their first use; {}",
+            "prepare-play: at {at} ({:.0} s): {} graphics pipelines queued for the background, {} graphics and {} compute pipelines missing at their first use ({:.0} s of compute creating or waiting); the background list: {} of {} items made ({} held by the store already); {}",
             self.t0.elapsed().as_secs_f64(),
             draw::ASYNC_GFX_STATS[1].load(Relaxed),
             draw::GFX_FIRST_USES[0].load(Relaxed),
             FIRST_USES[0].load(Relaxed),
+            FIRST_USES[1].load(Relaxed) as f64 / 1e9,
+            crate::gpu::compbench::BACKGROUND[1].load(Relaxed),
+            crate::gpu::compbench::BACKGROUND[0].load(Relaxed),
+            crate::gpu::compbench::STORED_SKIPS.load(Relaxed),
             crate::gpu::exec::import_backlog()
         );
     }
@@ -866,6 +943,22 @@ struct LevelOpts {
     /// The part of the levels this session plays (`--prepare-chunk`: i of n, in their order).
     chunk: Option<(usize, usize)>,
 }
+
+/// Whether the levels play as a fast-forward (`DS_PREPARE_FAST=0`: not, a test): each frame the
+/// game time of a frame at 60 a second (`gamestep::FIXED_FEED`), the automation's waits and the
+/// self-play's presses and sticks counted in frames (`input::FLIP_TIMED`), the frames as fast
+/// as the PC makes them up to `FAST_HZ` a second (the title's vblanks at that rate). What a
+/// frame does stays; a PC above 60 frames a second plays the levels in less time, one below
+/// it in the same frames as before (2026-11-20: the levels had run at ~30 frames a second,
+/// their frame-counted waits twice as long as written).
+fn fast_forward() -> bool {
+    std::env::var("DS_PREPARE_FAST").ok().as_deref() != Some("0")
+}
+
+/// The fast-forward's frame limit (the title's vblank rate meanwhile): game time up to 4 times
+/// real time at the levels' speed of 2, so that streaming and the pipelines compiled in the
+/// background keep up.
+const FAST_HZ: &str = "120";
 
 /// The levels stage's game speed (`DS_PREPARE_SPEED`, 0.25 to 4; default 2).
 fn level_speed() -> f64 {

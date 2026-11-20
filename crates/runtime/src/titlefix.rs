@@ -214,6 +214,19 @@ const FIXES: &[Fix] = &[
         why: "the static decals' draws walked the GPU's decal visibility mask before our GPU's writes landed; walls lost their decals for a frame",
         only_with: None,
     },
+    // The shader preparation's self-play (`prepplay`): the levels' tour opens with a 120 s wait
+    // of the title's automation; once the self-play sees the game in play that wait ends
+    // (`prepplay::automation_wait_hook` at the automation's wait step, eboot+0xaf7bf0: `vmovss
+    // xmm0,[rdi]; vsubss xmm0,xmm0,[rsi+8]`). Inert in any other session.
+    Fix {
+        name: "the self-play's opening wait ended once in play",
+        offset: 0xaf7bf0,
+        from: (9, 0xc4fca86b5b174336),
+        change: Change::Hook { at: 0, handler: crate::prepplay::automation_wait_hook },
+        kind: "self-play",
+        why: "the levels' tour waited 120 s of the title's time from boot, ~148 s after the self-play had reached the game",
+        only_with: None,
+    },
     Fix {
         name: "VG spawning held after scene resets (per frame)",
         offset: 0xa553c7,

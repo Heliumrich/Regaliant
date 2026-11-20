@@ -224,10 +224,52 @@ pub fn press_now(names: &str, hold: u64) -> Result<(), String> {
 /// flips (the flip it was first read at, u64::MAX before): a game frozen
 /// for the whole hold (a shader compiled in place on a slow PC, seconds)
 /// still sees it.
-static LIVE_TIMED: parking_lot::Mutex<Vec<(std::time::Instant, Step, u64)>> = parking_lot::Mutex::new(Vec::new());
+/// (until, the step, the flip it was first read at, the flips it is held at least.)
+static LIVE_TIMED: parking_lot::Mutex<Vec<(std::time::Instant, Step, u64, u64)>> = parking_lot::Mutex::new(Vec::new());
 
 /// The flips a timed press stays held at least, from the first the game read it at.
 const MIN_FLIPS: u64 = 3;
+
+/// Timed presses and sticks held for their time's flips at the title's 59.94 frames a second
+/// instead of the wall clock's time (the shader preparation's levels, a fast-forward:
+/// `gamestep::FIXED_FEED`): each frame steps the game as one at 60 a second does, so a hold
+/// covers the same game time at any frame rate.
+pub static FLIP_TIMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The flips a hold of `dur` lasts under `FLIP_TIMED` (at least one).
+fn flips_for(dur: std::time::Duration) -> u64 {
+    ((dur.as_secs_f64() * 59.94).ceil() as u64).max(1)
+}
+
+/// Under `FLIP_TIMED`, a timed press or a stick the title's automation asked for
+/// (`dsport-control: press <buttons> <n>ms` or `stick l|r <x> <y> <ms>`) held from the frame it
+/// was printed in (true), instead of from the control file's next poll, up to 250 ms later (30
+/// frames of the fast-forward: its fights' presses would have bunched). Other lines: false.
+pub fn control_now(line: &str) -> bool {
+    if !FLIP_TIMED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let w: Vec<&str> = line.split_whitespace().collect();
+    let r = match w.as_slice() {
+        ["press", names, h] if h.ends_with("ms") => match h.trim_end_matches("ms").parse::<u64>() {
+            Ok(ms) => press_for(names, std::time::Duration::from_millis(ms)),
+            Err(_) => return false,
+        },
+        ["stick", side @ ("l" | "r"), x, y, ms] => match (x.parse::<i32>(), y.parse::<i32>(), ms.parse::<u64>()) {
+            (Ok(x), Ok(y), Ok(ms)) => {
+                hold_stick(*side == "r", x, y, std::time::Duration::from_millis(ms));
+                Ok(())
+            }
+            _ => return false,
+        },
+        _ => return false,
+    };
+    match r {
+        Ok(()) => crate::info!("control: '{line}' at flip {} (at once)", crate::gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed)),
+        Err(e) => crate::warn!("control: '{line}': {e}"),
+    }
+    true
+}
 
 /// The menu pointer's presses (`press_quiet`): the game's alone (the system text box takes the
 /// pad's and the control channel's, never these: a click or a hover step there would cancel
@@ -251,14 +293,16 @@ pub fn press_for(names: &str, dur: std::time::Duration) -> Result<(), String> {
     let now = std::time::Instant::now();
     let mut live = LIVE_TIMED.lock();
     let flip = crate::gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
-    live.retain(|x| x.0 > now || x.2 == u64::MAX || flip < x.2 + MIN_FLIPS);
-    live.extend(steps.into_iter().map(|s| (now + dur, s, u64::MAX)));
+    live.retain(|x| x.0 > now || x.2 == u64::MAX || flip < x.2 + x.3);
+    let (until, flips) = if FLIP_TIMED.load(std::sync::atomic::Ordering::Relaxed) { (now, flips_for(dur).max(MIN_FLIPS)) } else { (now + dur, MIN_FLIPS) };
+    live.extend(steps.into_iter().map(|s| (until, s, u64::MAX, flips)));
     Ok(())
 }
 
 /// Sticks held at a tilt by the control channel (`hold_stick`): until when,
-/// right stick, x, y.
-static STICKS: parking_lot::Mutex<Vec<(std::time::Instant, bool, i32, i32)>> = parking_lot::Mutex::new(Vec::new());
+/// right stick, x, y, and under `FLIP_TIMED` the flip it was first read at and its flips (0:
+/// held by the wall clock).
+static STICKS: parking_lot::Mutex<Vec<(std::time::Instant, bool, i32, i32, u64, u64)>> = parking_lot::Mutex::new(Vec::new());
 
 /// Diagnosis (control channel `stick`): holds the left or right stick at
 /// (x, y) from the centre (-128..127, y down) for `dur`.
@@ -268,9 +312,11 @@ pub fn hold_stick(right: bool, x: i32, y: i32, dur: std::time::Duration) {
         note_device(DEVICE_PAD);
     }
     let now = std::time::Instant::now();
+    let flip = crate::gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
     let mut g = STICKS.lock();
-    g.retain(|s| s.0 > now);
-    g.push((now + dur, right, x.clamp(-128, 127), y.clamp(-128, 127)));
+    g.retain(|s| s.0 > now || (s.5 > 0 && (s.4 == u64::MAX || flip < s.4 + s.5)));
+    let flips = if FLIP_TIMED.load(std::sync::atomic::Ordering::Relaxed) { flips_for(dur) } else { 0 };
+    g.push((if flips > 0 { now } else { now + dur }, right, x.clamp(-128, 127), y.clamp(-128, 127), u64::MAX, flips));
 }
 
 /// The scripted presses and sticks into `st`; `quiet`: the menu pointer's presses too.
@@ -286,8 +332,17 @@ fn scripted(st: &mut PadState, flip: u64, quiet: bool) {
             }
         }
     }
-    for &(until, right, x, y) in STICKS.lock().iter() {
-        if now < until {
+    for (until, right, x, y, first, flips) in STICKS.lock().iter_mut() {
+        let on = if *flips > 0 {
+            if *first == u64::MAX {
+                *first = flip;
+            }
+            flip < *first + *flips
+        } else {
+            now < *until
+        };
+        if on {
+            let (right, x, y) = (*right, *x, *y);
             let (ax, ay) = ((128 + x) as u8, (128 + y) as u8);
             if right {
                 (st.rx, st.ry) = (ax, ay);
@@ -296,8 +351,8 @@ fn scripted(st: &mut PadState, flip: u64, quiet: bool) {
             }
         }
     }
-    for (until, step, first) in LIVE_TIMED.lock().iter_mut() {
-        if now < *until || *first == u64::MAX || flip < *first + MIN_FLIPS {
+    for (until, step, first, flips) in LIVE_TIMED.lock().iter_mut() {
+        if now < *until || *first == u64::MAX || flip < *first + *flips {
             if *first == u64::MAX {
                 *first = flip;
             }

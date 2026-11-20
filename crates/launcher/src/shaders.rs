@@ -34,6 +34,15 @@ const STAGE_STOPPED: i32 = 12;
 /// (`main::EXIT_RUNNING`): the step did not run.
 const GAME_RUNNING: i32 = 9;
 
+/// Whether a self-play step's exit status is worth one more try: the graphics device lost
+/// (`main::EXIT_DEVICE_LOST`, 5), memory exhausted (`EXIT_MEMORY`, 7) or a crash (a status the
+/// game does not give itself). Not: played (0), stopped (12), could not go on (13: it would stop
+/// there again), the game files, the CPU, a start too early, no graphics card (3, 8, 10, 11), the
+/// game's modules not loaded (`EXIT_START`, 0xD502).
+fn worth_retry(code: i32) -> bool {
+    !matches!(code, 0 | 3 | 8 | 9 | 10 | 11 | STAGE_STOPPED | 13 | 0xD502)
+}
+
 /// This build's translation fingerprint (`dsport --translation-fingerprint`): None while the
 /// check runs, then its answer.
 static CHECK: std::sync::Mutex<Option<Result<String, String>>> = std::sync::Mutex::new(None);
@@ -106,7 +115,9 @@ const LEVEL_PARTS: u8 = 3;
 /// The steps' times on the development PC (2026-11-20, a fresh store): the yardsticks of the
 /// whole preparation's estimate (`estimate`). The preparation has no deadline since 2026-11-20
 /// (the user: slower PCs get every level and every compute program too, warned of the time): it
-/// plays every level and makes the whole compute list.
+/// plays every level and makes the whole compute list. Since 2026-11-20 evening the compute
+/// step comes between the new game and the levels: the list's rest (what the new game's play
+/// left) on its own, so that the levels' first dispatches find their pipelines in the store.
 const REF_NEWGAME: f64 = 285.0;
 const REF_PART: f64 = 1010.0;
 const REF_COMPUTE: f64 = 1200.0;
@@ -173,15 +184,20 @@ pub struct Page {
     stopping: Option<Instant>,
     /// The game starts once the stop is done.
     then_play: bool,
-    /// When this preparation began, the new game's time and the levels parts' times in it (the
-    /// estimate, `estimate`).
+    /// When this preparation began and the levels parts' times in it (the estimate, `estimate`).
     prep_started: Option<Instant>,
-    newgame_secs: Option<f64>,
     part_secs: Vec<f64>,
     /// The progress file's last change seen and when it was seen (`STALL_SECS`).
     progress_seen: Option<(Option<std::time::SystemTime>, Instant)>,
     /// The slower-PC note was shown in the launcher's status line (once a preparation).
     slow_noted: bool,
+    /// The compute step's time (the estimate's speed before a part of the levels is played) and
+    /// the step after it (the levels' next part; None: the compute step is the last, after a new
+    /// game that could not be played).
+    compute_secs: Option<f64>,
+    after_compute: Option<Step>,
+    /// Self-play steps begun again after a crash or a lost device (once each: `worth_retry`).
+    crash_retried: Vec<Step>,
     /// The step the preparation goes on with after its check, and the check's round (2: again,
     /// with the store turned to cache data).
     after_check: Option<Step>,
@@ -489,6 +505,11 @@ pub fn start(app: &mut App, play_after: bool) {
         Played { newgame: Some(0), parts, tour, .. } if parts < LEVEL_PARTS && tour != Some(0) && has_save(&save, 4) => Step::Levels(parts + 1),
         _ => Step::NewGame,
     };
+    // (The compute step before the levels when its list is not made: stopped there before.)
+    let (first, after_compute) = match first {
+        Step::Levels(_) if !compute_state(app).0 => (Step::Compute, Some(first)),
+        _ => (first, None),
+    };
     // (The store check first, once a card and driver.)
     app.shaders.after_check = None;
     app.shaders.check_round = 1;
@@ -507,9 +528,11 @@ pub fn start(app: &mut App, play_after: bool) {
         _ => first,
     };
     app.shaders.prep_started = Some(Instant::now());
-    app.shaders.newgame_secs = None;
+    app.shaders.crash_retried.clear();
     app.shaders.part_secs.clear();
     app.shaders.slow_noted = false;
+    app.shaders.compute_secs = None;
+    app.shaders.after_compute = after_compute;
     app.shaders.play_after = play_after;
     app.shaders.stopping = None;
     app.shaders.then_play = false;
@@ -539,7 +562,7 @@ fn begin(app: &mut App, step: Step) -> bool {
     match (step, step.stage()) {
         (Step::CheckWrite, _) => cmd.arg("--pb-check").arg("write"),
         (Step::CheckRead, _) => cmd.arg("--pb-check").arg("read"),
-        (_, None) => cmd.arg("--precompile-all").arg(sys::prepare_threads().to_string()),
+        (_, None) => cmd.arg("--precompile-all").arg(sys::compute_threads().to_string()),
         (_, Some(s)) => cmd.arg("--prepare-play").arg(s).arg("--seconds").arg(step.seconds().to_string()).arg("--prepare-threads").arg(sys::prepare_threads().to_string()),
     };
     if let Step::Levels(i) = step {
@@ -672,13 +695,23 @@ pub fn tick(app: &mut App) {
         }
         app.shaders.ended = Some(Instant::now());
         app.shaders.retries = 0;
+        // (A self-play step that crashed or lost the graphics device: begun once more, its
+        // levels played again (what it made is kept: the second try is quicker). A preparation
+        // that marked such a part done left its levels to the player, 2026-11-20.)
+        if !stopped && matches!(step, Step::NewGame | Step::Levels(_) | Step::Compute) && worth_retry(code) && !app.shaders.crash_retried.contains(&step) {
+            app.shaders.crash_retried.push(step);
+            unsafe { ui::set_text(h(app.shaders.status), &format!("The preparation's step ended unexpectedly (code {code}). Starting it again...")) };
+            if begin(app, step) {
+                return;
+            }
+        }
         // (The step's time, for the estimate: a whole new game or part only.)
         if code == 0 {
             let secs = app.shaders.started.map_or(0.0, |s| s.elapsed().as_secs_f64());
             match step {
-                Step::NewGame => app.shaders.newgame_secs = Some(secs),
                 Step::Levels(_) => app.shaders.part_secs.push(secs),
-                Step::Compute | Step::CheckWrite | Step::CheckRead => {}
+                Step::Compute => app.shaders.compute_secs = Some(secs),
+                Step::NewGame | Step::CheckWrite | Step::CheckRead => {}
             }
         }
         // (Levels left: the self-play's marker says so, `levels_cut`; the clock alone would also
@@ -756,6 +789,13 @@ pub fn tick(app: &mut App) {
                 finish(app, Some(format!("Preparation ended with an error (code {code}). Open logs shows its log.")));
                 return;
             }
+            // (The compute list made: the levels next, their first dispatches finding their
+            // pipelines in the store.)
+            Step::Compute => app.shaders.after_compute.take(),
+            Step::NewGame if code == 0 && !compute_state(app).0 => {
+                app.shaders.after_compute = Some(Step::Levels(1));
+                Some(Step::Compute)
+            }
             Step::NewGame if code == 0 => Some(Step::Levels(1)),
             // (The new game could not be played: the compute shaders on their own, as before.)
             Step::NewGame if !compute_state(app).0 => Some(Step::Compute),
@@ -809,6 +849,7 @@ pub fn tick(app: &mut App) {
         };
         let text = match step {
             Step::CheckWrite | Step::CheckRead => "Preparing the shaders: first a check that this PC keeps them from one session to the next...".to_string(),
+            Step::Compute if app.shaders.after_compute.is_some() => format!("Preparing the shaders: the game's compute shaders, {done} of {total} ({:.0}%).{}", frac * 100.0, if budget.is_empty() { eta.as_str() } else { budget.as_str() }),
             Step::Compute => format!("Preparing the compute shaders: {done} of {total} ({:.0}%).{eta}", frac * 100.0),
             Step::NewGame => format!("Preparing the shaders, step 1 of {steps}: the game plays a new game in the background, {done} of {total}.{budget}{compute}"),
             Step::Levels(_) => format!("Preparing the shaders, step {} of {steps}: the game visits its levels in the background, {done} of {total}.{budget}{compute}", step.number()),
@@ -835,27 +876,31 @@ fn estimate(app: &App, step: Step, frac: f64, compute: Option<(u64, u64)>) -> Op
     let el = app.shaders.prep_started?.elapsed().as_secs_f64();
     let step_el = app.shaders.started?.elapsed().as_secs_f64();
     let parts = &app.shaders.part_secs;
-    let f = if let Some(ng) = app.shaders.newgame_secs {
-        ng / REF_NEWGAME
-    } else if !parts.is_empty() {
+    // (A step's own progress counts once a tenth of it is done: the compute step's and a part's.)
+    let own = frac > 0.1 && matches!(step, Step::Compute | Step::Levels(_));
+    // The PC's speed against the development PC's: the levels parts' times once there are some,
+    // else the compute step's (its CPU), else the current step's own progress. (None during the
+    // new game: its waits run in real time on any PC.)
+    let f = if !parts.is_empty() {
         parts.iter().sum::<f64>() / parts.len() as f64 / REF_PART
-    } else if frac > 0.1 && step != Step::NewGame {
+    } else if let Some(c) = app.shaders.compute_secs {
+        c / REF_COMPUTE
+    } else if own {
         step_el / frac / step.yardstick()
     } else {
         return None;
     };
     let f = f.clamp(0.6, 30.0);
-    // The current step's rest: its own progress when it has some (the new game's steps are
-    // uneven: its yardstick), else the yardstick.
-    let cur = if frac > 0.1 && step != Step::NewGame { step_el / frac } else { step.yardstick() * f };
+    let cur = if own { step_el / frac } else { step.yardstick() * f };
+    // The levels' parts still to come.
     let after = match step {
-        Step::CheckWrite | Step::CheckRead => LEVEL_PARTS as f64 + 1.0,
-        Step::NewGame => LEVEL_PARTS as f64,
+        Step::Compute if app.shaders.after_compute.is_some() => LEVEL_PARTS as f64,
         Step::Levels(i) => (LEVEL_PARTS - i) as f64,
-        Step::Compute => 0.0,
+        _ => 0.0,
     };
     let mut left = (cur - step_el).max(0.0) + after * REF_PART * f;
-    if let Some((made, all)) = compute {
+    // (The levels' own lists: a rest made after their last part.)
+    if let Some((made, all)) = compute.filter(|_| matches!(step, Step::Levels(_))) {
         if all > 0 && made < all && made > 0 {
             let rate = made as f64 / el.max(1.0);
             let rest = (all - made) as f64 - rate * left;

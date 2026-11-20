@@ -485,17 +485,35 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
 /// management while the CPU side limits its frame, and every batch completes late: 48
 /// flips/s where a run with a window makes 62 (FINDINGS.md 2026-11-17 night). `tune
 /// headless_present 0` (`DS_HEADLESS_PRESENT=0`): none, as until then.
+///
+/// An image is asked for with a fence, not a semaphore, and its flip presents it only once the
+/// fence says it is free (a later flip if not yet): the main queue never waits for the window
+/// system. And at most one present in `HIDDEN_GAP`. (2026-11-20: in the shader preparation's
+/// fast-forward, ~90 flips a second, a present blocked in the driver while holding the queue,
+/// its submission having made the main queue wait for an image the window system had not given
+/// back: the submission thread waited for the queue, the GPU idled, the game hung, and the
+/// process could not end; every run before had presented 60 a second at most.)
 struct Hidden {
     swapchain: vk::SwapchainKHR,
     cmds: Vec<vk::CommandBuffer>,
     fences: Vec<vk::Fence>,
-    acquire: Vec<vk::Semaphore>,
+    /// Per slot: the fence an image asked for signals once it is free.
+    acquired: Vec<vk::Fence>,
     done: Vec<vk::Semaphore>,
     images: Vec<vk::Image>,
     frame: usize,
+    /// An image asked for and its slot, not free yet at the flip that asked.
+    pending: Option<(u32, usize)>,
+    last: Option<std::time::Instant>,
     presented: u64,
     skipped: u64,
+    held: u64,
+    waited: u64,
 }
+
+/// The least time between two of `Hidden`'s presents (some 83 a second at most: every flip at
+/// 59.94 Hz, every other one of the fast-forward's 120).
+const HIDDEN_GAP: std::time::Duration = std::time::Duration::from_millis(12);
 // (Vulkan handles; used under the lock.)
 unsafe impl Send for Hidden {}
 
@@ -540,10 +558,10 @@ unsafe fn hidden_make() -> Result<Hidden, String> {
             .map_err(|e| e.to_string())?;
         let cmds = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(FRAMES as u32)).map_err(|e| e.to_string())?;
         let sem = || c.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).map_err(|e| e.to_string());
-        let mut h = Hidden { swapchain, cmds, fences: Vec::new(), acquire: Vec::new(), done: Vec::new(), images, frame: 0, presented: 0, skipped: 0 };
+        let mut h = Hidden { swapchain, cmds, fences: Vec::new(), acquired: Vec::new(), done: Vec::new(), images, frame: 0, pending: None, last: None, presented: 0, skipped: 0, held: 0, waited: 0 };
         for _ in 0..FRAMES {
             h.fences.push(c.device.create_fence(&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None).map_err(|e| e.to_string())?);
-            h.acquire.push(sem()?);
+            h.acquired.push(c.device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(|e| e.to_string())?);
         }
         // (A present's semaphore per image, as the window's presenter has them: an image
         // comes back only after its present let go of the semaphore.)
@@ -556,7 +574,8 @@ unsafe fn hidden_make() -> Result<Hidden, String> {
 }
 
 /// A flip of a run without a window (`Hidden`): skipped while the frame slot's last
-/// submission or a free image is not there yet (nothing here waits).
+/// submission or a free image is not there yet, or the last present was less than `HIDDEN_GAP`
+/// ago (nothing here waits, on the CPU or on the GPU).
 fn headless_present() {
     if !crate::gpu::tune::headless_present() || HIDDEN_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
         return;
@@ -574,22 +593,40 @@ fn headless_present() {
         }
     }
     let h = g.as_mut().unwrap();
+    if h.last.is_some_and(|t| t.elapsed() < HIDDEN_GAP) {
+        h.held += 1;
+        return;
+    }
     unsafe {
-        let f = h.frame % FRAMES;
-        if c.device.get_fence_status(h.fences[f]) != Ok(true) {
-            h.skipped += 1;
-            return;
-        }
-        let idx = match c.swapchain_d.acquire_next_image(h.swapchain, 0, h.acquire[f], vk::Fence::null()) {
-            Ok((i, _)) => i,
-            Err(_) => {
-                h.skipped += 1;
-                return;
+        // (An image asked for at an earlier flip: presented once it is free.)
+        let (idx, f) = match h.pending {
+            Some(p) => p,
+            None => {
+                let f = h.frame % FRAMES;
+                if c.device.get_fence_status(h.fences[f]) != Ok(true) {
+                    h.skipped += 1;
+                    return;
+                }
+                match c.swapchain_d.acquire_next_image(h.swapchain, 0, vk::Semaphore::null(), h.acquired[f]) {
+                    Ok((i, _)) => {
+                        h.pending = Some((i, f));
+                        (i, f)
+                    }
+                    Err(_) => {
+                        h.skipped += 1;
+                        return;
+                    }
+                }
             }
         };
+        if c.device.get_fence_status(h.acquired[f]) != Ok(true) {
+            h.waited += 1;
+            return;
+        }
+        h.pending = None;
         h.frame += 1;
         let cmd = h.cmds[f];
-        c.device.reset_fences(&[h.fences[f]]).ok();
+        c.device.reset_fences(&[h.fences[f], h.acquired[f]]).ok();
         c.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).ok();
         c.device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
         let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
@@ -602,11 +639,10 @@ fn headless_present() {
             .subresource_range(range);
         c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT, vk::PipelineStageFlags::BOTTOM_OF_PIPE, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
         c.device.end_command_buffer(cmd).ok();
-        let wait = [h.acquire[f]];
-        let stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+        // (No wait: the image's fence said it is free.)
         let signal = [h.done[idx as usize]];
         let cmds = [cmd];
-        let si = vk::SubmitInfo::default().wait_semaphores(&wait).wait_dst_stage_mask(&stages).command_buffers(&cmds).signal_semaphores(&signal);
+        let si = vk::SubmitInfo::default().command_buffers(&cmds).signal_semaphores(&signal);
         let scs = [h.swapchain];
         let idxs = [idx];
         let pi = vk::PresentInfoKHR::default().wait_semaphores(&signal).swapchains(&scs).image_indices(&idxs);
@@ -614,6 +650,7 @@ fn headless_present() {
         if c.device.queue_submit(*q, &[si], h.fences[f]).is_ok() {
             let _ = c.swapchain_d.queue_present(*q, &pi);
             h.presented += 1;
+            h.last = Some(std::time::Instant::now());
         }
     }
 }
@@ -621,7 +658,7 @@ fn headless_present() {
 /// Status part: the hidden swapchain's presents (`headless_present`).
 pub fn hidden_line() -> String {
     match HIDDEN.lock().as_ref() {
-        Some(h) => format!("hidden swapchain: {} flips presented, {} skipped (no free image or the slot's submission still running)", h.presented, h.skipped),
+        Some(h) => format!("hidden swapchain: {} flips presented, {} skipped (no free image or the slot's submission still running), {} within {} ms of the last, {} waited for their image to be free", h.presented, h.skipped, h.held, HIDDEN_GAP.as_millis(), h.waited),
         None => String::new(),
     }
 }

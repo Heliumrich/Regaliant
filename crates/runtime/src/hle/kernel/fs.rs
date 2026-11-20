@@ -404,7 +404,7 @@ fn console_write(fd: i32, data: &[u8]) {
         // 200ms`, `audio capture 30`, ...) at the script's point.
         if let Some(rest) = line.split("dsport-control:").nth(1) {
             let rest = rest.trim();
-            if !rest.is_empty() {
+            if !rest.is_empty() && !crate::input::control_now(rest) {
                 crate::INJECTED.lock().push(rest.to_string());
             }
         }
