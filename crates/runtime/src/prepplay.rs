@@ -896,8 +896,11 @@ fn levels_lines(text: &str, poi_text: &str, o: &LevelOpts) -> Option<(String, u3
     if !o.only.is_empty() {
         levels.retain(|l| o.only.contains(l));
     }
-    // The chunk's share, in order (the game's progression: the tutorial, the Nexus, world 1 first;
-    // a deadline that ends the preparation early leaves the latest levels).
+    // By depth: the tutorial and the Nexus, then every world's first level, every world's second,
+    // and so on (after 1-1 a player may go to any world: what a deadline leaves is the deepest).
+    levels.sort_by_key(|&(w, l)| if w == 8 || w == 0 { (0, w == 0, l) } else { (l, false, w) });
+    // The chunk's share, in that order (a deadline that ends the preparation early leaves the
+    // deepest levels).
     if let Some((i, n)) = o.chunk {
         let len = levels.len();
         let (from, to) = ((i - 1) * len / n, i * len / n);
