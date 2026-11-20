@@ -168,7 +168,8 @@ pub fn play(app: &mut App) {
         }
         return;
     }
-    if app.launch.prepare_shaders && !shaders::prepared(app) {
+    // (Not again after the player declined preparing for lack of space in this session.)
+    if app.launch.prepare_shaders && !app.shaders.space_declined && !shaders::prepared(app) {
         shaders::start(app, true);
         return;
     }
@@ -389,6 +390,9 @@ fn startup_status(app: &mut App) {
         app.running = Some(pid);
         app.update_play();
         app.set_status("The game is running.");
+        // (Its end posted as a game started here would post it: Play comes back then, the
+        // review of 2026-11-20.)
+        sys::watch_process(pid, app.hwnd as usize, WM_GAME_EXIT);
     } else {
         let _ = std::fs::remove_file(&marker);
         app.set_status("The last session did not end normally. Open logs shows its log.");

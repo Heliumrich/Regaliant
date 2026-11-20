@@ -545,8 +545,36 @@ pub fn precompile_all(app: &std::path::Path, threads: usize, progress: Option<&s
             }
         };
         write_progress();
+        // (A watch: no item made for `ITEM_HANG_SECS` is a compile that does not return, the
+        // driver's: stacks into the log, the run ended, `crate::hung`; the launcher begins the
+        // step once more, then goes on.)
+        const ITEM_HANG_SECS: u64 = 600;
+        let (mut seen, mut moved) = (0usize, Instant::now());
+        let mut stopped_at: Option<Instant> = None;
         while done.load(Relaxed) < all {
             std::thread::sleep(std::time::Duration::from_millis(200));
+            let d = done.load(Relaxed);
+            if d != seen {
+                (seen, moved) = (d, Instant::now());
+            } else if !stop.load(Relaxed) && moved.elapsed().as_secs() >= ITEM_HANG_SECS {
+                crate::hung(&format!("precompile all: no program made for {ITEM_HANG_SECS} s ({d} of {all} done): a compile does not return"), crate::prepplay::EXIT_HUNG);
+            }
+            // (The device lost, or the store's drive full: the run ends with its own status, the
+            // launcher's to act on; a stop waits at most a minute for the compiles in flight.)
+            if DEVICE_LOST.load(Relaxed) {
+                crate::error!("precompile all: the graphics device was lost ({d} of {all} done)");
+                crate::log::flush();
+                crate::hung("precompile all: the graphics device was lost", crate::EXIT_DEVICE_LOST as i32);
+            }
+            if super::pcache::store_full() {
+                crate::hung(&format!("precompile all: the shader store's drive is full ({} MiB free; {} files not written)", super::pcache::store_free_bytes().unwrap_or(0) >> 20, super::pcache::WRITE_FAILS.load(Relaxed)), crate::prepplay::EXIT_DISK_FULL);
+            }
+            if super::pcache::store_unwritable() {
+                crate::hung(&format!("precompile all: the shader store's folder refuses writes ({} files not written, none written)", super::pcache::WRITE_FAILS.load(Relaxed)), crate::prepplay::EXIT_UNWRITABLE);
+            }
+            if stop.load(Relaxed) && stopped_at.get_or_insert_with(Instant::now).elapsed().as_secs() >= 60 {
+                crate::hung(&format!("precompile all: stopped, but compiles in flight did not return within 60 s ({d} of {all} done)"), 4);
+            }
             if !stop.load(Relaxed) && stop_file.as_ref().is_some_and(|f| f.exists()) {
                 crate::info!("precompile all: stop asked for at {} of {} programs", done.load(Relaxed), all);
                 stop.store(true, Relaxed);
@@ -610,8 +638,19 @@ pub fn write_marker(app: &std::path::Path, m: &std::path::Path, done: usize, all
         c.device_name,
         props.driver_version,
     );
-    if let Err(e) = std::fs::write(m, t) {
-        crate::warn!("precompile all: cannot write {}: {e}", m.display());
+    // (Written beside, flushed to the drive, then put in place: a power loss while it was
+    // written would leave an empty marker, read as nothing prepared.)
+    let tmp = m.with_extension("txt.new");
+    let whole = std::fs::File::create(&tmp).and_then(|mut f| {
+        use std::io::Write;
+        f.write_all(t.as_bytes())?;
+        f.sync_all()
+    });
+    if whole.and_then(|_| std::fs::rename(&tmp, m)).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        if let Err(e) = std::fs::write(m, t) {
+            crate::warn!("precompile all: cannot write {}: {e}", m.display());
+        }
     }
 }
 
@@ -621,6 +660,18 @@ type Prog = (u64, std::sync::Arc<Vec<u32>>, rdna::translate::Spec, usize);
 /// Work items the store held already (their translation skipped).
 pub static STORED_SKIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Whether a pipeline the store holds is taken as made (`DS_STORE_UNTRUSTED=1`, the launcher's:
+/// its stale pipelines could not be set aside, so each item goes through the store's own check,
+/// which makes a stale one again).
+fn store_trusted() -> bool {
+    static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var("DS_STORE_UNTRUSTED").ok().as_deref() != Some("1"))
+}
+
+/// A work item's pipeline failed with the device lost (`precompile_all` ends with
+/// `EXIT_DEVICE_LOST`: the launcher begins the step once more).
+static DEVICE_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Item `i` of a work list (`work_list`) made: its pipeline translated and made through the
 /// store (compute), or the learned graphics recipe prepared; (ns, code words, made).
 fn work_item(progs: &[Prog], recipes: &[(usize, usize)], i: usize) -> (u64, u64, bool) {
@@ -628,7 +679,7 @@ fn work_item(progs: &[Prog], recipes: &[(usize, usize)], i: usize) -> (u64, u64,
         // (One the store holds, as an earlier stage of the shader preparation left it: its key
         // looked up before translating, `shaders::translate_code_unkept`'s.)
         let plan_key = h ^ (spec.user_sgprs as u64) << 48 ^ (spec.user_base as u64) << 56;
-        if super::exec::compute_key_stored(plan_key ^ spec_hash(spec).rotate_left(1)) {
+        if store_trusted() && super::exec::compute_key_stored(plan_key ^ spec_hash(spec).rotate_left(1)) {
             STORED_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return (0, *n as u64, true);
         }
@@ -640,6 +691,9 @@ fn work_item(progs: &[Prog], recipes: &[(usize, usize)], i: usize) -> (u64, u64,
                 static WARNED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
                 if WARNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
                     crate::warn!("precompile all: {h:#018x}: {e}");
+                }
+                if e.contains("DEVICE_LOST") {
+                    DEVICE_LOST.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 (t.elapsed().as_nanos() as u64, *n as u64, false)
             }
@@ -841,10 +895,20 @@ fn work_list(app: &std::path::Path, threads: usize) -> (Vec<Prog>, Vec<(usize, u
         progs.extend(extra);
     }
     let learned_n = progs.len() - guessed;
+    // (`DS_PRECOMPILE_LIMIT=<n>`, a test: the list cut to its first n compute items and n
+    // graphics ones, before those stored are left out: a whole preparation's flow in minutes.)
+    let mut recipes = recipes;
+    if let Some(n) = std::env::var("DS_PRECOMPILE_LIMIT").ok().and_then(|v| v.parse::<usize>().ok()) {
+        progs.truncate(n);
+        recipes.truncate(n);
+        crate::warn!("precompile all: DS_PRECOMPILE_LIMIT={n}: the list cut to its first {n} compute and graphics items (a test)");
+    }
     // (Those the store holds, as an earlier step of the shader preparation left them, out: the
     // list and its progress are the work left. `work_item` looks again for those made since.)
     let listed = progs.len();
-    progs.retain(|(h, _, spec, _)| !super::exec::compute_key_stored(h ^ (spec.user_sgprs as u64) << 48 ^ (spec.user_base as u64) << 56 ^ spec_hash(spec).rotate_left(1)));
+    if store_trusted() {
+        progs.retain(|(h, _, spec, _)| !super::exec::compute_key_stored(h ^ (spec.user_sgprs as u64) << 48 ^ (spec.user_base as u64) << 56 ^ spec_hash(spec).rotate_left(1)));
+    }
     let held = listed - progs.len();
     let gfx_words: usize = recipes.iter().map(|r| r.1).sum();
     let total_words: usize = progs.iter().map(|p| p.3).sum::<usize>() + gfx_words;

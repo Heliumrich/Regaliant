@@ -34,18 +34,102 @@ const STAGE_STOPPED: i32 = 12;
 /// (`main::EXIT_RUNNING`): the step did not run.
 const GAME_RUNNING: i32 = 9;
 
-/// Whether a self-play step's exit status is worth one more try: the graphics device lost
-/// (`main::EXIT_DEVICE_LOST`, 5), memory exhausted (`EXIT_MEMORY`, 7) or a crash (a status the
-/// game does not give itself). Not: played (0), stopped (12), could not go on (13: it would stop
-/// there again), the game files, the CPU, a start too early, no graphics card (3, 8, 10, 11), the
-/// game's modules not loaded (`EXIT_START`, 0xD502).
+/// A step ended itself for nothing having moved in it (`prepplay::EXIT_HUNG`): begun once more.
+const STAGE_HUNG: i32 = 14;
+/// The shaders folder's drive is full (`prepplay::EXIT_DISK_FULL`): the preparation ends there.
+const STAGE_DISK_FULL: i32 = 15;
+/// The shaders folder refuses writes (`prepplay::EXIT_UNWRITABLE`): the preparation ends there.
+const STAGE_UNWRITABLE: i32 = 16;
+
+/// Whether a step's exit status is worth one more try: the graphics device lost
+/// (`main::EXIT_DEVICE_LOST`, 5), memory exhausted (`EXIT_MEMORY`, 7), hung (14) or a crash (a
+/// status the game does not give itself). Not: played (0), stopped (12), could not go on (13: it
+/// would stop there again), the drive full (15), the game files, the CPU, a start too early, no
+/// graphics card (3, 8, 10, 11), the game's modules not loaded (`EXIT_START`, 0xD502).
 fn worth_retry(code: i32) -> bool {
-    !matches!(code, 0 | 3 | 8 | 9 | 10 | 11 | STAGE_STOPPED | 13 | 0xD502)
+    !matches!(code, 0 | 3 | 8 | 9 | 10 | 11 | STAGE_STOPPED | 13 | STAGE_DISK_FULL | STAGE_UNWRITABLE | 20 | 21 | 0xD502)
+}
+
+/// An exit status as the player is told it: small ones in decimal, Windows' exception codes in
+/// hexadecimal (as the launcher shows a game's).
+fn code_text(c: i32) -> String {
+    if (0..=255).contains(&c) { c.to_string() } else { format!("{:#x}", c as u32) }
+}
+
+/// What a step's exit status means, in the player's words, with the status after it.
+fn reason(code: i32) -> String {
+    let what = match code {
+        1 | 2 => "it ended with an error",
+        3 => "the game's files could not be read",
+        5 => "the graphics card stopped responding",
+        7 => "Windows ran out of memory",
+        8 => "this PC's processor lacks instructions the game needs",
+        10 => "the game could not reserve the memory it needs",
+        11 => "no graphics card the game can use was found",
+        13 => "it could not go on",
+        STAGE_HUNG => "it stopped responding",
+        STAGE_DISK_FULL => "the drive is full",
+        STAGE_UNWRITABLE => "the shaders folder cannot be written to",
+        0xD502 => "the game could not start",
+        _ => "it crashed",
+    };
+    format!("{what} (status {})", code_text(code))
+}
+
+/// Statuses no other step would end otherwise on this PC: the game's files, the processor, the
+/// memory range, no graphics card, the game's start.
+fn fatal(code: i32) -> bool {
+    matches!(code, 3 | 8 | 10 | 11 | 0xD502)
+}
+
+/// A record written whole or not at all: beside it first, flushed to the drive, then put in its
+/// place (a power loss while it was written would leave an empty file, read as nothing prepared:
+/// the whole preparation again).
+fn write_record(p: &std::path::Path, text: &str) {
+    use std::io::Write;
+    let tmp = p.with_extension("txt.new");
+    let whole = std::fs::File::create(&tmp).and_then(|mut f| {
+        f.write_all(text.as_bytes())?;
+        f.sync_all()
+    });
+    if whole.and_then(|_| std::fs::rename(&tmp, p)).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::write(p, text);
+    }
+}
+
+/// The launcher's own log (`<logs>\launcher.log`): the preparation's steps, their ends and the
+/// launcher's decisions, for a player's report (the review of 2026-11-20: none was kept). Kept
+/// under ~1 MB (the older half dropped). No folder names.
+pub fn log(app: &App, line: &str) {
+    use std::io::Write;
+    let p = app.paths.logs().join("launcher.log");
+    let _ = std::fs::create_dir_all(app.paths.logs());
+    if std::fs::metadata(&p).is_ok_and(|m| m.len() > 1 << 20) {
+        if let Ok(b) = std::fs::read(&p) {
+            let _ = std::fs::write(&p, &b[b.len() / 2..]);
+        }
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+        let _ = writeln!(f, "{} {line}", utc_stamp());
+    }
 }
 
 /// This build's translation fingerprint (`dsport --translation-fingerprint`): None while the
 /// check runs, then its answer.
 static CHECK: std::sync::Mutex<Option<Result<String, String>>> = std::sync::Mutex::new(None);
+/// The game's version, graphics card and driver as its check reported them: the card and driver
+/// the game itself uses (the launcher's own choice could differ on a PC with two graphics cards,
+/// the review of 2026-11-20).
+static GAME_ID: std::sync::Mutex<Option<(String, String, String)>> = std::sync::Mutex::new(None);
+
+/// The game's files are of another version than the launcher (a new version unpacked while the
+/// old game still ran keeps the old program): what the player is told.
+fn version_mismatch() -> Option<String> {
+    let g = GAME_ID.lock().unwrap_or_else(|e| e.into_inner());
+    let (v, _, _) = g.as_ref()?;
+    (v != dsconfig::VERSION).then(|| format!("The game's program is version {v}, the launcher {}. Close the game, then unpack the whole new version again. Nothing is prepared until then.", dsconfig::VERSION))
+}
 static CHECK_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Asks the game for its translation fingerprint on a thread of its own (a few seconds).
@@ -56,20 +140,37 @@ pub fn start_check(app: &App) {
     let exe = dsconfig::paths::game_exe_in(&app.paths.exe_dir);
     let dir = app.paths.exe_dir.clone();
     std::thread::spawn(move || {
-        use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
-        let r = std::process::Command::new(&exe)
-            .arg("--translation-fingerprint")
-            .current_dir(&dir)
-            .creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS)
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .map_err(|e| e.to_string())
-            .and_then(|o| {
-                String::from_utf8_lossy(&o.stdout).lines().find_map(|l| l.trim().strip_prefix("translation = ").map(|v| v.trim().to_string())).filter(|v| !v.is_empty()).ok_or_else(|| format!("no answer (exit code {:?})", o.status.code()))
-            });
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("--translation-fingerprint").current_dir(&dir).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+        // (In the launcher's job, and waited for 75 s at most: a check whose driver call does not
+        // return ends itself after 60 s, and is ended here otherwise; until 2026-11-20 the
+        // launcher would have waited for it for ever. Its output read only once it has ended.)
+        let r = sys::spawn_in_job(&mut cmd, CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS).map_err(|e| e.to_string()).and_then(|mut child| {
+            let t = Instant::now();
+            let status = loop {
+                match child.try_wait() {
+                    Ok(Some(s)) => break Ok(s),
+                    Ok(None) if t.elapsed().as_secs() < 75 => std::thread::sleep(std::time::Duration::from_millis(50)),
+                    Ok(None) => {
+                        let _ = child.kill();
+                        break Err("no answer in 75 s".to_string());
+                    }
+                    Err(e) => break Err(e.to_string()),
+                }
+            }?;
+            let mut out = String::new();
+            if let Some(mut so) = child.stdout.take() {
+                use std::io::Read;
+                let _ = so.read_to_string(&mut out);
+            }
+            let get = |k: &str| out.lines().find_map(|l| l.trim().strip_prefix(k).map(|v| v.trim().to_string())).filter(|v| !v.is_empty());
+            if let Some(v) = get("version = ") {
+                *GAME_ID.lock().unwrap_or_else(|e| e.into_inner()) = Some((v, get("device = ").unwrap_or_default(), get("driver = ").unwrap_or_default()));
+            }
+            get("translation = ").ok_or_else(|| format!("no answer (exit code {:?})", status.code()))
+        });
         *CHECK.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
     });
 }
@@ -81,8 +182,14 @@ fn checked_translation() -> Option<Result<String, String>> {
 
 /// The check timer: the page shows the check's outcome once it has one.
 pub fn check_tick(app: &mut App) {
-    if checked_translation().is_some() {
+    if let Some(r) = checked_translation() {
         unsafe { windows_sys::Win32::UI::WindowsAndMessaging::KillTimer(app.hwnd, CHECK_TIMER) };
+        let id = GAME_ID.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        log(app, &format!("launcher {} started; the game's check: translation {}; game {}", dsconfig::VERSION, r.as_deref().unwrap_or_else(|e| e), id.map_or("unknown".to_string(), |(v, d, r)| if d.is_empty() { format!("{v}, no graphics card reported") } else { format!("{v} on {d}, driver {r}") })));
+        if let Some(t) = version_mismatch() {
+            log(app, &t);
+            app.set_status(&t);
+        }
         refresh(app);
         app.update_play();
     }
@@ -123,9 +230,10 @@ const REF_PART: f64 = 1010.0;
 const REF_COMPUTE: f64 = 1200.0;
 /// The aim for the whole preparation: past it (and a tenth) the page says this PC takes longer.
 const AIM_SECS: f64 = 3600.0;
-/// A step whose progress file has not changed for this long is ended (a game that hangs: the
-/// self-play's own waits end it sooner, `prepplay::GameClock`).
-const STALL_SECS: u64 = 45 * 60;
+/// A step whose progress has not changed for this long is ended (a backstop: the steps end
+/// themselves sooner when nothing moves in them, `prepplay::watch_hangs` and the compute step's
+/// watch; 45 minutes until 2026-11-20).
+const STALL_SECS: u64 = 15 * 60;
 
 impl Step {
     /// The self-play stage (None: the compute step).
@@ -187,8 +295,8 @@ pub struct Page {
     /// When this preparation began and the levels parts' times in it (the estimate, `estimate`).
     prep_started: Option<Instant>,
     part_secs: Vec<f64>,
-    /// The progress file's last change seen and when it was seen (`STALL_SECS`).
-    progress_seen: Option<(Option<std::time::SystemTime>, Instant)>,
+    /// The progress file's contents last seen and when they changed (`STALL_SECS`).
+    progress_seen: Option<(String, Instant)>,
     /// The slower-PC note was shown in the launcher's status line (once a preparation).
     slow_noted: bool,
     /// The compute step's time (the estimate's speed before a part of the levels is played) and
@@ -208,6 +316,19 @@ pub struct Page {
     retries: u32,
     /// When the last step's child ended.
     ended: Option<Instant>,
+    /// The step's child was ended for its progress unchanged for `STALL_SECS`.
+    stalled: bool,
+    /// The store's stale pipelines could not be set aside (`retire_stale_store`): the steps take
+    /// no stored pipeline as made (`DS_STORE_UNTRUSTED`).
+    untrusted: bool,
+    /// The player declined preparing for lack of space in this launcher session: Play starts the
+    /// game.
+    pub space_declined: bool,
+    /// The timer's last tick (a gap of over 10 s: the PC slept, the watchdog's time starts again).
+    last_tick: Option<Instant>,
+    /// The step before failed (hung, crashed, the graphics card lost, memory), after its one more
+    /// try: one more failure ends the preparation (`tick`).
+    last_failed: bool,
 }
 
 fn h(v: usize) -> HWND {
@@ -240,11 +361,12 @@ fn store_identity_file(app: &App) -> PathBuf {
 /// holds as made (`compbench::work_list`: after a driver update or a new version nothing would
 /// have been made again, the release review of 2026-11-20). The folder is renamed (at once)
 /// and deleted on a thread of its own; its binaries mode file (the store check's) is kept.
-fn retire_stale_store(app: &App) {
+fn retire_stale_store(app: &App) -> bool {
     let (translation, device, driver) = identity();
     if translation.is_empty() || device.is_empty() {
-        return;
+        return true;
     }
+    let mut trusted = true;
     let shaders = app.paths.shaders();
     let get = |kv: &[(String, String)], k: &str| kv.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone()).unwrap_or_default();
     let recorded = [store_identity_file(app), marker(app), played_file(app)].into_iter().map(|f| read_kv(&f)).find(|kv| !kv.is_empty());
@@ -255,12 +377,22 @@ fn retire_stale_store(app: &App) {
             let mode = std::fs::read(dir.join("binaries-mode.txt")).ok();
             let old = shaders.join(format!("pipelines-old-{}", utc_stamp()));
             if std::fs::rename(&dir, &old).is_ok() {
+                log(app, "the stored pipelines were made for another translation, card or driver: set aside");
                 if let Some(m) = mode {
                     let _ = std::fs::create_dir_all(&dir);
                     let _ = std::fs::write(dir.join("binaries-mode.txt"), m);
                 }
+            } else {
+                // (A file in it held open, e.g. by a game or a virus scanner: its pipelines stay,
+                // and the steps take none of them as made; the identity stays the old one, so the
+                // next preparation tries again.)
+                log(app, "the stored pipelines were made for another translation, card or driver, but could not be set aside: none taken as made");
+                trusted = false;
             }
         }
+    }
+    if !trusted {
+        return false;
     }
     // (Folders set aside before, this one included: deleted in the background.)
     let olds: Vec<PathBuf> = std::fs::read_dir(&shaders).map(|r| r.flatten().map(|e| e.path()).filter(|p| p.is_dir() && p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("pipelines-old-"))).collect()).unwrap_or_default();
@@ -271,10 +403,11 @@ fn retire_stale_store(app: &App) {
             }
         });
     }
-    let _ = std::fs::write(
-        store_identity_file(app),
-        format!("# The translation, graphics card and driver the stored pipelines are made for; written by the launcher at a preparation's start\ntranslation = {translation}\ndevice = {device}\ndriver = {driver}\n"),
+    write_record(
+        &store_identity_file(app),
+        &format!("# The translation, graphics card and driver the stored pipelines are made for; written by the launcher at a preparation's start\ntranslation = {translation}\ndevice = {device}\ndriver = {driver}\n"),
     );
+    true
 }
 
 /// Whether the compute shaders are prepared for this graphics card, driver and translation; the
@@ -303,11 +436,16 @@ fn compute_state(app: &App) -> (bool, String) {
             return updated;
         }
     }
-    match sys::gpu() {
-        Ok(g) if g.name == get("device") && g.driver.to_string() == get("driver") => (true, format!("The shaders are prepared (on {date}, for this graphics card and driver).")),
-        Ok(g) if g.name == get("device") => (false, "The graphics driver changed since the shaders were prepared. Prepare them again.".into()),
-        Ok(_) => (false, "The graphics card changed since the shaders were prepared. Prepare them again.".into()),
-        Err(e) => (false, e),
+    let (_, device, driver) = identity();
+    if device.is_empty() {
+        return (false, sys::gpu().err().unwrap_or_else(|| "The graphics card could not be read.".into()));
+    }
+    if device == get("device") && driver == get("driver") {
+        (true, format!("The shaders are prepared (on {date}, for this graphics card and driver)."))
+    } else if device == get("device") {
+        (false, "The graphics driver changed since the shaders were prepared. Prepare them again.".into())
+    } else {
+        (false, "The graphics card changed since the shaders were prepared. Prepare them again.".into())
     }
 }
 
@@ -329,17 +467,60 @@ fn identity() -> (String, String, String) {
         Some(Ok(t)) => t,
         _ => String::new(),
     };
+    // (The card and driver the game uses, as its check reported them; else the launcher's own
+    // reading.)
+    if let Some((_, d, r)) = GAME_ID.lock().unwrap_or_else(|e| e.into_inner()).clone().filter(|(_, d, r)| !d.is_empty() && !r.is_empty()) {
+        return (translation, d, r);
+    }
     match sys::gpu() {
         Ok(g) => (translation, g.name, g.driver.to_string()),
         Err(_) => (translation, String::new(), String::new()),
     }
 }
 
+/// The preparation's rules in a translation fingerprint (its last part, `r9`): what the self-play
+/// learned holds while they stay, across drivers and versions that translate differently.
+fn rules_of(t: &str) -> &str {
+    t.rsplit('-').next().filter(|r| r.starts_with('r')).unwrap_or(t)
+}
+
+/// The self-play played to its end for this card and the preparation's rules.
+fn played_complete(p: &Played) -> bool {
+    p.newgame == Some(0) && p.tour.is_some_and(|c| c != STAGE_STOPPED)
+}
+
+/// The record of a preparation that could not finish (`record_outcome`): Play starts the game
+/// and does not prepare again until something changes (the card, driver or version) or Prepare
+/// now is pressed (the review of 2026-11-20: a compute step that failed restarted at every Play).
+fn outcome_file(app: &App) -> PathBuf {
+    app.paths.shaders().join("prepare-outcome.txt")
+}
+
+fn record_outcome(app: &App, why: &str) {
+    let (translation, device, driver) = identity();
+    log(app, &format!("preparation given up: {why}"));
+    write_record(
+        &outcome_file(app),
+        &format!("# A shader preparation that could not finish on this card, driver and version; written by the launcher\noutcome = gave up\nwhy = {why}\ntranslation = {translation}\ndevice = {device}\ndriver = {driver}\ndate = {}\n", utc_stamp()),
+    );
+}
+
+/// Why the preparation could not finish here, for this card, driver and version (None: no such
+/// record, or one for another).
+fn outcome(app: &App) -> Option<String> {
+    let kv = read_kv(&outcome_file(app));
+    let get = |k: &str| kv.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone()).unwrap_or_default();
+    let (translation, device, driver) = identity();
+    (!kv.is_empty() && get("translation") == translation && get("device") == device && get("driver") == driver).then(|| get("why"))
+}
+
 fn played(app: &App) -> Played {
     let kv = read_kv(&played_file(app));
     let get = |k: &str| kv.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone()).unwrap_or_default();
-    let (translation, device, driver) = identity();
-    if kv.is_empty() || get("device") != device || get("driver") != driver || (!translation.is_empty() && get("translation") != translation) {
+    // (For this card and the preparation's rules: a new driver or a version that translates
+    // differently keeps what the self-play learned, its pipelines made again by the compute step.)
+    let (translation, device, _) = identity();
+    if kv.is_empty() || get("device") != device || (!translation.is_empty() && rules_of(&get("translation")) != rules_of(&translation)) {
         return Played::default();
     }
     let code = |k: &str| get(k).parse::<i32>().ok();
@@ -359,7 +540,7 @@ fn record(app: &App, f: impl FnOnce(&mut Played)) {
         line(p.tour),
         p.cut as u8,
     );
-    let _ = std::fs::write(played_file(app), t);
+    write_record(&played_file(app), &t);
 }
 
 /// The prepared marker as the launcher writes it when the self-play's last part ended without
@@ -373,7 +554,7 @@ fn write_marker(app: &App) {
         "# The game's shaders prepared ahead; written by the launcher (the self-play's last part ended without marking them)\ndate = {}\nprograms = unknown\ndevice = {device}\ndriver = {driver}\ntranslation = {translation}\n",
         utc_stamp()
     );
-    let _ = std::fs::write(marker(app), t);
+    write_record(&marker(app), &t);
 }
 
 /// Whether `dir` holds a character's save within `depth` levels (a `SAVEDATA...PlayerProfile...`
@@ -417,14 +598,14 @@ fn check_file(app: &App) -> PathBuf {
 fn check_state(app: &App) -> Option<String> {
     let kv = read_kv(&check_file(app));
     let get = |k: &str| kv.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone()).unwrap_or_default();
-    let g = sys::gpu().ok()?;
-    (get("device") == g.name && get("driver") == g.driver.to_string() && !get("result").is_empty()).then(|| get("result"))
+    let (_, device, driver) = identity();
+    (!device.is_empty() && get("device") == device && get("driver") == driver && !get("result").is_empty()).then(|| get("result"))
 }
 
 fn record_check(app: &App, result: &str) {
     let (_, device, driver) = identity();
     let t = format!("# The check before preparing the shaders (dsport --pb-check): whether what one game session stores the next one takes; written by the launcher\nresult = {result}\ndevice = {device}\ndriver = {driver}\ndate = {}\n", utc_stamp());
-    let _ = std::fs::write(check_file(app), t);
+    write_record(&check_file(app), &t);
 }
 
 /// The note when preparing cannot help on this PC.
@@ -433,12 +614,24 @@ const NO_HELP: &str = "This PC's graphics driver does not keep compiled shaders 
 /// Whether the shaders are prepared for this graphics card and driver (the compute shaders, and
 /// the self-play played or tried to its end); the status line.
 pub fn state(app: &App) -> (bool, String) {
+    // (The game's program of another version: nothing prepared with it, Play starts the game.)
+    if let Some(t) = version_mismatch() {
+        return (true, t);
+    }
     // (Preparing cannot help on this card and driver: nothing to prepare, Play starts the game.)
     if check_state(app).as_deref() == Some("nohelp") {
         return (true, NO_HELP.into());
     }
+    // (A preparation that could not finish here: Play starts the game, Prepare now tries again.)
+    if let Some(why) = outcome(app) {
+        return (true, format!("The shaders could not be fully prepared on this PC: {why}. The game compiles the rest while you play. Prepare now tries again."));
+    }
     let (ok, text) = compute_state(app);
     if !ok {
+        // (A new driver or version: the self-play's learning holds, only the compile is redone.)
+        if app.game.ok && played_complete(&played(app)) && text.ends_with("Prepare them again.") {
+            return (false, text.replace("Prepare them again.", "Prepare now compiles them again, without the game playing again."));
+        }
         return (ok, text);
     }
     let ended = |c: Option<i32>| c.is_some_and(|c| c != STAGE_STOPPED);
@@ -486,9 +679,9 @@ pub fn build(app: &mut App) {
         app.shaders.auto = app.put(2, b.check("Prepare the shaders when Play is pressed and they are not prepared yet.", r, ID_AUTO), r) as usize;
         ui::set_check(h(app.shaders.auto), app.launch.prepare_shaders);
         let where_ = format!(
-            "Prepared shaders are kept in {}. They take up to 5 GB. Preparing uses {} of this PC's {} processor threads.",
+            "Prepared shaders are kept in {}. They take up to 5 GB. Preparing uses up to {} of this PC's {} processor threads.",
             ui::short(&app.paths.shaders(), 70),
-            sys::prepare_threads(),
+            sys::compute_threads(),
             sys::threads()
         );
         let r = (16, 306, 748, 60);
@@ -538,21 +731,39 @@ pub fn start(app: &mut App, play_after: bool) {
     app.shaders.ended = None;
     let dir = app.paths.shaders();
     if let Some(free) = sys::free_space(&dir) {
-        if free < 3 << 30 {
-            let t = format!("Only {} is free on the drive of {}. Preparing the shaders needs up to 5 GB. Prepare them anyway?", sys::gb(free), dir.display());
+        if free < 5 << 30 {
+            let t = format!("Only {} is free on the drive of {}. Prepared shaders take up to 5 GB. Prepare them anyway?", sys::gb(free), dir.display());
             if unsafe { ui::message(app.hwnd, &t, crate::TITLE, windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONWARNING | windows_sys::Win32::UI::WindowsAndMessaging::MB_YESNO) } != windows_sys::Win32::UI::WindowsAndMessaging::IDYES {
+                // (Not asked again in this session: Play starts the game, the review of
+                // 2026-11-20: No had done nothing, at every Play.)
+                log(app, &format!("preparation not begun: {} free, the player declined", sys::gb(free)));
+                app.shaders.space_declined = true;
+                if play_after {
+                    crate::start_game(app);
+                }
                 return;
             }
         }
     }
     let _ = std::fs::create_dir_all(&dir);
     wait_check();
-    retire_stale_store(app);
+    if version_mismatch().is_some() {
+        if play_after {
+            crate::start_game(app);
+        }
+        return;
+    }
+    let _ = std::fs::remove_file(outcome_file(app));
+    app.shaders.untrusted = !retire_stale_store(app);
     // (The next part of the levels when the new game was played for this version, card and
     // driver and the levels are not done; else, and when everything is done, the new game.)
     let p = played(app);
     let save = app.paths.cache.join("prepare").join("user").join("saves");
+    // (The self-play played to its end, the compiled pipelines stale: a new driver or version.
+    // The compute step alone makes again everything learned; the game does not play again.)
+    let recompile = played_complete(&p) && !compute_state(app).0;
     let first = match p {
+        _ if recompile => Step::Compute,
         Played { newgame: Some(0), parts, tour, .. } if parts < LEVEL_PARTS && tour != Some(0) && has_save(&save, 4) => Step::Levels(parts + 1),
         _ => Step::NewGame,
     };
@@ -587,7 +798,23 @@ pub fn start(app: &mut App, play_after: bool) {
     app.shaders.play_after = play_after;
     app.shaders.stopping = None;
     app.shaders.then_play = false;
+    app.shaders.stalled = false;
+    app.shaders.last_failed = false;
+    log(
+        app,
+        &format!(
+            "preparation begun ({}): first step {first:?}{}{}; {} free on the shaders' drive; {} of {} processor threads for compiling; {}",
+            if play_after { "from Play" } else { "Prepare now" },
+            if recompile { ", the compile again only" } else { "" },
+            if app.shaders.untrusted { ", stored pipelines not trusted" } else { "" },
+            sys::free_space(&app.paths.shaders()).map_or("unknown".to_string(), sys::gb),
+            sys::compute_threads(),
+            sys::threads(),
+            sys::power_text()
+        ),
+    );
     if begin(app, first) {
+        sys::keep_awake(true);
         unsafe {
             ui::set_progress(h(app.shaders.bar), 0);
             ui::show(h(app.shaders.bar), true);
@@ -597,16 +824,30 @@ pub fn start(app: &mut App, play_after: bool) {
         }
         app.update_play();
         app.set_status(if play_after { "Preparing the shaders first. The game starts when they are done." } else { "" });
+    } else {
+        // (Its first step could not begin: the drive full, or the game's program not started.
+        // The page says why, and Play starts the game: until 2026-11-20 night Play did nothing.)
+        finish(app, None);
+        if play_after {
+            crate::start_game(app);
+        }
     }
 }
 
 /// Starts `step`'s child (false when it could not be started: the status says why).
 fn begin(app: &mut App, step: Step) -> bool {
+    // (The shaders folder's drive nearly full: nothing more could be kept, the step not begun;
+    // the page then says why, `outcome`.)
+    if let Some(free) = sys::free_space(&app.paths.shaders()).filter(|&f| f < 1 << 30) {
+        record_outcome(app, &format!("the drive of the shaders folder is full ({} free)", sys::gb(free)));
+        app.shaders.child = None;
+        app.shaders.step = None;
+        return false;
+    }
     let exe = dsconfig::paths::game_exe_in(&app.paths.exe_dir);
     let progress = progress_file(app);
     let _ = std::fs::remove_file(&progress);
     let _ = std::fs::remove_file(progress.with_extension("stop"));
-    use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
     let mut cmd = std::process::Command::new(&exe);
@@ -619,9 +860,13 @@ fn begin(app: &mut App, step: Step) -> bool {
     if let Step::Levels(i) = step {
         cmd.arg("--prepare-chunk").arg(format!("{i}/{LEVEL_PARTS}"));
     }
-    cmd.arg("--progress").arg(&progress).current_dir(&app.paths.exe_dir).creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
-    match cmd.spawn() {
+    cmd.arg("--progress").arg(&progress).current_dir(&app.paths.exe_dir);
+    if app.shaders.untrusted {
+        cmd.env("DS_STORE_UNTRUSTED", "1");
+    }
+    match sys::spawn_in_job(&mut cmd, CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS) {
         Ok(c) => {
+            log(app, &format!("step {step:?} begun"));
             app.shaders.child = Some(c);
             app.shaders.step = Some(step);
             app.shaders.started = Some(Instant::now());
@@ -636,9 +881,10 @@ fn begin(app: &mut App, step: Step) -> bool {
             true
         }
         Err(e) => {
+            log(app, &format!("step {step:?} could not begin: {e}"));
             app.shaders.child = None;
             app.shaders.step = None;
-            app.set_status(&format!("Could not start the preparation: {e}"));
+            record_outcome(app, &format!("the game's program could not be started for it ({e})"));
             false
         }
     }
@@ -660,7 +906,7 @@ pub fn stop(app: &mut App) {
     // (Between a step and its new start: nothing runs, it ends at once.)
     if app.shaders.child.is_none() && app.shaders.retry.take().is_some() {
         app.shaders.play_after = false;
-        finish(app, Some("Preparation stopped. The next one goes on where it left off.".into()));
+        finish(app, Some("Preparation stopped. The next one goes on from the step it stopped in.".into()));
         return;
     }
     if app.shaders.child.is_none() || app.shaders.stopping.is_some() {
@@ -679,8 +925,14 @@ pub fn stop(app: &mut App) {
 fn finish(app: &mut App, note: Option<String>) {
     app.shaders.step = None;
     unsafe { windows_sys::Win32::UI::WindowsAndMessaging::KillTimer(app.hwnd, TIMER) };
+    sys::keep_awake(false);
+    // (The launcher's status line may say the game starts when they are done: not any more,
+    // unless it does, the review of 2026-11-20.)
+    app.set_status("");
     refresh(app);
     app.update_play();
+    let shown = note.clone().unwrap_or_else(|| state(app).1);
+    log(app, &format!("preparation ended: {shown}"));
     if let Some(n) = note {
         unsafe { ui::set_text(h(app.shaders.status), &n) };
     }
@@ -695,6 +947,9 @@ pub fn tick(app: &mut App) {
                 app.shaders.retry = None;
                 if !begin(app, step) {
                     finish(app, None);
+                    if std::mem::take(&mut app.shaders.play_after) {
+                        crate::start_game(app);
+                    }
                 }
             }
         }
@@ -710,26 +965,40 @@ pub fn tick(app: &mut App) {
     if exited.is_none() && app.shaders.stopping.is_some_and(|t| t.elapsed().as_secs() > 90) {
         let _ = child.kill();
     }
-    // (A step whose progress has not moved for `STALL_SECS`: a hung game, ended.)
+    let step = app.shaders.step.unwrap_or(Step::Compute);
+    // (A step whose progress has not changed for `STALL_SECS`: hung, ended. Its numbers, not the
+    // file's time: the compute step writes the file every second, the review of 2026-11-20. A gap
+    // of over 10 s between ticks, the PC asleep, starts that time again.)
+    let slept = app.shaders.last_tick.is_some_and(|t| t.elapsed().as_secs() > 10);
+    app.shaders.last_tick = Some(Instant::now());
     if exited.is_none() {
-        let m = std::fs::metadata(progress_file(app)).and_then(|m| m.modified()).ok();
-        match app.shaders.progress_seen {
-            Some((seen, at)) if seen == m => {
-                if at.elapsed().as_secs() > STALL_SECS {
+        let content = std::fs::read_to_string(progress_file(app)).unwrap_or_default();
+        match &app.shaders.progress_seen {
+            Some((seen, at)) if *seen == content && !slept => {
+                if at.elapsed().as_secs() > STALL_SECS && !app.shaders.stalled {
+                    app.shaders.stalled = true;
+                    log(app, &format!("step {step:?}: no progress for {} minutes: ended", STALL_SECS / 60));
                     if let Some(c) = app.shaders.child.as_mut() {
                         let _ = c.kill();
                     }
                 }
             }
-            _ => app.shaders.progress_seen = Some((m, Instant::now())),
+            _ => app.shaders.progress_seen = Some((content, Instant::now())),
         }
     }
-    let step = app.shaders.step.unwrap_or(Step::Compute);
     if let Some(code) = exited {
         app.shaders.child = None;
+        let secs = app.shaders.started.map_or(0.0, |s| s.elapsed().as_secs_f64());
         let _ = std::fs::remove_file(progress_file(app).with_extension("stop"));
-        let stopped = app.shaders.stopping.take().is_some();
+        let asked = app.shaders.stopping.take().is_some();
+        // (Stopped without the launcher asking: a game started meanwhile asked the step to stop,
+        // `dsport`'s `ask_preparation_to_stop`; the compute step's stop status is 4.)
+        let paused = !asked && (code == STAGE_STOPPED || (step == Step::Compute && code == 4));
+        let stopped = asked || paused;
         let code = if stopped && code != 0 { STAGE_STOPPED } else { code };
+        log(app, &format!("step {step:?} ended: status {} after {secs:.0} s{}", code_text(code), if app.shaders.stalled { " (ended: no progress)" } else if paused { " (stopped for a game started meanwhile)" } else if code == STAGE_HUNG { " (it found itself hung: its log has the threads' stacks)" } else { "" }));
+        // (What happened, in the player's words: the outcome and the notes.)
+        let why = if std::mem::take(&mut app.shaders.stalled) { format!("it made no progress for {} minutes", STALL_SECS / 60) } else { reason(code) };
         // (Another game session held the player's folder: the step did not run.)
         if code == GAME_RUNNING {
             // (Its own previous step's session still ending: the step again 3 s later, 10 times
@@ -749,13 +1018,51 @@ pub fn tick(app: &mut App) {
         // (A self-play step that crashed or lost the graphics device: begun once more, its
         // levels played again (what it made is kept: the second try is quicker). A preparation
         // that marked such a part done left its levels to the player, 2026-11-20.)
-        if !stopped && matches!(step, Step::NewGame | Step::Levels(_) | Step::Compute) && worth_retry(code) && !app.shaders.crash_retried.contains(&step) {
+        // (The shaders folder's drive full: nothing more can be kept; the player told, the game
+        // started if Play asked.)
+        if code == STAGE_DISK_FULL || code == STAGE_UNWRITABLE {
+            let free = sys::free_space(&app.paths.shaders()).map(sys::gb).unwrap_or_default();
+            record_outcome(app, &if code == STAGE_DISK_FULL { format!("the drive of the shaders folder is full ({free} free)") } else { "the shaders folder cannot be written to (a security program or the folder's permissions may block it)".to_string() });
+            finish(app, None);
+            if std::mem::take(&mut app.shaders.play_after) {
+                crate::start_game(app);
+            }
+            return;
+        }
+        // (No other step would end otherwise on this PC: the game's files, the processor, the
+        // memory range, no graphics card, the game's start. The preparation ends at once and the
+        // page says why; Play starts the game, which tells its own message.)
+        if !stopped && fatal(code) {
+            record_outcome(app, &why);
+            finish(app, None);
+            if std::mem::take(&mut app.shaders.play_after) {
+                crate::start_game(app);
+            }
+            return;
+        }
+        // (Failed for the PC's sake: hung, crashed, the graphics card lost, memory. A step is
+        // begun once more; when the step before failed too, it keeps failing on this PC and the
+        // preparation ends there, the player told and let play: until 2026-11-20 a PC on which
+        // every step hung waited for each of them, twice.)
+        let failed = !stopped && worth_retry(code);
+        if failed && app.shaders.last_failed {
+            record_outcome(app, &format!("its steps kept failing, the last because {why}"));
+            finish(app, None);
+            if std::mem::take(&mut app.shaders.play_after) {
+                crate::start_game(app);
+            }
+            return;
+        }
+        if failed && matches!(step, Step::NewGame | Step::Levels(_) | Step::Compute) && !app.shaders.crash_retried.contains(&step) {
             app.shaders.crash_retried.push(step);
-            unsafe { ui::set_text(h(app.shaders.status), &format!("The preparation's step ended unexpectedly (code {code}). Starting it again...")) };
+            log(app, &format!("step {step:?} begun again: {why}"));
+            // (In the launcher's status line: the page's own is the new step's at once.)
+            app.set_status(&format!("A step of the shader preparation ended unexpectedly: {why}. It runs again."));
             if begin(app, step) {
                 return;
             }
         }
+        app.shaders.last_failed = failed;
         // (The step's time, for the estimate: a whole new game or part only.)
         if code == 0 {
             let secs = app.shaders.started.map_or(0.0, |s| s.elapsed().as_secs_f64());
@@ -791,7 +1098,7 @@ pub fn tick(app: &mut App) {
             write_marker(app);
         }
         if stopped {
-            finish(app, Some("Preparation stopped. The next one goes on where it left off.".into()));
+            finish(app, Some(if paused { "Preparation paused: the game was started. The next one goes on from the step it stopped in." } else { "Preparation stopped. The next one goes on from the step it stopped in." }.into()));
             if std::mem::take(&mut app.shaders.then_play) {
                 crate::start_game(app);
             }
@@ -836,8 +1143,14 @@ pub fn tick(app: &mut App) {
         }
         let next = match step {
             Step::Compute if code != 0 || !compute_state(app).0 => {
-                app.shaders.play_after = false;
-                finish(app, Some(format!("Preparation ended with an error (code {code}). Open logs shows its log.")));
+                // (Recorded for this card, driver and version: Play starts the game instead of
+                // preparing again, Prepare now tries again; the review of 2026-11-20.)
+                let why = if code != 0 { format!("its compute step failed because {why}") } else { "its compute step's record could not be written".to_string() };
+                record_outcome(app, &why);
+                finish(app, None);
+                if std::mem::take(&mut app.shaders.play_after) {
+                    crate::start_game(app);
+                }
                 return;
             }
             // (The compute list made: the levels next, their first dispatches finding their
@@ -861,7 +1174,7 @@ pub fn tick(app: &mut App) {
             }
         }
         // (A stage that could not go on: what it learned is kept, and the game can be played.)
-        let note = (code != 0 && step != Step::Compute).then(|| format!("The game's self-play could not finish (code {code}): some graphics shaders are learned only while you play. Open logs shows its log."));
+        let note = (code != 0 && step != Step::Compute).then(|| format!("The game's self-play could not finish: {why}. Some graphics shaders are learned only while you play. Open logs shows its log."));
         finish(app, note);
         if std::mem::take(&mut app.shaders.play_after) && prepared(app) {
             crate::start_game(app);

@@ -5,9 +5,11 @@
 # README.txt is the player README (with the port's copyright and license notice), then the
 # third-party notices of the two programs (THIRD_PARTY_NOTICES.txt, made by scripts\notices.py
 # from what was just built), then the text of the port's license, the GNU GPL version 3.
-# The programs are built with the dist profile (LTO, no debug information, stripped), a static C
-# runtime, and the paths of the machine that builds them remapped; the package is refused if
-# one of those paths, the user profile or the user name is still found in them.
+# The programs are built with the dist profile (LTO, line tables in a PDB), a static C runtime,
+# and the paths of the machine that builds them remapped; the package is refused if one of those
+# paths, the user profile or the user name is still found in them. The PDBs stay here with the
+# programs as built (dist\symbols\<package>-<build id>, the id the game's log names): never in
+# the package.
 # Only the files listed here go in (an allowlist): nothing of the game, no keys, saves, caches
 # or logs, and not NVIDIA's nvngx_dlss.dll (players add their own copy).
 #   .\scripts\package.ps1 [-NoBuild] [-Pgo <profile.profdata>] [-NoUpscalers] [-Upscalers <dir>]
@@ -130,6 +132,41 @@ $readme = (& $read (Join-Path $root 'docs\PLAYER_README.txt')) + "`n`n`n$rule`nT
 $allowed = @($programs.Keys) + @('README.txt') + @($upNames | ForEach-Object { "upscalers\$_" })
 $extra = @(Get-ChildItem -Recurse -File $out | Where-Object { $allowed -notcontains $_.FullName.Substring($out.Length + 1) })
 if ($extra.Count -gt 0) { Write-Host "unexpected files in the package: $($extra.FullName -join ', ')"; exit 1 }
+# The symbols: the programs as built and their PDBs, beside the package (tools\symbolize.ps1 reads
+# a player's log's stacks with them), named by the build id the game's log gives (its PDB's GUID
+# and age, from the program's debug directory).
+function Get-BuildId([string]$path) {
+  $b = [IO.File]::ReadAllBytes($path)
+  $pe = [BitConverter]::ToInt32($b, 0x3c)
+  $nsec = [BitConverter]::ToUInt16($b, $pe + 6)
+  $optSize = [BitConverter]::ToUInt16($b, $pe + 20)
+  $opt = $pe + 24
+  if ([BitConverter]::ToUInt16($b, $opt) -ne 0x20b) { return 'none' }
+  $dirRva = [BitConverter]::ToUInt32($b, $opt + 112 + 48); $dirSize = [BitConverter]::ToUInt32($b, $opt + 112 + 52)
+  $off = -1
+  for ($i = 0; $i -lt $nsec; $i++) {
+    $s = $opt + $optSize + 40 * $i
+    $va = [BitConverter]::ToUInt32($b, $s + 12); $vs = [Math]::Max([BitConverter]::ToUInt32($b, $s + 8), [BitConverter]::ToUInt32($b, $s + 16))
+    if ($dirRva -ge $va -and $dirRva -lt $va + $vs) { $off = $dirRva - $va + [BitConverter]::ToUInt32($b, $s + 20) }
+  }
+  if ($off -lt 0) { return 'none' }
+  for ($e = 0; $e -lt [Math]::Floor($dirSize / 28); $e++) {
+    $d = $off + 28 * $e
+    if ([BitConverter]::ToUInt32($b, $d + 12) -ne 2) { continue }
+    $cv = [BitConverter]::ToUInt32($b, $d + 24)
+    if ([Text.Encoding]::ASCII.GetString($b, $cv, 4) -ne 'RSDS') { continue }
+    $d4 = -join ($b[($cv + 12)..($cv + 19)] | ForEach-Object { $_.ToString('X2') })
+    return ('{0:X8}{1:X4}{2:X4}{3}{4:X}' -f [BitConverter]::ToUInt32($b, $cv + 4), [BitConverter]::ToUInt16($b, $cv + 8), [BitConverter]::ToUInt16($b, $cv + 10), $d4, [BitConverter]::ToUInt32($b, $cv + 20))
+  }
+  return 'none'
+}
+$buildId = Get-BuildId (Join-Path $bin 'dsport.exe')
+$symDir = Join-Path $dist "symbols\$name-$buildId"
+New-Item -ItemType Directory -Force $symDir | Out-Null
+foreach ($f in 'dsport.exe', 'dsport.pdb', 'regaliant-launcher.exe', 'regaliant_launcher.pdb') {
+  $src = Join-Path $bin $f
+  if (Test-Path $src) { Copy-Item $src $symDir -Force } else { Write-Host "no $f to keep in $symDir (a player's stacks then cannot be read)" }
+}
 $zip = Join-Path $dist "$name.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
 Compress-Archive -Path (Join-Path $out '*') -DestinationPath $zip
@@ -148,4 +185,4 @@ if (-not (Test-Path $final)) {
   Write-Host "$final is in use (a program from it is running): the new package's files are in $out; the zip is complete"
 }
 $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-Write-Host ("package {0}: {1} files, {2:N1} MB; zip {3:N1} MB, SHA-256 {4}" -f $out, $count, ($size / 1MB), ((Get-Item $zip).Length / 1MB), $hash)
+Write-Host ("package {0}: {1} files, {2:N1} MB; zip {3:N1} MB, SHA-256 {4}; build {5}, symbols in {6}" -f $out, $count, ($size / 1MB), ((Get-Item $zip).Length / 1MB), $hash, $buildId, $symDir)

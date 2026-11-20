@@ -108,7 +108,14 @@ struct GameClock {
     last: Instant,
     flip: u64,
     frozen: Duration,
+    /// Spans in which this process did not run (the PC asleep or the process held: a poll more
+    /// than `SLEPT_GAP` after the last), left out whole (the review of 2026-11-20: a sleep had
+    /// counted as a wait's time and failed a part).
+    slept: Duration,
 }
+
+/// A gap between two of a wait's polls (every 0.1-1 s) this long: the process did not run.
+const SLEPT_GAP: Duration = Duration::from_secs(10);
 
 /// The longest a frozen game extends one wait.
 const FROZEN_MAX: Duration = Duration::from_secs(900);
@@ -116,25 +123,86 @@ const FROZEN_MAX: Duration = Duration::from_secs(900);
 impl GameClock {
     fn new() -> GameClock {
         let now = Instant::now();
-        GameClock { start: now, last: now, flip: crate::hle::libs::videoout::QUEUED_FLIP.load(Relaxed), frozen: Duration::ZERO }
+        GameClock { start: now, last: now, flip: crate::hle::libs::videoout::QUEUED_FLIP.load(Relaxed), frozen: Duration::ZERO, slept: Duration::ZERO }
     }
 
-    /// The wait's time so far, without the spans in which the game flipped nothing.
+    /// The wait's time so far, without the spans in which the game flipped nothing nor those in
+    /// which the process did not run.
     fn elapsed(&mut self) -> Duration {
         let now = Instant::now();
         let f = crate::hle::libs::videoout::QUEUED_FLIP.load(Relaxed);
-        if f == self.flip {
-            self.frozen += now - self.last;
+        let gap = now - self.last;
+        if gap > SLEPT_GAP {
+            self.slept += gap;
+            self.flip = f;
+        } else if f == self.flip {
+            self.frozen += gap;
         } else {
             self.flip = f;
         }
         self.last = now;
-        (now - self.start).saturating_sub(self.frozen.min(FROZEN_MAX))
+        (now - self.start).saturating_sub(self.slept).saturating_sub(self.frozen.min(FROZEN_MAX))
     }
 }
 
 /// Spans of the stages' waits the game spent frozen, in all (the stage's summary line).
 static FROZEN_TOTAL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The session ended itself: nothing had moved for `HANG_SECS` (`watch_hangs`). The launcher
+/// begins the step once more, then goes on without it.
+pub const EXIT_HUNG: i32 = 14;
+/// The shader store's drive is full (`pcache::store_full`): the step ends, the launcher tells the
+/// player and stops preparing.
+pub const EXIT_DISK_FULL: i32 = 15;
+/// The shader store's folder refuses writes (`pcache::store_unwritable`): the step ends, the
+/// launcher tells the player and stops preparing.
+pub const EXIT_UNWRITABLE: i32 = 16;
+/// How long nothing may move (no flip, no pipeline made, no item of the compute list made)
+/// before a self-play session counts as hung; before its first flip (the boot) `HANG_BOOT_SECS`.
+const HANG_SECS: u64 = 180;
+const HANG_BOOT_SECS: u64 = 240;
+
+/// The self-play's hang watch, a thread of its own: a session in which nothing has moved for
+/// `HANG_SECS` is hung (a driver call that does not return, a guest thread that waits for
+/// ever): its threads' stacks go into the log and it ends with `EXIT_HUNG` at once
+/// (`crate::hung`). (2026-11-20: hangs inside the driver had each left the preparation waiting
+/// for the launcher's 45-minute watchdog.)
+fn watch_hangs() {
+    let _ = std::thread::Builder::new().name("prepare-watch".into()).spawn(|| {
+        crate::log::set_thread_name("prepare-watch");
+        // (The game's own progress: its flips and the first uses its command processors waited
+        // for, which end one by one while a slow PC compiles in place; not the background list's
+        // items, which move on beside a frozen game.)
+        let moved = || (crate::gpu::FRAMES.load(Relaxed), crate::gpu::exec::FIRST_USES[0].load(Relaxed), crate::gpu::exec::draw::GFX_FIRST_USES[0].load(Relaxed));
+        let (mut last, mut since) = (moved(), Instant::now());
+        let mut tick = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_secs(5));
+            // (The PC asleep or the process held: not a hang.)
+            if tick.elapsed() > SLEPT_GAP {
+                since = Instant::now();
+            }
+            tick = Instant::now();
+            if crate::gpu::pcache::store_full() {
+                crate::error!("prepare-play: the shader store's drive is full ({} MiB free; {} pipeline files not written): the session ends", crate::gpu::pcache::store_free_bytes().unwrap_or(0) >> 20, crate::gpu::pcache::WRITE_FAILS.load(Relaxed));
+                end(EXIT_DISK_FULL);
+            }
+            if crate::gpu::pcache::store_unwritable() {
+                crate::error!("prepare-play: the shader store's folder refuses writes ({} pipeline files not written, none written): the session ends", crate::gpu::pcache::WRITE_FAILS.load(Relaxed));
+                end(EXIT_UNWRITABLE);
+            }
+            let now = moved();
+            if now != last {
+                (last, since) = (now, Instant::now());
+                continue;
+            }
+            let limit = if now.0 == 0 { HANG_BOOT_SECS } else { HANG_SECS };
+            if since.elapsed() >= Duration::from_secs(limit) {
+                crate::hung(&format!("prepare-play: nothing moved for {limit} s (no flip after flip {}, no pipeline made, no compute item made): the session is hung", now.0), EXIT_HUNG);
+            }
+        }
+    });
+}
 
 /// The levels' tour opens with `wait 120.0` (the title ignores level loads until it is in the
 /// game, and its automation starts at boot); set once the self-play sees the game in play, the
@@ -235,7 +303,10 @@ pub fn setup(stage: Stage, cfg: &mut crate::Config) {
     // had waited for the second vblank). The levels: a fast-forward (`fast_forward`).
     // SAFETY: still the only thread.
     unsafe {
-        for (k, v) in [("DS_FRAME_CAP", "0"), ("DS_UNCAPPED", "0")] {
+        // (No hidden present either, `present::Hidden`: presents to a window never shown blocked
+        // in the driver three times on 2026-11-20 and took every other driver call with them;
+        // the GPU's clock may run lower, the self-play a little slower.)
+        for (k, v) in [("DS_FRAME_CAP", "0"), ("DS_UNCAPPED", "0"), ("DS_HEADLESS_PRESENT", "0")] {
             if std::env::var_os(k).is_none() {
                 std::env::set_var(k, v);
             }
@@ -289,13 +360,61 @@ fn prepare_files(s: &Setup) {
         }
     }
     if s.stage == Stage::NewGame {
-        for d in [paths.saves(), paths.save_backups(), paths.runtime()] {
+        for d in [paths.saves(), paths.save_backups(), paths.runtime(), newgame_saves(paths), newgame_saves(paths).with_extension("part")] {
             let _ = std::fs::remove_dir_all(d);
         }
         for f in [paths.save_folder_record(), paths.achievements_file()] {
             let _ = std::fs::remove_file(f);
         }
     }
+    if s.stage == Stage::Tour {
+        newgame_save_for_part(paths);
+    }
+}
+
+/// The new game's save as its step left it (`newgame_save_for_part`).
+fn newgame_saves(paths: &dsconfig::paths::Paths) -> std::path::PathBuf {
+    paths.user.join("saves-newgame")
+}
+
+/// Each part of the levels starts from the new game's save: the first part to start keeps a copy
+/// of it (written whole, then named), and every part after it, or one played again, starts from
+/// that copy. A save damaged in a part (a write cut short by a power loss) then stops no other
+/// part. (Until 2026-11-20 each part went on from the save the part before it left.)
+fn newgame_save_for_part(paths: &dsconfig::paths::Paths) {
+    let (saves, kept) = (paths.saves(), newgame_saves(paths));
+    if !kept.is_dir() {
+        let part = kept.with_extension("part");
+        let _ = std::fs::remove_dir_all(&part);
+        match copy_synced(&saves, &part).and_then(|n| std::fs::rename(&part, &kept).map(|_| n)) {
+            Ok(n) => crate::info!("prepare-play: the new game's save kept for the levels' parts ({n} files)"),
+            Err(e) => crate::warn!("prepare-play: the new game's save not kept ({e}): this part plays the save as it is"),
+        }
+        return;
+    }
+    let _ = std::fs::remove_dir_all(&saves);
+    match copy_synced(&kept, &saves) {
+        Ok(n) => crate::info!("prepare-play: this part starts from the new game's save ({n} files)"),
+        Err(e) => crate::warn!("prepare-play: the new game's save could not be put in place ({e})"),
+    }
+}
+
+/// Copies folder `from` into `to` (made), each file flushed to the drive: the files copied.
+fn copy_synced(from: &Path, to: &Path) -> std::io::Result<u64> {
+    std::fs::create_dir_all(to)?;
+    let mut n = 0;
+    for e in std::fs::read_dir(from)? {
+        let e = e?;
+        let target = to.join(e.file_name());
+        if e.file_type()?.is_dir() {
+            n += copy_synced(&e.path(), &target)?;
+        } else {
+            std::fs::copy(e.path(), &target)?;
+            std::fs::OpenOptions::new().write(true).open(&target)?.sync_all()?;
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
 /// Starts the stage (`main`, once the log is open; before the title starts: the tour's
@@ -366,6 +485,7 @@ pub fn start(app: &Path) {
         BACKGROUND_ON.store(true, Relaxed);
     }
     let (stage, progress, store, app) = (s.stage, s.progress.clone(), s.store.clone(), app.to_path_buf());
+    watch_hangs();
     let spawned = std::thread::Builder::new().name("prepare-play".into()).spawn(move || {
         crate::log::set_thread_name("prepare-play");
         let mut p = Play::new(progress, total);

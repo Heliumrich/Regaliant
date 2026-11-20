@@ -159,7 +159,9 @@ impl Paths {
     pub fn logs_kept(&self) -> usize {
         match self.layout {
             Layout::Dev => 100,
-            _ => 10,
+            // (One shader preparation alone makes 8-10 sessions' folders, retries more: with 10
+            // a player's report lost its first steps, the review of 2026-11-20.)
+            _ => 40,
         }
     }
 

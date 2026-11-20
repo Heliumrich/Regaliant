@@ -33,13 +33,15 @@ inherits = "release-lto"
 [profile.release-pgo]
 inherits = "release-lto"
 
-# The player package (scripts/package.ps1): release-lto without debug information, stripped,
-# built with the profile release-pgo uses (dsport) and the release flags (a static C runtime,
-# this machine's paths remapped).
+# The player package (scripts/package.ps1): release-lto, built with the profile release-pgo uses
+# (dsport) and the release flags (a static C runtime, this machine's paths remapped). Its line
+# tables go into a PDB that stays here (dist/symbols, never in the package; the program names
+# only the PDB's file name, rustc's /PDBALTPATH): a player's log's stacks are read with it
+# (tools/symbolize.ps1). Until 2026-11-20 night: no debug information, stripped.
 [profile.dist]
 inherits = "release-lto"
-debug = false
-strip = true
+debug = "line-tables-only"
+strip = "none"
 incremental = false
 
 [profile.dev.package."*"]

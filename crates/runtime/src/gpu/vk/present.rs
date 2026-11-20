@@ -696,7 +696,9 @@ fn hidden_present_once() {
 
 /// Status part: the hidden swapchain's presents (`headless_present`).
 pub fn hidden_line() -> String {
-    match HIDDEN.lock().as_ref() {
+    // (Without waiting: a present stuck in the driver holds the lock, and every exit reads this.)
+    let Some(g) = HIDDEN.try_lock() else { return "    hidden swapchain: busy (a present in the driver)\n".to_string() };
+    match g.as_ref() {
         Some(h) => format!("hidden swapchain: {} flips presented, {} skipped (no free image or the slot's submission still running), {} within {} ms of the last, {} waited for their image to be free", h.presented, h.skipped, h.held, HIDDEN_GAP.as_millis(), h.waited),
         None => String::new(),
     }

@@ -350,8 +350,10 @@ fn init_inner() -> Result<(), String> {
         // Pick a discrete GPU with a graphics+compute queue.
         let pdevs = instance.enumerate_physical_devices().map_err(|e| format!("enumerate devices: {e}"))?;
         let mut chosen = None;
+        let mut seen = Vec::new();
         for &pd in &pdevs {
             let props = instance.get_physical_device_properties(pd);
+            seen.push(format!("{} ({:?})", CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy(), props.device_type));
             let qfs = instance.get_physical_device_queue_family_properties(pd);
             if let Some(qf) = qfs.iter().position(|q| q.queue_flags.contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)) {
                 let discrete = props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU;
@@ -360,6 +362,8 @@ fn init_inner() -> Result<(), String> {
                 }
             }
         }
+        // (Every card Vulkan lists, for a player's report: a laptop with two graphics chips.)
+        crate::info!("Vulkan devices: {} (taken: the last discrete one with a graphics and compute queue, else the first)", seen.join(", "));
         let (pdev, qf, props) = chosen.ok_or("no Vulkan device with graphics+compute")?;
         let device_name = CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy().into_owned();
         // (The driver's version and pipeline cache id: players' logs are compared by them.)
@@ -393,7 +397,8 @@ fn init_inner() -> Result<(), String> {
         // (Two queues of the graphics family when it has them: the second for the hidden
         // present, `Ctx::present_queue`.)
         let prio2 = [1.0f32, 0.5];
-        let gfx_queues = instance.get_physical_device_queue_family_properties(pdev).get(qf as usize).map_or(1, |q| q.queue_count);
+        // (`DS_PRESENT_QUEUE=0`: one queue, as on a device with one in that family: a test.)
+        let gfx_queues = if std::env::var("DS_PRESENT_QUEUE").ok().as_deref() == Some("0") { 1 } else { instance.get_physical_device_queue_family_properties(pdev).get(qf as usize).map_or(1, |q| q.queue_count) };
         let mut qci = vec![vk::DeviceQueueCreateInfo::default().queue_family_index(qf).queue_priorities(if gfx_queues >= 2 { &prio2[..] } else { &prio[..] })];
         if let Some(f) = copy_family {
             qci.push(vk::DeviceQueueCreateInfo::default().queue_family_index(f).queue_priorities(&prio));

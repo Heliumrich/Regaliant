@@ -1666,6 +1666,16 @@ fn thread_summary() -> String {
     thread_summary_ex(false)
 }
 
+/// Every thread's stacks (ours, then the title's and the queues'), taken on a thread of their
+/// own and given up after 20 s (a thread stuck inside the driver may not answer a stack walk).
+fn stacks_bounded() -> String {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = std::thread::Builder::new().name("stacks".into()).spawn(move || {
+        let _ = tx.send(format!("our threads:\n{}the title's threads and the queues:\n{}", host_thread_stacks(), thread_summary_ex(true)));
+    });
+    rx.recv_timeout(Duration::from_secs(20)).unwrap_or_else(|_| "the threads' stacks were not taken within 20 s (a thread did not answer)".to_string())
+}
+
 /// Guest threads and their states; with `with_stacks`, each running thread is
 /// sampled (rip, frame chain, guest return addresses) for hang diagnosis.
 /// The stacks of this process's own threads by name (the GPU front end's, front end 2's, the
@@ -1689,7 +1699,11 @@ fn host_thread_stacks() -> String {
         ok = unsafe { Thread32Next(snap, &mut te) } != 0;
     }
     unsafe { windows_sys::Win32::Foundation::CloseHandle(snap) };
-    let mut named: Vec<(String, u32)> = tids.into_iter().map(|t| (guestprof::thread_description(t), t)).filter(|(n, _)| (n.starts_with("gpu") || n.starts_with("fe2") || n.starts_with("host") || n.starts_with("forward")) && !n.starts_with("gpu-precompile")).collect();
+    let mut named: Vec<(String, u32)> = tids
+        .into_iter()
+        .map(|t| (guestprof::thread_description(t), t))
+        .filter(|(n, _)| (n.starts_with("gpu") || n.starts_with("fe2") || n.starts_with("host") || n.starts_with("forward") || n.starts_with("vblank") || n.starts_with("prepare")) && !n.starts_with("gpu-precompile"))
+        .collect();
     named.sort();
     let mut s = String::new();
     for (name, tid) in named {
@@ -1783,6 +1797,101 @@ fn fatal_text(code: u32, reason: &str) -> String {
     }
 }
 
+/// This program's build as symbol stores name it: its PDB's GUID and age, read from the debug
+/// directory of its own image. A player's log names the exact build, and the release's symbols
+/// folder (`scripts/package.ps1`: `dist/symbols/<package>-<build id>`) is named by it ("none":
+/// no CodeView record, a build without debug information).
+fn build_id() -> String {
+    unsafe {
+        let base = windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null()) as *const u8;
+        if base.is_null() {
+            return "none".into();
+        }
+        let rd32 = |p: *const u8| std::ptr::read_unaligned(p as *const u32);
+        let nt = base.add(rd32(base.add(0x3c)) as usize);
+        let opt = nt.add(24);
+        if std::ptr::read_unaligned(opt as *const u16) != 0x20b {
+            return "none".into();
+        }
+        let (dir, size) = (rd32(opt.add(112 + 6 * 8)) as usize, rd32(opt.add(112 + 6 * 8 + 4)) as usize);
+        for i in 0..size / 28 {
+            let e = base.add(dir + 28 * i);
+            if rd32(e.add(12)) != 2 {
+                continue;
+            }
+            let cv = base.add(rd32(e.add(20)) as usize);
+            if std::slice::from_raw_parts(cv, 4) != b"RSDS" {
+                continue;
+            }
+            let g = std::slice::from_raw_parts(cv.add(4), 16);
+            let d4: String = g[8..16].iter().map(|b| format!("{b:02X}")).collect();
+            return format!(
+                "{:08X}{:04X}{:04X}{d4}{:X}",
+                u32::from_le_bytes([g[0], g[1], g[2], g[3]]),
+                u16::from_le_bytes([g[4], g[5]]),
+                u16::from_le_bytes([g[6], g[7]]),
+                rd32(cv.add(20))
+            );
+        }
+        "none".into()
+    }
+}
+
+/// The command line, the memory and Windows' build (the run's log, for a player's report).
+fn system_line() -> String {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mem = {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        let g = |b: u64| b as f64 / (1u64 << 30) as f64;
+        if unsafe { GlobalMemoryStatusEx(&mut m) } != 0 {
+            format!("memory {:.1} GiB ({:.1} free), commit limit {:.1} GiB ({:.1} free)", g(m.ullTotalPhys), g(m.ullAvailPhys), g(m.ullTotalPageFile), g(m.ullAvailPageFile))
+        } else {
+            "memory unknown".to_string()
+        }
+    };
+    // (RtlGetVersion: the real build, not the manifest's.)
+    let build = unsafe {
+        #[repr(C)]
+        struct Ver {
+            size: u32,
+            major: u32,
+            minor: u32,
+            build: u32,
+            platform: u32,
+            csd: [u16; 128],
+        }
+        let ntdll = windows_sys::Win32::System::LibraryLoader::GetModuleHandleA(c"ntdll.dll".as_ptr() as *const u8);
+        match windows_sys::Win32::System::LibraryLoader::GetProcAddress(ntdll, c"RtlGetVersion".as_ptr() as *const u8) {
+            Some(f) => {
+                let f: unsafe extern "system" fn(*mut Ver) -> i32 = std::mem::transmute(f);
+                let mut v: Ver = std::mem::zeroed();
+                v.size = std::mem::size_of::<Ver>() as u32;
+                if f(&mut v) == 0 { format!("Windows {}.{} build {}", v.major, v.minor, v.build) } else { "Windows build unknown".to_string() }
+            }
+            None => "Windows build unknown".to_string(),
+        }
+    };
+    // (Mains or battery, and the battery saver: a laptop on battery runs the preparation slower.)
+    let power = unsafe {
+        use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+        let mut s: SYSTEM_POWER_STATUS = std::mem::zeroed();
+        if GetSystemPowerStatus(&mut s) != 0 {
+            let source = match s.ACLineStatus {
+                0 => "on battery",
+                1 => "on mains power",
+                _ => "power source unknown",
+            };
+            let battery = if s.BatteryFlag & 128 != 0 { String::new() } else if s.BatteryLifePercent <= 100 { format!(", battery {}%", s.BatteryLifePercent) } else { ", battery level unknown".to_string() };
+            format!("{source}{battery}{}", if s.SystemStatusFlag == 1 { ", battery saver on" } else { "" })
+        } else {
+            "power unknown".to_string()
+        }
+    };
+    format!("{build}; {mem}; {} logical processors; {power}; args {:?}", std::thread::available_parallelism().map_or(0, |n| n.get()), args)
+}
+
 /// One game session at a time for a data folder (two would share saves, settings and the
 /// shader store): a second start is told and ends. Modes that run no game are not counted.
 fn single_instance(cfg: &Config) {
@@ -1799,14 +1908,46 @@ fn single_instance(cfg: &Config) {
     let user = prepplay::player_user().unwrap_or(&cfg.paths.user);
     let key: String = user.display().to_string().chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).collect();
     let name: Vec<u16> = format!("Local\\Regaliant_{key}").encode_utf16().chain(std::iter::once(0)).collect();
+    // A game started while the shader preparation runs (hidden: from the launcher, or started
+    // on its own beside it): the preparation is asked to stop, as the launcher's Stop asks (its
+    // stop file; it goes on from there the next time), and its hold on the data folder waited
+    // for, up to 30 s. (The review of 2026-11-20: such a start was told the game was already
+    // running, with nothing to be seen.)
+    let preparing = cfg.prepare_play.is_none() && ask_preparation_to_stop(cfg);
     // (Kept for the process's life: never closed.)
-    let h = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    let mut h = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    if !h.is_null() && unsafe { GetLastError() } == ERROR_ALREADY_EXISTS && preparing {
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(30) {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(h) };
+            std::thread::sleep(Duration::from_millis(250));
+            h = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+            if !h.is_null() && unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
+                info!("the shader preparation stopped for this session after {:.1} s (it goes on the next time)", t.elapsed().as_secs_f64());
+                return;
+            }
+        }
+    }
     if !h.is_null() && unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         error!("another game session runs with the same data folder: this start ends");
+        // (Its running marker, written before this check, is this start's: removed.)
+        session_ended();
         player_error("The game is already running.");
         log::flush();
         std::process::exit(EXIT_RUNNING as i32);
     }
+}
+
+/// A shader preparation step seems to run (its progress file written in the last 2 minutes): its
+/// stop file written (true), as the launcher's Stop writes it.
+fn ask_preparation_to_stop(cfg: &Config) -> bool {
+    let progress = cfg.paths.shaders().join("prepare-progress.txt");
+    let recent = std::fs::metadata(&progress).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|d| d < Duration::from_secs(120));
+    if recent && std::fs::write(progress.with_extension("stop"), "stop (a game session started)\n").is_ok() {
+        info!("a shader preparation step runs: asked to stop for this session");
+        return true;
+    }
+    false
 }
 
 /// Only the first thread that ends the game tells the player (others wait for the end).
@@ -1885,6 +2026,21 @@ fn session_ended() {
     }
 }
 
+/// A session found hung (`prepplay`'s and the compute step's watches): `why` and every thread's
+/// stacks into the log, then the process ended at once with `code`, not through `shutdown`
+/// (its GPU teardown would wait for the hung work).
+pub fn hung(why: &str, code: i32) -> ! {
+    error!("{why}; {}", stacks_bounded());
+    session_ended();
+    crate::log::flush();
+    unsafe {
+        windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), code as u32);
+    }
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
 pub fn shutdown(code: i32) -> ! {
     display::restore_on_exit();
     session_ended();
@@ -1931,6 +2087,27 @@ fn read_proc_param(m: &loader::LoadedModule) -> (u64, String, i32) {
 }
 
 fn main() {
+    // A run without a window (the launcher's preparation and checks, the drivers' runs) known
+    // from the command line before anything can fail: no message box (`player_error`) and none
+    // of Windows' own error popups, which a hidden run would leave waiting for a click (the
+    // review of 2026-11-20: the memory range's error came before the arguments were read).
+    // The preparation's runs keep the PC from sleeping while they last.
+    {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        if args.iter().any(|a| matches!(a.as_str(), "--headless" | "--prepare-play" | "--precompile-all" | "--pb-check" | "--translation-fingerprint" | "--compile-bench")) {
+            HEADLESS.store(true, std::sync::atomic::Ordering::Relaxed);
+            unsafe {
+                use windows_sys::Win32::System::Diagnostics::Debug::{SetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SEM_NOOPENFILEERRORBOX};
+                SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+            }
+        }
+        if args.iter().any(|a| matches!(a.as_str(), "--prepare-play" | "--precompile-all")) {
+            unsafe {
+                use windows_sys::Win32::System::Power::{SetThreadExecutionState, ES_CONTINUOUS, ES_SYSTEM_REQUIRED};
+                SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
+            }
+        }
+    }
     // Under front end 2 (the default) and with `--host` this process only
     // hosts dsport (its debugger; `hosted::wants_host`).
     if hosted::wants_host() {
@@ -1980,7 +2157,7 @@ This happens when other software takes that range. Restart the PC and try again.
     // that panicked: the run log is what post-mortems read.
     // A panic ends the game as a crash does (the player told, the display mode back).
     std::panic::set_hook(Box::new(move |info| {
-        crate::error!("panic: {info}");
+        crate::error!("panic: {info}\n{}", std::backtrace::Backtrace::force_capture());
         crate::fatal_exit(0xD540, "panic");
     }));
     if cfg.debug || cfg.trace {
@@ -1988,7 +2165,8 @@ This happens when other software takes that range. Restart the PC and try again.
     }
     log::TRACE_HLE.store(cfg.trace, std::sync::atomic::Ordering::Relaxed);
     hle::LENIENT_IMPORTS.store(cfg.lenient, std::sync::atomic::Ordering::Relaxed);
-    info!("Regaliant {} | run dir {} | TLS slot {} | host heap: {} | guest write watch: {}", env!("CARGO_PKG_VERSION"), cfg.run_dir.display(), slot, heap::name(), mem::write_watch_state());
+    info!("Regaliant {} (build {}) | run dir {} | TLS slot {} | host heap: {} | guest write watch: {}", env!("CARGO_PKG_VERSION"), build_id(), cfg.run_dir.display(), slot, heap::name(), mem::write_watch_state());
+    info!("start: {}", system_line());
     info!("files: {:?} layout, settings and saves in {}, logs and caches in {}", cfg.paths.layout, cfg.paths.user.display(), cfg.paths.cache.display());
     if let Some(p) = &cfg.game_problem {
         error!("game files: {}", p.replace('\n', " "));
@@ -2036,11 +2214,27 @@ This happens when other software takes that range. Restart the PC and try again.
     // beside a game session (it ran their start-up until 2026-11-14: a pending Save Folder move
     // or PS5 import applied under a running game, the stores' unfinished files deleted).
     if cfg.translation_fingerprint {
+        // (A check takes seconds, 2.3 s on the development PC: one not done in 60 s is a driver
+        // call that does not return. The launcher waits for it a little longer.)
+        let _ = std::thread::Builder::new().name("check-watch".into()).spawn(|| {
+            std::thread::sleep(Duration::from_secs(60));
+            hung("translation check: not done in 60 s", prepplay::EXIT_HUNG);
+        });
+        // (This program's version first: the launcher compares it with its own, a new version's
+        // files unpacked over a game still running would leave the old game beside the new
+        // launcher.)
+        println!("version = {}", std::env::var("DS_SIM_VERSION").unwrap_or_else(|_| dsconfig::VERSION.to_string()));
         // (Translations made here are for the game's hosted sessions: their specs as those make
         // them, `fe2::specs_as_hosted`.)
         gpu::fe2::specs_as_hosted();
         let code = match gpu::compbench::translation_fingerprint(&cfg.app) {
             Ok(fp) => {
+                // (The card and driver this program uses, as the prepared marker names them: the
+                // launcher's records follow the game's own device, the review of 2026-11-20.)
+                if let Some(c) = gpu::vk::try_ctx() {
+                    println!("device = {}", c.device_name);
+                    println!("driver = {}", unsafe { c.instance.get_physical_device_properties(c.pdev) }.driver_version);
+                }
                 println!("translation = {fp}");
                 info!("translation fingerprint: {fp}");
                 0
@@ -2161,6 +2355,12 @@ This happens when other software takes that range. Restart the PC and try again.
         std::process::exit(code);
     }
     if let Some(phase) = &cfg.pb_check {
+        // (A check takes seconds: one not done in 2 minutes is a driver call that does not return;
+        // 5 minutes until 2026-11-20, a long wait on a PC whose next steps would hang too.)
+        let _ = std::thread::Builder::new().name("pb-check-watch".into()).spawn(|| {
+            std::thread::sleep(Duration::from_secs(120));
+            hung("pb-check: not done in 120 s", prepplay::EXIT_HUNG);
+        });
         let code = gpu::pcache::pb_check(phase);
         log::flush();
         std::process::exit(code);
@@ -2273,9 +2473,18 @@ This happens when other software takes that range. Restart the PC and try again.
     let stall_watch = std::env::var("DS_STALL_WATCH").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
     let mut stall_left = std::env::var("DS_STALL_WATCH_MAX").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(4);
     let mut stall_at = (0u64, Instant::now(), false);
+    // (Time in which this loop did not run, the PC asleep or the process held: not counted
+    // against the time limit; an overnight sleep had ended a preparation's step at its limit.)
+    let (mut slept, mut last_tick) = (Duration::ZERO, Instant::now());
     loop {
         std::thread::sleep(Duration::from_millis(250));
         ticks += 1;
+        let gap = last_tick.elapsed();
+        last_tick = Instant::now();
+        if gap > Duration::from_secs(10) {
+            slept += gap;
+            info!("the process did not run for {:.0} s (the PC asleep or the process held): time limits extended", gap.as_secs_f64());
+        }
         if stall_watch > 0 && stall_left > 0 {
             let f = gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
             if f != stall_at.0 {
@@ -2307,8 +2516,8 @@ This happens when other software takes that range. Restart the PC and try again.
             shutdown(0);
         }
         if let Some(s) = cfg.seconds {
-            if start.elapsed() >= Duration::from_secs(s) {
-                info!("time limit of {s}s reached; guest thread stacks:\n{}", thread_summary_ex(true));
+            if start.elapsed().saturating_sub(slept) >= Duration::from_secs(s) {
+                info!("time limit of {s}s reached; {}", stacks_bounded());
                 // (A self-play stage that ran out of time did not play to its end.)
                 if cfg.prepare_play.is_some() {
                     error!("prepare-play: the stage did not end within its time limit of {s} s");

@@ -218,7 +218,9 @@ fn load() {
     DONE_LOADING.call_once(|| {
         let mut m: HashMap<u64, (u32, Vec<Seen>)> = HashMap::new();
         let mut g = GfxLearned::default();
-        if let Some(text) = STORE.get().and_then(|p| std::fs::read_to_string(p).ok()) {
+        // (Read as text even with bytes that are not: a write cut by a power loss; such lines are
+        // passed, the rest read.)
+        if let Some(text) = STORE.get().and_then(|p| std::fs::read(p).ok()).map(|b| String::from_utf8_lossy(&b).into_owned()) {
             for (k, line) in text.lines().enumerate() {
                 let rank = k as u32;
                 if let Some(r) = line.strip_prefix("G ").and_then(parse_gfx) {
@@ -238,17 +240,10 @@ fn load() {
         }
         let mut codes: HashMap<u64, std::sync::Arc<Vec<u32>>> = HashMap::new();
         if let Some(b) = code_path().and_then(|p| std::fs::read(p).ok()) {
-            let mut at = 0usize;
-            while at + 12 <= b.len() {
-                let h = u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
-                let n = u32::from_le_bytes(b[at + 8..at + 12].try_into().unwrap()) as usize;
-                let end = at + 12 + 4 * n;
-                if n == 0 || end > b.len() {
-                    break;
-                }
-                let words: Vec<u32> = b[at + 12..end].chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
-                codes.insert(h, std::sync::Arc::new(words));
-                at = end;
+            let (passed, bad);
+            (codes, passed, bad) = parse_codes(&b);
+            if passed > 0 {
+                crate::warn!("gpu: the learned programs' code file has a damaged part ({passed} bytes passed, {bad} records not matching their hash; a write cut short, e.g. by a power loss): the records after it read");
             }
         }
         STATS[CODES_LOADED].fetch_add(codes.len() as u64, Ordering::Relaxed);
@@ -256,6 +251,38 @@ fn load() {
         *GFX.lock() = Some(g);
         *CODES.lock() = Some(codes);
     });
+}
+
+/// The code file's records ([code hash, word count, words], appended): each taken when its words
+/// match its hash. Anything else, e.g. the zeros a write cut short by a power loss leaves (the
+/// file's length kept, not its data), is passed in 4-byte steps, the records' alignment, to the
+/// next record: the records after it are read, and a program whose record was lost is kept again
+/// when next met (until 2026-11-20 the reading stopped there, and what later sessions kept was
+/// never read again). With the bytes passed and the records that did not match their hash.
+fn parse_codes(b: &[u8]) -> (HashMap<u64, std::sync::Arc<Vec<u32>>>, usize, usize) {
+    const MOST_WORDS: usize = 1 << 18;
+    let mut codes = HashMap::new();
+    let (mut at, mut passed, mut bad) = (0usize, 0usize, 0usize);
+    while at + 12 <= b.len() {
+        let h = u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+        let n = u32::from_le_bytes(b[at + 8..at + 12].try_into().unwrap()) as usize;
+        let end = at + 12 + 4 * n;
+        if h == 0 || n == 0 || n > MOST_WORDS || end > b.len() {
+            at += 4;
+            passed += 4;
+            continue;
+        }
+        let words: Vec<u32> = b[at + 12..end].chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        if super::shaders::hash_words(&words) != h {
+            at += 4;
+            passed += 4;
+            bad += 1;
+            continue;
+        }
+        codes.insert(h, std::sync::Arc::new(words));
+        at = end;
+    }
+    (codes, passed, bad)
 }
 
 /// The code file beside the store.
@@ -1397,6 +1424,42 @@ pub fn status() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A code record as `keep_code` appends it.
+    fn code_record(words: &[u32]) -> Vec<u8> {
+        let mut r = super::super::shaders::hash_words(words).to_le_bytes().to_vec();
+        r.extend_from_slice(&(words.len() as u32).to_le_bytes());
+        for w in words {
+            r.extend_from_slice(&w.to_le_bytes());
+        }
+        r
+    }
+
+    #[test]
+    fn code_file_read_through_damage() {
+        let (a, b, c) = (vec![0xBF80_0000u32, 7, 9], vec![0x1234_5678u32; 5], vec![0xBF81_0000u32]);
+        // Whole: all three.
+        let mut f = [code_record(&a), code_record(&b), code_record(&c)].concat();
+        let (codes, passed, bad) = parse_codes(&f);
+        assert_eq!((codes.len(), passed, bad), (3, 0, 0));
+        // Zeros after the first (a write cut by a power loss, 4 KB), then the others appended later.
+        f = [code_record(&a), vec![0u8; 4096], code_record(&b), code_record(&c)].concat();
+        let (codes, passed, bad) = parse_codes(&f);
+        assert_eq!((codes.len(), passed, bad), (3, 4096, 0));
+        // A record whose words were lost (zeros after its header), then the next.
+        let mut cut = code_record(&b);
+        for x in &mut cut[12..] {
+            *x = 0;
+        }
+        f = [code_record(&a), cut.clone(), code_record(&c)].concat();
+        let (codes, _, bad) = parse_codes(&f);
+        assert!(codes.contains_key(&super::super::shaders::hash_words(&a)) && codes.contains_key(&super::super::shaders::hash_words(&c)));
+        assert!(!codes.contains_key(&super::super::shaders::hash_words(&b)) && bad >= 1);
+        // A record cut short at the file's end: the ones before it.
+        f = [code_record(&a), code_record(&b)[..10].to_vec()].concat();
+        let (codes, _, _) = parse_codes(&f);
+        assert_eq!(codes.len(), 1);
+    }
 
     #[test]
     fn store_lines_round_trip() {

@@ -268,15 +268,76 @@ fn touch_later(p: &Path) {
     TOUCH.lock().push(p.to_path_buf());
 }
 
+/// Pipeline files that could not be written (a full drive, no rights; the first 8 logged).
+pub static WRITE_FAILS: AtomicU64 = AtomicU64::new(0);
+
 /// Writes a pipeline file (temporary name first: two threads may make the
 /// same pipeline).
 fn write_file(p: &Path, bytes: &[u8]) -> bool {
     let tmp = p.with_extension(format!("{:x}.tmp", std::thread::current().id().as_u64_compat()));
-    if std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, p)).is_ok() {
-        return true;
+    let write = || {
+        if sim_disk_full() {
+            Err(std::io::Error::other("there is not enough space on the disk (DS_SIM_DISK_FULL, a test)"))
+        } else if sim_unwritable() {
+            Err(std::io::Error::other("access is denied (DS_SIM_UNWRITABLE, a test)"))
+        } else {
+            std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, p))
+        }
+    };
+    match write() {
+        Ok(()) => {
+            WRITES_OK.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        Err(e) => {
+            if WRITE_FAILS.fetch_add(1, Ordering::Relaxed) < 8 {
+                crate::warn!("pipeline store: {} not written: {e}", p.display());
+            }
+        }
     }
     let _ = std::fs::remove_file(&tmp);
     false
+}
+
+/// Pipeline files written (`write_file`).
+pub static WRITES_OK: AtomicU64 = AtomicU64::new(0);
+
+/// The store's folder refuses writes (not for lack of space: a folder whose permissions or a
+/// security program block them): at least 16 writes failed and none was written. The steps of
+/// the shader preparation end then (`prepplay::EXIT_UNWRITABLE`): nothing they make is kept.
+pub fn store_unwritable() -> bool {
+    WRITE_FAILS.load(Ordering::Relaxed) >= 16 && WRITES_OK.load(Ordering::Relaxed) == 0
+}
+
+/// `DS_SIM_UNWRITABLE=1` (a test): the store's writes fail, its drive with its own free space.
+fn sim_unwritable() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var("DS_SIM_UNWRITABLE").ok().as_deref() == Some("1"))
+}
+
+/// `DS_SIM_DISK_FULL=1` (a test): the store's writes fail and its drive has 100 MiB free.
+fn sim_disk_full() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var("DS_SIM_DISK_FULL").ok().as_deref() == Some("1"))
+}
+
+/// The free bytes on the store's drive (None: no store, or unknown).
+pub fn store_free_bytes() -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    let dir = DIR.get()?;
+    if sim_disk_full() {
+        return Some(100 << 20);
+    }
+    let w: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut free = 0u64;
+    let ok = unsafe { windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(w.as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut()) };
+    (ok != 0).then_some(free)
+}
+
+/// The store's drive is full: pipeline files could not be written and under 1 GiB is free there
+/// (the shader preparation's steps end then, the launcher tells the player).
+pub fn store_full() -> bool {
+    WRITE_FAILS.load(Ordering::Relaxed) > 0 && store_free_bytes().is_some_and(|f| f < 1 << 30)
 }
 
 /// Stores the pipeline files written whole without their shared block
@@ -1000,9 +1061,12 @@ fn note_refusal() {
 /// compile, 20 when the driver compiled them again (binaries refused, or cache data that did not
 /// serve), 21 when nothing was stored; 1 Vulkan failed.
 pub fn pb_check(phase: &str) -> i32 {
+    // (No usable graphics card: the launcher ends the preparation at once, not after the steps
+    // after it failed too.)
     if let Err(e) = super::vk::init() {
         crate::error!("pb-check: Vulkan: {e}");
-        return 1;
+        println!("pb-check = {}", crate::EXIT_NO_GPU);
+        return crate::EXIT_NO_GPU as i32;
     }
     let c = ctx();
     let read = phase == "read";
@@ -1010,6 +1074,7 @@ pub fn pb_check(phase: &str) -> i32 {
     let code = rdna::kernels::timestamp_store_many();
     let Ok(module) = (unsafe { c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None) }) else { return 1 };
     let (mut served, mut compiled, mut missing) = (0u32, 0u32, 0u32);
+    let (mut errors, mut lost) = (0u32, false);
     for k in 0..4u32 {
         // (Four pipelines: the kernel's two buffers and k unused ones, so four layouts.)
         let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..2 + k)
@@ -1051,15 +1116,24 @@ pub fn pb_check(phase: &str) -> i32 {
             (Ok(_), true) if refused => "its binaries refused, compiled again",
             (Ok(_), true) => "no binaries stored, compiled",
             (Ok(_), false) => "served by its cache data",
+            (Err(e), _) if e.contains("DEVICE_LOST") => "the device lost",
             (Err(e), false) if e.contains("COMPILE_REQUIRED") && stored_before => "its cache data did not serve it",
-            (Err(_), false) => "no cache data stored",
-            (Err(_), true) => "failed",
+            (Err(e), false) if e.contains("COMPILE_REQUIRED") => "no cache data stored",
+            (Err(_), _) => "failed",
         };
-        crate::info!("pb-check {phase}: pipeline {k} ({}): {outcome}", if binaries { "binaries" } else { "cache data" });
+        crate::info!("pb-check {phase}: pipeline {k} ({}): {outcome}{}", if binaries { "binaries" } else { "cache data" }, r.as_ref().err().map(|e| format!(" ({e})")).unwrap_or_default());
+        // (Errors are not refusals: a driver that fails pipelines, or a lost device, says nothing
+        // about the store's way; the review of 2026-11-20: they had turned binaries off for good.)
+        match outcome {
+            "the device lost" => lost = true,
+            "failed" => errors += 1,
+            _ => {}
+        }
         if read {
             match outcome {
                 "from its binaries" | "served by its cache data" => served += 1,
                 "no binaries stored, compiled" | "no cache data stored" => missing += 1,
+                "the device lost" | "failed" => {}
                 _ => compiled += 1,
             }
         }
@@ -1072,13 +1146,29 @@ pub fn pb_check(phase: &str) -> i32 {
         }
     }
     unsafe { c.device.destroy_shader_module(module, None) };
+    if lost {
+        crate::error!("pb-check {phase}: the graphics device was lost");
+        println!("pb-check = 5");
+        return crate::EXIT_DEVICE_LOST as i32;
+    }
     if !read {
-        crate::info!("pb-check write: done ({})", if binaries { "binaries" } else { "cache data" });
-        return 0;
+        // (The store not written, its drive full or its folder refusing writes: not the driver's
+        // doing. Its own status, so the launcher says why and does not conclude that this PC's
+        // driver keeps nothing (until 2026-11-20 night the read would have found nothing stored
+        // and recorded "cannot help" for the driver for good).)
+        let (fails, written) = (WRITE_FAILS.load(Ordering::Relaxed), WRITES_OK.load(Ordering::Relaxed));
+        if fails > 0 && (store_full() || written == 0) {
+            let code = if store_full() { crate::prepplay::EXIT_DISK_FULL } else { crate::prepplay::EXIT_UNWRITABLE };
+            crate::error!("pb-check write: the store not written ({fails} files failed, {written} written, {} MiB free)", store_free_bytes().unwrap_or(0) >> 20);
+            println!("pb-check = {code}");
+            return code;
+        }
+        crate::info!("pb-check write: done ({}; {errors} failed)", if binaries { "binaries" } else { "cache data" });
+        return if errors > 0 { 21 } else { 0 };
     }
     let code = if served >= 3 {
         0
-    } else if compiled > 0 {
+    } else if compiled > 0 && errors == 0 {
         20
     } else {
         21

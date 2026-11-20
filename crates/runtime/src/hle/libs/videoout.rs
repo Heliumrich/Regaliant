@@ -156,6 +156,9 @@ static VBLANK_CV: Condvar = Condvar::new();
 
 fn vblank_thread() {
     crate::log::set_thread_name("vblank");
+    // (`DS_SIM_HANG_AT=<s>`, a test: this thread stops that long after it began, no flip from
+    // then on: a hung session for the hang watches.)
+    let hang_at = std::env::var("DS_SIM_HANG_AT").ok().and_then(|v| v.parse::<u64>().ok()).map(|s| Instant::now() + Duration::from_secs(s));
     // DS_VBLANK_HZ=<hz> (diagnosis, 30-1000): vblanks at another rate, so
     // flips are not quantized to 16.7 ms steps and A/Bs see frame cost below
     // a vblank (the title flips at every vblank, `sceVideoOutSetFlipRate(0)`;
@@ -203,6 +206,12 @@ fn vblank_thread() {
     crate::displayclock::start();
     crate::vrr::start();
     loop {
+        if hang_at.is_some_and(|t| Instant::now() >= t) {
+            crate::warn!("DS_SIM_HANG_AT: the vblank thread stops (a test)");
+            loop {
+                std::thread::sleep(Duration::from_secs(3600));
+            }
+        }
         // Once a vblank: the PC settings' console variables (changed values, objects the title
         // builds later) and the other per-vblank work.
         if std::mem::take(&mut ticked) {
