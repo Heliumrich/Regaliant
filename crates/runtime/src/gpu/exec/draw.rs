@@ -965,6 +965,11 @@ pub(crate) fn precompile_gfx_translations(vs: StageTr, ps: Option<StageTr>, stat
     if gfx_known(hkey) {
         return Some(false);
     }
+    // (One whose compile crashed this driver in an earlier session is left to the draws that
+    // need it: `pcache::crashed_skip`.)
+    if crate::gpu::pcache::crashed_skip('g', hkey) {
+        return None;
+    }
     // (Kept alive only when a recent session used it; else made through the
     // store and let go when the store lacks it: `precompile_or_warm`.)
     if !(keep_ok && super::super::pipeuse::recent(hkey)) {

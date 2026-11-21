@@ -462,11 +462,16 @@ static DISARM_FAILED: AtomicU64 = AtomicU64::new(0);
 /// without bits, whose writes reach dsport's own handlers (a title crash
 /// on a page of a writable mapping: FINDINGS.md 2026-10-27 night); pages
 /// not armed keep their protection.
+#[track_caller]
 pub fn disarm(base: u64, len: u64) {
     let Some(s) = shared() else { return };
     let _lock = arm_lock();
     let lo = (base & !(PAGE - 1)).max(crate::mem::GUEST_BASE);
     let hi = base.saturating_add(len).next_multiple_of(PAGE).min(crate::mem::GUEST_END);
+    if let Some(p) = crate::gpu::fe2::traced(lo, hi) {
+        let at = std::panic::Location::caller();
+        crate::gpu::fe2::trace_event(p, &format!("a host disarm over it: {lo:#x}..{hi:#x} from {}:{}", at.file().rsplit(['/', '\\']).next().unwrap_or(""), at.line()));
+    }
     let armed = |a: u64| bit(s, a, false).is_some_and(|(w, m)| w.load(Ordering::Acquire) & m != 0);
     let mut a = lo;
     while a < hi {

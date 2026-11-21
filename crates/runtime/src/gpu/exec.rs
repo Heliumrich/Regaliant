@@ -1896,7 +1896,28 @@ const AUDIT_SPANS: usize = 64;
 /// mirror pages compared, differing at the first read, differing again while
 /// still current and armed (logged), mirror pages left out because a batch
 /// not finished yet writes them].
-static AUDIT: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+static AUDIT: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+
+/// Ranges filled in front end 2's mirror alone (`fill_mirror_only`: the VG per-view clear),
+/// noted while the import audit runs: their guest memory keeps older words by design, so the
+/// mirror audit leaves their pages out (AUDIT[9]; 2026-11-21: they were 52 of the 62 pages a
+/// boot's audit logged).
+static MIRROR_ONLY: parking_lot::RwLock<Vec<(u64, u64)>> = parking_lot::RwLock::new(Vec::new());
+
+fn note_mirror_only(base: u64, len: u64) {
+    let end = base + len;
+    if MIRROR_ONLY.read().iter().any(|&(a, b)| a <= base && end <= b) {
+        return;
+    }
+    let mut g = MIRROR_ONLY.write();
+    if g.len() < 64 {
+        g.push((base, end));
+    }
+}
+
+fn mirror_only_covers(p: u64) -> bool {
+    MIRROR_ONLY.read().iter().any(|&(a, b)| a <= p && p < b)
+}
 
 /// Whether a batch that has not finished writes guest page `p` (its mirror
 /// copy may then hold dwords its write-back has not stored yet).
@@ -2063,6 +2084,9 @@ fn audit_mirror(buf: vk::Buffer, ptr: *mut u8, round: u64, cpu: &dyn Fn(u64) -> 
     let before = pages.len();
     pages.retain(|&p| !audit_written_now(p));
     AUDIT[8].fetch_add((before - pages.len()) as u64, Relaxed);
+    let before = pages.len();
+    pages.retain(|&p| !mirror_only_covers(p));
+    AUDIT[9].fetch_add((before - pages.len()) as u64, Relaxed);
     if pages.is_empty() || !read(&pages) {
         return;
     }
@@ -2212,8 +2236,8 @@ fn audit_line() -> String {
     }
     let v: Vec<u64> = AUDIT.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
-        "    import audit (`DS_IMPORT_AUDIT`): {} rounds, {} pages compared, {} differing at the first read, {} read by the GPU as the CPU had them neither before nor after (logged), {} not readable; front end 2's mirror: {} current armed pages compared, {} differing at the first read, {} again 50 ms later while still current and armed (logged), {} left out while an unfinished batch wrote them\n",
-        v[4], v[0], v[1], v[2], v[3], v[5], v[6], v[7], v[8]
+        "    import audit (`DS_IMPORT_AUDIT`): {} rounds, {} pages compared, {} differing at the first read, {} read by the GPU as the CPU had them neither before nor after (logged), {} not readable; front end 2's mirror: {} current armed pages compared, {} differing at the first read, {} again 50 ms later while still current and armed (logged), {} left out while an unfinished batch wrote them, {} in buffers filled in the mirror alone\n",
+        v[4], v[0], v[1], v[2], v[3], v[5], v[6], v[7], v[8], v[9]
     )
 }
 
@@ -3085,6 +3109,9 @@ fn import_once(base: u64, size: u64, window: u64) -> Option<Option<(vk::Buffer, 
             });
             super::pagetable::map(start, end - start, va);
             drop(g);
+            if let Some(p) = super::fe2::traced(start, end) {
+                super::fe2::trace_event(p, &format!("an import window over it made: {start:#x}..{end:#x}"));
+            }
             IMPORTS.fetch_add(1, Ordering::Relaxed);
             IMPORT_BYTES.fetch_add(end - start, Ordering::Relaxed);
             if audit_ms() != 0 {
@@ -15305,6 +15332,10 @@ impl Exec {
                         }
                         runs = kept;
                     }
+                    if let Some(p) = super::fe2::traced(x, e) {
+                        let here = runs.iter().any(|&(cx, ce)| cx <= p && p < ce);
+                        super::fe2::trace_event(p, &format!("{}: an upload of {x:#x}..{e:#x} {}", self.name, if here { "copies it in this batch's prologue" } else { "leaves it out (another part's copy or held)" }));
+                    }
                     for &(cx, ce) in &runs {
                         self.pre_copies.push((buf, mbuf, vk::BufferCopy { src_offset: cx - start, dst_offset: cx - MIRROR_BASE, size: ce - cx }));
                         super::fe2::upload_census(cx, ce);
@@ -16055,6 +16086,9 @@ impl Exec {
             self.dispatched = false;
         }
         unsafe { ctx().device.cmd_fill_buffer(cmd, m, base - super::resident::MIRROR_BASE, len, v) };
+        if audit_ms() != 0 {
+            note_mirror_only(base, len);
+        }
         self.ops[OP_FILLS] += 1;
         self.ops[OP_FILL_BYTES] += len;
         if !lazy_barriers() {

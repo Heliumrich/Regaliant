@@ -1912,6 +1912,9 @@ fn back_in(m: &Mirror, base: u64, len: u64, count: &AtomicU64) -> Result<(), Str
             let (w, bit) = ((p / 64) as usize, 1u64 << (p % 64));
             if r.is_ok() {
                 m.backed[w].fetch_or(bit, Ordering::AcqRel);
+                if let Some(t) = super::fe2::traced(MIRROR_BASE + p * m.page, MIRROR_BASE + (p + 1) * m.page) {
+                    super::fe2::trace_event(t, "its mirror page bound (back_in)");
+                }
             } else {
                 g.claimed[w] &= !bit;
                 if let Some((blk, off)) = g.page_mem.remove(&p) {

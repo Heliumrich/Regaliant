@@ -1371,6 +1371,8 @@ unsafe fn veh_body(info: *mut EXCEPTION_POINTERS) -> i32 {
                         let module = module_offset(rip).map_or_else(|| format!("{rip:#x}"), |(m, o)| format!("{m}+{o:#x}"));
                         crate::warn!("driver fault {code:#010x} at {module} while compiling {what}");
                         crate::log::try_flush();
+                        // (Left out of the next sessions' background compiles.)
+                        crate::gpu::pcache::note_crash();
                     }
                 }
                 return EXCEPTION_CONTINUE_SEARCH;

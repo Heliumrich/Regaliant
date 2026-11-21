@@ -337,6 +337,10 @@ fn bump_gen(start: u64, end: u64) {
         c.pop_front();
     }
     c.push_back((generation, start, end));
+    drop(c);
+    if let Some(p) = crate::gpu::fe2::traced(start, end) {
+        crate::gpu::fe2::trace_event(p, &format!("a mapping change over it: {start:#x}..{end:#x} (generation {generation})"));
+    }
 }
 
 /// Brings a thread's cached runs from generation `from` to `to`: drops the
@@ -1105,6 +1109,9 @@ fn mixed_make(a: u64, e: u64) -> Result<(), u32> {
                 let i = ((w - GUEST_BASE) >> mixed_shift()) as usize;
                 MIXED_MADE[i / 64].fetch_or(1 << (i % 64), Ordering::AcqRel);
                 MIXED_STATS[0].fetch_add(1, Ordering::Relaxed);
+                if let Some(p) = crate::gpu::fe2::traced(w, w + win) {
+                    crate::gpu::fe2::trace_event(p, &format!("its mixed window {w:#x} made"));
+                }
             }
         }
         w += win;
@@ -2181,8 +2188,15 @@ pub fn kernel_io<T>(what: &dyn Fn() -> String, base: u64, len: u64, into_guest: 
     crate::gpu::resident::release_range(base, len);
     const TRIES: u32 = 8;
     let mut tries = 0;
+    let traced = crate::gpu::fe2::traced(base & !4095, base.saturating_add(len));
     loop {
+        if let Some(p) = traced {
+            crate::gpu::fe2::trace_event(p, &format!("kernel I/O over it begins (try {tries}, into guest {into_guest}): {} ({base:#x}+{len:#x})", what()));
+        }
         let r = op();
+        if let Some(p) = traced {
+            crate::gpu::fe2::trace_event(p, &format!("kernel I/O over it ended (try {tries}): {}", if r.is_ok() { "ok".to_string() } else { format!("{:?}", r.as_ref().err().and_then(|e| e.raw_os_error())) }));
+        }
         match &r {
             Err(e) if matches!(e.raw_os_error(), Some(998 | 1784)) && tries < TRIES => {
                 if tries == 0 && KERNEL_IO[0].fetch_add(1, Relaxed) < 32 {

@@ -984,6 +984,9 @@ pub fn run_claim(a: u64, b: u64, run: u64, chunk: u32, out: &mut Vec<(u64, u64)>
         } else {
             left += 1;
         }
+        if traced(p, p + PAGE).is_some() {
+            trace_event(p, &format!("run {r:#x} part {chunk}: {} (page generation {g})", if won { "claimed for this part's copy" } else { "left to an earlier part's copy" }));
+        }
         p += PAGE;
     }
     RUN_SHARED[1].fetch_add(claimed, Ordering::Relaxed);
@@ -1461,6 +1464,9 @@ pub fn adopt_armed(page: u64) {
     let i = idx(page);
     c.armed[i / 64].fetch_or(1u64 << (i % 64), Ordering::AcqRel);
     STATS[S_ADOPTED].fetch_add(1, Ordering::Relaxed);
+    if traced(page, page + PAGE).is_some() {
+        trace_event(page, "armed (adopted from the host)");
+    }
 }
 
 /// Counts written bindings whose pages no import window covers (their GPU
@@ -2323,6 +2329,9 @@ fn take_run(a: u64, b: u64, ta: u64, tb: u64, frame: u64, arm: bool, armable: &A
     if slow_place_us() != 0 {
         probe_add(P_TAKE_NS, tt.elapsed().as_nanos() as u64);
     }
+    if let Some(p) = traced(ta, tb) {
+        trace_event(p, &format!("taken with {ta:#x}..{tb:#x} for {a:#x}..{b:#x} (arm {arm}, role {}): found written {}", super::prio::role(), if r.is_none() { "unknown".to_string() } else { written.contains(&p).to_string() }));
+    }
     caller_since(C_TAKE, t);
     if r.is_some() {
         hole_check(written);
@@ -3099,6 +3108,9 @@ fn set_clean(a: u64, b: u64, ep: u32, validate: bool) {
         }
         x = e;
     }
+    if let Some(p) = traced(a, b) {
+        trace_event(p, &format!("set clean in epoch {ep} (validate {validate}) with {a:#x}..{b:#x}"));
+    }
 }
 
 /// Pages of [a, b) we armed whose host bit is gone (a write fault, its
@@ -3117,6 +3129,11 @@ fn note_arming_ended(a: u64, b: u64) {
             if gone != 0 {
                 c.armed[w].fetch_and(!gone, Ordering::AcqRel);
                 c.cgen.fetch_add(1, Ordering::AcqRel);
+                if let Some(p) = traced(x, e) {
+                    if gone >> (idx(p) % 64) & 1 != 0 {
+                        trace_event(p, "a take saw its arming ended (note_arming_ended)");
+                    }
+                }
                 let base = w * 64;
                 let f = super::FRAMES.load(Ordering::Relaxed) as u32 + 1;
                 let mut r = gone;
@@ -3657,6 +3674,9 @@ fn behind_disarm_all() -> u64 {
                 continue;
             }
             c.cgen.fetch_add(1, Ordering::AcqRel);
+            if traced(p, p + PAGE).is_some() {
+                trace_event(p, "disarmed with everything armed behind (behind_disarm_all)");
+            }
             n += 1;
             pend = match pend {
                 Some((a, b)) if b == p => Some((a, p + PAGE)),
@@ -3825,6 +3845,9 @@ fn watch() {
                 continue;
             };
             FAULTS[F_SPAN].fetch_add(1, Ordering::Relaxed);
+            if traced(page, page + PAGE).is_some() {
+                trace_event(page, &format!("a {} fault the host answered (watcher, before its handling)", if write { "write" } else { "read" }));
+            }
             let (i, w) = (idx(page), idx(page) / 64);
             let bit = 1u64 << (i % 64);
             if crate::engine::census_on() {
@@ -3888,6 +3911,11 @@ fn word_ended(wa: u64, level: u8, frame: u64) -> u64 {
         return 0;
     }
     c.armed[w].fetch_and(!gone, Ordering::AcqRel);
+    if let Some(p) = traced(wa, wa + 64 * PAGE) {
+        if gone >> (idx(p) % 64) & 1 != 0 {
+            trace_event(p, "its word's arming ended by a fault (word_ended)");
+        }
+    }
     let base = w * 64;
     let mut r = gone;
     while r != 0 {
@@ -3940,6 +3968,11 @@ fn burst(k: usize, n: u32, total: u32, frame: u64, rip: u64) {
                 continue;
             }
             c.armed[w].fetch_and(!live, Ordering::AcqRel);
+            if let Some(t) = traced(wa, wa + 64 * PAGE) {
+                if live >> (idx(t) % 64) & 1 != 0 {
+                    trace_event(t, &format!("disarmed by a fault burst in its chunk ({n} faults, the first at {})", describe_code(rip)));
+                }
+            }
             let mut r = live;
             while r != 0 {
                 let b = r.trailing_zeros() as u64;
@@ -4051,6 +4084,11 @@ fn arm_part(x: u64, y: u64, frame: u64) {
             // (Not taken since this arming yet: `take_run`.)
             c.varmed[idx(p) / 64].fetch_and(!m, Ordering::AcqRel);
             c.armed[idx(p) / 64].fetch_or(m, Ordering::AcqRel);
+            if let Some(t) = traced(p, e) {
+                if m >> (idx(t) % 64) & 1 != 0 {
+                    trace_event(t, "armed (arm_part)");
+                }
+            }
         }
         p = e;
     }
@@ -4121,6 +4159,9 @@ fn hold_part(x: u64, y: u64) {
             if let Some(c) = chunk(a, false) {
                 c.varmed[idx(a) / 64].fetch_and(!word_mask(a, e), Ordering::AcqRel);
                 c.armed[idx(a) / 64].fetch_or(word_mask(a, e), Ordering::AcqRel);
+                if let Some(t) = traced(a, e) {
+                    trace_event(t, "armed (a run)");
+                }
             }
             a = e;
         }
@@ -4200,8 +4241,14 @@ pub fn uploaded(runs: &[(u64, u64)], gens: &[u32], ep: u32) {
                 if Some(c.wgen[idx(x) / 64].load(Ordering::Acquire)) == g {
                     set_clean(x, e, ep, true);
                     STATS[S_VALIDATED].fetch_add((e - x) / PAGE, Ordering::Relaxed);
+                    if let Some(p) = traced(x, e) {
+                        trace_event(p, &format!("its upload's batch queued: validated in epoch {ep}"));
+                    }
                 } else {
                     STATS[S_RACED].fetch_add((e - x) / PAGE, Ordering::Relaxed);
+                    if let Some(p) = traced(x, e) {
+                        trace_event(p, &format!("its upload's batch queued: raced (word generation {g:?} then)"));
+                    }
                 }
             }
             x = e;
@@ -4219,6 +4266,49 @@ pub fn marks_taken(r: Option<()>, base: u64, size: u64, pages: &[u64]) {
         Some(()) => cpu_written(pages),
         None => invalidate(base, size),
     }
+}
+
+/// `DS_FE2_TRACE_PAGE=<hex page>` (diagnosis, boot; 2026-11-21): front end 2's events on that
+/// guest page logged with its state (the first 4,000): takes and what they found, writes found,
+/// invalidations, uploads recorded and validated, run claims, armings, faults.
+pub fn trace_page() -> u64 {
+    static P: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *P.get_or_init(|| std::env::var("DS_FE2_TRACE_PAGE").ok().and_then(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()).map_or(0, |p| p & !(PAGE - 1)))
+}
+
+/// The traced page when it lies in [a, b).
+#[inline]
+pub fn traced(a: u64, b: u64) -> Option<u64> {
+    let p = trace_page();
+    (p != 0 && a <= p && p < b).then_some(p)
+}
+
+/// Logs an event on the traced page `p` with its state.
+pub fn trace_event(p: u64, what: &str) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) >= 4000 {
+        return;
+    }
+    let st = match chunk(p, false) {
+        Some(c) => {
+            let (i, w, bit) = (idx(p), idx(p) / 64, idx(p) % 64);
+            format!(
+                "valid {}, armed {} host {}, cgen {} wgen {} pgen {}, wrote {}, clean {} wclean {}, epoch {}",
+                c.valid[w].load(Ordering::Acquire) >> bit & 1,
+                c.armed[w].load(Ordering::Acquire) >> bit & 1,
+                crate::hosted::armed_word(p & !(64 * PAGE - 1)) >> bit & 1,
+                c.cgen.load(Ordering::Acquire),
+                c.wgen[w].load(Ordering::Acquire),
+                c.pgen[i].load(Ordering::Acquire),
+                c.wrote[i].load(Ordering::Acquire),
+                c.clean[i].load(Ordering::Acquire),
+                c.wclean[w].load(Ordering::Acquire),
+                super::precache::epoch()
+            )
+        }
+        None => "no chunk".into(),
+    };
+    crate::info!("fe2 trace {p:#x} at flip {} on {}: {what} [{st}]", super::FRAMES.load(Ordering::Relaxed), std::thread::current().name().unwrap_or("?"));
 }
 
 /// CPU writes to these pages were found (by a take).
@@ -4243,6 +4333,9 @@ pub fn cpu_written(pages: &[u64]) {
         c.pgen[i].fetch_add(1, Ordering::AcqRel);
         c.uses[w].store(0, Ordering::Relaxed);
         n += 1;
+        if traced(p, p + PAGE).is_some() {
+            trace_event(p, "a take found it written (cpu_written)");
+        }
     }
     STATS[S_INVAL_TAKEN].fetch_add(n, Ordering::Relaxed);
 }
@@ -4283,6 +4376,9 @@ pub fn invalidate(base: u64, len: u64) {
             // No chunk: nothing valid in it.
             x = ((x >> CHUNK_SHIFT) + 1) << CHUNK_SHIFT;
         }
+    }
+    if let Some(p) = traced(lo, hi) {
+        trace_event(p, &format!("invalidated with {base:#x}+{len:#x}"));
     }
 }
 

@@ -673,6 +673,91 @@ pub fn crumb_report() -> Option<String> {
     })
 }
 
+/// Pipelines whose compile crashed the driver (`crashed.txt` in the store, 2026-11-21): the
+/// fault handler appends the faulting compile's key with the driver's pipeline cache id
+/// (`note_crash`), and background compiles (`draw::precompile_gfx_translations`, the launcher's
+/// preparation through it) leave them out under that driver: a pipeline the driver's compiler
+/// cannot make ends one session, not every session that would make it ahead (NVIDIA's compiler
+/// crashed on one pipeline in two boots and on others of its vertex stage: FINDINGS.md
+/// 2026-11-21 afternoon). A draw that needs one still makes it. Another driver (cache id) reads
+/// none of the lines.
+static CRASHED: OnceLock<parking_lot::RwLock<std::collections::HashSet<(char, u64)>>> = OnceLock::new();
+/// Background compiles left out for a pipeline that crashed the driver (status).
+pub static CRASH_SKIPS: AtomicU64 = AtomicU64::new(0);
+
+fn crashed_file() -> Option<PathBuf> {
+    DIR.get().map(|d| d.join("crashed.txt"))
+}
+
+fn crashed_set() -> Option<&'static parking_lot::RwLock<std::collections::HashSet<(char, u64)>>> {
+    let (_, id) = IDENTITY.get()?;
+    Some(CRASHED.get_or_init(|| {
+        let mut s = std::collections::HashSet::new();
+        if let Some(t) = crashed_file().and_then(|p| std::fs::read_to_string(p).ok()) {
+            for l in t.lines() {
+                let mut w = l.split_whitespace();
+                let (Some(k), Some(cid)) = (w.next(), w.next()) else { continue };
+                let mut ch = k.chars();
+                if let (true, Some(kind @ ('g' | 'c')), Ok(key)) = (cid == id, ch.next(), u64::from_str_radix(ch.as_str(), 16)) {
+                    s.insert((kind, key));
+                }
+            }
+        }
+        if !s.is_empty() {
+            crate::info!("pipeline cache: {} pipelines whose compile crashed this driver are left out of background compiles (crashed.txt)", s.len());
+        }
+        parking_lot::RwLock::new(s)
+    }))
+}
+
+/// Whether a background compile leaves pipeline `key` of `kind` out: its compile crashed this
+/// driver in an earlier session (counted).
+pub fn crashed_skip(kind: char, key: u64) -> bool {
+    let hit = crashed_set().is_some_and(|s| s.read().contains(&(kind, key)));
+    if hit {
+        CRASH_SKIPS.fetch_add(1, Ordering::Relaxed);
+    }
+    hit
+}
+
+/// The pipeline a crumb's text names: `graphics pipeline g<16 hex>...` or `compute pipeline
+/// c<16 hex>`.
+fn crumb_key(what: &str) -> Option<(char, u64)> {
+    let rest = what.split("pipeline ").nth(1)?;
+    let kind = rest.chars().next().filter(|k| matches!(k, 'g' | 'c'))?;
+    let hex = rest.get(1..17)?;
+    Some((kind, u64::from_str_radix(hex, 16).ok()?))
+}
+
+#[cfg(test)]
+mod crash_tests {
+    #[test]
+    fn crumb_keys() {
+        let g = "graphics pipeline g317775312c680825: vs 0x100a276d00 (translation e7560359797a10f9), ps 0x100c8bb500";
+        assert_eq!(super::crumb_key(g), Some(('g', 0x317775312c680825)));
+        assert_eq!(super::crumb_key("compute pipeline c00000000deadbeef"), Some(('c', 0xdeadbeef)));
+        assert_eq!(super::crumb_key("graphics pipeline x317775312c680825"), None);
+        assert_eq!(super::crumb_key("graphics pipeline g3177"), None);
+        assert_eq!(super::crumb_key("something else"), None);
+    }
+}
+
+/// The fault handler (`exception::veh_body`): the driver faulted inside the compile this
+/// thread's crumb names (`graphics pipeline g<key>` or `compute pipeline c<key>`); its key goes
+/// to `crashed.txt` with the driver's pipeline cache id.
+pub fn note_crash() {
+    if READ_ONLY.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(what) = CRUMB.with(|c| c.try_borrow().ok().and_then(|g| g.as_ref().map(|(w, _)| w.clone()))) else { return };
+    let Some((kind, key)) = crumb_key(&what) else { return };
+    let (Some(path), Some((_, id))) = (crashed_file(), IDENTITY.get()) else { return };
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{kind}{key:016x} {id} {}", what.replace(['\n', '\r'], " "));
+    }
+}
+
 /// Creates the pipeline of `key` (`kind` 'c' compute, 'g' graphics) through
 /// the store: with pipeline binaries on (`vk::pipeline_binaries`), from its
 /// stored binaries when it has them (and they were made from the same code,
@@ -902,7 +987,7 @@ pub fn status() -> String {
     let l: Vec<u64> = LAPS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let n = l[7].max(1) as f64 * 1000.0;
     format!(
-        "    pipeline cache files: {} pipelines from their file, {} written ({} MiB; {} of them after the driver refused their data), {} pruned; {} creations, us each: file read {:.0}, decode {:.0}, cache object {:.0}, creation {:.0}, its size or data {:.0}, write or last-use mark {:.0}, destroy {:.0}; shader modules before them: {} at {:.0} us\n",
+        "    pipeline cache files: {} pipelines from their file, {} written ({} MiB; {} of them after the driver refused their data), {} pruned; {} creations, us each: file read {:.0}, decode {:.0}, cache object {:.0}, creation {:.0}, its size or data {:.0}, write or last-use mark {:.0}, destroy {:.0}; shader modules before them: {} at {:.0} us{}\n",
         s[0],
         s[1],
         s[2] >> 20,
@@ -917,7 +1002,11 @@ pub fn status() -> String {
         l[4] as f64 / n,
         l[5] as f64 / n,
         MODULES[0].load(Ordering::Relaxed),
-        MODULES[1].load(Ordering::Relaxed) as f64 / MODULES[0].load(Ordering::Relaxed).max(1) as f64 / 1000.0
+        MODULES[1].load(Ordering::Relaxed) as f64 / MODULES[0].load(Ordering::Relaxed).max(1) as f64 / 1000.0,
+        match (CRASH_SKIPS.load(Ordering::Relaxed), CRASHED.get().map_or(0, |s| s.read().len())) {
+            (0, 0) => String::new(),
+            (n, m) => format!("; {n} background compiles left out, their pipeline having crashed this driver ({m} listed in crashed.txt)"),
+        }
     ) + &{
         let b: Vec<u64> = PB.iter().map(|c| c.load(Ordering::Relaxed)).collect();
         if super::vk::try_ctx().is_none_or(|c| c.pbin.is_none()) {
