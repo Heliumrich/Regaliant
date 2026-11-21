@@ -8581,6 +8581,11 @@ fn note_seg_use(deferred: bool, compute: bool, shadow: u64, pre: u64) {
 }
 
 /// The `batch slots` status line: what the executors' slots hold.
+/// Video memory the batch slots hold now (shadows, batch-start copies, snapshots, rings), bytes.
+pub fn slot_device_bytes() -> u64 {
+    (1..=4).map(|i| SLOT_MEM[i].load(Ordering::Relaxed)).sum()
+}
+
 fn slot_mem_line() -> String {
     let v: Vec<u64> = SLOT_MEM.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let device = v[1] + v[2] + v[3] + v[4];
@@ -22135,6 +22140,7 @@ pub fn status() -> String {
         + &slot_mem_line()
         + &clear_pass_line()
         + &super::images::pressure_line()
+        + &super::vk::gate_line()
         + &super::resident::spare_line()
         + &fill_partial_line()
         + &super::track::status()

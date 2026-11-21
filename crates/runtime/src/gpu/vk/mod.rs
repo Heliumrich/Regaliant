@@ -1034,6 +1034,52 @@ impl Ctx {
         fails
     }
 
+    /// Whether memory type `ty` is in the largest device-local heap (the one the refusal window
+    /// and `DS_SIM_VRAM_MIB` concern).
+    fn in_main_heap(&self, ty: u32) -> bool {
+        static HEAP: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        let props = &self.mem_props;
+        let main = *HEAP.get_or_init(|| (0..props.memory_heap_count).filter(|&i| props.memory_heaps[i as usize].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL)).max_by_key(|&i| props.memory_heaps[i as usize].size));
+        ty < props.memory_type_count && Some(props.memory_types[ty as usize].heap_index) == main
+    }
+
+    /// Whether an allocation of `size` bytes in memory type `ty` is refused before any driver
+    /// call: inside the refusal window (`gate_refuses`) or as on a card with less room
+    /// (`sim_alloc_fails`, noted as a failure). Other heaps' types are never refused here.
+    pub fn refuse_alloc(&self, ty: u32, size: u64) -> bool {
+        if !self.in_main_heap(ty) {
+            return false;
+        }
+        if gate_refuses(size) {
+            return true;
+        }
+        if self.sim_alloc_fails(ty, size) {
+            self.note_alloc_fail(ty, size);
+            return true;
+        }
+        false
+    }
+
+    /// A failed allocation of `size` bytes in memory type `ty`: in the largest device-local heap
+    /// the refusal window begins (inside one, it takes the smaller size) and video memory counts
+    /// as under pressure (`images::note_pressure`).
+    pub fn note_alloc_fail(&self, ty: u32, size: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.in_main_heap(ty) {
+            return;
+        }
+        let now = gate_clock_ms();
+        let at = GATE_AT_MS.load(Relaxed);
+        if at == 0 || now >= at + GATE_MS {
+            GATE_SIZE.store(size, Relaxed);
+            GATE_AT_MS.store(now, Relaxed);
+        } else {
+            GATE_SIZE.fetch_min(size, Relaxed);
+        }
+        GATE_STATS[1].fetch_add(1, Relaxed);
+        super::images::note_pressure();
+    }
+
     /// The size of the largest device-local heap, bytes (at most
     /// `vram_cap`).
     pub fn device_heap_size(&self) -> u64 {
@@ -1115,6 +1161,46 @@ pub static SIM_VRAM_FAILS: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 
 /// The error an allocation failed by `DS_SIM_VRAM_MIB` returns (the driver's own words for it).
 pub const SIM_OOM: vk::Result = vk::Result::ERROR_OUT_OF_DEVICE_MEMORY;
+
+/// The refusal window after a video-memory allocation failed: for `GATE_MS` requests of at least
+/// the smallest size that failed in it are refused with no driver call (`Ctx::refuse_alloc`),
+/// and every path that allocates video memory notes its failures (`Ctx::note_alloc_fail`).
+/// Without it a card out of room met the same failing allocation from every command and draw:
+/// 12.8 million refusals in one 280 s session of a test with 7 GB of room (2026-11-21 night),
+/// each a driver call, where a real failing vkAllocateMemory takes milliseconds while the system
+/// pages; that session ran at 4 frames a second until its device was lost.
+const GATE_MS: u64 = 250;
+/// When the window began (`gate_clock_ms` + 1; 0: never) and the smallest size failed in it.
+static GATE_AT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GATE_SIZE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+/// [requests the window refused, failures noted (the driver's or `DS_SIM_VRAM_MIB`'s)].
+pub static GATE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+fn gate_clock_ms() -> u64 {
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    T0.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+/// Whether the refusal window refuses a video-memory request of `size` bytes now (counted).
+pub fn gate_refuses(size: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let at = GATE_AT_MS.load(Relaxed);
+    if at == 0 || size < GATE_SIZE.load(Relaxed) || gate_clock_ms() >= at + GATE_MS {
+        return false;
+    }
+    GATE_STATS[0].fetch_add(1, Relaxed);
+    true
+}
+
+/// The status line of failed and refused video-memory requests ("" with none).
+pub fn gate_line() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (refused, failed) = (GATE_STATS[0].load(Relaxed), GATE_STATS[1].load(Relaxed));
+    if failed == 0 {
+        return String::new();
+    }
+    format!("    video-memory allocations failed {failed} times ({} of them by DS_SIM_VRAM_MIB); {refused} requests refused with no driver call in the {GATE_MS} ms after a failure\n", SIM_VRAM_FAILS.load(Relaxed))
+}
 
 pub fn vram_cap() -> u64 {
     static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -1380,12 +1466,15 @@ impl Ctx {
 
     pub fn alloc(&self, req: vk::MemoryRequirements, want: vk::MemoryPropertyFlags) -> Result<vk::DeviceMemory, String> {
         let ty = self.memory_type(req.memory_type_bits, want).ok_or("no suitable memory type")?;
-        if self.sim_alloc_fails(ty, req.size) {
-            return Err(format!("vkAllocateMemory({}): {SIM_OOM} (DS_SIM_VRAM_MIB)", req.size));
+        if self.refuse_alloc(ty, req.size) {
+            return Err(format!("vkAllocateMemory({}): {SIM_OOM} (refused: video memory ran out in the last {GATE_MS} ms, or DS_SIM_VRAM_MIB)", req.size));
         }
         let ai = vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ty);
         let t0 = std::time::Instant::now();
-        let r = unsafe { self.device.allocate_memory(&ai, None) }.map_err(|e| format!("vkAllocateMemory({}): {e}", req.size));
+        let r = unsafe { self.device.allocate_memory(&ai, None) }.map_err(|e| {
+            self.note_alloc_fail(ty, req.size);
+            format!("vkAllocateMemory({}): {e}", req.size)
+        });
         note_alloc("memory", req.size, t0);
         r
     }
@@ -1397,13 +1486,16 @@ impl Ctx {
             return self.alloc(req, want);
         }
         let ty = self.memory_type(req.memory_type_bits, want).ok_or("no suitable memory type")?;
-        if self.sim_alloc_fails(ty, req.size) {
-            return Err(format!("vkAllocateMemory({}): {SIM_OOM} (DS_SIM_VRAM_MIB)", req.size));
+        if self.refuse_alloc(ty, req.size) {
+            return Err(format!("vkAllocateMemory({}): {SIM_OOM} (refused: video memory ran out in the last {GATE_MS} ms, or DS_SIM_VRAM_MIB)", req.size));
         }
         let mut fl = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
         let ai = vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ty).push_next(&mut fl);
         let t0 = std::time::Instant::now();
-        let r = unsafe { self.device.allocate_memory(&ai, None) }.map_err(|e| format!("vkAllocateMemory({}): {e}", req.size));
+        let r = unsafe { self.device.allocate_memory(&ai, None) }.map_err(|e| {
+            self.note_alloc_fail(ty, req.size);
+            format!("vkAllocateMemory({}): {e}", req.size)
+        });
         note_alloc("buffer memory", req.size, t0);
         r
     }
@@ -1438,15 +1530,16 @@ impl Ctx {
                 self.device.destroy_buffer(buf, None);
                 return Err("no suitable memory type".into());
             };
-            if self.sim_alloc_fails(ty, req.size) {
+            if self.refuse_alloc(ty, req.size) {
                 self.device.destroy_buffer(buf, None);
-                return Err(format!("vkAllocateMemory({}): {SIM_OOM} (DS_SIM_VRAM_MIB)", req.size));
+                return Err(format!("vkAllocateMemory({}): {SIM_OOM} (refused: video memory ran out in the last {GATE_MS} ms, or DS_SIM_VRAM_MIB)", req.size));
             }
             let mut fl = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
             let ai = vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ty).push_next(&mut fl);
             let mem = match self.device.allocate_memory(&ai, None) {
                 Ok(m) => m,
                 Err(e) => {
+                    self.note_alloc_fail(ty, req.size);
                     self.device.destroy_buffer(buf, None);
                     return Err(format!("vkAllocateMemory({}): {e}", req.size));
                 }
@@ -1477,8 +1570,20 @@ impl Ctx {
             let bi = self.shared(vk::BufferCreateInfo::default().size(size).usage(self.addressable(usage)));
             let buf = self.device.create_buffer(&bi, None).map_err(|e| format!("vkCreateBuffer: {e}"))?;
             let req = self.device.get_buffer_memory_requirements(buf);
-            let mem = self.alloc_buffer_mem(req, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
-            self.device.bind_buffer_memory(buf, mem, 0).map_err(|e| format!("bind buffer: {e}"))?;
+            // (The buffer destroyed when its memory fails: a refused allocation retried by every
+            // batch had left one buffer behind each time.)
+            let mem = match self.alloc_buffer_mem(req, vk::MemoryPropertyFlags::DEVICE_LOCAL) {
+                Ok(m) => m,
+                Err(e) => {
+                    self.device.destroy_buffer(buf, None);
+                    return Err(e);
+                }
+            };
+            if let Err(e) = self.device.bind_buffer_memory(buf, mem, 0) {
+                self.device.destroy_buffer(buf, None);
+                self.device.free_memory(mem, None);
+                return Err(format!("bind buffer: {e}"));
+            }
             Ok((buf, mem))
         }
     }

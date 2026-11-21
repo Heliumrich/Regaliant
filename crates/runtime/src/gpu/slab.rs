@@ -84,10 +84,29 @@ struct State {
     /// Memory types the helper is to allocate a spare slab of.
     wanted: Vec<u32>,
     helper: bool,
-    failed: bool,
+    /// When a slab last failed (`clock_ms`; 0: never): images get memory of their own until
+    /// `RETRY_MS` after it.
+    failed: u64,
 }
 
-static STATE: Mutex<State> = Mutex::new(State { slabs: Vec::new(), spare: Vec::new(), wanted: Vec::new(), helper: false, failed: false });
+static STATE: Mutex<State> = Mutex::new(State { slabs: Vec::new(), spare: Vec::new(), wanted: Vec::new(), helper: false, failed: 0 });
+
+/// How long after a slab failed images keep memory of their own. Until 2026-11-21 night one
+/// failure turned slabs off for the session, so a card out of room for a moment made every later
+/// image an allocation of its own (on AMD's driver, against its limit of 4,096 allocations).
+const RETRY_MS: u64 = 10_000;
+
+fn clock_ms() -> u64 {
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    T0.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+impl State {
+    /// Whether slabs are off for now (a slab failed less than `RETRY_MS` ago).
+    fn failing(&self) -> bool {
+        self.failed != 0 && clock_ms() < self.failed + RETRY_MS
+    }
+}
 static WAKE: Condvar = Condvar::new();
 
 /// [images in slabs now, their bytes, images with memory of their own now, their bytes, slabs
@@ -113,13 +132,16 @@ fn slab_size() -> u64 {
 }
 
 fn allocate(ty: u32, size: u64) -> Result<vk::DeviceMemory, vk::Result> {
-    // (`DS_SIM_VRAM_MIB`: as on a card with less room, `Ctx::sim_alloc_fails`.)
-    if ctx().sim_alloc_fails(ty, size) {
+    // (The refusal window after a failure and `DS_SIM_VRAM_MIB`: `Ctx::refuse_alloc`.)
+    if ctx().refuse_alloc(ty, size) {
         return Err(super::vk::SIM_OOM);
     }
     let ai = vk::MemoryAllocateInfo::default().allocation_size(size).memory_type_index(ty);
     let t0 = std::time::Instant::now();
     let r = unsafe { ctx().device.allocate_memory(&ai, None) };
+    if r.is_err() {
+        ctx().note_alloc_fail(ty, size);
+    }
     super::vk::note_alloc("an image slab", size, t0);
     r
 }
@@ -153,7 +175,7 @@ pub fn alloc(req: vk::MemoryRequirements, requires_own: bool, prefers_own: bool)
     let Some(ty) = ctx().memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL) else { return own(req) };
     let align = req.alignment.max(1);
     let mut g = STATE.lock();
-    if g.failed {
+    if g.failing() {
         drop(g);
         return own(req);
     }
@@ -182,11 +204,11 @@ pub fn alloc(req: vk::MemoryRequirements, requires_own: bool, prefers_own: bool)
                 Ok(m) => m,
                 Err(e) => {
                     // Out of video memory for a slab: images get memory of
-                    // their own from now on (as before slabs).
-                    if !g.failed {
-                        g.failed = true;
-                        crate::warn!("images: a {} MiB slab of video memory failed ({e}): images get memory of their own from now on", size >> 20);
+                    // their own for a while (`RETRY_MS`; as before slabs).
+                    if g.failed == 0 {
+                        crate::warn!("images: a {} MiB slab of video memory failed ({e}): images get memory of their own for {} s after each such failure", size >> 20, RETRY_MS / 1000);
                     }
+                    g.failed = clock_ms();
                     drop(g);
                     return own(req);
                 }
@@ -248,7 +270,7 @@ fn helper() {
         match r {
             Ok(m) => g.spare.push((ty, m)),
             Err(e) => {
-                if !g.failed {
+                if g.failed == 0 {
                     crate::warn!("images: a spare {} MiB slab of video memory failed ({e})", slab_size() >> 20);
                 }
             }
@@ -281,6 +303,14 @@ pub fn free(m: Mem) {
     drop(g);
     unsafe { ctx().device.free_memory(s.memory, None) };
     STATS[8].fetch_add(1, Relaxed);
+}
+
+/// Video memory images hold now, bytes: their slabs (used or not, spares too) and their
+/// allocations of their own (`images::over_budget_line`).
+pub fn held_bytes() -> u64 {
+    let own = STATS[3].load(Relaxed);
+    let g = STATE.lock();
+    own + g.slabs.iter().flatten().map(|s| s.size).sum::<u64>() + g.spare.len() as u64 * slab_size()
 }
 
 /// Video memory the slabs hold but no image uses (free ranges and spares), bytes: memory that

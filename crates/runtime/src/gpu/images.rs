@@ -1296,16 +1296,16 @@ fn pressure_clock_ms() -> u64 {
 }
 
 /// A device-memory allocation failed (the mirror, shadows, batches): video memory under pressure
-/// from now on for `PRESSURE_HOLD_MS`. Counted in `ALLOC_FAILS`.
+/// from now on for `PRESSURE_HOLD_MS`. A spell begun is counted in `PRESSURE_SPELLS` (until
+/// 2026-11-21 night every call was: 5 million in one session, each a failure that the refusal
+/// window, `vk::refuse_alloc`, now spares the driver; the failures are `vk::GATE_STATS`).
 pub fn note_pressure() {
     use std::sync::atomic::Ordering::Relaxed;
-    PRESSURE_UNTIL_MS.store(pressure_clock_ms() + PRESSURE_HOLD_MS, Relaxed);
-    PRESSURE_SPELLS.fetch_add(1, Relaxed);
-    ALLOC_FAILS.fetch_add(1, Relaxed);
+    let now = pressure_clock_ms();
+    if PRESSURE_UNTIL_MS.swap(now + PRESSURE_HOLD_MS, Relaxed) <= now {
+        PRESSURE_SPELLS.fetch_add(1, Relaxed);
+    }
 }
-
-/// Device-memory allocations that failed (`note_pressure`).
-pub static ALLOC_FAILS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// The highest share of its video-memory budget this process used, per mille, and that budget in
 /// MiB (`maybe_evict`'s readings, every `EVICT_CHECK_MS`; the preparation's health line).
 pub static VRAM_PEAK: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
@@ -1316,12 +1316,34 @@ pub fn pressure_line() -> String {
     if n == 0 {
         return String::new();
     }
-    format!("    video memory under pressure {n} times (textures alone could not bring this process under its mark, or an allocation failed: the mirror's cold pages given back sooner)\n")
+    format!("    video memory under pressure {n} times (spells of 10 s or more: textures alone could not bring this process under its mark, or an allocation failed; the mirror's cold pages given back sooner)\n")
 }
 
 /// Whether video memory is under pressure now (`PRESSURE_UNTIL_MS`).
 pub fn under_pressure() -> bool {
     PRESSURE_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed) > pressure_clock_ms()
+}
+
+/// What holds this process's video memory when it is over its budget: images (slabs and their
+/// own), the mirror's blocks, the batch slots, and the rest (the driver's own memory for
+/// pipelines, descriptors and the like, and anything not counted here). Added 2026-11-21 night: a
+/// test with 7 GB of room ended a session at 12.6 GB used, every counted allocation refused past
+/// the room, and nothing said what had grown.
+pub fn over_budget_line(used: u64, budget: u64) -> String {
+    let (img, mirror, slots) = (super::slab::held_bytes(), super::resident::mirror_bytes(), super::exec::slot_device_bytes());
+    let rest = used.saturating_sub(img + mirror + slots);
+    format!(
+        "video memory over this process's budget: {} of {} MiB at flip {}: images {} MiB, the mirror {} MiB, batch slots {} MiB, the rest {} MiB; device allocations failed {}, refused with no driver call {}",
+        used >> 20,
+        budget >> 20,
+        super::FRAMES.load(std::sync::atomic::Ordering::Relaxed),
+        img >> 20,
+        mirror >> 20,
+        slots >> 20,
+        rest >> 20,
+        super::vk::GATE_STATS[1].load(std::sync::atomic::Ordering::Relaxed),
+        super::vk::GATE_STATS[0].load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 /// When this process uses more video memory than `tune vram_high` percent of
@@ -1345,14 +1367,20 @@ pub fn maybe_evict() {
     }
     LAST.store(ms, Relaxed);
     let frame = super::FRAMES.load(Relaxed);
-    let Some((used, budget)) = ctx().device_budget() else { return };
+    let Some((raw_used, budget)) = ctx().device_budget() else { return };
     // (Slab memory no image uses is free for new images.)
-    let used = used.saturating_sub(super::slab::idle_bytes());
+    let used = raw_used.saturating_sub(super::slab::idle_bytes());
     if budget > 0 {
         let pm = used.saturating_mul(1000) / budget;
         if pm > VRAM_PEAK[0].load(Relaxed) {
             VRAM_PEAK[0].store(pm, Relaxed);
             VRAM_PEAK[1].store(budget >> 20, Relaxed);
+        }
+        // (Over the budget: what holds the memory, at most every 10 s.)
+        static LAST_OVER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if pm > 1000 && ms >= LAST_OVER.load(Relaxed) + 10_000 {
+            LAST_OVER.store(ms, Relaxed);
+            crate::warn!("{}", over_budget_line(raw_used, budget));
         }
     }
     let (mut high, mut low) = (budget / 100 * super::tune::vram_high(), budget / 100 * super::tune::vram_low());
@@ -1382,8 +1410,7 @@ pub fn maybe_evict() {
     // `under_pressure`: the other PC's 12 GB card ran 2 GB over its budget with 45 MiB of textures
     // left to evict, and its allocations failed, 2026-11-21.)
     if used.saturating_sub(out.1) > high {
-        PRESSURE_UNTIL_MS.store(pressure_clock_ms() + PRESSURE_HOLD_MS, Relaxed);
-        PRESSURE_SPELLS.fetch_add(1, Relaxed);
+        note_pressure();
     }
     // What holds the memory (the first reports).
     let largest = if EVICTED[2].load(Relaxed) < 5 { format!("; largest: {}", im.largest(6)) } else { String::new() };
@@ -3216,6 +3243,13 @@ impl Images {
         // layout as the main queue's do).
         let fams = [c.queue_family, c.compute.as_ref().map_or(c.queue_family, |q| q.family)];
         let ci = if c.compute.is_some() { ci.sharing_mode(vk::SharingMode::CONCURRENT).queue_family_indices(&fams) } else { ci };
+        // (Inside the refusal window after a failed allocation, `vk::gate_refuses`, an image whose
+        // smallest possible size (half a byte a texel, one level) would be refused is not made:
+        // while memory was out every draw sampling a texture not made yet tried again.)
+        let least = (key.width as u64 * key.height as u64 * key.layers.max(1) as u64) / 2;
+        if least >= 64 << 10 && super::vk::gate_refuses(least) {
+            return Err(format!("image {}x{}x{} {:?}: video memory ran out moments ago (refused with no driver call)", key.width, key.height, key.layers, key.format));
+        }
         unsafe {
             let t0 = std::time::Instant::now();
             let image = c.device.create_image(&ci, None).map_err(|e| format!("vkCreateImage {key:?}: {e}"))?;
@@ -3226,9 +3260,22 @@ impl Images {
             let req = req2.memory_requirements;
             let (requires, prefers) = (ded.requires_dedicated_allocation != 0, ded.prefers_dedicated_allocation != 0);
             let t1 = std::time::Instant::now();
-            let mem = super::slab::alloc(req, requires, prefers)?;
+            // (The image destroyed when its memory fails: until 2026-11-21 night each failure left
+            // its VkImage behind, and while memory was out every draw sampling a texture not made
+            // yet failed again.)
+            let mem = match super::slab::alloc(req, requires, prefers) {
+                Ok(m) => m,
+                Err(e) => {
+                    c.device.destroy_image(image, None);
+                    return Err(e);
+                }
+            };
             let t2 = std::time::Instant::now();
-            c.device.bind_image_memory(image, mem.memory, mem.offset).map_err(|e| format!("bind image: {e}"))?;
+            if let Err(e) = c.device.bind_image_memory(image, mem.memory, mem.offset) {
+                c.device.destroy_image(image, None);
+                super::slab::free(mem);
+                return Err(format!("bind image: {e}"));
+            }
             // (Its parts: the image, the memory's allocation, the bind.)
             super::hitch::note_since(super::hitch::Kind::Upload, t0, || {
                 let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;

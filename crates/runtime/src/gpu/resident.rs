@@ -1542,6 +1542,14 @@ static SPARE_FILLING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// [taken, made, pages refused while one was being made].
 pub static SPARE_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+/// Video memory the mirror's blocks hold now (its pages, the written-bit maps' pages and the
+/// spare block), bytes (`images::over_budget_line`).
+pub fn mirror_bytes() -> u64 {
+    let Some(m) = MIRROR.get() else { return 0 };
+    let g = m.blocks.lock();
+    (g.mems.iter().filter(|&&x| x != vk::DeviceMemory::null()).count() as u64 + g.spare.is_some() as u64) * BLOCK
+}
+
 /// The spare block's status line (`SPARE_STATS`).
 pub fn spare_line() -> String {
     let (taken, made, refused) = (SPARE_STATS[0].load(Ordering::Relaxed), SPARE_STATS[1].load(Ordering::Relaxed), SPARE_STATS[2].load(Ordering::Relaxed));
@@ -1562,7 +1570,9 @@ fn refill_spare(m: &Mirror) {
         return;
     }
     let c = ctx();
-    if !c.sim_alloc_fails(m.mem_type, BLOCK) {
+    // (Not inside the refusal window after a failure, `Ctx::refuse_alloc`: every placement over
+    // pages not yet backed comes here, and while memory was out each made a failing driver call.)
+    if !c.refuse_alloc(m.mem_type, BLOCK) {
         let mut fl = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
         let ai = vk::MemoryAllocateInfo::default().allocation_size(BLOCK).memory_type_index(m.mem_type);
         let ai = if c.device_addresses { ai.push_next(&mut fl) } else { ai };
@@ -1579,7 +1589,7 @@ fn refill_spare(m: &Mirror) {
                 unsafe { c.device.free_memory(mem, None) };
             }
         } else {
-            super::images::note_pressure();
+            c.note_alloc_fail(m.mem_type, BLOCK);
         }
     }
     SPARE_FILLING.store(false, Release);
@@ -1633,11 +1643,14 @@ fn take_page(g: &mut Backing, m: &Mirror, alloc_ns: &mut u64, marks: bool) -> Re
                 let ai = vk::MemoryAllocateInfo::default().allocation_size(BLOCK).memory_type_index(m.mem_type);
                 let ai = if c.device_addresses { ai.push_next(&mut fl) } else { ai };
                 let ta = std::time::Instant::now();
-                // (`DS_SIM_VRAM_MIB`: as on a card with less room, `Ctx::sim_alloc_fails`.)
-                if c.sim_alloc_fails(m.mem_type, BLOCK) {
-                    return Err(format!("vkAllocateMemory (mirror block): {} (DS_SIM_VRAM_MIB)", super::vk::SIM_OOM));
+                // (The refusal window after a failure and `DS_SIM_VRAM_MIB`: `Ctx::refuse_alloc`.)
+                if c.refuse_alloc(m.mem_type, BLOCK) {
+                    return Err(format!("vkAllocateMemory (mirror block): {} (refused: video memory ran out moments ago, or DS_SIM_VRAM_MIB)", super::vk::SIM_OOM));
                 }
-                let mem = unsafe { c.device.allocate_memory(&ai, None) }.map_err(|e| format!("vkAllocateMemory (mirror block): {e}"))?;
+                let mem = unsafe { c.device.allocate_memory(&ai, None) }.map_err(|e| {
+                    c.note_alloc_fail(m.mem_type, BLOCK);
+                    format!("vkAllocateMemory (mirror block): {e}")
+                })?;
                 super::vk::note_alloc("a mirror block", BLOCK, ta);
                 *alloc_ns += ta.elapsed().as_nanos() as u64;
                 mem

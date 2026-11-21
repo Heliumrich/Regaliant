@@ -241,6 +241,30 @@ fn start_probe(app: &App) {
     });
 }
 
+/// Whether the probe runs and has not answered yet: Play and Prepare now wait for its answer with
+/// the window live (`defer_play`, `start`). Until 2026-11-21 night they waited in `wait_probe` on
+/// the window's own thread, up to a minute on a slow PC, the window "not responding" meanwhile.
+fn probe_in_flight() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    PROBE_STARTED.load(Relaxed) && !PROBE_HANDLED.load(Relaxed) && PROBE.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+}
+
+/// Whether Play or Prepare now waits for the probe: it runs, or it is due and starts now (the
+/// check answered, nothing else running). The check's timer delivers its answer (`check_tick`).
+fn probe_pending(app: &App) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if PROBE_HANDLED.load(Relaxed) {
+        return false;
+    }
+    if !PROBE_STARTED.load(Relaxed) {
+        if checked_translation().is_none() || running(app) || app.running.is_some() || !probe_due(app) {
+            return false;
+        }
+        start_probe(app);
+    }
+    probe_in_flight()
+}
+
 /// Waits for the probe to end (it is ended `PROBE_SECS` after its start, so it has an answer
 /// then; the margin covers a slow start of its process, the review of 2026-11-21).
 fn wait_probe() {
@@ -395,6 +419,7 @@ pub fn check_tick(app: &mut App) {
         }
         if PROBE_HANDLED.load(Relaxed) {
             unsafe { windows_sys::Win32::UI::WindowsAndMessaging::KillTimer(app.hwnd, CHECK_TIMER) };
+            run_pending(app, "the prepared shaders' probe answered");
         }
         return;
     }
@@ -415,17 +440,24 @@ pub fn check_tick(app: &mut App) {
         } else if !PROBE_STARTED.load(Relaxed) {
             PROBE_HANDLED.store(true, Relaxed);
         }
-        // (A preparation asked for during the check: begun now, the store judged with the
-        // check's translation; `start` runs the probe first when it is due.)
-        if let Some(play_after) = app.shaders.pending_start.take() {
-            log(app, "the game's check answered: the preparation asked for during it begins");
-            start(app, play_after);
+        // (A preparation asked for or Play pressed during the check: begun now, the store judged
+        // with the check's translation; with the probe just started, once it answers.)
+        if !probe_in_flight() {
+            run_pending(app, "the game's check answered");
         }
-        // (Play pressed during the check: its decision now.)
-        if std::mem::take(&mut app.shaders.pending_play) {
-            log(app, "the game's check answered: Play pressed during it goes on");
-            crate::play(app);
-        }
+    }
+}
+
+/// A preparation asked for, or Play pressed, while the game's check or the probe had not answered:
+/// begun now that they have (`why` says which answered).
+fn run_pending(app: &mut App, why: &str) {
+    if let Some(play_after) = app.shaders.pending_start.take() {
+        log(app, &format!("{why}: the preparation asked for meanwhile begins"));
+        start(app, play_after);
+    }
+    if std::mem::take(&mut app.shaders.pending_play) {
+        log(app, &format!("{why}: Play pressed meanwhile goes on"));
+        crate::play(app);
     }
 }
 
@@ -1191,11 +1223,12 @@ pub fn running(app: &App) -> bool {
 /// waited 20 s and then judged the store without the check's translation, so a store an update
 /// had made stale could start the game unprepared (the other PC's check took 50 s).
 pub fn defer_play(app: &mut App) -> bool {
-    if !(CHECK_STARTED.load(std::sync::atomic::Ordering::Relaxed) && checked_translation().is_none()) {
+    let check = CHECK_STARTED.load(std::sync::atomic::Ordering::Relaxed) && checked_translation().is_none();
+    if !check && !probe_pending(app) {
         return false;
     }
     if !app.shaders.pending_play {
-        log(app, "Play pressed during the game's check: it goes on once the check answers");
+        log(app, if check { "Play pressed during the game's check: it goes on once the check answers" } else { "Play pressed during the prepared shaders' probe: it goes on once the probe answers" });
     }
     app.shaders.pending_play = true;
     app.set_status("Checking the game first. Play goes on once that is done.");
@@ -1222,9 +1255,10 @@ pub fn start(app: &mut App, play_after: bool) {
     }
     // (The game's check first: without its translation the store cannot be judged, and none of
     // it is taken as made. Begun by the check's timer once it answers; the window stays live.)
-    if CHECK_STARTED.load(std::sync::atomic::Ordering::Relaxed) && checked_translation().is_none() {
+    let check = CHECK_STARTED.load(std::sync::atomic::Ordering::Relaxed) && checked_translation().is_none();
+    if check || probe_pending(app) {
         if app.shaders.pending_start.is_none() {
-            log(app, "preparation asked for during the game's check: it begins once the check answers");
+            log(app, if check { "preparation asked for during the game's check: it begins once the check answers" } else { "preparation asked for during the prepared shaders' probe: it begins once the probe answers" });
         }
         app.shaders.pending_start = Some(play_after || app.shaders.pending_start.unwrap_or(false));
         unsafe {
@@ -1444,7 +1478,7 @@ pub fn stop_then_play(app: &mut App) {
 pub fn stop(app: &mut App) {
     // (Asked for during the game's check and not begun yet: dropped.)
     if app.shaders.pending_start.take().is_some() {
-        log(app, "the preparation asked for during the game's check was stopped before it began");
+        log(app, "the preparation asked for during the game's check or the shaders' probe was stopped before it began");
         refresh(app);
         app.update_play();
         return;

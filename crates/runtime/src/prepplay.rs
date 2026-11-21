@@ -601,7 +601,7 @@ pub fn health_line(stage: &str, code: i32) -> String {
     use crate::gpu::exec::{FIRST_USES, draw};
     let secs = crate::log::elapsed_ms() / 1000.0;
     format!(
-        "prepare-health: stage={stage}; status={code}; secs={secs:.0}; compute_first_uses={}; compute_first_use_s={:.0}; gfx_first_uses={}; gfx_first_use_s={:.0}; frozen_s={:.0}; vram_peak_pct={}; vram_budget_mib={}; alloc_fails={}; sim_alloc_fails={}; vram_pressure={}; crash_skips={}; background_made={}; background_items={}",
+        "prepare-health: stage={stage}; status={code}; secs={secs:.0}; compute_first_uses={}; compute_first_use_s={:.0}; gfx_first_uses={}; gfx_first_use_s={:.0}; frozen_s={:.0}; vram_peak_pct={}; vram_budget_mib={}; alloc_fails={}; sim_alloc_fails={}; alloc_refused={}; vram_pressure={}; crash_skips={}; background_made={}; background_items={}",
         FIRST_USES[0].load(Relaxed),
         FIRST_USES[1].load(Relaxed) as f64 / 1e9,
         draw::GFX_FIRST_USES[0].load(Relaxed),
@@ -609,8 +609,9 @@ pub fn health_line(stage: &str, code: i32) -> String {
         FROZEN_TOTAL_MS.load(Relaxed) as f64 / 1000.0,
         crate::gpu::images::VRAM_PEAK[0].load(Relaxed) / 10,
         crate::gpu::images::VRAM_PEAK[1].load(Relaxed),
-        crate::gpu::images::ALLOC_FAILS.load(Relaxed),
+        crate::gpu::vk::GATE_STATS[1].load(Relaxed),
         crate::gpu::vk::SIM_VRAM_FAILS.load(Relaxed),
+        crate::gpu::vk::GATE_STATS[0].load(Relaxed),
         crate::gpu::images::PRESSURE_SPELLS.load(Relaxed),
         crate::gpu::pcache::CRASH_SKIPS.load(Relaxed),
         crate::gpu::compbench::BACKGROUND[1].load(Relaxed),

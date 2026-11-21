@@ -351,9 +351,12 @@ fn bundle_compute(app: &std::path::Path) -> Vec<(u64, std::sync::Arc<Vec<u32>>, 
     bundle_compute_sampled(app, sample)
 }
 
-/// The programs a preparation's fingerprint translates: one in this many by code hash
-/// (~16 of the game's 8,233 compute programs).
-const FINGERPRINT_SAMPLE: u64 = 509;
+/// The programs a preparation's fingerprint translates: one in this many by code hash (~65 of
+/// the game's 8,233 compute programs; one in 509, ~16, until 2026-11-21 night, when a change to
+/// the translator outside those 16 would have left stale pipelines taken as prepared; the check
+/// is cached since, `translation_fingerprint_cached`, so the larger sample costs its first run
+/// a second or two).
+const FINGERPRINT_SAMPLE: u64 = 127;
 
 /// The preparation's rules (the guessed specs, `shaders::guess_compute_spec`, and the variants
 /// made): raised whenever they change, since the fingerprint's sample may not show it (2: an
