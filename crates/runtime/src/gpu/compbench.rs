@@ -396,16 +396,16 @@ pub fn translation_fingerprint(app: &std::path::Path) -> Result<String, String> 
     Ok(format!("{fp:016x}-{}-r{PREPARATION_RULES}", items.len()))
 }
 
-/// `bundle_compute`, one program in `sample` by code hash.
-fn bundle_compute_sampled(app: &std::path::Path, sample: u64) -> Vec<(u64, std::sync::Arc<Vec<u32>>, Vec<rdna::translate::Spec>)> {
+/// The game's shader bundle files the compute programs come from, in the order they are read:
+/// the particles' bundles, then the engine's tree before the materials' (a stack), so that a
+/// program in both is the engine's and gets its image variants.
+fn shader_bundle_files(app: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut files: Vec<std::path::PathBuf> = Vec::new();
     let pdir = app.join("particles").join("!cookedparticleshaders").join("version01").join("_ps5");
     files.extend(std::fs::read_dir(&pdir).into_iter().flatten().flatten().map(|e| e.path()));
     // The engine's shaders, and the materials' bundles (their compute programs: 58% of a prepared
     // first session's remaining misses, 2026-11-13; a material's `_trinity` bundle repeats its
     // other one's programs, left out).
-    // (A stack: the engine's tree is walked before the materials', so a program in both is
-    // the engine's and gets its image variants.)
     let materials = app.join("materials").join("!cookedshaders");
     let mut stack = vec![materials.clone(), app.join("coredata").join("enginesupport").join("shaders").join("_ps5")];
     while let Some(d) = stack.pop() {
@@ -418,6 +418,53 @@ fn bundle_compute_sampled(app: &std::path::Path, sample: u64) -> Vec<(u64, std::
             }
         }
     }
+    files
+}
+
+/// `translation_fingerprint` through its cache (`<dir>/fingerprint.txt`): the fingerprint last
+/// computed and what it holds for, this program's `build`, the card and driver, the preparation's
+/// rules and the shader bundles' names, sizes and write times. Computing it reads every bundle
+/// (12,860 files, 265 MiB) to sample one program in 509, which a slow drive, a virus scanner or a
+/// cold file cache can stretch past the check's 60 s watch, leaving the store untrusted at every
+/// launcher start (the review of 2026-11-21 night); listing the files takes a fraction of that.
+pub fn translation_fingerprint_cached(app: &std::path::Path, dir: Option<&std::path::Path>, build: &str) -> Result<String, String> {
+    super::vk::init().map_err(|e| format!("Vulkan: {e}"))?;
+    let c = super::vk::ctx();
+    let driver = unsafe { c.instance.get_physical_device_properties(c.pdev) }.driver_version;
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut mix = |b: &[u8]| {
+        for &x in b {
+            h = (h ^ x as u64).wrapping_mul(0x100_0000_01b3);
+        }
+    };
+    for f in shader_bundle_files(app).iter().filter(|p| p.extension().is_some_and(|x| x == "csdr")) {
+        let md = std::fs::metadata(f).ok();
+        mix(f.strip_prefix(app).unwrap_or(f).to_string_lossy().as_bytes());
+        mix(&md.as_ref().map_or(0, |m| m.len()).to_le_bytes());
+        let t = md.and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+        mix(&t.to_le_bytes());
+    }
+    let key = format!("{build} {} {driver} r{PREPARATION_RULES} {h:016x}", c.device_name);
+    let file = dir.map(|d| d.join("fingerprint.txt"));
+    if let Some(t) = file.as_ref().and_then(|f| std::fs::read_to_string(f).ok()) {
+        let get = |k: &str| t.lines().find_map(|l| l.strip_prefix(k).map(|v| v.trim().to_string()));
+        if get("key = ").as_deref() == Some(key.as_str()) {
+            if let Some(fp) = get("translation = ").filter(|v| !v.is_empty()) {
+                crate::info!("translation fingerprint: from its cache (the same build, card, driver and shader files)");
+                return Ok(fp);
+            }
+        }
+    }
+    let fp = translation_fingerprint(app)?;
+    if let Some(f) = file {
+        let _ = std::fs::write(&f, format!("# The translation fingerprint and what it holds for (the game's check, 2026-11-21 night)\nkey = {key}\ntranslation = {fp}\n"));
+    }
+    Ok(fp)
+}
+
+/// `bundle_compute`, one program in `sample` by code hash.
+fn bundle_compute_sampled(app: &std::path::Path, sample: u64) -> Vec<(u64, std::sync::Arc<Vec<u32>>, Vec<rdna::translate::Spec>)> {
+    let files = shader_bundle_files(app);
     let mut seen = std::collections::HashSet::new();
     let (mut programs, mut no_object) = (0u64, 0u64);
     let mut out = Vec::new();
@@ -507,6 +554,8 @@ pub fn precompile_all(app: &std::path::Path, threads: usize, progress: Option<&s
     let done = AtomicUsize::new(0);
     let code_done = AtomicU64::new(0);
     let failed = AtomicUsize::new(0);
+    // (The failed items, made once more after the list: below.)
+    let failed_items = parking_lot::Mutex::new(Vec::<usize>::new());
     let compile_ns = AtomicU64::new(0);
     // A stop asked for by the launcher (`<progress>.stop`): the programs being compiled finish,
     // no other starts.
@@ -527,6 +576,7 @@ pub fn precompile_all(app: &std::path::Path, threads: usize, progress: Option<&s
                 code_done.fetch_add(words, Relaxed);
                 if !ok {
                     failed.fetch_add(1, Relaxed);
+                    failed_items.lock().push(i);
                 }
                 done.fetch_add(1, Relaxed);
             });
@@ -551,8 +601,22 @@ pub fn precompile_all(app: &std::path::Path, threads: usize, progress: Option<&s
         const ITEM_HANG_SECS: u64 = 600;
         let (mut seen, mut moved) = (0usize, Instant::now());
         let mut stopped_at: Option<Instant> = None;
+        let mut tick = Instant::now();
         while done.load(Relaxed) < all {
             std::thread::sleep(std::time::Duration::from_millis(200));
+            // (A gap of over 10 s between these ticks: the PC slept or the process was held. The
+            // watches' time starts again, as the self-play's does, `prepplay::watch_hangs`; a lid
+            // closed for 10 minutes had read as a compile that does not return; the review of
+            // 2026-11-21 night.)
+            let now = Instant::now();
+            if now.duration_since(tick).as_secs() > 10 {
+                crate::info!("precompile all: the process did not run for {:.0} s (the PC asleep or the process held): its watches start again", now.duration_since(tick).as_secs_f64());
+                moved = now;
+                if stopped_at.is_some() {
+                    stopped_at = Some(now);
+                }
+            }
+            tick = now;
             let d = done.load(Relaxed);
             if d != seen {
                 (seen, moved) = (d, Instant::now());
@@ -602,6 +666,31 @@ pub fn precompile_all(app: &std::path::Path, threads: usize, progress: Option<&s
     if stop.load(Relaxed) {
         crate::info!("precompile all: stopped at {} of {} programs ({:.1} s)", done.load(Relaxed), all, t_all.elapsed().as_secs_f64());
         return 4;
+    }
+    // (The failed items once more: one that failed for want of memory or a passing driver error
+    // is made now, one that fails again stays failed and is counted in the marker. Failures had
+    // counted as made and were never tried again; the review of 2026-11-21 night. Items the
+    // crash list leaves out fail again at once.)
+    let again: Vec<usize> = std::mem::take(&mut *failed_items.lock());
+    if !again.is_empty() {
+        let (next2, still) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        std::thread::scope(|s| {
+            for _ in 0..threads.max(1).min(again.len()) {
+                s.spawn(|| loop {
+                    let k = next2.fetch_add(1, Relaxed);
+                    if k >= again.len() {
+                        break;
+                    }
+                    let (ns, _, ok) = work_item(&progs, &recipes, again[k]);
+                    compile_ns.fetch_add(ns, Relaxed);
+                    if !ok {
+                        still.fetch_add(1, Relaxed);
+                    }
+                });
+            }
+        });
+        crate::info!("precompile all: {} failed programs made once more: {} made, {} failed again", again.len(), again.len() - still.load(Relaxed), still.load(Relaxed));
+        failed.store(still.load(Relaxed), Relaxed);
     }
     crate::info!(
         "precompile all: {} programs in {:.1} s ({:.1} s of pipeline creation over the threads; {} failed)",

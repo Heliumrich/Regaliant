@@ -679,8 +679,9 @@ pub fn crumb_report() -> Option<String> {
 /// preparation through it) leave them out under that driver: a pipeline the driver's compiler
 /// cannot make ends one session, not every session that would make it ahead (NVIDIA's compiler
 /// crashed on one pipeline in two boots and on others of its vertex stage: FINDINGS.md
-/// 2026-11-21 afternoon). A draw that needs one still makes it. Another driver (cache id) reads
-/// none of the lines.
+/// 2026-11-21 afternoon). Since 2026-11-21 night no creation makes one (`create_with`): the draw
+/// or dispatch that needs it goes without it, as a crash there would come back every session.
+/// Another driver (cache id) reads none of the lines.
 static CRASHED: OnceLock<parking_lot::RwLock<std::collections::HashSet<(char, u64)>>> = OnceLock::new();
 /// Background compiles left out for a pipeline that crashed the driver (status).
 pub static CRASH_SKIPS: AtomicU64 = AtomicU64::new(0);
@@ -692,6 +693,7 @@ fn crashed_file() -> Option<PathBuf> {
 fn crashed_set() -> Option<&'static parking_lot::RwLock<std::collections::HashSet<(char, u64)>>> {
     let (_, id) = IDENTITY.get()?;
     Some(CRASHED.get_or_init(|| {
+        confirm_left_suspects();
         let mut s = std::collections::HashSet::new();
         if let Some(t) = crashed_file().and_then(|p| std::fs::read_to_string(p).ok()) {
             for l in t.lines() {
@@ -708,6 +710,13 @@ fn crashed_set() -> Option<&'static parking_lot::RwLock<std::collections::HashSe
         }
         parking_lot::RwLock::new(s)
     }))
+}
+
+/// `DS_SIM_COMPILER_CRASH=<n>` (a test): pipelines whose key n divides crash in their compile
+/// (`create_with`).
+fn sim_compiler_crash() -> Option<u64> {
+    static N: OnceLock<Option<u64>> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("DS_SIM_COMPILER_CRASH").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&n| n >= 2))
 }
 
 /// Whether a background compile leaves pipeline `key` of `kind` out: its compile crashed this
@@ -746,16 +755,74 @@ mod crash_tests {
 /// thread's crumb names (`graphics pipeline g<key>` or `compute pipeline c<key>`); its key goes
 /// to `crashed.txt` with the driver's pipeline cache id.
 pub fn note_crash() {
+    if let (Some(line), Some(path)) = (crash_line(), crashed_file()) {
+        append_line(&path, &line);
+    }
+}
+
+/// The crash list's line for what this thread's crumb names: `<kind><key> <cache id> <what>`.
+fn crash_line() -> Option<String> {
+    if READ_ONLY.load(Ordering::Relaxed) {
+        return None;
+    }
+    let what = CRUMB.with(|c| c.try_borrow().ok().and_then(|g| g.as_ref().map(|(w, _)| w.clone())))?;
+    let (kind, key) = crumb_key(&what)?;
+    let (_, id) = IDENTITY.get()?;
+    Some(format!("{kind}{key:016x} {id} {}", what.replace(['\n', '\r'], " ")))
+}
+
+fn append_line(path: &Path, line: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// The suspected compiles (`crash-suspect.txt`): a fault inside the driver at its first chance,
+/// which the driver's own handlers may still take. A fatal end confirms it (`note_crash` from the
+/// fault report); a clean shutdown drops this process's (`clear_crash_suspects`); a session that
+/// ended neither way left its suspects, which the next session confirms (`confirm_left_suspects`).
+/// Until 2026-11-21 night the first chance went straight to the crash list, so a fault the driver
+/// handled itself would have left a pipeline out for good.
+fn suspect_file() -> Option<PathBuf> {
+    DIR.get().map(|d| d.join("crash-suspect.txt"))
+}
+
+/// A fault inside the driver at its first chance, while this thread compiles (`exception`).
+pub fn note_crash_suspect() {
+    if let (Some(line), Some(path)) = (crash_line(), suspect_file()) {
+        append_line(&path, &format!("pid={} {line}", std::process::id()));
+    }
+}
+
+/// A clean shutdown: this process's suspects were handled by the driver, not fatal.
+pub fn clear_crash_suspects() {
+    let Some(path) = suspect_file() else { return };
+    let Ok(t) = std::fs::read_to_string(&path) else { return };
+    let mine = format!("pid={} ", std::process::id());
+    let rest: String = t.lines().filter(|l| !l.starts_with(&mine)).map(|l| format!("{l}\n")).collect();
+    let _ = if rest.is_empty() { std::fs::remove_file(&path) } else { std::fs::write(&path, rest) };
+}
+
+/// At this session's start (`crashed_set`): suspects other sessions left, which ended neither by
+/// a clean shutdown nor through the fault report (e.g. a fail-fast exit), go to the crash list.
+fn confirm_left_suspects() {
+    let (Some(path), Some(crashed)) = (suspect_file(), crashed_file()) else { return };
     if READ_ONLY.load(Ordering::Relaxed) {
         return;
     }
-    let Some(what) = CRUMB.with(|c| c.try_borrow().ok().and_then(|g| g.as_ref().map(|(w, _)| w.clone()))) else { return };
-    let Some((kind, key)) = crumb_key(&what) else { return };
-    let (Some(path), Some((_, id))) = (crashed_file(), IDENTITY.get()) else { return };
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(f, "{kind}{key:016x} {id} {}", what.replace(['\n', '\r'], " "));
+    let Ok(t) = std::fs::read_to_string(&path) else { return };
+    let mine = format!("pid={} ", std::process::id());
+    let mut kept = String::new();
+    for l in t.lines() {
+        if l.starts_with(&mine) {
+            kept.push_str(l);
+            kept.push('\n');
+        } else if let Some((_, line)) = l.split_once(' ') {
+            append_line(&crashed, line);
+        }
     }
+    let _ = if kept.is_empty() { std::fs::remove_file(&path) } else { std::fs::write(&path, kept) };
 }
 
 /// Creates the pipeline of `key` (`kind` 'c' compute, 'g' graphics) through
@@ -764,6 +831,25 @@ pub fn note_crash() {
 /// `fp`), else made anew with its binaries captured into the store; without
 /// them through its cache file (`with_cache`).
 pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result<vk::Pipeline, String>) -> Result<vk::Pipeline, String> {
+    // (A pipeline whose compile crashed this driver before (`crashed.txt`) is not made again,
+    // however it is asked for: its draw or dispatch goes without it. Until 2026-11-21 night only
+    // background compiles left it out, so a draw needing it crashed every session that reached
+    // it, and a preparation step begun again after such a crash would have met it again.)
+    if crashed_skip(kind, key) {
+        return Err(format!("{kind}{key:016x} left out: its compile crashed this graphics driver before (crashed.txt)"));
+    }
+    // (`DS_SIM_COMPILER_CRASH=<n>`, a test of a driver whose compiler crashes on some pipelines,
+    // as NVIDIA's did on a few here and on the other PC: a pipeline whose key n divides faults
+    // inside its compile, its note set, as that crash does. The fault handler records it in
+    // crashed.txt and the process ends; each session meets it again until it is left out.)
+    if let Some(n) = sim_compiler_crash() {
+        if kind != 'q' && key % n == 0 {
+            crate::warn!("pipeline cache: {kind}{key:016x} faults now in its compile (DS_SIM_COMPILER_CRASH={n})");
+            crate::log::try_flush();
+            // SAFETY: none; a deliberate access violation, as the driver's own crash.
+            unsafe { std::ptr::write_volatile(std::ptr::without_provenance_mut::<u64>(8), 0) };
+        }
+    }
     let Some(pb) = ctx().pbin.as_ref() else {
         return with_cache(kind, key, |cache| create(Via { cache, capture: false, binaries: None }));
     };

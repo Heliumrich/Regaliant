@@ -123,16 +123,18 @@ pub struct Ctx {
     pub pbin: Option<pbin::Fns>,
 }
 
-/// The pipeline store keeps the driver's pipeline binaries
-/// (VK_KHR_pipeline_binary, `gpu::pcache`) where the device has them (since
-/// 2026-11-08; `DS_PIPELINE_BINARIES=0`: cache data only, as before); read
-/// when the device is made. With them the driver's own cache is off for this
-/// device (`DS_PB_NO_INTERNAL=0` keeps it): the store holds what it would,
-/// and the driver's cache budget, shared with the player's games, is left to
-/// them. (So the store's older cache files, which need the driver's cache on
-/// this driver, no longer help: the first boot with binaries compiles what it
-/// has no binaries for; `DS_PB_NO_INTERNAL=0` once captures them through a
-/// warm driver cache.)
+/// The pipeline store keeps the driver's pipeline binaries (VK_KHR_pipeline_binary,
+/// `gpu::pcache`) where the device has them (since 2026-11-08; `DS_PIPELINE_BINARIES=0`: cache
+/// data only); read when the device is made. Binaries hold the compiled code themselves; the
+/// store's cache data does not on this driver: on 2026-11-21 night two boots on a store of cache
+/// data compiled every creation (1.4 s each, 1,834-1,903 of them), with the driver's own cache as
+/// it was and with it in an empty folder, where at 18:00 the same store had served in 1.3 ms
+/// (after other runs had filled the driver's cache, which is shared with every program); on
+/// 2026-11-08 a reset of that cache did the same. (A store check's four small pipelines did serve
+/// from cache data alone: not the real ones.) Some drivers refuse binaries across processes (the
+/// other PC's refused 2,136 of 2,670 that night): the driver's own cache stays on beside them
+/// since then (`DS_PB_NO_INTERNAL=1` turns it off, as before), so a refused binary's compile is
+/// served from it when it holds the pipeline, as cache data had been there.
 pub fn pipeline_binaries() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("DS_PIPELINE_BINARIES").ok().as_deref() != Some("0"))
@@ -784,12 +786,15 @@ fn init_inner() -> Result<(), String> {
             dci = dci.push_next(&mut m5);
             pb_feat.p_next = dci.p_next as *mut std::ffi::c_void;
             dci.p_next = &pb_feat as *const pbin::Features as *const std::ffi::c_void;
-            // (The driver's own cache off for this device; `DS_PB_NO_INTERNAL=0`
-            // keeps it.)
-            if std::env::var("DS_PB_NO_INTERNAL").ok().as_deref() != Some("0") {
+            // (The driver's own cache on beside the binaries since 2026-11-21 night: a binary the
+            // driver refuses is compiled again, from that cache when it holds the pipeline;
+            // `DS_PB_NO_INTERNAL=1` turns it off for this device, as before.)
+            if std::env::var("DS_PB_NO_INTERNAL").ok().as_deref() == Some("1") {
                 pb_cache.p_next = dci.p_next;
                 dci.p_next = &pb_cache as *const pbin::CacheControl as *const std::ffi::c_void;
                 crate::info!("Vulkan pipeline binaries: the driver's own cache is off for this device (the store keeps the binaries)");
+            } else {
+                crate::info!("Vulkan pipeline binaries: the driver's own cache on beside them (a refused binary's compile served from it when it holds the pipeline)");
             }
         }
         init_stage(3);
@@ -1000,7 +1005,33 @@ impl Ctx {
         let props = p2.memory_properties;
         let i = (0..props.memory_heap_count as usize).filter(|&i| props.memory_heaps[i].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL)).max_by_key(|&i| props.memory_heaps[i].size)?;
         drop(p2);
-        Some((budget.heap_usage[i], budget.heap_budget[i].min(vram_cap())))
+        Some((budget.heap_usage[i], budget.heap_budget[i].min(vram_cap()).min(sim_vram_limit().unwrap_or(u64::MAX))))
+    }
+
+    /// `DS_SIM_VRAM_MIB` (a test, `sim_vram_limit`): whether an allocation of `size` bytes in
+    /// memory type `ty` fails as on a card whose room for this process ends at the limit: the
+    /// type's heap is the largest device-local one and this process's usage of it plus the
+    /// request would pass the limit. Counted in `SIM_VRAM_FAILS`.
+    pub fn sim_alloc_fails(&self, ty: u32, size: u64) -> bool {
+        let Some(limit) = sim_vram_limit() else { return false };
+        if !self.memory_budget || ty >= self.mem_props.memory_type_count {
+            return false;
+        }
+        let heap = self.mem_props.memory_types[ty as usize].heap_index as usize;
+        let props = &self.mem_props;
+        let largest = (0..props.memory_heap_count as usize).filter(|&i| props.memory_heaps[i].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL)).max_by_key(|&i| props.memory_heaps[i].size);
+        if largest != Some(heap) {
+            return false;
+        }
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let mut p2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+        unsafe { self.instance.get_physical_device_memory_properties2(self.pdev, &mut p2) };
+        drop(p2);
+        let fails = budget.heap_usage[heap].saturating_add(size) > limit;
+        if fails {
+            SIM_VRAM_FAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        fails
     }
 
     /// The size of the largest device-local heap, bytes (at most
@@ -1067,6 +1098,24 @@ pub fn gpu_compat() -> Option<&'static str> {
 /// device-local budget our decisions see (`Ctx::device_budget`: texture
 /// eviction, and sizes derived from it) is at most this; allocations are
 /// not limited by it.
+/// `DS_SIM_VRAM_MIB=<n>` (a test of a card with less video memory, on this PC): this process's
+/// room in the largest device-local heap ends at n MiB, as on a smaller card with other programs'
+/// memory taken out: its allocations there fail past it (`Ctx::sim_alloc_fails`) and the budget
+/// the port sees is n MiB (`device_budget`). Until 2026-11-21 night tests capped only that budget
+/// (`DS_VRAM_CAP_MIB`): on a 24 GB card no allocation ever failed, so the failures a 12 GB card
+/// met in the preparation (allocations refused, a lock held while one blocked) could not happen
+/// here.
+pub fn sim_vram_limit() -> Option<u64> {
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| std::env::var("DS_SIM_VRAM_MIB").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&m| m >= 512).map(|m| m << 20))
+}
+
+/// Device-local allocations failed by `DS_SIM_VRAM_MIB`.
+pub static SIM_VRAM_FAILS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The error an allocation failed by `DS_SIM_VRAM_MIB` returns (the driver's own words for it).
+pub const SIM_OOM: vk::Result = vk::Result::ERROR_OUT_OF_DEVICE_MEMORY;
+
 pub fn vram_cap() -> u64 {
     static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *CAP.get_or_init(|| std::env::var("DS_VRAM_CAP_MIB").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&m| m >= 1024).map_or(u64::MAX, |m| m << 20))
@@ -1331,6 +1380,9 @@ impl Ctx {
 
     pub fn alloc(&self, req: vk::MemoryRequirements, want: vk::MemoryPropertyFlags) -> Result<vk::DeviceMemory, String> {
         let ty = self.memory_type(req.memory_type_bits, want).ok_or("no suitable memory type")?;
+        if self.sim_alloc_fails(ty, req.size) {
+            return Err(format!("vkAllocateMemory({}): {SIM_OOM} (DS_SIM_VRAM_MIB)", req.size));
+        }
         let ai = vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ty);
         let t0 = std::time::Instant::now();
         let r = unsafe { self.device.allocate_memory(&ai, None) }.map_err(|e| format!("vkAllocateMemory({}): {e}", req.size));
@@ -1345,6 +1397,9 @@ impl Ctx {
             return self.alloc(req, want);
         }
         let ty = self.memory_type(req.memory_type_bits, want).ok_or("no suitable memory type")?;
+        if self.sim_alloc_fails(ty, req.size) {
+            return Err(format!("vkAllocateMemory({}): {SIM_OOM} (DS_SIM_VRAM_MIB)", req.size));
+        }
         let mut fl = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
         let ai = vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ty).push_next(&mut fl);
         let t0 = std::time::Instant::now();
@@ -1383,6 +1438,10 @@ impl Ctx {
                 self.device.destroy_buffer(buf, None);
                 return Err("no suitable memory type".into());
             };
+            if self.sim_alloc_fails(ty, req.size) {
+                self.device.destroy_buffer(buf, None);
+                return Err(format!("vkAllocateMemory({}): {SIM_OOM} (DS_SIM_VRAM_MIB)", req.size));
+            }
             let mut fl = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
             let ai = vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ty).push_next(&mut fl);
             let mem = match self.device.allocate_memory(&ai, None) {

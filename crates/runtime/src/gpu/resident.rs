@@ -1530,6 +1530,59 @@ struct Backing {
     /// Cold words whose backed bits a sweep cleared, still bound
     /// (`unback_cold`): their bits, their stamp then, the flip.
     draining: std::collections::HashMap<usize, (u64, u32, u32)>,
+    /// A block allocated outside this lock (`refill_spare`), which `take_page` takes before
+    /// allocating under it.
+    spare: Option<vk::DeviceMemory>,
+}
+
+/// The spare block's state (`Backing::spare`): none there, one thread making one, and the
+/// blocks taken from it and made for it (status).
+static SPARE_EMPTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static SPARE_FILLING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// [taken, made, pages refused while one was being made].
+pub static SPARE_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// The spare block's status line (`SPARE_STATS`).
+pub fn spare_line() -> String {
+    let (taken, made, refused) = (SPARE_STATS[0].load(Ordering::Relaxed), SPARE_STATS[1].load(Ordering::Relaxed), SPARE_STATS[2].load(Ordering::Relaxed));
+    if made == 0 && refused == 0 {
+        return String::new();
+    }
+    format!("    the mirror's spare blocks: {made} made outside the backing's lock, {taken} taken under it with no driver call, {refused} pages gone without while one was still being made\n")
+}
+
+/// Makes the spare block when there is none, outside the backing's lock, one thread at a time
+/// (`back`): `take_page` then needs no driver call under that lock. A thread there had blocked in
+/// vkAllocateMemory with the lock held while video memory ran out, every recording thread and the
+/// graphics CP waiting behind it until the hang watch ended the session (the other PC's 12 GB
+/// card, 2026-11-21). An allocation that fails leaves `take_page` to try under the lock as before.
+fn refill_spare(m: &Mirror) {
+    use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+    if !SPARE_EMPTY.load(Acquire) || SPARE_FILLING.swap(true, AcqRel) {
+        return;
+    }
+    let c = ctx();
+    if !c.sim_alloc_fails(m.mem_type, BLOCK) {
+        let mut fl = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let ai = vk::MemoryAllocateInfo::default().allocation_size(BLOCK).memory_type_index(m.mem_type);
+        let ai = if c.device_addresses { ai.push_next(&mut fl) } else { ai };
+        let ta = std::time::Instant::now();
+        if let Ok(mem) = unsafe { c.device.allocate_memory(&ai, None) } {
+            super::vk::note_alloc("a spare mirror block", BLOCK, ta);
+            let mut g = m.blocks.lock();
+            if g.spare.is_none() {
+                g.spare = Some(mem);
+                SPARE_EMPTY.store(false, Release);
+                SPARE_STATS[1].fetch_add(1, Ordering::Relaxed);
+            } else {
+                drop(g);
+                unsafe { c.device.free_memory(mem, None) };
+            }
+        } else {
+            super::images::note_pressure();
+        }
+    }
+    SPARE_FILLING.store(false, Release);
 }
 
 /// The written-bit maps as sparse buffers (`make_marks`): the bit words of
@@ -1561,14 +1614,34 @@ fn take_page(g: &mut Backing, m: &Mirror, alloc_ns: &mut u64, marks: bool) -> Re
     let (b, off) = match open {
         Some((b, off)) if off + m.page <= BLOCK => (b, off),
         _ => {
-            let c = ctx();
-            let mut fl = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
-            let ai = vk::MemoryAllocateInfo::default().allocation_size(BLOCK).memory_type_index(m.mem_type);
-            let ai = if c.device_addresses { ai.push_next(&mut fl) } else { ai };
-            let ta = std::time::Instant::now();
-            let mem = unsafe { c.device.allocate_memory(&ai, None) }.map_err(|e| format!("vkAllocateMemory (mirror block): {e}"))?;
-            super::vk::note_alloc("a mirror block", BLOCK, ta);
-            *alloc_ns += ta.elapsed().as_nanos() as u64;
+            // (The spare block first, made outside this lock: `refill_spare`.)
+            let mem = if let Some(mem) = g.spare.take() {
+                SPARE_EMPTY.store(true, Ordering::Release);
+                SPARE_STATS[0].fetch_add(1, Ordering::Relaxed);
+                mem
+            } else if SPARE_FILLING.load(Ordering::Acquire) && super::images::under_pressure() {
+                // (Under video-memory pressure another thread is making the spare and has not
+                // finished in `back`'s wait: the driver is slow to give memory, and an allocation
+                // here would hold the lock while it waits, every recording thread behind it. The
+                // page goes without, as when memory runs out; the review of 2026-11-21 night.
+                // Without pressure a refill takes milliseconds, and the allocation below is safe.)
+                SPARE_STATS[2].fetch_add(1, Ordering::Relaxed);
+                return Err("vkAllocateMemory (mirror block): the spare block is still being made".into());
+            } else {
+                let c = ctx();
+                let mut fl = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+                let ai = vk::MemoryAllocateInfo::default().allocation_size(BLOCK).memory_type_index(m.mem_type);
+                let ai = if c.device_addresses { ai.push_next(&mut fl) } else { ai };
+                let ta = std::time::Instant::now();
+                // (`DS_SIM_VRAM_MIB`: as on a card with less room, `Ctx::sim_alloc_fails`.)
+                if c.sim_alloc_fails(m.mem_type, BLOCK) {
+                    return Err(format!("vkAllocateMemory (mirror block): {} (DS_SIM_VRAM_MIB)", super::vk::SIM_OOM));
+                }
+                let mem = unsafe { c.device.allocate_memory(&ai, None) }.map_err(|e| format!("vkAllocateMemory (mirror block): {e}"))?;
+                super::vk::note_alloc("a mirror block", BLOCK, ta);
+                *alloc_ns += ta.elapsed().as_nanos() as u64;
+                mem
+            };
             g.mems.push(mem);
             g.block_used.push(0);
             (g.mems.len() - 1, 0)
@@ -1674,14 +1747,24 @@ fn make_mirror() -> Result<Mirror, String> {
         c.limits.sparse_address_space_size >> 30
     );
     let words = pages.div_ceil(64);
-    let blocks = Mutex::new(Backing { mems: Vec::new(), cur: None, next: 0, mark_cur: None, claimed: vec![0; words], pending: Vec::new(), binding: false, mark_claimed: Vec::new(), mark_pending: Vec::new(), mark_new: Vec::new(), block_used: Vec::new(), free: Vec::new(), page_mem: std::collections::HashMap::new(), draining: std::collections::HashMap::new() });
+    let blocks = Mutex::new(Backing { mems: Vec::new(), cur: None, next: 0, mark_cur: None, claimed: vec![0; words], pending: Vec::new(), binding: false, mark_claimed: Vec::new(), mark_pending: Vec::new(), mark_new: Vec::new(), block_used: Vec::new(), free: Vec::new(), page_mem: std::collections::HashMap::new(), draining: std::collections::HashMap::new(), spare: None });
     Ok(Mirror { buf, page: req.alignment, mem_type, blocks, bound: parking_lot::Condvar::new(), backed: (0..words).map(|_| AtomicU64::new(0)).collect(), used: (0..words).map(|_| std::sync::atomic::AtomicU32::new(0)).collect() })
 }
 
 /// Binds device memory to the mirror's pages over guest [base, base+len)
 /// that have none yet (synchronously: the bind completes before return).
 pub fn back(base: u64, len: u64) -> Result<(), String> {
-    back_in(MIRROR.get().ok_or("no mirror")?, base, len, &STATS[S_BACKED])
+    let m = MIRROR.get().ok_or("no mirror")?;
+    refill_spare(m);
+    // (Another thread making the spare: waited for here, outside the lock, at most 200 ms; a
+    // driver slower than that leaves `take_page` to go without a new block.)
+    if SPARE_EMPTY.load(Ordering::Acquire) && SPARE_FILLING.load(Ordering::Acquire) {
+        let t = std::time::Instant::now();
+        while SPARE_FILLING.load(Ordering::Acquire) && t.elapsed() < std::time::Duration::from_millis(200) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    back_in(m, base, len, &STATS[S_BACKED])
 }
 
 /// Whether the mirror's pages of [base, base + len) are all backed, their words' last placement
@@ -2099,6 +2182,11 @@ const DRAIN_FLIPS: u32 = 10;
 
 /// `unback_cold` every this many milliseconds (its own thread).
 const UNBACK_EVERY_MS: u64 = 5000;
+/// Under video-memory pressure (`images::under_pressure`): a sweep this often, and a word cold
+/// after this many flips without a placement (`tune mirror_cold` when that is less).
+const PRESSURE_EVERY_MS: u64 = 1000;
+const PRESSURE_COLD_FLIPS: u32 = 300;
+const PRESSURE_COLD_SECS: f64 = 15.0;
 
 /// Starts the thread that runs `unback_cold` (front end 2 only; called by
 /// the completion thread, which it keeps clear of the unbinds' waits).
@@ -2108,14 +2196,33 @@ pub fn maybe_unback() {
         return;
     }
     STARTED.call_once(|| {
-        let r = std::thread::Builder::new().name("gpu-unback".into()).spawn(|| loop {
-            std::thread::sleep(std::time::Duration::from_millis(UNBACK_EVERY_MS));
-            let flips = super::tune::mirror_cold().min(u32::MAX as u64) as u32;
-            if flips == 0 {
-                continue;
-            }
-            if let Err(e) = unback_cold(flips, 256) {
-                crate::warn!("resident: cold mirror pages not unbound: {e}");
+        let r = std::thread::Builder::new().name("gpu-unback".into()).spawn(|| {
+            // (The flip rate between sweeps, for a coldness in time under pressure.)
+            let (mut last_flips, mut last_at) = (super::FRAMES.load(Ordering::Relaxed), std::time::Instant::now());
+            let mut rate = 60.0f64;
+            loop {
+                // (Under video-memory pressure, `images::under_pressure`: a sweep every second,
+                // words cold for PRESSURE_COLD_SECS (at least PRESSURE_COLD_FLIPS flips), more of
+                // them a sweep; the other PC's 12 GB card ran 2 GB over its budget with the mirror
+                // at 3.2 GB, 454 MiB of it cold, 2026-11-21. In time, not flips: 300 flips were
+                // 2.5 s at the tour's 120 a second or uncapped, the review of 2026-11-21 night.)
+                let pressure = super::images::under_pressure();
+                std::thread::sleep(std::time::Duration::from_millis(if pressure { PRESSURE_EVERY_MS } else { UNBACK_EVERY_MS }));
+                let (f, at) = (super::FRAMES.load(Ordering::Relaxed), std::time::Instant::now());
+                let dt = at.duration_since(last_at).as_secs_f64();
+                if dt > 0.5 && f >= last_flips {
+                    rate = (f - last_flips) as f64 / dt;
+                }
+                (last_flips, last_at) = (f, at);
+                let cold = super::tune::mirror_cold().min(u32::MAX as u64) as u32;
+                if cold == 0 {
+                    continue;
+                }
+                let pressure_flips = ((rate * PRESSURE_COLD_SECS) as u32).max(PRESSURE_COLD_FLIPS);
+                let (flips, words) = if super::images::under_pressure() { (cold.min(pressure_flips), 2048) } else { (cold, 256) };
+                if let Err(e) = unback_cold(flips, words) {
+                    crate::warn!("resident: cold mirror pages not unbound: {e}");
+                }
             }
         });
         if let Err(e) = r {

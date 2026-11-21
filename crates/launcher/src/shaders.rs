@@ -40,6 +40,11 @@ const STAGE_HUNG: i32 = 14;
 const STAGE_DISK_FULL: i32 = 15;
 /// The shaders folder refuses writes (`prepplay::EXIT_UNWRITABLE`): the preparation ends there.
 const STAGE_UNWRITABLE: i32 = 16;
+/// A levels part's session ended at a level's start for video memory (`prepplay::EXIT_CONTINUE`):
+/// the part goes on in a new session from that level.
+const STAGE_CONTINUE: i32 = 17;
+/// Such new sessions in a preparation at most (each takes a minute or so of loading).
+const MAX_CONTINUES: u8 = 40;
 
 /// Whether a step's exit status is worth one more try: the graphics device lost
 /// (`main::EXIT_DEVICE_LOST`, 5), memory exhausted (`EXIT_MEMORY`, 7), hung (14) or a crash (a
@@ -154,23 +159,31 @@ pub fn start_check(app: &App) {
         // return ends itself after 60 s, and is ended here otherwise; until 2026-11-20 the
         // launcher would have waited for it for ever. Its output read only once it has ended.)
         let r = sys::spawn_in_job(&mut cmd, CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS).map_err(|e| e.to_string()).and_then(|mut child| {
+            // (Its output read on a thread of its own and waited for at most 10 s after the exit: a
+            // process the check left behind holding the pipe had kept the read, and so the answer
+            // and everything waiting for it, for ever; the review of 2026-11-21 night.)
+            let (tx, rx) = std::sync::mpsc::channel::<String>();
+            if let Some(mut so) = child.stdout.take() {
+                std::thread::spawn(move || {
+                    use std::io::Read;
+                    let mut out = String::new();
+                    let _ = so.read_to_string(&mut out);
+                    let _ = tx.send(out);
+                });
+            }
             let t = Instant::now();
             let status = loop {
                 match child.try_wait() {
                     Ok(Some(s)) => break Ok(s),
-                    Ok(None) if t.elapsed().as_secs() < 75 => std::thread::sleep(std::time::Duration::from_millis(50)),
+                    Ok(None) if t.elapsed().as_secs() < 165 => std::thread::sleep(std::time::Duration::from_millis(50)),
                     Ok(None) => {
                         let _ = child.kill();
-                        break Err("no answer in 75 s".to_string());
+                        break Err("no answer in 165 s".to_string());
                     }
                     Err(e) => break Err(e.to_string()),
                 }
             }?;
-            let mut out = String::new();
-            if let Some(mut so) = child.stdout.take() {
-                use std::io::Read;
-                let _ = so.read_to_string(&mut out);
-            }
+            let out = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap_or_default();
             let get = |k: &str| out.lines().find_map(|l| l.trim().strip_prefix(k).map(|v| v.trim().to_string())).filter(|v| !v.is_empty());
             if let Some(v) = get("version = ") {
                 *GAME_ID.lock().unwrap_or_else(|e| e.into_inner()) = Some((v, get("device = ").unwrap_or_default(), get("driver = ").unwrap_or_default()));
@@ -402,6 +415,17 @@ pub fn check_tick(app: &mut App) {
         } else if !PROBE_STARTED.load(Relaxed) {
             PROBE_HANDLED.store(true, Relaxed);
         }
+        // (A preparation asked for during the check: begun now, the store judged with the
+        // check's translation; `start` runs the probe first when it is due.)
+        if let Some(play_after) = app.shaders.pending_start.take() {
+            log(app, "the game's check answered: the preparation asked for during it begins");
+            start(app, play_after);
+        }
+        // (Play pressed during the check: its decision now.)
+        if std::mem::take(&mut app.shaders.pending_play) {
+            log(app, "the game's check answered: Play pressed during it goes on");
+            crate::play(app);
+        }
     }
 }
 
@@ -428,6 +452,31 @@ pub enum Step {
 
 /// The levels' parts (sessions).
 const LEVEL_PARTS: u8 = 3;
+
+/// A step's attempts in a preparation when it fails for the PC's sake (`worth_retry`): two more
+/// tries (one until 2026-11-21: the other PC's last part hung, ran again, met NVIDIA's compiler
+/// crash, and the preparation ended unfinished after 2.8 hours).
+const MAX_ATTEMPTS: u8 = 3;
+/// Attempts begun again in a preparation for crashes that added a pipeline to the compiler-crash
+/// list (the game makes no such pipeline again, so each crash is another pipeline: bounded by the
+/// pipelines a driver cannot compile; this PC's driver crashed on 7 in a day of boots).
+const MAX_CRASH_RETRIES: u8 = 25;
+
+/// The lines of the store's compiler-crash list (`crashed.txt`, the game's: the pipelines whose
+/// compile crashed this card's driver), 0 when there is none.
+fn crashed_lines(app: &App) -> usize {
+    // (With the suspects a session left, `crash-suspect.txt`: a step that died on a driver fault
+    // it had not confirmed yet; the next session confirms them.)
+    let dir = app.paths.shaders().join("pipelines");
+    ["crashed.txt", "crash-suspect.txt"].iter().map(|f| std::fs::read_to_string(dir.join(f)).map_or(0, |t| t.lines().filter(|l| !l.trim().is_empty()).count())).sum()
+}
+
+/// Whether the compute list is made for this translation, card and driver, as the steps' order
+/// decides it: never when the store could not be judged at the preparation's start
+/// (`untrusted`), as its marker may describe pipelines the store no longer serves.
+fn compute_done(app: &App) -> bool {
+    !app.shaders.untrusted && compute_state(app).0
+}
 
 /// The steps' times on the development PC (2026-11-20 night: the whole preparation through the
 /// launcher on a fresh store, 52.6 minutes: the new game 401 s, the compute step 1,111 s on 23
@@ -529,8 +578,28 @@ pub struct Page {
     /// game that could not be played).
     compute_secs: Option<f64>,
     after_compute: Option<Step>,
-    /// Self-play steps begun again after a crash or a lost device (once each: `worth_retry`).
-    crash_retried: Vec<Step>,
+    /// Each step's failed attempts in this preparation (hung, crashed, the device lost, memory:
+    /// `worth_retry`), up to `MAX_ATTEMPTS`; a crash that added a pipeline to the compiler-crash
+    /// list (`crashed_lines`) is not counted, as the next attempt leaves that pipeline out.
+    attempts: Vec<(Step, u8)>,
+    /// The compiler-crash list's length when the running step began, and the attempts begun again
+    /// for such crashes in this preparation (`MAX_CRASH_RETRIES`).
+    crashed_at_begin: usize,
+    crash_retries: u8,
+    /// A preparation asked for while the game's check had not answered (its `play_after`): begun
+    /// by the check's timer once the answer comes (`check_tick`), so that the store is judged with
+    /// the check's translation (the other PC, 2026-11-21: Prepare pressed 27 s into its 50 s check
+    /// left an old marker trusted, the compute step was skipped and the levels compiled it).
+    pending_start: Option<bool>,
+    /// Play pressed while the game's check had not answered: Play runs again once it answers
+    /// (`defer_play`, `check_tick`), so that it judges the store with the check's translation.
+    pending_play: bool,
+    /// The step begins again after a crash or a hang: a levels part goes on from the level its
+    /// last attempt reached (`<progress>.resume`, the game's), which `begin` keeps.
+    resuming: bool,
+    /// Levels parts gone on in a new session for video memory in this preparation
+    /// (`STAGE_CONTINUE`, at most `MAX_CONTINUES`).
+    continues: u8,
     /// The step the preparation goes on with after its check, and the check's round (2: again,
     /// with the store turned to cache data).
     after_check: Option<Step>,
@@ -638,16 +707,52 @@ fn retire_stale_store(app: &App) -> bool {
     // identity's rewrites, for the page's text.)
     let mut set_aside = if read_kv(&marker(app)).is_empty() { set_aside_reason(app) } else { None };
     if let Some(kv) = recorded {
-        let same = get(&kv, "translation") == translation && get(&kv, "device") == device && get(&kv, "driver") == driver && !refused;
         let dir = shaders.join("pipelines");
+        // (Pipelines kept as the driver's binaries while the game keeps cache data, binaries
+        // turned off (`DS_PIPELINE_BINARIES=0`): none of them serves, whatever the records say.)
+        let form_stale = !binaries_form() && dir_has_binaries(&dir);
+        let same_identity = get(&kv, "translation") == translation && get(&kv, "device") == device && get(&kv, "driver") == driver && !refused;
+        // (The same translation, card and driver, the binaries alone stale: only their folder is
+        // set aside, the store's cache data kept (the review of 2026-11-21 night: the whole folder
+        // went, a mixed store's usable cache data with it), and the marker dropped, so that the
+        // compute step makes what the cache data lacks.)
+        if same_identity && form_stale {
+            let old = shaders.join(format!("pipelines-old-{}", utc_stamp()));
+            if std::fs::create_dir_all(&old).is_ok() && std::fs::rename(dir.join("binaries"), old.join("binaries")).is_ok() {
+                log(app, "the stored pipelines' binaries, which this version no longer keeps, set aside; their cache data kept");
+                let _ = std::fs::remove_file(marker(app));
+                set_aside = Some("form".to_string());
+            } else {
+                log(app, "the stored pipelines' binaries could not be set aside: none taken as made");
+                trusted = false;
+            }
+        }
+        let same = same_identity;
         if !same && dir.is_dir() {
             let mode = std::fs::read(dir.join("binaries-mode.txt")).ok();
+            // (The compiler-crash list holds for the driver's cache id its lines name, whatever
+            // the store's translation: kept, so a store set aside meets those crashes no more;
+            // the review of 2026-11-21 night.)
+            let crashed = std::fs::read(dir.join("crashed.txt")).ok();
             let old = shaders.join(format!("pipelines-old-{}", utc_stamp()));
             if std::fs::rename(&dir, &old).is_ok() {
-                log(app, if refused { "the stored pipelines are refused by the graphics driver now: set aside" } else { "the stored pipelines were made for another translation, card or driver: set aside" });
+                log(
+                    app,
+                    if refused {
+                        "the stored pipelines are refused by the graphics driver now: set aside"
+                    } else if form_stale {
+                        "the stored pipelines are the driver's binaries, which this version no longer keeps: set aside"
+                    } else {
+                        "the stored pipelines were made for another translation, card or driver: set aside"
+                    },
+                );
                 if let Some(m) = mode {
                     let _ = std::fs::create_dir_all(&dir);
                     let _ = std::fs::write(dir.join("binaries-mode.txt"), m);
+                }
+                if let Some(c) = crashed {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::fs::write(dir.join("crashed.txt"), c);
                 }
                 // (The marker described the pipelines set aside: none are prepared until the
                 // compile is done again, and a preparation stopped before then goes on from
@@ -660,6 +765,8 @@ fn retire_stale_store(app: &App) -> bool {
                 set_aside = Some(
                     if refused {
                         "refused"
+                    } else if form_stale {
+                        "form"
                     } else if get(&kv, "translation") != translation {
                         "translation"
                     } else if get(&kv, "device") != device {
@@ -698,8 +805,35 @@ fn retire_stale_store(app: &App) -> bool {
     true
 }
 
-/// Why the store's pipelines were last set aside (`retire_stale_store`: refused, translation,
-/// card, driver), from the identity record.
+/// The resume record (`<progress>.resume`, the game's: `chunk=i/n`, `level=k`) moved one level on:
+/// a part that hung at a level goes on from the next one.
+fn resume_next_level(app: &App) {
+    let f = progress_file(app).with_extension("resume");
+    let Ok(t) = std::fs::read_to_string(&f) else { return };
+    let out: String = t
+        .lines()
+        .map(|l| match l.trim().strip_prefix("level=").and_then(|v| v.parse::<u64>().ok()) {
+            Some(k) => format!("level={}\n", k + 1),
+            None => format!("{l}\n"),
+        })
+        .collect();
+    let _ = std::fs::write(&f, out);
+    log(app, "the part that hung goes on from the level after the one it hung in");
+}
+
+/// Whether the game keeps the driver's pipeline binaries (unless `DS_PIPELINE_BINARIES=0`, as the
+/// game's `vk::pipeline_binaries` decides; cache data then).
+fn binaries_form() -> bool {
+    std::env::var("DS_PIPELINE_BINARIES").ok().as_deref() != Some("0")
+}
+
+/// Whether the store's pipelines folder holds pipeline binaries (its `binaries` folder not empty).
+fn dir_has_binaries(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir.join("binaries")).is_ok_and(|mut r| r.next().is_some())
+}
+
+/// Why the store's pipelines were last set aside (`retire_stale_store`: refused, form,
+/// translation, card, driver), from the identity record.
 fn set_aside_reason(app: &App) -> Option<String> {
     read_kv(&store_identity_file(app)).into_iter().find(|(k, _)| k == "set_aside").map(|(_, v)| v).filter(|v| !v.is_empty())
 }
@@ -718,6 +852,7 @@ fn compute_state(app: &App) -> (bool, String) {
             false,
             match set_aside_reason(app).as_deref() {
                 Some("refused") => "The graphics driver no longer takes the prepared shaders. Prepare them again.",
+                Some("form") => "This version keeps prepared shaders in another form. Prepare them again.",
                 Some("translation") => "The game was updated since the shaders were prepared. Prepare them again.",
                 Some("card") => "The graphics card changed since the shaders were prepared. Prepare them again.",
                 Some("driver") => "The graphics driver changed since the shaders were prepared. Prepare them again.",
@@ -748,6 +883,12 @@ fn compute_state(app: &App) -> (bool, String) {
     // (The driver refused them since they were made: `handle_probe`.)
     if refused_after(app, &get("date")) {
         return (false, "The graphics driver no longer takes the prepared shaders. Prepare them again.".into());
+    }
+    // (Prepared as the driver's binaries while the game keeps cache data, binaries turned off:
+    // none serves, so Play prepares again; the review of 2026-11-21 night: only a preparation's
+    // start looked.)
+    if !binaries_form() && dir_has_binaries(&app.paths.shaders().join("pipelines")) {
+        return (false, "This version keeps prepared shaders in another form. Prepare them again.".into());
     }
     if device == get("device") && driver == get("driver") {
         (true, format!("The shaders are prepared (on {date}, for this graphics card and driver)."))
@@ -849,6 +990,12 @@ fn record(app: &App, f: impl FnOnce(&mut Played)) {
     let mut p = played(app);
     f(&mut p);
     let (translation, device, driver) = identity();
+    // (The check gave no answer: the record keeps what it held, never an empty translation, card
+    // or driver, which the next start read as another version and played everything again; the
+    // review of 2026-11-21 night.)
+    let old = read_kv(&played_file(app));
+    let keep = |now: String, k: &str| if now.is_empty() { old.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone()).unwrap_or_default() } else { now };
+    let (translation, device, driver) = (keep(translation, "translation"), keep(device, "device"), keep(driver, "driver"));
     let line = |v: Option<i32>| v.map_or(String::new(), |c| c.to_string());
     let t = format!(
         "# The game's self-play that learned the shaders (dsport --prepare-play); written by the launcher\n# (0: played to its end, {STAGE_STOPPED}: stopped, other: it could not go on; parts: the levels' parts played; cut: the time ran out first)\nnewgame = {}\nparts = {}\ntour = {}\ncut = {}\ntranslation = {translation}\ndriver = {driver}\ndevice = {device}\n",
@@ -1014,6 +1161,17 @@ pub fn refresh(app: &mut App) {
     if running(app) {
         return;
     }
+    // (A preparation waiting for the game's check: its own text and buttons, which a page change
+    // had replaced, so it could not be stopped; the review of 2026-11-21 night.)
+    if app.shaders.pending_start.is_some() {
+        unsafe {
+            ui::set_text(h(app.shaders.status), "Checking the game first. The shader preparation begins once that is done.");
+            ui::show(h(app.shaders.bar), false);
+            ui::enable(h(app.shaders.prepare), false);
+            ui::enable(h(app.shaders.stop), true);
+        }
+        return;
+    }
     let (_, text) = state(app);
     let text = battery_note(app).map_or(text, str::to_string);
     unsafe {
@@ -1026,6 +1184,22 @@ pub fn refresh(app: &mut App) {
 
 pub fn running(app: &App) -> bool {
     app.shaders.child.is_some() || app.shaders.retry.is_some()
+}
+
+/// Play pressed while the game's check has not answered: Play goes on once it answers
+/// (`check_tick`), the window live meanwhile. True when deferred. Until 2026-11-21 night Play
+/// waited 20 s and then judged the store without the check's translation, so a store an update
+/// had made stale could start the game unprepared (the other PC's check took 50 s).
+pub fn defer_play(app: &mut App) -> bool {
+    if !(CHECK_STARTED.load(std::sync::atomic::Ordering::Relaxed) && checked_translation().is_none()) {
+        return false;
+    }
+    if !app.shaders.pending_play {
+        log(app, "Play pressed during the game's check: it goes on once the check answers");
+    }
+    app.shaders.pending_play = true;
+    app.set_status("Checking the game first. Play goes on once that is done.");
+    true
 }
 
 /// Whether a stop was asked for (the preparation ends on its own).
@@ -1046,6 +1220,22 @@ pub fn start(app: &mut App, play_after: bool) {
         unsafe { ui::message(app.hwnd, &format!("{} was not found next to the launcher.", dsconfig::paths::GAME_EXE), crate::TITLE, windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONERROR) };
         return;
     }
+    // (The game's check first: without its translation the store cannot be judged, and none of
+    // it is taken as made. Begun by the check's timer once it answers; the window stays live.)
+    if CHECK_STARTED.load(std::sync::atomic::Ordering::Relaxed) && checked_translation().is_none() {
+        if app.shaders.pending_start.is_none() {
+            log(app, "preparation asked for during the game's check: it begins once the check answers");
+        }
+        app.shaders.pending_start = Some(play_after || app.shaders.pending_start.unwrap_or(false));
+        unsafe {
+            ui::set_text(h(app.shaders.status), "Checking the game first. The shader preparation begins once that is done.");
+            ui::enable(h(app.shaders.prepare), false);
+            ui::enable(h(app.shaders.stop), true);
+        }
+        app.update_play();
+        return;
+    }
+    app.shaders.pending_start = None;
     app.shaders.retry = None;
     app.shaders.retries = 0;
     app.shaders.ended = None;
@@ -1092,7 +1282,7 @@ pub fn start(app: &mut App, play_after: bool) {
     let save = app.paths.cache.join("prepare").join("user").join("saves");
     // (The self-play played to its end, the compiled pipelines stale: a new driver or version.
     // The compute step alone makes again everything learned; the game does not play again.)
-    let recompile = played_ended(&p) && !compute_state(app).0;
+    let recompile = played_ended(&p) && !compute_done(app);
     let first = match p {
         _ if recompile => Step::Compute,
         Played { newgame: Some(0), parts, tour, .. } if parts < LEVEL_PARTS && tour != Some(0) && has_save(&save, 4) => Step::Levels(parts + 1),
@@ -1100,12 +1290,19 @@ pub fn start(app: &mut App, play_after: bool) {
     };
     // (The compute step before the levels when its list is not made: stopped there before.)
     let (first, after_compute) = match first {
-        Step::Levels(_) if !compute_state(app).0 => (Step::Compute, Some(first)),
+        Step::Levels(_) if !compute_done(app) => (Step::Compute, Some(first)),
         _ => (first, None),
     };
     // (The store check first, once a card and driver.)
     app.shaders.after_check = None;
     app.shaders.check_round = 1;
+    // (Prepare now pressed on a card and driver recorded as one preparing cannot help: the check
+    // runs again, as the driver or its settings may have changed since; Play leaves it be. The
+    // review of 2026-11-21 night: the record had stood for good.)
+    if !play_after && check_state(app).as_deref() == Some("nohelp") {
+        log(app, "Prepare now on a card and driver recorded as one preparing cannot help: the store check runs again");
+        let _ = std::fs::remove_file(check_file(app));
+    }
     let first = match check_state(app).as_deref() {
         Some("nohelp") => {
             finish(app, Some(NO_HELP.into()));
@@ -1121,7 +1318,9 @@ pub fn start(app: &mut App, play_after: bool) {
         _ => first,
     };
     app.shaders.prep_started = Some(Instant::now());
-    app.shaders.crash_retried.clear();
+    app.shaders.attempts.clear();
+    app.shaders.crash_retries = 0;
+    app.shaders.continues = 0;
     app.shaders.part_secs.clear();
     app.shaders.slow_noted = false;
     app.shaders.compute_secs = None;
@@ -1182,6 +1381,11 @@ fn begin(app: &mut App, step: Step) -> bool {
     let progress = progress_file(app);
     let _ = std::fs::remove_file(&progress);
     let _ = std::fs::remove_file(progress.with_extension("stop"));
+    let _ = std::fs::remove_file(progress.with_extension("health"));
+    // (A part begun again keeps its resume record; a step begun anew starts from its first level.)
+    if !std::mem::take(&mut app.shaders.resuming) {
+        let _ = std::fs::remove_file(progress.with_extension("resume"));
+    }
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
     let mut cmd = std::process::Command::new(&exe);
@@ -1201,6 +1405,7 @@ fn begin(app: &mut App, step: Step) -> bool {
     match sys::spawn_in_job(&mut cmd, CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS) {
         Ok(c) => {
             log(app, &format!("step {step:?} begun"));
+            app.shaders.crashed_at_begin = crashed_lines(app);
             app.shaders.child = Some(c);
             app.shaders.step = Some(step);
             app.shaders.started = Some(Instant::now());
@@ -1237,6 +1442,13 @@ pub fn stop_then_play(app: &mut App) {
 
 /// Asks the preparation to stop (its current shaders finish first).
 pub fn stop(app: &mut App) {
+    // (Asked for during the game's check and not begun yet: dropped.)
+    if app.shaders.pending_start.take().is_some() {
+        log(app, "the preparation asked for during the game's check was stopped before it began");
+        refresh(app);
+        app.update_play();
+        return;
+    }
     // (Between a step and its new start: nothing runs, it ends at once.)
     if app.shaders.child.is_none() && app.shaders.retry.take().is_some() {
         app.shaders.play_after = false;
@@ -1371,6 +1583,20 @@ pub fn tick(app: &mut App) {
         let stopped = asked || paused;
         let code = if stopped && code != 0 { STAGE_STOPPED } else { code };
         log(app, &format!("step {step:?} ended: status {} after {secs:.0} s{}", code_text(code), if app.shaders.stalled { " (ended: no progress)" } else if paused { " (stopped for a game started meanwhile)" } else if code == STAGE_HUNG { " (it found itself hung: its log has the threads' stacks)" } else { "" }));
+        // (The step's health line, `prepplay::health_line`: what its tests hold to their limits,
+        // and what a player's logs show of how the step went.)
+        let health = std::fs::read_to_string(progress_file(app).with_extension("health")).ok().and_then(|t| t.lines().next().map(|l| l.trim().to_string())).filter(|l| !l.is_empty());
+        if let Some(l) = &health {
+            log(app, &format!("step {step:?} health: {}", l.trim_start_matches("prepare-health: ")));
+        }
+        // (Played to its end, then hung in its teardown: its health line, written before that,
+        // says status 0. Done, not a failure to play again; the review of 2026-11-21 night.)
+        let code = if code == STAGE_HUNG && health.as_deref().is_some_and(|l| l.contains("; status=0;")) {
+            log(app, &format!("step {step:?} had ended its work (its health line says status 0) before it hung in its teardown: taken as done"));
+            0
+        } else {
+            code
+        };
         // (What happened, in the player's words: the outcome and the notes.)
         let why = if std::mem::take(&mut app.shaders.stalled) { format!("it made no progress for {} minutes", stall_secs() / 60) } else { reason(code) };
         // (Another game session held the player's folder: the step did not run.)
@@ -1384,6 +1610,17 @@ pub fn tick(app: &mut App) {
                 return;
             }
             app.shaders.play_after = false;
+            // (A process of an earlier step still in the launcher's job, past its host's end and
+            // these retries: one the graphics driver holds (2026-11-20: such processes stayed with
+            // GBs of memory until a restart). The player is told to restart Windows, not to close
+            // a game that is not theirs; the review of 2026-11-21 night.)
+            let left = sys::job_processes();
+            if !left.is_empty() {
+                log(app, &format!("a process of an earlier step is still there after its end (ids {left:?}): the graphics driver holds it"));
+                record_outcome(app, "a process of the preparation is stuck in the graphics driver, and only restarting Windows ends it");
+                finish(app, Some("A process of the shader preparation is stuck in the graphics driver. Restart Windows, then press Prepare now.".into()));
+                return;
+            }
             finish(app, Some("The game is running, so the shaders cannot be prepared now. Close the game and press Prepare now.".into()));
             return;
         }
@@ -1422,9 +1659,41 @@ pub fn tick(app: &mut App) {
         // menus' navigation can slip, 2026-11-21: once in about fifteen new games.)
         // (The slip is not the PC's failure: it is not counted against the step before, the review
         // of 2026-11-21: a store check that crashed, then one slip, had ended the preparation.)
+        // (A levels part's session that ended at a level's start for video memory, `EXIT_CONTINUE`
+        // (17): the part goes on in a new session from that level, no attempt counted, at most
+        // MAX_CONTINUES times a preparation.)
+        if !stopped && code == STAGE_CONTINUE && matches!(step, Step::Levels(_)) {
+            if app.shaders.continues < MAX_CONTINUES {
+                app.shaders.continues += 1;
+                log(app, &format!("step {step:?} goes on in a new session (video memory was under pressure; {} so far)", app.shaders.continues));
+                app.shaders.resuming = true;
+                if begin(app, step) {
+                    return;
+                }
+            } else {
+                log(app, &format!("step {step:?} would go on in a new session again ({MAX_CONTINUES} so far): taken as played to here"));
+            }
+        }
+        let code = if code == STAGE_CONTINUE { 0 } else { code };
         let failed = !stopped && worth_retry(code);
         let slip = !stopped && step == Step::NewGame && code == 13;
-        if failed && app.shaders.last_failed {
+        let retryable = matches!(step, Step::NewGame | Step::Levels(_) | Step::Compute);
+        // (A failure that added a pipeline to the compiler-crash list: the driver's shader
+        // compiler crashed on it, and the next attempt leaves it out of its background compiles.
+        // Begun again without counting against the step, a few times a preparation; the other PC,
+        // 2026-11-21: its last part met that crash after a hang had used its one more try.)
+        let compiler_crash = failed && crashed_lines(app) > app.shaders.crashed_at_begin;
+        if compiler_crash && retryable && app.shaders.crash_retries < MAX_CRASH_RETRIES {
+            app.shaders.crash_retries += 1;
+            log(app, &format!("step {step:?} begun again: {why}, in the graphics driver's shader compiler (that pipeline is left out from now on)"));
+            app.set_status("A step of the shader preparation ended in the graphics driver's shader compiler. It runs again without that shader.");
+            // (A part goes on from the level it reached, that shader left out.)
+            app.shaders.resuming = matches!(step, Step::Levels(_));
+            if begin(app, step) {
+                return;
+            }
+        }
+        if failed && !compiler_crash && app.shaders.last_failed {
             record_outcome(app, &format!("its steps kept failing, the last because {why}"));
             finish(app, None);
             if std::mem::take(&mut app.shaders.play_after) {
@@ -1432,16 +1701,29 @@ pub fn tick(app: &mut App) {
             }
             return;
         }
-        if (failed || slip) && matches!(step, Step::NewGame | Step::Levels(_) | Step::Compute) && !app.shaders.crash_retried.contains(&step) {
-            app.shaders.crash_retried.push(step);
-            log(app, &format!("step {step:?} begun again: {why}"));
+        // (Up to `MAX_ATTEMPTS` attempts a step; one more try only until 2026-11-21.)
+        let tries = app.shaders.attempts.iter().find(|(s, _)| *s == step).map_or(0, |e| e.1);
+        if (failed || slip) && retryable && tries + 1 < MAX_ATTEMPTS {
+            match app.shaders.attempts.iter_mut().find(|(s, _)| *s == step) {
+                Some(e) => e.1 += 1,
+                None => app.shaders.attempts.push((step, 1)),
+            }
+            log(app, &format!("step {step:?} begun again (attempt {} of {MAX_ATTEMPTS}): {why}", tries + 2));
             // (In the launcher's status line: the page's own is the new step's at once.)
             app.set_status(&format!("A step of the shader preparation ended unexpectedly: {why}. It runs again."));
+            // (A part goes on from the level it reached; after a hang from the next one, as the
+            // level that hung would hang again.)
+            if matches!(step, Step::Levels(_)) {
+                app.shaders.resuming = true;
+                if code == STAGE_HUNG {
+                    resume_next_level(app);
+                }
+            }
             if begin(app, step) {
                 return;
             }
         }
-        app.shaders.last_failed = failed;
+        app.shaders.last_failed = failed && !compiler_crash;
         // (The step's time, for the estimate: a whole new game or part only.)
         if code == 0 {
             let secs = app.shaders.started.map_or(0.0, |s| s.elapsed().as_secs_f64());
@@ -1499,10 +1781,14 @@ pub fn tick(app: &mut App) {
                 (Step::CheckWrite, 0) => Some(Step::CheckRead),
                 (Step::CheckRead, 0) => {
                     let cache = std::fs::read_to_string(app.paths.shaders().join("pipelines").join("binaries-mode.txt")).is_ok_and(|t| t.lines().any(|l| l.replace(' ', "") == "binaries=off"));
-                    record_check(app, if cache { "cache" } else { "binaries" });
+                    // (The form the store keeps: cache data unless binaries are asked for, or the
+                    // mode file turned them off.)
+                    record_check(app, if cache || !binaries_form() { "cache" } else { "binaries" });
                     Some(go)
                 }
-                (Step::CheckRead, 20) if app.shaders.check_round < 2 => {
+                // (A second round turns binaries to cache data and checks that: only when the
+                // store kept binaries; with cache data it would repeat the same check.)
+                (Step::CheckRead, 20) if app.shaders.check_round < 2 && binaries_form() => {
                     app.shaders.check_round = 2;
                     Some(Step::CheckWrite)
                 }
@@ -1514,8 +1800,11 @@ pub fn tick(app: &mut App) {
                     }
                     return;
                 }
+                // (No answer (the device lost, a crash, its watch): not recorded, so the check
+                // runs again at the next preparation and the probe stays on; a recorded "unknown"
+                // had turned the probe off for good, the review of 2026-11-21 night.)
                 _ => {
-                    record_check(app, "unknown");
+                    log(app, &format!("the store check gave no answer (status {}): it runs again at the next preparation", code_text(code)));
                     Some(go)
                 }
             };
@@ -1547,13 +1836,13 @@ pub fn tick(app: &mut App) {
             // (The compute list made: the levels next, their first dispatches finding their
             // pipelines in the store.)
             Step::Compute => app.shaders.after_compute.take(),
-            Step::NewGame if code == 0 && !compute_state(app).0 => {
+            Step::NewGame if code == 0 && !compute_done(app) => {
                 app.shaders.after_compute = Some(Step::Levels(1));
                 Some(Step::Compute)
             }
             Step::NewGame if code == 0 => Some(Step::Levels(1)),
             // (The new game could not be played: the compute shaders on their own, as before.)
-            Step::NewGame if !compute_state(app).0 => Some(Step::Compute),
+            Step::NewGame if !compute_done(app) => Some(Step::Compute),
             // (The next part even past the preparation's time: it marks the shaders prepared at
             // once then.)
             Step::Levels(i) if i < LEVEL_PARTS => Some(Step::Levels(i + 1)),

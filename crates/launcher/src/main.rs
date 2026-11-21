@@ -168,6 +168,10 @@ pub fn play(app: &mut App) {
         }
         return;
     }
+    // (During the game's check: Play goes on once it answers, the store judged with it.)
+    if shaders::defer_play(app) {
+        return;
+    }
     // (Not again after the player declined preparing for lack of space in this session. Not on
     // battery either: an hour of the PC's full load would come before the game; the page says how
     // to prepare later, 2026-11-21.)

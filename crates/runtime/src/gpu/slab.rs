@@ -113,6 +113,10 @@ fn slab_size() -> u64 {
 }
 
 fn allocate(ty: u32, size: u64) -> Result<vk::DeviceMemory, vk::Result> {
+    // (`DS_SIM_VRAM_MIB`: as on a card with less room, `Ctx::sim_alloc_fails`.)
+    if ctx().sim_alloc_fails(ty, size) {
+        return Err(super::vk::SIM_OOM);
+    }
     let ai = vk::MemoryAllocateInfo::default().allocation_size(size).memory_type_index(ty);
     let t0 = std::time::Instant::now();
     let r = unsafe { ctx().device.allocate_memory(&ai, None) };

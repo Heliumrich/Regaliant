@@ -1746,9 +1746,17 @@ fn thread_summary_ex(with_stacks: bool) -> String {
             }
         }
     }
-    s.push_str(&gpu::status_ex(with_stacks));
+    // (Not before the Vulkan device exists: its sections read it. A preparation stopped 10 s in,
+    // before the device, panicked here: "Vulkan not initialized", the other PC, 2026-11-21.)
+    if gpu::vk::try_ctx().is_some() {
+        s.push_str(&gpu::status_ex(with_stacks));
+    } else {
+        s.push_str("    gpu: no Vulkan device yet\n");
+    }
     s.push_str(&displayclock::status_line());
-    s.push_str(&gpu::vk::present::stats_line());
+    if gpu::vk::try_ctx().is_some() {
+        s.push_str(&gpu::vk::present::stats_line());
+    }
     s.push_str(&audio::status());
     s.push_str(&hle::libs::audio2::status());
     s.push_str(&hle::libs::ajm::status());
@@ -2055,6 +2063,8 @@ fn session_ended() {
 /// (its GPU teardown would wait for the hung work).
 pub fn hung(why: &str, code: i32) -> ! {
     error!("{why}; {}", stacks_bounded());
+    // (A self-play stage's health line too, its counters as they stood.)
+    prepplay::health_if_playing(code);
     session_ended();
     crate::log::flush();
     unsafe {
@@ -2070,6 +2080,8 @@ pub fn shutdown(code: i32) -> ! {
     session_ended();
     hle::libs::videoout::wait_shots();
     gpu::shutdown();
+    // (A clean end: faults the driver took itself were not crashes, `pcache::note_crash_suspect`.)
+    gpu::pcache::clear_crash_suspects();
     // (The exact key specs still queued: written, the session's last ones.)
     gpu::precompile::exact_flush();
     info!("shutdown with status {code}\n{}", thread_summary());
@@ -2242,20 +2254,30 @@ This happens when other software takes that range. Restart the PC and try again.
     // beside a game session (it ran their start-up until 2026-11-14: a pending Save Folder move
     // or PS5 import applied under a running game, the stores' unfinished files deleted).
     if cfg.translation_fingerprint {
-        // (A check takes seconds, 2.3 s on the development PC: one not done in 60 s is a driver
-        // call that does not return. The launcher waits for it a little longer.)
+        // (A check takes seconds, 2.3 s on the development PC, ~50 s on the other PC's first: one
+        // not done in 150 s is a driver call that does not return (60 s until 2026-11-21 night,
+        // which a first check on a slow drive could pass). The launcher waits a little longer.)
         let _ = std::thread::Builder::new().name("check-watch".into()).spawn(|| {
-            std::thread::sleep(Duration::from_secs(60));
-            hung("translation check: not done in 60 s", prepplay::EXIT_HUNG);
+            std::thread::sleep(Duration::from_secs(150));
+            hung("translation check: not done in 150 s", prepplay::EXIT_HUNG);
         });
         // (This program's version first: the launcher compares it with its own, a new version's
         // files unpacked over a game still running would leave the old game beside the new
         // launcher.)
         println!("version = {}", std::env::var("DS_SIM_VERSION").unwrap_or_else(|_| dsconfig::VERSION.to_string()));
+        // (`DS_SIM_CHECK_DELAY_S=<s>`, a test of a slow PC's check: the answer that many seconds
+        // later, the process and its session lock held meanwhile, as the other PC's 50 s check
+        // held them. Under the 60 s watch above.)
+        if let Some(s) = std::env::var("DS_SIM_CHECK_DELAY_S").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+            std::thread::sleep(Duration::from_secs(s.min(140)));
+        }
         // (Translations made here are for the game's hosted sessions: their specs as those make
         // them, `fe2::specs_as_hosted`.)
         gpu::fe2::specs_as_hosted();
-        let code = match gpu::compbench::translation_fingerprint(&cfg.app) {
+        // (Through its cache beside the store: the bundles read only after an install, an
+        // update or another card or driver.)
+        let fp_dir = cfg.cache.clone().unwrap_or_else(|| cfg.paths.shaders());
+        let code = match gpu::compbench::translation_fingerprint_cached(&cfg.app, Some(&fp_dir), &build_id()) {
             Ok(fp) => {
                 // (The card and driver this program uses, as the prepared marker names them: the
                 // launcher's records follow the game's own device, the review of 2026-11-20.)
@@ -2390,6 +2412,7 @@ This happens when other software takes that range. Restart the PC and try again.
     }
     if let Some(n) = cfg.precompile_all {
         let code = gpu::compbench::precompile_all(&cfg.app, n, cfg.progress.as_deref(), Some(&cache_root.join("prepared.txt")));
+        prepplay::write_health(cfg.progress.as_deref(), &prepplay::health_line("compute", code));
         log::flush();
         std::process::exit(code);
     }

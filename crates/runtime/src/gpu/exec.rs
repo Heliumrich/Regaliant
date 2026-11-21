@@ -3220,8 +3220,10 @@ fn compile_in_background(p: &Prepared) -> bool {
     }
     // A pipeline the store holds is made in milliseconds: where it is first
     // used (or waited for when a session-start precompile has it in flight),
-    // so that only a machine's first compiles leave dispatches out.
-    if super::pcache::stored('c', key) {
+    // so that only a machine's first compiles leave dispatches out. (In this
+    // session's form only, `stored_cheap`: a binary kept while the store keeps
+    // cache data is compiled, in seconds; the other PC's store held both.)
+    if super::pcache::stored_cheap('c', key) {
         return false;
     }
     if compute_pipe_known(p) || !ASYNC_QUEUED.lock().get_or_insert_with(HashSet::new).insert(key) {
@@ -3692,6 +3694,11 @@ static EXTRA_PIPE_FLAGS: AtomicU64 = AtomicU64::new(0);
 /// `cache_key`, through that key's pipeline cache file).
 fn compute_pipeline(out: &rdna::translate::Output, push_mode: bool, cache_key: Option<u64>) -> Result<Pipe, String> {
     let c = ctx();
+    // (A pipeline whose compile crashed this driver: refused before its layouts and module are
+    // made, which a refusal inside `pcache::create_with` made and leaked at every use.)
+    if let Some(k) = cache_key.filter(|&k| super::pcache::crashed_skip('c', k)) {
+        return Err(format!("c{k:016x} left out: its compile crashed this graphics driver before (crashed.txt)"));
+    }
     {
         unsafe {
             let bindings: Vec<vk::DescriptorSetLayoutBinding> = descriptor_bindings(out)
@@ -3740,7 +3747,14 @@ fn compute_pipeline(out: &rdna::translate::Output, push_mode: bool, cache_key: O
                 None => make(super::pcache::Via { cache: vk::PipelineCache::null(), capture: false, binaries: None }),
             };
             c.device.destroy_shader_module(module, None);
-            Ok(Pipe { pipeline: pipeline?, layout, set_layout, push })
+            match pipeline {
+                Ok(pipeline) => Ok(Pipe { pipeline, layout, set_layout, push }),
+                Err(e) => {
+                    c.device.destroy_pipeline_layout(layout, None);
+                    c.device.destroy_descriptor_set_layout(set_layout, None);
+                    Err(e)
+                }
+            }
         }
     }
 }
@@ -13343,7 +13357,9 @@ impl Exec {
                 true
             }
             Err(e) => {
-                crate::warn!("gpu[{}]: no video memory for shadows ({e})", self.name);
+                // (Once a message: the other PC's log had 5,918 of these lines in one session.)
+                self.report(format!("no video memory for shadows ({e})"));
+                super::images::note_pressure();
                 false
             }
         }
@@ -13375,6 +13391,7 @@ impl Exec {
             }
             Err(e) => {
                 crate::warn!("gpu[{}]: no video memory for batch-start copies ({e})", self.name);
+                super::images::note_pressure();
                 self.pre_failed = true;
                 false
             }
@@ -14939,6 +14956,7 @@ impl Exec {
         }
         if let Err(e) = super::resident::back(lo, hi - lo) {
             self.report_error("front end 2: no video memory for the mirror (bound as zeros)", || format!("{lo:#x}..{hi:#x}: {e}"));
+            super::images::note_pressure();
             return None;
         }
         let t1 = tsc();
@@ -22116,6 +22134,8 @@ pub fn status() -> String {
     ) + &super::images::IMAGES.try_lock().and_then(|g| g.as_ref().map(|i| i.status())).unwrap_or_default()
         + &slot_mem_line()
         + &clear_pass_line()
+        + &super::images::pressure_line()
+        + &super::resident::spare_line()
         + &fill_partial_line()
         + &super::track::status()
         + &crate::mem::remap_status()

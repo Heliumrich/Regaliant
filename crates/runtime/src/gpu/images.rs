@@ -1282,6 +1282,48 @@ const EVICT_CHECK_MS: u64 = 500;
 /// and its detiling about halved (FINDINGS.md 2026-11-15 late night).
 const OTHERS_FLOOR_PCT: u64 = 50;
 
+/// Video memory under pressure until this time (`pressure_clock_ms`): set when evicting textures
+/// left this process over the high mark (`maybe_evict`), read by the mirror's cold-page thread
+/// (`resident::maybe_unback`), which then gives cold pages back sooner. And how often it was set.
+static PRESSURE_UNTIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PRESSURE_SPELLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// How long a pressure reading holds (the eviction checks come every `EVICT_CHECK_MS`).
+const PRESSURE_HOLD_MS: u64 = 10_000;
+
+fn pressure_clock_ms() -> u64 {
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    T0.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// A device-memory allocation failed (the mirror, shadows, batches): video memory under pressure
+/// from now on for `PRESSURE_HOLD_MS`. Counted in `ALLOC_FAILS`.
+pub fn note_pressure() {
+    use std::sync::atomic::Ordering::Relaxed;
+    PRESSURE_UNTIL_MS.store(pressure_clock_ms() + PRESSURE_HOLD_MS, Relaxed);
+    PRESSURE_SPELLS.fetch_add(1, Relaxed);
+    ALLOC_FAILS.fetch_add(1, Relaxed);
+}
+
+/// Device-memory allocations that failed (`note_pressure`).
+pub static ALLOC_FAILS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The highest share of its video-memory budget this process used, per mille, and that budget in
+/// MiB (`maybe_evict`'s readings, every `EVICT_CHECK_MS`; the preparation's health line).
+pub static VRAM_PEAK: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The status line of video-memory pressure (`PRESSURE_SPELLS`).
+pub fn pressure_line() -> String {
+    let n = PRESSURE_SPELLS.load(std::sync::atomic::Ordering::Relaxed);
+    if n == 0 {
+        return String::new();
+    }
+    format!("    video memory under pressure {n} times (textures alone could not bring this process under its mark, or an allocation failed: the mirror's cold pages given back sooner)\n")
+}
+
+/// Whether video memory is under pressure now (`PRESSURE_UNTIL_MS`).
+pub fn under_pressure() -> bool {
+    PRESSURE_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed) > pressure_clock_ms()
+}
+
 /// When this process uses more video memory than `tune vram_high` percent of
 /// the device-local budget, evicts the least recently used images until
 /// about `vram_low` percent (completion thread, at most every
@@ -1306,6 +1348,13 @@ pub fn maybe_evict() {
     let Some((used, budget)) = ctx().device_budget() else { return };
     // (Slab memory no image uses is free for new images.)
     let used = used.saturating_sub(super::slab::idle_bytes());
+    if budget > 0 {
+        let pm = used.saturating_mul(1000) / budget;
+        if pm > VRAM_PEAK[0].load(Relaxed) {
+            VRAM_PEAK[0].store(pm, Relaxed);
+            VRAM_PEAK[1].store(budget >> 20, Relaxed);
+        }
+    }
     let (mut high, mut low) = (budget / 100 * super::tune::vram_high(), budget / 100 * super::tune::vram_low());
     // What the heap leaves beside other processes' dedicated memory, less
     // `vram_others` MiB (high) and a GiB more (low), but never under
@@ -1328,6 +1377,14 @@ pub fn maybe_evict() {
     let Some(mut g) = IMAGES.try_lock() else { return };
     let Some(im) = g.as_mut() else { return };
     let out = im.evict(frame, want);
+    // (Textures alone could not bring it under the high mark: the rest is memory images the GPU
+    // wrote, the mirror and the like. The mirror then gives its cold pages back sooner for a while,
+    // `under_pressure`: the other PC's 12 GB card ran 2 GB over its budget with 45 MiB of textures
+    // left to evict, and its allocations failed, 2026-11-21.)
+    if used.saturating_sub(out.1) > high {
+        PRESSURE_UNTIL_MS.store(pressure_clock_ms() + PRESSURE_HOLD_MS, Relaxed);
+        PRESSURE_SPELLS.fetch_add(1, Relaxed);
+    }
     // What holds the memory (the first reports).
     let largest = if EVICTED[2].load(Relaxed) < 5 { format!("; largest: {}", im.largest(6)) } else { String::new() };
     drop(g);

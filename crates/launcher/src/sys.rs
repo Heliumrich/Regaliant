@@ -36,7 +36,15 @@ fn driver_text(vendor: u32, v: u32) -> String {
 }
 
 /// The game's graphics card, or why there is none.
+/// The graphics card the game would use, read once a launcher session (`gpu_query` makes a Vulkan
+/// instance: the Shaders page's state read it ~5 times a refresh while the game's check had not
+/// reported the card, on the window's thread; the review of 2026-11-21 night).
 pub fn gpu() -> Result<Gpu, String> {
+    static GPU: std::sync::OnceLock<Result<Gpu, String>> = std::sync::OnceLock::new();
+    GPU.get_or_init(gpu_query).clone()
+}
+
+fn gpu_query() -> Result<Gpu, String> {
     unsafe {
         let entry = ash::Entry::load().map_err(|_| "Vulkan is not installed. Install or update the graphics driver.".to_string())?;
         let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
@@ -125,6 +133,23 @@ fn job() -> Option<windows_sys::Win32::Foundation::HANDLE> {
         job as isize
     });
     (h != 0).then_some(h as windows_sys::Win32::Foundation::HANDLE)
+}
+
+/// The processes in the launcher's job now (the preparation's steps and their hosted games; the
+/// launcher and Play's game are not in it): after a step's host ended, any left are that step's,
+/// e.g. a game process the graphics driver holds, which Windows cannot end until a restart.
+pub fn job_processes() -> Vec<u32> {
+    use windows_sys::Win32::System::JobObjects::{JobObjectBasicProcessIdList, QueryInformationJobObject};
+    let Some(j) = job() else { return Vec::new() };
+    // (JOBOBJECT_BASIC_PROCESS_ID_LIST: two u32 counts, then the ids as pointer-sized words.)
+    let mut buf = vec![0usize; 1 + 256];
+    let mut ret = 0u32;
+    let ok = unsafe { QueryInformationJobObject(j, JobObjectBasicProcessIdList, buf.as_mut_ptr() as *mut std::ffi::c_void, (buf.len() * std::mem::size_of::<usize>()) as u32, &mut ret) };
+    if ok == 0 {
+        return Vec::new();
+    }
+    let n = ((buf[0] as u64 >> 32) as usize).min(256);
+    buf[1..1 + n].iter().map(|&p| p as u32).collect()
 }
 
 /// Starts `cmd` (its creation flags given, `CREATE_SUSPENDED` added here) in the launcher's job,

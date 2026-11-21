@@ -1576,6 +1576,11 @@ pub static ATTACHLESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 
 fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, push_mode: bool) -> Result<Pipe, String> {
     let c = ctx();
+    // (A pipeline whose compile crashed this driver: refused before its layouts and modules are
+    // made, which a refusal inside `pcache::create_with` made and leaked at every draw.)
+    if crate::gpu::pcache::crashed_skip('g', hkey) {
+        return Err(format!("g{hkey:016x} left out: its compile crashed this graphics driver before (crashed.txt)"));
+    }
     unsafe {
         let mut stages_p = vec![(vs.0, vk::ShaderStageFlags::VERTEX)];
         if let Some(p) = ps {
@@ -1745,7 +1750,14 @@ fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, 
         for (_, m) in modules {
             c.device.destroy_shader_module(m, None);
         }
-        let pipeline = r?;
+        let pipeline = match r {
+            Ok(p) => p,
+            Err(e) => {
+                c.device.destroy_pipeline_layout(layout, None);
+                c.device.destroy_descriptor_set_layout(set_layout, None);
+                return Err(e);
+            }
+        };
         crate::gpu::pstats::report(pipeline, &format!("vs {:#x} ps {:#x}", vs.1, ps.map_or(0, |p| p.1)));
         Ok(Pipe { pipeline, layout, set_layout, push })
     }

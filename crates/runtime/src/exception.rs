@@ -1371,8 +1371,9 @@ unsafe fn veh_body(info: *mut EXCEPTION_POINTERS) -> i32 {
                         let module = module_offset(rip).map_or_else(|| format!("{rip:#x}"), |(m, o)| format!("{m}+{o:#x}"));
                         crate::warn!("driver fault {code:#010x} at {module} while compiling {what}");
                         crate::log::try_flush();
-                        // (Left out of the next sessions' background compiles.)
-                        crate::gpu::pcache::note_crash();
+                        // (A suspect: the driver's own handlers may still take it. The fatal
+                        // report confirms it, `pcache::note_crash_suspect`.)
+                        crate::gpu::pcache::note_crash_suspect();
                     }
                 }
                 return EXCEPTION_CONTINUE_SEARCH;
@@ -1404,6 +1405,12 @@ unsafe fn veh_body(info: *mut EXCEPTION_POINTERS) -> i32 {
             }
         }
         REPORTER.store(me, Ordering::SeqCst);
+        // (A fatal fault while this thread has the driver compile a pipeline, wherever it lands:
+        // in our code, or in the driver called closely from it (`called_from_our_code`), which the
+        // branch above leaves to this report. The pipeline goes to the crash list as a deeper
+        // driver fault's does, so no later session makes it again: the preparation's injected
+        // crash of 2026-11-21 night met it in every attempt and the preparation gave up.)
+        crate::gpu::pcache::note_crash();
         if break_stats_enabled() {
             dump_break_stats();
         }

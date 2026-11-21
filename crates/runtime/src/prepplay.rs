@@ -157,6 +157,13 @@ pub const EXIT_DISK_FULL: i32 = 15;
 /// The shader store's folder refuses writes (`pcache::store_unwritable`): the step ends, the
 /// launcher tells the player and stops preparing.
 pub const EXIT_UNWRITABLE: i32 = 16;
+/// A levels part ended at a level's start because video memory was under pressure in the level
+/// before (`images::PRESSURE_SPELLS`): the launcher begins the part again in a new session from
+/// that level (`<progress>.resume`), its memory fresh, no attempt counted. Since 2026-11-21 night:
+/// a part's session kept what each level left (the other PC's 12 GB card ran 2 GB past its budget
+/// by its part's fifth level, its allocations refused and the part hung), and how many levels a
+/// card holds depends on it and on the other programs beside the game.
+pub const EXIT_CONTINUE: i32 = 17;
 /// The progress file and the driver's last text for it (`Play::write_progress`).
 static PROGRESS: std::sync::Mutex<Option<(PathBuf, String)>> = std::sync::Mutex::new(None);
 
@@ -337,6 +344,12 @@ pub fn setup(stage: Stage, cfg: &mut crate::Config) {
         }
         if stage == Stage::NewGame && std::env::var_os("DS_FLIP_GRID").is_none() {
             std::env::set_var("DS_FLIP_GRID", "0");
+        }
+        // (The tour moves on and seldom comes back: the mirror gives a place's pages back after
+        // 1,200 flips without a placement (10 s at its 120 a second) rather than 3,600, so a 12 GB
+        // card's budget holds; the other PC's ran 2 GB over it, 2026-11-21.)
+        if stage == Stage::Tour && std::env::var_os("DS_MIRROR_COLD").is_none() {
+            std::env::set_var("DS_MIRROR_COLD", "1200");
         }
     }
     // The levels at the self-play's game speed (`level_speed`; the new game's screens at their own).
@@ -541,6 +554,13 @@ pub fn start(app: &Path) {
                 crate::info!("prepare-play: stopped (the launcher's stop file) after {:.0} s", p.t0.elapsed().as_secs_f64());
                 EXIT_STOPPED
             }
+            Err(End::Continue) => {
+                // (The pipelines queued for the background made first, briefly: the next session
+                // learns again what is left of the level it goes on from.)
+                p.drain(60);
+                crate::info!("prepare-play: this session ends at a level's start, video memory under pressure in the level before; the part goes on in a new session from it ({:.0} s)", p.t0.elapsed().as_secs_f64());
+                EXIT_CONTINUE
+            }
             Err(End::Failed(why)) => {
                 crate::error!("prepare-play: stage {} could not go on: {why} (after {:.0} s)", stage.name(), p.t0.elapsed().as_secs_f64());
                 p.drain(60);
@@ -566,11 +586,90 @@ fn note_frozen(c: &GameClock) {
 
 fn end(code: i32) -> ! {
     crate::info!("prepare-play: the game was frozen for {:.0} s of the stage's waits in all (their time ran on)", FROZEN_TOTAL_MS.load(Relaxed) as f64 / 1000.0);
+    health_if_playing(code);
     crate::shutdown(code)
+}
+
+/// A preparation step's health in one line (`prepare-health:`, `key=value` pairs), the signals its
+/// tests hold to their limits (tools/prephealth.py): first uses compiled in place (in the levels
+/// they should be few once the compute step has made the list), the game's frozen time, video
+/// memory's peak against its budget, failed allocations (`DS_SIM_VRAM_MIB`'s among them),
+/// pipelines left out for crashing the driver. Until 2026-11-21 night the tests judged a step by
+/// its status alone, and a preparation that froze the game for an hour on first uses and ran past
+/// its video memory still passed (the other PC).
+pub fn health_line(stage: &str, code: i32) -> String {
+    use crate::gpu::exec::{FIRST_USES, draw};
+    let secs = crate::log::elapsed_ms() / 1000.0;
+    format!(
+        "prepare-health: stage={stage}; status={code}; secs={secs:.0}; compute_first_uses={}; compute_first_use_s={:.0}; gfx_first_uses={}; gfx_first_use_s={:.0}; frozen_s={:.0}; vram_peak_pct={}; vram_budget_mib={}; alloc_fails={}; sim_alloc_fails={}; vram_pressure={}; crash_skips={}; background_made={}; background_items={}",
+        FIRST_USES[0].load(Relaxed),
+        FIRST_USES[1].load(Relaxed) as f64 / 1e9,
+        draw::GFX_FIRST_USES[0].load(Relaxed),
+        draw::GFX_FIRST_USES[1].load(Relaxed) as f64 / 1e9,
+        FROZEN_TOTAL_MS.load(Relaxed) as f64 / 1000.0,
+        crate::gpu::images::VRAM_PEAK[0].load(Relaxed) / 10,
+        crate::gpu::images::VRAM_PEAK[1].load(Relaxed),
+        crate::gpu::images::ALLOC_FAILS.load(Relaxed),
+        crate::gpu::vk::SIM_VRAM_FAILS.load(Relaxed),
+        crate::gpu::images::PRESSURE_SPELLS.load(Relaxed),
+        crate::gpu::pcache::CRASH_SKIPS.load(Relaxed),
+        crate::gpu::compbench::BACKGROUND[1].load(Relaxed),
+        crate::gpu::compbench::BACKGROUND[0].load(Relaxed),
+    )
+}
+
+/// The levels this part's level list dropped for a resume (`resume_from`): level indices in the
+/// resume record count from the part's first level.
+static RESUME_BASE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The resume record beside the progress file (`<progress>.resume`): the part (i/n) and the index
+/// of the level its session started last, from the part's first. The launcher keeps it for an
+/// attempt begun again after a crash or a hang (moving it one level on after a hang) and drops it
+/// when a step begins anew.
+fn resume_file() -> Option<PathBuf> {
+    SETUP.get().and_then(|s| s.progress.as_ref()).map(|p| p.with_extension("resume"))
+}
+
+/// The level a part begun again goes on from (0: its first).
+fn resume_from(chunk: (usize, usize)) -> usize {
+    let Some(t) = resume_file().and_then(|f| std::fs::read_to_string(f).ok()) else { return 0 };
+    let get = |k: &str| t.lines().find_map(|l| l.trim().strip_prefix(k).map(str::to_string));
+    if get("chunk=").as_deref() != Some(&format!("{}/{}", chunk.0, chunk.1)) {
+        return 0;
+    }
+    get("level=").and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
+/// A level of this part started (its index from the part's first): the resume record.
+fn note_resume(level: usize) {
+    let (Some(f), Some((i, n))) = (resume_file(), SETUP.get().and_then(|s| s.chunk)) else { return };
+    let _ = std::fs::write(f, format!("chunk={i}/{n}\nlevel={level}\n"));
+}
+
+/// A self-play stage's health line when it ends otherwise than through `end` (found hung).
+pub fn health_if_playing(code: i32) {
+    if let Some(s) = SETUP.get() {
+        let name = match (s.stage, s.chunk) {
+            (Stage::Tour, Some((i, n))) => format!("tour {i}/{n}"),
+            (st, _) => st.name().to_string(),
+        };
+        write_health(s.progress.as_deref(), &health_line(&name, code));
+    }
+}
+
+/// The health line into the log and beside the step's progress file (`<progress>.health`, which
+/// the launcher copies into its own log at the step's end).
+pub fn write_health(progress: Option<&std::path::Path>, line: &str) {
+    crate::info!("{line}");
+    if let Some(p) = progress {
+        let _ = std::fs::write(p.with_extension("health"), format!("{line}\n"));
+    }
 }
 
 enum End {
     Stopped,
+    /// A levels part's session ends at a level's start for video memory (`EXIT_CONTINUE`).
+    Continue,
     Failed(String),
 }
 
@@ -831,9 +930,18 @@ impl Play {
         // (The workers' own state: their statistics leave out jobs dropped as made meanwhile, and
         // the arithmetic of them never reached 0, the whole limit waited at every end.)
         let idle = crate::gpu::exec::draw::async_gfx_idle;
-        let t = Instant::now();
+        let mut t = Instant::now();
         let (mut made, mut moved, mut shown) = (s[3].load(Relaxed), Instant::now(), Instant::now());
+        let mut tick = Instant::now();
         while !idle() && self.check_stop().is_ok() {
+            // (A gap of over 10 s: the PC slept or the process was held; the waits start again,
+            // as `watch_hangs`'s do. The review of 2026-11-21 night: a sleep had ended the drain
+            // with pipelines not made, and the store was marked prepared.)
+            let now = Instant::now();
+            if now.duration_since(tick) > Duration::from_secs(10) {
+                (t, moved) = (now, now);
+            }
+            tick = now;
             let m = s[3].load(Relaxed);
             if m != made {
                 (made, moved) = (m, Instant::now());
@@ -1035,6 +1143,8 @@ impl Play {
         }
         self.step("the levels");
         let (mut seen, mut fogs, mut levels) = (0usize, 0usize, 0usize);
+        // (Video memory's pressure count when the last level started: a split, `End::Continue`.)
+        let mut spells_at_level = crate::gpu::images::PRESSURE_SPELLS.load(Relaxed);
         let mut last = GameClock::new();
         // Presses of Cross still to come at a fog door, at these flips (a press while the player
         // still moves may not take: -214433's 2-2 door kept its prompt). Flips, not time: the
@@ -1072,6 +1182,16 @@ impl Play {
             if l > levels {
                 levels = l;
                 self.coverage(&format!("level {l} starts"));
+                note_resume(RESUME_BASE.load(Relaxed) as usize + l - 1);
+                // (Video memory under pressure since the level before began, and this session has
+                // played a level: it ends here and the part goes on in a new one from this level,
+                // `EXIT_CONTINUE`. `DS_PREPARE_SPLIT=0`: as before, one session a part.)
+                let spells = crate::gpu::images::PRESSURE_SPELLS.load(Relaxed);
+                if l >= 2 && spells > spells_at_level && std::env::var("DS_PREPARE_SPLIT").ok().as_deref() != Some("0") && SETUP.get().is_some_and(|s| s.chunk.is_some()) {
+                    crate::info!("prepare-play: video memory was under pressure {} times in the level before: this session ends here", spells - spells_at_level);
+                    return Err(End::Continue);
+                }
+                spells_at_level = spells;
                 // The preparation's time is up: the session ends at this level's start (the
                 // levels before it were played; the rest are left to the player's first visits).
                 if past_deadline() {
@@ -1110,10 +1230,18 @@ impl Play {
         // a slower PC gets them all. With a deadline: at most `COMPUTE_TAIL`, never past it.)
         let tail = time_left().map(|l| l.min(COMPUTE_TAIL));
         let (mut made, mut moved) = (b[1].load(Relaxed) + b[2].load(Relaxed), Instant::now());
+        let mut tick = Instant::now();
         while b[0].load(Relaxed) == 0 || left() > 0 {
             if tail.is_some_and(|tl| t.elapsed() >= tl) {
                 break;
             }
+            // (A gap of over 10 s: the PC slept or the process was held; the no-progress time
+            // starts again, as in `drain`; the review of 2026-11-21 night.)
+            let now = Instant::now();
+            if now.duration_since(tick) > Duration::from_secs(10) {
+                moved = now;
+            }
+            tick = now;
             let m = b[1].load(Relaxed) + b[2].load(Relaxed);
             if m != made {
                 (made, moved) = (m, Instant::now());
@@ -1324,6 +1452,15 @@ fn levels_lines(text: &str, poi_text: &str, o: &LevelOpts) -> Option<(String, u3
         let len = levels.len();
         let (from, to) = ((i - 1) * len / n, i * len / n);
         levels = levels[from..to].to_vec();
+        // (This part begun again after a crash or a hang: from the level its last attempt
+        // reached, `resume_from`, not its first; a crash had cost the part's whole replay, about
+        // an hour on the other PC; the review of 2026-11-21 night.)
+        let skip = resume_from((i, n)).min(levels.len().saturating_sub(1));
+        if skip > 0 {
+            crate::info!("prepare-play: this part goes on from its level {} of {} (its last attempt reached it)", skip + 1, levels.len());
+            levels.drain(..skip);
+            RESUME_BASE.store(skip as u32, Relaxed);
+        }
     }
     // (The automation counts frames from the title's boot, and the title ignores level loads
     // until it is in the game: its first wait covers the self-play's way through the title, the
