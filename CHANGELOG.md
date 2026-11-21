@@ -11,6 +11,14 @@
   a moment.
 - Smoother frame rates where many shadows are drawn: clearing shadows no longer stalls the
   graphics card.
+- No more flicker while turning the camera at the start of the first level.
+- The shader preparation finishes on more PCs. Pressing Prepare or Play while the launcher
+  checks the game now waits for the check. An old preparation is never taken as done.
+- When the graphics driver crashes on a shader, the preparation leaves that shader out and goes
+  on. Play does the same.
+- When the graphics card runs out of memory, the game no longer slows to a crawl or stops
+  responding. Some things may look wrong until memory frees up.
+- A long preparation that runs short of graphics memory goes on in a fresh session.
 
 ## 0.1.0
 
