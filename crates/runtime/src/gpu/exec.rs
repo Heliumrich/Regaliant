@@ -13364,7 +13364,8 @@ impl Exec {
             Err(e) => {
                 // (Once a message: the other PC's log had 5,918 of these lines in one session.)
                 self.report(format!("no video memory for shadows ({e})"));
-                super::images::note_pressure();
+                // (Pressure noted by the failing allocation itself, `vk::note_alloc_fail`; a refusal
+                // in its window renews none: the review of 2026-11-21 night.)
                 false
             }
         }
@@ -13396,7 +13397,6 @@ impl Exec {
             }
             Err(e) => {
                 crate::warn!("gpu[{}]: no video memory for batch-start copies ({e})", self.name);
-                super::images::note_pressure();
                 self.pre_failed = true;
                 false
             }
@@ -14961,7 +14961,9 @@ impl Exec {
         }
         if let Err(e) = super::resident::back(lo, hi - lo) {
             self.report_error("front end 2: no video memory for the mirror (bound as zeros)", || format!("{lo:#x}..{hi:#x}: {e}"));
-            super::images::note_pressure();
+            // (No pressure noted here: a real failure noted it (`vk::note_alloc_fail`), and a page
+            // gone without while the spare block was made had renewed the spell, which kept pages
+            // going without: the review of 2026-11-21 night.)
             return None;
         }
         let t1 = tsc();

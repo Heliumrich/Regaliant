@@ -602,12 +602,6 @@ pub fn stored_cheap(kind: char, key: u64) -> bool {
     }
 }
 
-/// Whether the store holds the pipeline of `key` (its creation then takes
-/// milliseconds, not the seconds of a first compile).
-pub fn stored(kind: char, key: u64) -> bool {
-    DIR.get().is_some_and(|dir| dir.join(format!("{kind}{key:016x}.bin")).exists()) || BIN_DIR.get().is_some_and(|dir| dir.join(format!("{kind}{key:016x}.pb")).exists())
-}
-
 /// How `create_with` has a pipeline made: through `cache`, with its
 /// binaries captured (VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR in a
 /// VkPipelineCreateFlags2CreateInfoKHR with the create info's own flags),
@@ -682,7 +676,58 @@ pub fn crumb_report() -> Option<String> {
 /// 2026-11-21 afternoon). Since 2026-11-21 night no creation makes one (`create_with`): the draw
 /// or dispatch that needs it goes without it, as a crash there would come back every session.
 /// Another driver (cache id) reads none of the lines.
-static CRASHED: OnceLock<parking_lot::RwLock<std::collections::HashSet<(char, u64)>>> = OnceLock::new();
+static CRASHED: OnceLock<parking_lot::RwLock<Crashed>> = OnceLock::new();
+
+/// The crash list as read (`crashed_set`): `background` every listed pipeline (background
+/// compiles leave them out); `foreground` those a creation of any kind refuses: confirmed by a
+/// fatal report once, or a suspect two sessions left. A suspect alone (a session that died
+/// without its fatal report, or was ended from outside, after the driver faulted at first chance
+/// in a compile it may have taken itself) holds back only background compiles: until the review
+/// of 2026-11-21 night one became a refusal everywhere, its draws or dispatches dropped in every
+/// later session.
+#[derive(Default)]
+pub struct Crashed {
+    background: std::collections::HashSet<(char, u64)>,
+    foreground: std::collections::HashSet<(char, u64)>,
+}
+
+impl Crashed {
+    pub fn len(&self) -> usize {
+        self.background.len()
+    }
+}
+
+/// The marker of a suspect's line in `crashed.txt` (after the cache id).
+const SUSPECT_MARK: &str = "suspect:";
+
+/// The compute step's or the store check's process: every compile in it is a background one.
+static BACKGROUND_PROCESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// This process compiles only ahead of use (the compute step, the store check): `crashed_skip`
+/// applies the background rule to all of it.
+pub fn background_process() {
+    BACKGROUND_PROCESS.store(true, Ordering::Relaxed);
+}
+
+/// Whether this thread compiles ahead of use: the background list's, precompile's, compile-ahead's
+/// and the background compiles' workers, or any thread of a background process.
+fn background_thread() -> bool {
+    thread_local! {
+        static BG: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+    if BACKGROUND_PROCESS.load(Ordering::Relaxed) {
+        return true;
+    }
+    BG.with(|b| {
+        if let Some(v) = b.get() {
+            return v;
+        }
+        let n = crate::log::thread_name();
+        let v = ["gpu-prep", "gpu-precompile", "gpu-compile", "gpu-async", "gpu-gfxasync"].iter().any(|p| n.starts_with(p));
+        b.set(Some(v));
+        v
+    })
+}
 /// Background compiles left out for a pipeline that crashed the driver (status).
 pub static CRASH_SKIPS: AtomicU64 = AtomicU64::new(0);
 
@@ -690,39 +735,77 @@ fn crashed_file() -> Option<PathBuf> {
     DIR.get().map(|d| d.join("crashed.txt"))
 }
 
-fn crashed_set() -> Option<&'static parking_lot::RwLock<std::collections::HashSet<(char, u64)>>> {
+fn crashed_set() -> Option<&'static parking_lot::RwLock<Crashed>> {
     let (_, id) = IDENTITY.get()?;
     Some(CRASHED.get_or_init(|| {
         confirm_left_suspects();
-        let mut s = std::collections::HashSet::new();
+        let mut s = Crashed::default();
+        let mut suspects: std::collections::HashMap<(char, u64), u32> = std::collections::HashMap::new();
         if let Some(t) = crashed_file().and_then(|p| std::fs::read_to_string(p).ok()) {
             for l in t.lines() {
                 let mut w = l.split_whitespace();
                 let (Some(k), Some(cid)) = (w.next(), w.next()) else { continue };
+                let suspect = w.next() == Some(SUSPECT_MARK);
                 let mut ch = k.chars();
                 if let (true, Some(kind @ ('g' | 'c')), Ok(key)) = (cid == id, ch.next(), u64::from_str_radix(ch.as_str(), 16)) {
-                    s.insert((kind, key));
+                    s.background.insert((kind, key));
+                    if suspect {
+                        let n = suspects.entry((kind, key)).or_insert(0);
+                        *n += 1;
+                        if *n >= 2 {
+                            s.foreground.insert((kind, key));
+                        }
+                    } else {
+                        s.foreground.insert((kind, key));
+                    }
                 }
             }
         }
-        if !s.is_empty() {
-            crate::info!("pipeline cache: {} pipelines whose compile crashed this driver are left out of background compiles (crashed.txt)", s.len());
+        if !s.background.is_empty() {
+            crate::info!(
+                "pipeline cache: {} pipelines whose compile crashed this driver are left out of background compiles, {} of them out of every creation (crashed.txt)",
+                s.background.len(),
+                s.foreground.len()
+            );
         }
         parking_lot::RwLock::new(s)
     }))
 }
 
 /// `DS_SIM_COMPILER_CRASH=<n>` (a test): pipelines whose key n divides crash in their compile
-/// (`create_with`).
+/// (`create_with`); with `DS_SIM_COMPILER_CRASH_THREADS=<prefix>` only on threads whose name
+/// starts with it (`gpu-prep`: the background list's workers, as the full injected run of
+/// 2026-11-21 night met every crash).
 fn sim_compiler_crash() -> Option<u64> {
     static N: OnceLock<Option<u64>> = OnceLock::new();
-    *N.get_or_init(|| std::env::var("DS_SIM_COMPILER_CRASH").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&n| n >= 2))
+    static PREFIX: OnceLock<Option<String>> = OnceLock::new();
+    let n = (*N.get_or_init(|| std::env::var("DS_SIM_COMPILER_CRASH").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&n| n >= 2)))?;
+    match PREFIX.get_or_init(|| std::env::var("DS_SIM_COMPILER_CRASH_THREADS").ok().filter(|p| !p.is_empty())) {
+        Some(p) if !crate::log::thread_name().starts_with(p.as_str()) => None,
+        _ => Some(n),
+    }
 }
 
-/// Whether a background compile leaves pipeline `key` of `kind` out: its compile crashed this
-/// driver in an earlier session (counted).
+thread_local! {
+    /// This thread makes the injected compiler crash now (`DS_SIM_COMPILER_CRASH`): the fatal
+    /// report lists it as a driver's crash, though it lands in our code.
+    static SIM_CRASHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread's fault is the injected compiler crash (`exception`'s fatal report).
+pub fn sim_crash_now() -> bool {
+    SIM_CRASHING.with(|c| c.get())
+}
+
+/// Whether a creation leaves pipeline `key` of `kind` out: its compile crashed this driver in an
+/// earlier session (`Crashed`: a background compile by any listing, a creation for use only when
+/// confirmed; counted).
 pub fn crashed_skip(kind: char, key: u64) -> bool {
-    let hit = crashed_set().is_some_and(|s| s.read().contains(&(kind, key)));
+    let bg = background_thread();
+    let hit = crashed_set().is_some_and(|s| {
+        let s = s.read();
+        if bg { s.background.contains(&(kind, key)) } else { s.foreground.contains(&(kind, key)) }
+    });
     if hit {
         CRASH_SKIPS.fetch_add(1, Ordering::Relaxed);
     }
@@ -805,24 +888,48 @@ pub fn clear_crash_suspects() {
 }
 
 /// At this session's start (`crashed_set`): suspects other sessions left, which ended neither by
-/// a clean shutdown nor through the fault report (e.g. a fail-fast exit), go to the crash list.
+/// a clean exit nor through the fault report (a fail-fast exit, or ended from outside), go to the
+/// crash list as suspects (`Crashed`); a session still running keeps its own.
 fn confirm_left_suspects() {
     let (Some(path), Some(crashed)) = (suspect_file(), crashed_file()) else { return };
     if READ_ONLY.load(Ordering::Relaxed) {
         return;
     }
     let Ok(t) = std::fs::read_to_string(&path) else { return };
-    let mine = format!("pid={} ", std::process::id());
     let mut kept = String::new();
     for l in t.lines() {
-        if l.starts_with(&mine) {
+        let Some((pid, line)) = l.split_once(' ') else { continue };
+        let pid = pid.strip_prefix("pid=").and_then(|p| p.parse::<u32>().ok()).unwrap_or(0);
+        if pid == std::process::id() || process_alive(pid) {
             kept.push_str(l);
             kept.push('\n');
-        } else if let Some((_, line)) = l.split_once(' ') {
-            append_line(&crashed, line);
+            continue;
+        }
+        // (`<kind><key> <cache id> suspect: <what>`.)
+        let mut w = line.splitn(3, ' ');
+        if let (Some(k), Some(cid)) = (w.next(), w.next()) {
+            append_line(&crashed, &format!("{k} {cid} {SUSPECT_MARK} {}", w.next().unwrap_or("")));
         }
     }
     let _ = if kept.is_empty() { std::fs::remove_file(&path) } else { std::fs::write(&path, kept) };
+}
+
+/// Whether process `pid` still runs (a suspect's session beside this one).
+fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    if pid == 0 {
+        return false;
+    }
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return false;
+        }
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(h, &mut code) != 0;
+        windows_sys::Win32::Foundation::CloseHandle(h);
+        ok && code == 259 // STILL_ACTIVE
+    }
 }
 
 /// Creates the pipeline of `key` (`kind` 'c' compute, 'g' graphics) through
@@ -846,6 +953,7 @@ pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result
         if kind != 'q' && key % n == 0 {
             crate::warn!("pipeline cache: {kind}{key:016x} faults now in its compile (DS_SIM_COMPILER_CRASH={n})");
             crate::log::try_flush();
+            SIM_CRASHING.with(|c| c.set(true));
             // SAFETY: none; a deliberate access violation, as the driver's own crash.
             unsafe { std::ptr::write_volatile(std::ptr::without_provenance_mut::<u64>(8), 0) };
         }

@@ -390,7 +390,10 @@ pub fn translation_fingerprint(app: &std::path::Path) -> Result<String, String> 
                 spec.lod_stats = false;
                 spec.lod_lean = false;
             }
-            let tr = super::shaders::translate_code_unkept(&code, h, spec).ok()?;
+            let Ok(tr) = super::shaders::translate_code_unkept(&code, h, spec) else {
+                FP_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return None;
+            };
             Some((h, super::shaders::hash_words(&tr.out.spirv)))
         })
         .collect();
@@ -458,12 +461,24 @@ pub fn translation_fingerprint_cached(app: &std::path::Path, dir: Option<&std::p
             }
         }
     }
+    FP_MISSES.store(0, std::sync::atomic::Ordering::Relaxed);
     let fp = translation_fingerprint(app)?;
-    if let Some(f) = file {
+    // (Kept only when whole: a shader file that could not be read, or a sampled program that did
+    // not translate, makes a fingerprint the markers' own (made afresh) would not match, and a
+    // cached one would say "the game was updated" after every preparation; the review of
+    // 2026-11-21 night.)
+    let misses = FP_MISSES.load(std::sync::atomic::Ordering::Relaxed);
+    if misses > 0 {
+        crate::warn!("translation fingerprint: {misses} shader files or sampled programs could not be read or translated: not cached");
+    } else if let Some(f) = file {
         let _ = std::fs::write(&f, format!("# The translation fingerprint and what it holds for (the game's check, 2026-11-21 night)\nkey = {key}\ntranslation = {fp}\n"));
     }
     Ok(fp)
 }
+
+/// Shader files not read and sampled programs not translated in the last fingerprint
+/// (`translation_fingerprint_cached`).
+static FP_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `bundle_compute`, one program in `sample` by code hash.
 fn bundle_compute_sampled(app: &std::path::Path, sample: u64) -> Vec<(u64, std::sync::Arc<Vec<u32>>, Vec<rdna::translate::Spec>)> {
@@ -475,7 +490,10 @@ fn bundle_compute_sampled(app: &std::path::Path, sample: u64) -> Vec<(u64, std::
     let mut variants = 0u64;
     let mut d3_variants = 0u64;
     for f in files.iter().filter(|p| p.extension().is_some_and(|x| x == "csdr")) {
-        let Some(v) = std::fs::read(f).ok().and_then(|b| super::particles::bundle_programs(&b)) else { continue };
+        let Some(v) = std::fs::read(f).ok().and_then(|b| super::particles::bundle_programs(&b)) else {
+            FP_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        };
         let engine = f.starts_with(&engine_dir);
         for p in v.into_iter().filter(|p| p.stage == 0) {
             if !seen.insert(p.hash) || p.hash % sample != 0 {
@@ -676,10 +694,14 @@ pub fn precompile_all(app: &std::path::Path, threads: usize, progress: Option<&s
     // crash list leaves out fail again at once.)
     let again: Vec<usize> = std::mem::take(&mut *failed_items.lock());
     if !again.is_empty() {
-        let (next2, still) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let (next2, still, done2) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+        crate::info!("precompile all: {} failed programs made once more", again.len());
         std::thread::scope(|s| {
             for _ in 0..threads.max(1).min(again.len()) {
                 s.spawn(|| loop {
+                    if stop.load(Relaxed) {
+                        break;
+                    }
                     let k = next2.fetch_add(1, Relaxed);
                     if k >= again.len() {
                         break;
@@ -689,9 +711,67 @@ pub fn precompile_all(app: &std::path::Path, threads: usize, progress: Option<&s
                     if !ok {
                         still.fetch_add(1, Relaxed);
                     }
+                    done2.fetch_add(1, Relaxed);
                 });
             }
+            // (The list's watches here too: its progress written (a third line, so the launcher's
+            // no-progress limit sees it move), a compile that does not return, the device lost,
+            // the stop file. The review of 2026-11-21 night: this pass ran unwatched, and many slow
+            // failures on a slow PC could pass the launcher's limit and end a working step.)
+            const AGAIN_HANG_SECS: u64 = 600;
+            let (mut seen, mut moved, mut tick, mut last_file) = (0usize, Instant::now(), Instant::now(), Instant::now());
+            let mut stopped_at: Option<Instant> = None;
+            loop {
+                let d = done2.load(Relaxed);
+                if d >= again.len() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                let now = Instant::now();
+                if now.duration_since(tick).as_secs() > 10 {
+                    moved = now;
+                    if stopped_at.is_some() {
+                        stopped_at = Some(now);
+                    }
+                }
+                tick = now;
+                if d != seen {
+                    (seen, moved) = (d, now);
+                } else if !stop.load(Relaxed) && moved.elapsed().as_secs() >= AGAIN_HANG_SECS {
+                    crate::hung(&format!("precompile all: no failed program made again for {AGAIN_HANG_SECS} s ({d} of {}): a compile does not return", again.len()), crate::prepplay::EXIT_HUNG);
+                }
+                if DEVICE_LOST.load(Relaxed) {
+                    crate::hung("precompile all: the graphics device was lost", crate::EXIT_DEVICE_LOST as i32);
+                }
+                if !stop.load(Relaxed) && stop_file.as_ref().is_some_and(|f| f.exists()) {
+                    crate::info!("precompile all: stop asked for while failed programs were made again ({d} of {})", again.len());
+                    stop.store(true, Relaxed);
+                }
+                if stop.load(Relaxed) {
+                    if stopped_at.get_or_insert_with(Instant::now).elapsed().as_secs() >= 60 {
+                        crate::hung("precompile all: stopped, but compiles in flight did not return within 60 s", 4);
+                    }
+                    if next2.load(Relaxed) >= again.len() || d >= next2.load(Relaxed).min(again.len()) {
+                        break;
+                    }
+                    continue;
+                }
+                if last_file.elapsed().as_millis() >= 1000 {
+                    last_file = now;
+                    if let Some(p) = progress {
+                        let t = format!("{all} {all}\n{total_words} {total_words}\nagain {d} {}\n", again.len());
+                        let tmp = p.with_extension("tmp");
+                        if std::fs::write(&tmp, t).is_ok() {
+                            let _ = std::fs::rename(&tmp, p);
+                        }
+                    }
+                }
+            }
         });
+        if stop.load(Relaxed) {
+            crate::info!("precompile all: stopped while failed programs were made again ({:.1} s)", t_all.elapsed().as_secs_f64());
+            return 4;
+        }
         crate::info!("precompile all: {} failed programs made once more: {} made, {} failed again", again.len(), again.len() - still.load(Relaxed), still.load(Relaxed));
         failed.store(still.load(Relaxed), Relaxed);
     }

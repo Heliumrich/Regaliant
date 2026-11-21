@@ -584,9 +584,14 @@ fn note_frozen(c: &GameClock) {
     FROZEN_TOTAL_MS.fetch_add(c.frozen.as_millis() as u64, Relaxed);
 }
 
+/// The stage reached its own end (`end`): its health line stands, whatever its teardown meets
+/// after it (`health_if_playing`).
+static ENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn end(code: i32) -> ! {
     crate::info!("prepare-play: the game was frozen for {:.0} s of the stage's waits in all (their time ran on)", FROZEN_TOTAL_MS.load(Relaxed) as f64 / 1000.0);
     health_if_playing(code);
+    ENDED.store(true, Relaxed);
     crate::shutdown(code)
 }
 
@@ -647,8 +652,14 @@ fn note_resume(level: usize) {
     let _ = std::fs::write(f, format!("chunk={i}/{n}\nlevel={level}\n"));
 }
 
-/// A self-play stage's health line when it ends otherwise than through `end` (found hung).
+/// A self-play stage's health line when it ends otherwise than through `end` (found hung). Not
+/// after `end`: a stage played to its end whose teardown then hung keeps its line (status 0), so
+/// the launcher takes it as done; the review of 2026-11-21 night: the hang's line had replaced it,
+/// and a new game played to its end was played again, twice.
 pub fn health_if_playing(code: i32) {
+    if ENDED.load(Relaxed) {
+        return;
+    }
     if let Some(s) = SETUP.get() {
         let name = match (s.stage, s.chunk) {
             (Stage::Tour, Some((i, n))) => format!("tour {i}/{n}"),
@@ -1456,7 +1467,15 @@ fn levels_lines(text: &str, poi_text: &str, o: &LevelOpts) -> Option<(String, u3
         // (This part begun again after a crash or a hang: from the level its last attempt
         // reached, `resume_from`, not its first; a crash had cost the part's whole replay, about
         // an hour on the other PC; the review of 2026-11-21 night.)
-        let skip = resume_from((i, n)).min(levels.len().saturating_sub(1));
+        let from_level = resume_from((i, n));
+        // (Past its last level: the part's attempts reached every one of its levels, the last
+        // one hung or crashed; nothing is left to play. The clamp below had played that level
+        // again, which hung again; the review of 2026-11-21 night.)
+        if from_level > 0 && from_level >= levels.len() {
+            crate::info!("prepare-play: this part's attempts reached all of its {} levels: nothing left to play", levels.len());
+            end(0);
+        }
+        let skip = from_level.min(levels.len().saturating_sub(1));
         if skip > 0 {
             crate::info!("prepare-play: this part goes on from its level {} of {} (its last attempt reached it)", skip + 1, levels.len());
             levels.drain(..skip);

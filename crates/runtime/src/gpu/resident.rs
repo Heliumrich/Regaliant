@@ -1544,10 +1544,11 @@ pub static SPARE_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// Video memory the mirror's blocks hold now (its pages, the written-bit maps' pages and the
 /// spare block), bytes (`images::over_budget_line`).
-pub fn mirror_bytes() -> u64 {
-    let Some(m) = MIRROR.get() else { return 0 };
-    let g = m.blocks.lock();
-    (g.mems.iter().filter(|&&x| x != vk::DeviceMemory::null()).count() as u64 + g.spare.is_some() as u64) * BLOCK
+pub fn mirror_bytes() -> Option<u64> {
+    let Some(m) = MIRROR.get() else { return Some(0) };
+    // (Not waited for: the reaper asks, which must not stand behind a page's allocation.)
+    let g = m.blocks.try_lock()?;
+    Some((g.mems.iter().filter(|&&x| x != vk::DeviceMemory::null()).count() as u64 + g.spare.is_some() as u64) * BLOCK)
 }
 
 /// The spare block's status line (`SPARE_STATS`).

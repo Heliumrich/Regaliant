@@ -1405,12 +1405,13 @@ unsafe fn veh_body(info: *mut EXCEPTION_POINTERS) -> i32 {
             }
         }
         REPORTER.store(me, Ordering::SeqCst);
-        // (A fatal fault while this thread has the driver compile a pipeline, wherever it lands:
-        // in our code, or in the driver called closely from it (`called_from_our_code`), which the
-        // branch above leaves to this report. The pipeline goes to the crash list as a deeper
-        // driver fault's does, so no later session makes it again: the preparation's injected
-        // crash of 2026-11-21 night met it in every attempt and the preparation gave up.)
-        crate::gpu::pcache::note_crash();
+        // (A fatal fault in the driver while this thread has it compile a pipeline (another
+        // module's code, called closely from ours or deeper), or the injected compiler crash: the
+        // pipeline goes to the crash list, so no later session makes it again (the preparation's
+        // injected crash of 2026-11-21 night met it in every attempt and the preparation gave up).
+        // A fault in our own code inside a compile (reading or decoding its binaries) is our bug,
+        // not the driver's: until the review of 2026-11-21 night it listed the pipeline too.)
+        let compile_crash = (!in_host && !in_guest(rip) && !stub) || crate::gpu::pcache::sim_crash_now();
         if break_stats_enabled() {
             dump_break_stats();
         }
@@ -1420,6 +1421,11 @@ unsafe fn veh_body(info: *mut EXCEPTION_POINTERS) -> i32 {
         // The first line goes out at once: if composing the rest faults, it survives.
         crate::log::write(crate::log::Level::Error, format_args!("fatal fault (report follows): {}", r.trim_end()));
         crate::log::try_flush();
+        // (The crash list's file work after that line: a fault inside it (a stack overflow's)
+        // had ended the process before any FATAL line; the review of 2026-11-21 night.)
+        if compile_crash {
+            crate::gpu::pcache::note_crash();
+        }
         if in_guest(rip) && *(rip as *const u8) == 0xCD && *((rip + 1) as *const u8) == 0x45 {
             // PS5 libc's fatal-error trap: `mov dword ptr fs:[28h], code; int 45h`
             // (the FS store is rewritten to the guest TCB).

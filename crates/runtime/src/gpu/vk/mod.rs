@@ -1652,9 +1652,25 @@ impl Ctx {
                     return Err(e);
                 }
             };
-            self.device.bind_buffer_memory(buf, mem, 0).map_err(|e| format!("bind buffer: {e}"))?;
-            let ptr = self.device.map_memory(mem, 0, size, vk::MemoryMapFlags::empty()).map_err(|e| format!("map: {e}"))? as *mut u8;
-            Ok((buf, mem, ptr))
+            self.bind_map(buf, mem, size)
+        }
+    }
+
+    /// `mem` bound to `buf` and mapped, both freed when either fails (`bar_buffer`, `host_buffer`,
+    /// `upload_buffer`: such a failure had left them behind; on cards whose system memory is
+    /// their video memory the refusal window can refuse these too, at a storm's rate; the review
+    /// of 2026-11-21 night).
+    unsafe fn bind_map(&self, buf: vk::Buffer, mem: vk::DeviceMemory, size: u64) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8), String> {
+        let r = unsafe { self.device.bind_buffer_memory(buf, mem, 0) }.map_err(|e| format!("bind buffer: {e}")).and_then(|_| unsafe { self.device.map_memory(mem, 0, size, vk::MemoryMapFlags::empty()) }.map_err(|e| format!("map: {e}")));
+        match r {
+            Ok(p) => Ok((buf, mem, p as *mut u8)),
+            Err(e) => {
+                unsafe {
+                    self.device.destroy_buffer(buf, None);
+                    self.device.free_memory(mem, None);
+                }
+                Err(e)
+            }
         }
     }
 
@@ -1667,10 +1683,14 @@ impl Ctx {
             // Prefer cached host memory: results are read back by the CPU
             // (buffer write-back), which is very slow from write-combined memory.
             let hv = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-            let mem = self.alloc_buffer_mem(req, hv | vk::MemoryPropertyFlags::HOST_CACHED).or_else(|_| self.alloc_buffer_mem(req, hv))?;
-            self.device.bind_buffer_memory(buf, mem, 0).map_err(|e| format!("bind buffer: {e}"))?;
-            let ptr = self.device.map_memory(mem, 0, size, vk::MemoryMapFlags::empty()).map_err(|e| format!("map: {e}"))? as *mut u8;
-            Ok((buf, mem, ptr))
+            let mem = match self.alloc_buffer_mem(req, hv | vk::MemoryPropertyFlags::HOST_CACHED).or_else(|_| self.alloc_buffer_mem(req, hv)) {
+                Ok(m) => m,
+                Err(e) => {
+                    self.device.destroy_buffer(buf, None);
+                    return Err(e);
+                }
+            };
+            self.bind_map(buf, mem, size)
         }
     }
 
@@ -1707,9 +1727,7 @@ impl Ctx {
                 }
             };
             note_alloc("upload memory", req.size, t0);
-            self.device.bind_buffer_memory(buf, mem, 0).map_err(|e| format!("bind buffer: {e}"))?;
-            let ptr = self.device.map_memory(mem, 0, size, vk::MemoryMapFlags::empty()).map_err(|e| format!("map: {e}"))? as *mut u8;
-            Ok((buf, mem, ptr))
+            self.bind_map(buf, mem, size)
         }
     }
 

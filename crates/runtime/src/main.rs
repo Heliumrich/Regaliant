@@ -2017,6 +2017,9 @@ pub fn fatal_exit(code: u32, reason: &str) -> ! {
     // Exclusive fullscreen's display mode back first (the desktop must not stay changed).
     display::restore_on_exit();
     session_ended();
+    // (This session's crash suspects: a fatal compile crash was recorded by its report already,
+    // and no other end here is one; left behind, the next session would have listed them.)
+    gpu::pcache::clear_crash_suspects();
     // After a fault, every thread's frames (what the others were doing:
     // the title's teardown when a job read freed memory).
     let summary = if reason == "fatal exception" { thread_summary_ex(true) } else { thread_summary() };
@@ -2066,6 +2069,7 @@ pub fn hung(why: &str, code: i32) -> ! {
     // (A self-play stage's health line too, its counters as they stood.)
     prepplay::health_if_playing(code);
     session_ended();
+    gpu::pcache::clear_crash_suspects();
     crate::log::flush();
     unsafe {
         windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), code as u32);
@@ -2407,13 +2411,24 @@ This happens when other software takes that range. Restart the PC and try again.
     }
     if let Some(a) = &cfg.compile_bench {
         let code = gpu::compbench::run(a, &cfg.app);
+        gpu::pcache::clear_crash_suspects();
         log::flush();
         std::process::exit(code);
     }
     if let Some(n) = cfg.precompile_all {
+        // (Every compile of the compute step is ahead of use: the crash list's background rule.)
+        gpu::pcache::background_process();
         let code = gpu::compbench::precompile_all(&cfg.app, n, cfg.progress.as_deref(), Some(&cache_root.join("prepared.txt")));
         prepplay::write_health(cfg.progress.as_deref(), &prepplay::health_line("compute", code));
+        gpu::pcache::clear_crash_suspects();
         log::flush();
+        // (Its work done: a teardown that stalls (a driver thread) ends the process with its own
+        // status 60 s later, not the launcher's no-progress limit 15 minutes later with none; the
+        // review of 2026-11-21 night.)
+        let _ = std::thread::Builder::new().name("exit-watch".into()).spawn(move || {
+            std::thread::sleep(Duration::from_secs(60));
+            unsafe { windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), code as u32) };
+        });
         std::process::exit(code);
     }
     if let Some(phase) = &cfg.pb_check {

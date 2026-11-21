@@ -307,10 +307,11 @@ pub fn free(m: Mem) {
 
 /// Video memory images hold now, bytes: their slabs (used or not, spares too) and their
 /// allocations of their own (`images::over_budget_line`).
-pub fn held_bytes() -> u64 {
+pub fn held_bytes() -> Option<u64> {
     let own = STATS[3].load(Relaxed);
-    let g = STATE.lock();
-    own + g.slabs.iter().flatten().map(|s| s.size).sum::<u64>() + g.spare.len() as u64 * slab_size()
+    // (Not waited for: the reaper asks, which must not stand behind an allocation.)
+    let g = STATE.try_lock()?;
+    Some(own + g.slabs.iter().flatten().map(|s| s.size).sum::<u64>() + g.spare.len() as u64 * slab_size())
 }
 
 /// Video memory the slabs hold but no image uses (free ranges and spares), bytes: memory that

@@ -1331,16 +1331,20 @@ pub fn under_pressure() -> bool {
 /// the room, and nothing said what had grown.
 pub fn over_budget_line(used: u64, budget: u64) -> String {
     let (img, mirror, slots) = (super::slab::held_bytes(), super::resident::mirror_bytes(), super::exec::slot_device_bytes());
-    let rest = used.saturating_sub(img + mirror + slots);
+    let mib = |b: Option<u64>| b.map_or("? (busy)".to_string(), |b| format!("{}", b >> 20));
+    let rest = match (img, mirror) {
+        (Some(i), Some(m)) => Some(used.saturating_sub(i + m + slots)),
+        _ => None,
+    };
     format!(
         "video memory over this process's budget: {} of {} MiB at flip {}: images {} MiB, the mirror {} MiB, batch slots {} MiB, the rest {} MiB; device allocations failed {}, refused with no driver call {}",
         used >> 20,
         budget >> 20,
         super::FRAMES.load(std::sync::atomic::Ordering::Relaxed),
-        img >> 20,
-        mirror >> 20,
+        mib(img),
+        mib(mirror),
         slots >> 20,
-        rest >> 20,
+        mib(rest),
         super::vk::GATE_STATS[1].load(std::sync::atomic::Ordering::Relaxed),
         super::vk::GATE_STATS[0].load(std::sync::atomic::Ordering::Relaxed),
     )

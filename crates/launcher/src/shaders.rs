@@ -136,12 +136,22 @@ fn version_mismatch() -> Option<String> {
     (v != dsconfig::VERSION).then(|| format!("The game's program is version {v}, the launcher {}. Close the game, then unpack the whole new version again. Nothing is prepared until then.", dsconfig::VERSION))
 }
 static CHECK_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// When the check began (`check_pending`'s deadline).
+static CHECK_AT: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// Whether Play and Prepare now still wait for the check: begun, no answer, and not past the
+/// longest a check takes with its reader's margin (an answer never coming, its thread gone, had
+/// kept them waiting for the launcher's whole session; the review of 2026-11-21 night).
+fn check_pending() -> bool {
+    CHECK_STARTED.load(std::sync::atomic::Ordering::Relaxed) && checked_translation().is_none() && CHECK_AT.get().is_none_or(|t| t.elapsed().as_secs() < 200)
+}
 
 /// Asks the game for its translation fingerprint on a thread of its own (a few seconds).
 pub fn start_check(app: &App) {
     if CHECK_STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    let _ = CHECK_AT.set(Instant::now());
     let exe = dsconfig::paths::game_exe_in(&app.paths.exe_dir);
     let dir = app.paths.exe_dir.clone();
     // (`DS_SIM_CHECK_FAIL=1`, a test: the check gives no answer, as one whose driver call did not
@@ -451,11 +461,22 @@ pub fn check_tick(app: &mut App) {
 /// A preparation asked for, or Play pressed, while the game's check or the probe had not answered:
 /// begun now that they have (`why` says which answered).
 fn run_pending(app: &mut App, why: &str) {
+    // (Play pressed too: the preparation begins with the game to start after it, Play's own
+    // question not asked; the review of 2026-11-21 night: Play then asked whether to stop it.)
+    let play = std::mem::take(&mut app.shaders.pending_play);
     if let Some(play_after) = app.shaders.pending_start.take() {
-        log(app, &format!("{why}: the preparation asked for meanwhile begins"));
-        start(app, play_after);
+        log(app, &format!("{why}: the preparation asked for meanwhile begins{}", if play { ", the game after it (Play pressed too)" } else { "" }));
+        start(app, play_after || play);
+        // (A start that went no further (a version mismatch, the player declining for lack of
+        // space, the game's program missing): the page's own text again, not "Checking the game
+        // first" with Prepare now off; the review of 2026-11-21 night.)
+        if !running(app) && app.shaders.pending_start.is_none() {
+            refresh(app);
+            app.update_play();
+        }
+        return;
     }
-    if std::mem::take(&mut app.shaders.pending_play) {
+    if play {
         log(app, &format!("{why}: Play pressed meanwhile goes on"));
         crate::play(app);
     }
@@ -617,6 +638,13 @@ pub struct Page {
     /// The compiler-crash list's length when the running step began, and the attempts begun again
     /// for such crashes in this preparation (`MAX_CRASH_RETRIES`).
     crashed_at_begin: usize,
+    /// The new game runs again without its background compute list (`DS_PREPARE_BACKGROUND=0`):
+    /// set when an attempt of it ended in the driver's shader compiler. The list's compiles run
+    /// in the game's own process, so a crash among them cost the whole new game (2026-11-21
+    /// night, an injected crash in one pipeline of 4,000: four attempts lost after 771, 35, 197
+    /// and 133 s, every crash in a list worker); the compute step after it makes the list in a
+    /// process of its own, begun again where it was.
+    newgame_no_list: bool,
     crash_retries: u8,
     /// A preparation asked for while the game's check had not answered (its `play_after`): begun
     /// by the check's timer once the answer comes (`check_tick`), so that the store is judged with
@@ -1223,7 +1251,7 @@ pub fn running(app: &App) -> bool {
 /// waited 20 s and then judged the store without the check's translation, so a store an update
 /// had made stale could start the game unprepared (the other PC's check took 50 s).
 pub fn defer_play(app: &mut App) -> bool {
-    let check = CHECK_STARTED.load(std::sync::atomic::Ordering::Relaxed) && checked_translation().is_none();
+    let check = check_pending();
     if !check && !probe_pending(app) {
         return false;
     }
@@ -1255,7 +1283,7 @@ pub fn start(app: &mut App, play_after: bool) {
     }
     // (The game's check first: without its translation the store cannot be judged, and none of
     // it is taken as made. Begun by the check's timer once it answers; the window stays live.)
-    let check = CHECK_STARTED.load(std::sync::atomic::Ordering::Relaxed) && checked_translation().is_none();
+    let check = check_pending();
     if check || probe_pending(app) {
         if app.shaders.pending_start.is_none() {
             log(app, if check { "preparation asked for during the game's check: it begins once the check answers" } else { "preparation asked for during the prepared shaders' probe: it begins once the probe answers" });
@@ -1272,6 +1300,7 @@ pub fn start(app: &mut App, play_after: bool) {
     app.shaders.pending_start = None;
     app.shaders.retry = None;
     app.shaders.retries = 0;
+    app.shaders.newgame_no_list = false;
     app.shaders.ended = None;
     let dir = app.paths.shaders();
     if let Some(free) = sys::free_space(&dir) {
@@ -1310,6 +1339,20 @@ pub fn start(app: &mut App, play_after: bool) {
     ensure_probe(app);
     let _ = std::fs::remove_file(outcome_file(app));
     app.shaders.untrusted = !retire_stale_store(app);
+    // (Prepare now on a preparation that was done: the shaders listed as having crashed the
+    // driver's compiler get a fresh chance too. One that crashed for a passing reason (memory ran
+    // out) was otherwise left out for good, its draws or dispatches going without it every
+    // session; the review of 2026-11-21 night. One that crashes again is listed again at once.)
+    if !play_after && state(app).0 {
+        let had = crashed_lines(app);
+        if had > 0 {
+            let dir = app.paths.shaders().join("pipelines");
+            for f in ["crashed.txt", "crash-suspect.txt"] {
+                let _ = std::fs::remove_file(dir.join(f));
+            }
+            log(app, &format!("Prepare now on prepared shaders: the {had} listed as having crashed the driver's compiler get a fresh chance"));
+        }
+    }
     // (The next part of the levels when the new game was played for this version, card and
     // driver and the levels are not done; else, and when everything is done, the new game.)
     let p = played(app);
@@ -1435,6 +1478,9 @@ fn begin(app: &mut App, step: Step) -> bool {
     cmd.arg("--progress").arg(&progress).current_dir(&app.paths.exe_dir);
     if app.shaders.untrusted {
         cmd.env("DS_STORE_UNTRUSTED", "1");
+    }
+    if step == Step::NewGame && app.shaders.newgame_no_list {
+        cmd.env("DS_PREPARE_BACKGROUND", "0");
     }
     match sys::spawn_in_job(&mut cmd, CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS) {
         Ok(c) => {
@@ -1623,9 +1669,11 @@ pub fn tick(app: &mut App) {
         if let Some(l) = &health {
             log(app, &format!("step {step:?} health: {}", l.trim_start_matches("prepare-health: ")));
         }
-        // (Played to its end, then hung in its teardown: its health line, written before that,
-        // says status 0. Done, not a failure to play again; the review of 2026-11-21 night.)
-        let code = if code == STAGE_HUNG && health.as_deref().is_some_and(|l| l.contains("; status=0;")) {
+        // (Played to its end, then hung or stalled in its teardown: its health line, written
+        // before that, says status 0. Done, not a failure to play again; the review of 2026-11-21
+        // night: first only for a hang, which the hang's own line then replaced, and the compute
+        // step's teardown has no hang watch but its exit's.)
+        let code = if code != 0 && code != GAME_RUNNING && health.as_deref().is_some_and(|l| l.contains("; status=0;")) {
             log(app, &format!("step {step:?} had ended its work (its health line says status 0) before it hung in its teardown: taken as done"));
             0
         } else {
@@ -1641,6 +1689,10 @@ pub fn tick(app: &mut App) {
             if app.shaders.ended.is_some_and(|t| t.elapsed().as_secs() < 90) && app.shaders.retries < 10 {
                 app.shaders.retries += 1;
                 app.shaders.retry = Some((step, Instant::now() + std::time::Duration::from_secs(3)));
+                // (A session that met the lock played nothing: a part goes on from where its
+                // record says. The retry's begin had found `resuming` used up and deleted the
+                // record, the part replayed from its first level; the review of 2026-11-21 night.)
+                app.shaders.resuming = matches!(step, Step::Levels(_));
                 return;
             }
             app.shaders.play_after = false;
@@ -1704,6 +1756,13 @@ pub fn tick(app: &mut App) {
                 if begin(app, step) {
                     return;
                 }
+                // (Its new session could not start (its reason recorded by `begin`): not played
+                // to its end; the review of 2026-11-21 night: it had been recorded as played.)
+                finish(app, None);
+                if std::mem::take(&mut app.shaders.play_after) {
+                    crate::start_game(app);
+                }
+                return;
             } else {
                 log(app, &format!("step {step:?} would go on in a new session again ({MAX_CONTINUES} so far): taken as played to here"));
             }
@@ -1721,8 +1780,13 @@ pub fn tick(app: &mut App) {
             app.shaders.crash_retries += 1;
             log(app, &format!("step {step:?} begun again: {why}, in the graphics driver's shader compiler (that pipeline is left out from now on)"));
             app.set_status("A step of the shader preparation ended in the graphics driver's shader compiler. It runs again without that shader.");
-            // (A part goes on from the level it reached, that shader left out.)
+            // (A part goes on from the level it reached, that shader left out; a new game runs
+            // again without its background list, `newgame_no_list`.)
             app.shaders.resuming = matches!(step, Step::Levels(_));
+            if step == Step::NewGame && !app.shaders.newgame_no_list {
+                app.shaders.newgame_no_list = true;
+                log(app, "the new game runs again without its background compiles: the compute step makes them");
+            }
             if begin(app, step) {
                 return;
             }
@@ -1757,7 +1821,10 @@ pub fn tick(app: &mut App) {
                 return;
             }
         }
-        app.shaders.last_failed = failed && !compiler_crash;
+        // (Only the self-play's and the compute step's failures chain: a store check that failed
+        // had ended the next step at its first failure, at every preparation on a PC whose check
+        // fails; the review of 2026-11-21 night.)
+        app.shaders.last_failed = failed && !compiler_crash && retryable;
         // (The step's time, for the estimate: a whole new game or part only.)
         if code == 0 {
             let secs = app.shaders.started.map_or(0.0, |s| s.elapsed().as_secs_f64());
