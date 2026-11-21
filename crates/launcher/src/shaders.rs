@@ -241,7 +241,9 @@ fn wait_probe() {
 /// choice or the player's, does not run beside it). Nothing when none was started.
 pub fn settle_probe(app: &mut App) {
     use std::sync::atomic::Ordering::Relaxed;
-    if PROBE_STARTED.load(Relaxed) && !PROBE_HANDLED.load(Relaxed) {
+    // (A probe not started yet runs now when it is due: Play's own wait may have come before the
+    // translation check answered; the review of 2026-11-21.)
+    if !PROBE_HANDLED.load(Relaxed) {
         ensure_probe(app);
     }
 }
@@ -557,6 +559,12 @@ pub struct Page {
     killed_at: Option<Instant>,
     /// The preparation was stopped for a low battery (`tick`): the page says so.
     battery_stop: bool,
+    /// Low battery readings in a row while a step runs (`tick`: three, 1.5 s, stop it).
+    battery_low: u8,
+    /// Play started the game without preparing, on battery (`note_battery`): the page and the
+    /// status line after the game say so while the PC is still on battery and nothing is
+    /// prepared (the review of 2026-11-21: the status line's note was replaced at once).
+    battery_note: bool,
 }
 
 /// The battery's charge at which a preparation does not begin or stops (an hour of the PC's full
@@ -569,7 +577,15 @@ const BATTERY_NOTE: &str = "The PC runs on battery, so the shaders are prepared 
 /// load would come before it), and the page says how to prepare later.
 pub fn note_battery(app: &mut App, pct: u8) {
     log(app, &format!("preparation not begun on Play: the PC runs on battery ({pct}%)"));
+    app.shaders.battery_note = true;
     app.set_status(BATTERY_NOTE);
+    refresh(app);
+}
+
+/// The battery note while it holds: Play left the shaders unprepared on battery, the PC is still
+/// on battery and nothing is prepared.
+pub fn battery_note(app: &App) -> Option<&'static str> {
+    (app.shaders.battery_note && sys::battery().is_some() && !state(app).0).then_some(BATTERY_NOTE)
 }
 
 fn h(v: usize) -> HWND {
@@ -999,6 +1015,7 @@ pub fn refresh(app: &mut App) {
         return;
     }
     let (_, text) = state(app);
+    let text = battery_note(app).map_or(text, str::to_string);
     unsafe {
         ui::set_text(h(app.shaders.status), &text);
         ui::show(h(app.shaders.bar), false);
@@ -1115,6 +1132,8 @@ pub fn start(app: &mut App, play_after: bool) {
     app.shaders.stalled = false;
     app.shaders.last_failed = false;
     app.shaders.battery_stop = false;
+    app.shaders.battery_low = 0;
+    app.shaders.battery_note = false;
     log(
         app,
         &format!(
@@ -1284,8 +1303,15 @@ pub fn tick(app: &mut App) {
     let step = app.shaders.step.unwrap_or(Step::Compute);
     // (The battery low while the PC runs on it: the step stops after what it compiles now, and the
     // next preparation goes on from there.)
-    if exited.is_none() && app.shaders.stopping.is_none() && !app.shaders.battery_stop {
-        if let Some(pct) = sys::battery().filter(|&p| p <= BATTERY_LOW) {
+    // (Three low readings in a row, 1.5 s: a reading that flickers, a dock renegotiating, does not
+    // end the preparation. Not when the step is stopping already for a game started meanwhile
+    // (its stop file): that pause stays a pause, and Play's game is not started beside it; the
+    // review of 2026-11-21.)
+    let low = sys::battery().filter(|&p| p <= BATTERY_LOW);
+    app.shaders.battery_low = if low.is_some() { app.shaders.battery_low.saturating_add(1) } else { 0 };
+    let stop_file = progress_file(app).with_extension("stop").exists();
+    if exited.is_none() && app.shaders.stopping.is_none() && !app.shaders.battery_stop && app.shaders.battery_low >= 3 && !stop_file {
+        if let Some(pct) = low {
             app.shaders.battery_stop = true;
             log(app, &format!("step {step:?}: the battery is at {pct}%: stopped"));
             // (A preparation Play began: the game starts once the step has stopped.)

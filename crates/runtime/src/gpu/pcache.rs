@@ -55,6 +55,8 @@ const SHARED_MIN: usize = 1 << 20;
 static PB: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 /// Binary files of other code under a pipeline's key (made again).
 static PB_STALE: AtomicU64 = AtomicU64::new(0);
+/// Stored binaries made under another global key (the driver's: a store it no longer takes).
+static PB_OTHER_KEY: AtomicU64 = AtomicU64::new(0);
 
 /// File header of data stored without its shared block: the magic, the
 /// block's offset and length (u32 each) and its hash (u64), then the data
@@ -868,6 +870,7 @@ fn decode_pb(b: &[u8], global: &[u8], fp: u64) -> Option<Vec<super::vk::pbin::Pa
     };
     let gl = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
     if take(gl)? != global {
+        PB_OTHER_KEY.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     if u64::from_le_bytes(take(8)?.try_into().ok()?) != fp {
@@ -1127,7 +1130,7 @@ pub fn pb_check(phase: &str) -> i32 {
         let fp = fingerprint(&[&code, &[k]]);
         // (This mode's file only: one the other mode left says nothing about this one.)
         let stored_before = stored_cheap('q', key);
-        let pb = [PB[0].load(Ordering::Relaxed), PB[2].load(Ordering::Relaxed)];
+        let pb = [PB[0].load(Ordering::Relaxed), PB[2].load(Ordering::Relaxed), PB_OTHER_KEY.load(Ordering::Relaxed)];
         let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
         // (Cache data read: the driver must serve it without compiling, else the pipeline is not
         // made at all: pipelineCreationCacheControl.)
@@ -1154,9 +1157,12 @@ pub fn pb_check(phase: &str) -> i32 {
             _ if !read => "made",
             (Ok(_), true) if from_bins => "from its binaries",
             (Ok(_), true) if refused => "its binaries refused, compiled again",
-            // (Stored, but not for this driver's key or the pipeline's fingerprint: stale, not
-            // missing; the review of 2026-11-21.)
-            (Ok(_), true) if stored_before => "its stored binaries did not serve it, compiled again",
+            // (Stored under another key of the driver's: the store is stale, as when refused. Stored
+            // but for another fingerprint (the check's kernel changed in a new version) or damaged:
+            // the check's own file is what does not hold, so it counts as not stored; the reviews
+            // of 2026-11-21.)
+            (Ok(_), true) if stored_before && PB_OTHER_KEY.load(Ordering::Relaxed) > pb[2] => "its stored binaries are for another driver key, compiled again",
+            (Ok(_), true) if stored_before => "its stored file is stale or damaged, compiled",
             (Ok(_), true) => "no binaries stored, compiled",
             (Ok(_), false) => "served by its cache data",
             (Err(e), _) if e.contains("DEVICE_LOST") => "the device lost",
@@ -1175,7 +1181,7 @@ pub fn pb_check(phase: &str) -> i32 {
         if read {
             match outcome {
                 "from its binaries" | "served by its cache data" => served += 1,
-                "no binaries stored, compiled" | "no cache data stored" => missing += 1,
+                "no binaries stored, compiled" | "no cache data stored" | "its stored file is stale or damaged, compiled" => missing += 1,
                 "the device lost" | "failed" => {}
                 _ => compiled += 1,
             }

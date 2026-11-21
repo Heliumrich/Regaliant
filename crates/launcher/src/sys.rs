@@ -255,10 +255,13 @@ pub fn battery() -> Option<u8> {
     }
     use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
     let mut s: SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };
-    if unsafe { GetSystemPowerStatus(&mut s) } == 0 || s.ACLineStatus != 0 {
+    // (No system battery (flag 128) or an unknown level (255): taken as mains power, as a PC or a
+    // virtual machine may report its power source offline without a battery; the review of
+    // 2026-11-21.)
+    if unsafe { GetSystemPowerStatus(&mut s) } == 0 || s.ACLineStatus != 0 || s.BatteryFlag & 128 != 0 || s.BatteryLifePercent > 100 {
         return None;
     }
-    Some(s.BatteryLifePercent.min(100))
+    Some(s.BatteryLifePercent)
 }
 
 /// Mains or battery, and the battery saver (the launcher's log: a laptop on battery prepares

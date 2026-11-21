@@ -261,7 +261,7 @@ fn game_exited(app: &mut App, code: i32) {
         ui::redraw(app.hwnd);
     }
     match code {
-        0 => app.set_status(""),
+        0 => app.set_status(shaders::battery_note(app).unwrap_or("")),
         EXIT_GAME_FILES => app.set_status("The game could not use its game files. The Game page shows why."),
         EXIT_NO_GPU => app.set_status("The game could not start the graphics card. Restart Windows, or update the graphics driver."),
         EXIT_CPU | EXIT_DEVICE_LOST | EXIT_MEMORY | EXIT_RUNNING | EXIT_EARLY | 0xD500..=0xD5FF => app.set_status(&format!("The game stopped with an error (code {code:#x}). Open logs shows its log.")),
