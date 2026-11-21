@@ -32,6 +32,7 @@ player's own game files on Windows.
   more, and when preparing cannot finish on a PC (no usable graphics card, a full drive, steps
   that keep failing) the launcher says why and Play starts the game. An interrupted preparation
   goes on where it stopped, and after a graphics driver or port update only the compile is done
-  again.
+  again. Some graphics drivers stop taking prepared shaders after Windows events. The launcher
+  notices this when it starts and compiles them again.
 - Trophies as achievements with a pop-up and a list.
 - Saves are backed up before each session changes them.

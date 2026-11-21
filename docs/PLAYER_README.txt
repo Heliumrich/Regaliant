@@ -120,8 +120,10 @@ The launcher
   first time it needs it. An object can then be missing for a moment, and some compiles make
   play stutter. Prepared shaders make the stutters much shorter, but some remain on first
   visits. They hold for one graphics card and driver. After a graphics driver update or a port
-  update, the launcher compiles them again without the game playing again. If preparing cannot
-  finish on your PC, the Shaders page says why, and Play starts the game.
+  update, the launcher compiles them again without the game playing again. Some drivers stop
+  taking prepared shaders after Windows events. The launcher notices this when it starts and
+  compiles them again too. If preparing cannot finish on your PC, the Shaders page says why,
+  and Play starts the game.
 - Saves: the save folder and the backups the game makes. The game copies each save before a
   session first changes it. "Restore..." puts a backup back. The save as it is now is kept
   as a backup first.
