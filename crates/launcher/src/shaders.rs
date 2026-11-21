@@ -1240,7 +1240,9 @@ pub fn tick(app: &mut App) {
         // begun once more; when the step before failed too, it keeps failing on this PC and the
         // preparation ends there, the player told and let play: until 2026-11-20 a PC on which
         // every step hung waited for each of them, twice.)
-        let failed = !stopped && worth_retry(code);
+        // (A new game that could not go on runs once more too: the levels need its save, and its
+        // menus' navigation can slip, 2026-11-21: once in about fifteen new games.)
+        let failed = !stopped && (worth_retry(code) || (step == Step::NewGame && code == 13 && !app.shaders.crash_retried.contains(&step)));
         if failed && app.shaders.last_failed {
             record_outcome(app, &format!("its steps kept failing, the last because {why}"));
             finish(app, None);

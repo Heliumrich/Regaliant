@@ -4490,9 +4490,442 @@ fn translate_one(tr: &mut T, ins: &Inst) -> R<()> {
     }
 }
 
+/// A spec as one line of words and back (`to_words`, `from_words`): every field in order, the
+/// flags as one mask. The runtime's learned store keeps the exact key spec of each compute
+/// pipeline a session made this way, so that its compute step can make all of them again after a
+/// driver update or a refused store (2026-11-21: the learned specs, five fields, could not name
+/// batched programs' address variants, LOD-statistics variants or every buffer-format mix, and a
+/// store the compute step made again left ~330 compute pipelines to first sessions). Both take
+/// every field by name: a field added to `Spec` fails to compile here until it is written too.
+impl Spec {
+    pub fn to_words(&self) -> String {
+        let Spec {
+            stage,
+            user_sgprs,
+            user_base,
+            code_base,
+            wave64,
+            ps_input_addr,
+            ps_inputs,
+            barycentric,
+            bary_gs,
+            mrt,
+            cs_local_size,
+            cs_rsrc2,
+            resources,
+            binding_base,
+            probe,
+            dump,
+            force_dispatcher,
+            dispatcher_for_loops,
+            dom_nest,
+            reg_vars,
+            lane_guards,
+            mip_views,
+            lod_stats,
+            lod_lean,
+            early_tests,
+            early_ok,
+            per_lane,
+            lane_votes,
+            lockstep_off,
+            sg_waves,
+            sg_appends,
+            known_active,
+            hw_bounds,
+            base_instance_sgpr,
+            sgpr_pc,
+            addresses,
+            batched,
+            write_marks,
+            marks_untouched,
+            touch_test,
+            mark_twice,
+            touch_twice,
+            part_twice,
+            dep_loads,
+            marks_part,
+            marks_held,
+            sgpr_ubo,
+            gpu_loads,
+            gpu_res,
+            pt_linear,
+            outlier,
+        } = self;
+        let flags = [
+            *wave64,
+            *barycentric,
+            *bary_gs,
+            *force_dispatcher,
+            *dispatcher_for_loops,
+            *dom_nest,
+            *reg_vars,
+            *lane_guards,
+            *mip_views,
+            *lod_stats,
+            *lod_lean,
+            *early_tests,
+            *early_ok,
+            *per_lane,
+            *lane_votes,
+            *lockstep_off,
+            *sg_waves,
+            *sg_appends,
+            *known_active,
+            *hw_bounds,
+            *addresses,
+            *batched,
+            *write_marks,
+            *marks_untouched,
+            *touch_test,
+            *mark_twice,
+            *touch_twice,
+            *part_twice,
+            *dep_loads,
+            *marks_part,
+            *marks_held,
+            *pt_linear,
+        ];
+        let mask: u64 = flags.iter().enumerate().fold(0, |m, (i, &f)| m | (f as u64) << i);
+        let opt = |o: Option<String>| o.unwrap_or_else(|| "-".into());
+        let mut w: Vec<String> = vec![
+            "s1".into(),
+            match stage {
+                Stage::Vertex => "v",
+                Stage::Fragment => "f",
+                Stage::Compute => "c",
+            }
+            .into(),
+            user_sgprs.to_string(),
+            user_base.to_string(),
+            format!("{code_base:x}"),
+            ps_input_addr.to_string(),
+            format!("{mask:x}"),
+            format!("{},{},{}", cs_local_size[0], cs_local_size[1], cs_local_size[2]),
+            cs_rsrc2.to_string(),
+            binding_base.to_string(),
+            opt(probe.map(|(a, b)| format!("{a},{b}"))),
+            opt(dump.map(|(a, b)| format!("{a},{},{},{}", b[0], b[1], b[2]))),
+            opt(base_instance_sgpr.map(|v| v.to_string())),
+            opt(sgpr_pc.map(|v| v.to_string())),
+            sgpr_ubo.to_string(),
+            format!("{gpu_loads:x}"),
+            format!("{gpu_res:x}"),
+            opt(outlier.map(|(a, b)| format!("{a},{b:x}"))),
+        ];
+        w.push(mrt.iter().map(|m| format!("{}.{}", m.export_format, m.class)).collect::<Vec<_>>().join(","));
+        w.push(if ps_inputs.is_empty() {
+            "-".into()
+        } else {
+            ps_inputs.iter().map(|i| format!("{}.{}.{}", i.param, i.flat as u8, i.default.map_or("-".into(), |d| d.to_string()))).collect::<Vec<_>>().join(",")
+        });
+        let dim = |d: ImageDim| match d {
+            ImageDim::D1 => 0,
+            ImageDim::D2 => 1,
+            ImageDim::D3 => 2,
+            ImageDim::Cube => 3,
+            ImageDim::D1Array => 4,
+            ImageDim::D2Array => 5,
+            ImageDim::D2Msaa => 6,
+            ImageDim::D2MsaaArray => 7,
+            ImageDim::CubeArray => 8,
+            ImageDim::D3OrD2 => 9,
+        };
+        let class = |c: NumClass| match c {
+            NumClass::Float => 0,
+            NumClass::Sint => 1,
+            NumClass::Uint => 2,
+        };
+        w.push(if resources.is_empty() {
+            "-".into()
+        } else {
+            resources
+                .iter()
+                .map(|r| match r {
+                    ResSpec::Buffer { format, dst_sel } => format!("b{format}.{dst_sel}"),
+                    ResSpec::Image { dim: d, class: c, depth } => format!("i{}.{}.{}", dim(*d), class(*c), *depth as u8),
+                    ResSpec::Sampler => "s".into(),
+                    ResSpec::Global => "g".into(),
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        });
+        w.join(" ")
+    }
+
+    pub fn from_words(line: &str) -> Option<Spec> {
+        let mut t = line.split_whitespace();
+        if t.next()? != "s1" {
+            return None;
+        }
+        let stage = match t.next()? {
+            "v" => Stage::Vertex,
+            "f" => Stage::Fragment,
+            "c" => Stage::Compute,
+            _ => return None,
+        };
+        let user_sgprs: u16 = t.next()?.parse().ok()?;
+        let user_base: u16 = t.next()?.parse().ok()?;
+        let code_base = u64::from_str_radix(t.next()?, 16).ok()?;
+        let ps_input_addr: u32 = t.next()?.parse().ok()?;
+        let mask = u64::from_str_radix(t.next()?, 16).ok()?;
+        let f = |i: u32| mask >> i & 1 == 1;
+        let ls: Vec<u32> = t.next()?.split(',').map(|v| v.parse().ok()).collect::<Option<Vec<u32>>>()?;
+        if ls.len() != 3 {
+            return None;
+        }
+        let cs_rsrc2: u32 = t.next()?.parse().ok()?;
+        let binding_base: u32 = t.next()?.parse().ok()?;
+        let opt = |w: &str| if w == "-" { None } else { Some(w.to_string()) };
+        let nums = |w: &str| w.split(',').map(|v| v.parse::<u32>().ok()).collect::<Option<Vec<u32>>>();
+        let probe = match opt(t.next()?) {
+            None => None,
+            Some(v) => {
+                let n = nums(&v)?;
+                if n.len() != 2 {
+                    return None;
+                }
+                Some((n[0], n[1]))
+            }
+        };
+        let dump = match opt(t.next()?) {
+            None => None,
+            Some(v) => {
+                let n = nums(&v)?;
+                if n.len() != 4 {
+                    return None;
+                }
+                Some((n[0], [n[1], n[2], n[3]]))
+            }
+        };
+        let base_instance_sgpr = match opt(t.next()?) {
+            None => None,
+            Some(v) => Some(v.parse::<u16>().ok()?),
+        };
+        let sgpr_pc = match opt(t.next()?) {
+            None => None,
+            Some(v) => Some(v.parse::<u32>().ok()?),
+        };
+        let sgpr_ubo: u8 = t.next()?.parse().ok()?;
+        let gpu_loads = u64::from_str_radix(t.next()?, 16).ok()?;
+        let gpu_res = u64::from_str_radix(t.next()?, 16).ok()?;
+        let outlier = match opt(t.next()?) {
+            None => None,
+            Some(v) => {
+                let (a, b) = v.split_once(',')?;
+                Some((a.parse::<u32>().ok()?, u64::from_str_radix(b, 16).ok()?))
+            }
+        };
+        let mrt_w: Vec<&str> = t.next()?.split(',').collect();
+        if mrt_w.len() != 8 {
+            return None;
+        }
+        let mut mrt = [MrtSpec::default(); 8];
+        for (m, w) in mrt.iter_mut().zip(mrt_w) {
+            let (a, b) = w.split_once('.')?;
+            *m = MrtSpec { export_format: a.parse().ok()?, class: b.parse().ok()? };
+        }
+        let ps_w = t.next()?;
+        let ps_inputs = if ps_w == "-" {
+            Vec::new()
+        } else {
+            ps_w.split(',')
+                .map(|w| {
+                    let mut p = w.split('.');
+                    let param: u8 = p.next()?.parse().ok()?;
+                    let flat = p.next()? == "1";
+                    let d = p.next()?;
+                    let default = if d == "-" { None } else { Some(d.parse::<u8>().ok()?) };
+                    Some(PsInput { param, flat, default })
+                })
+                .collect::<Option<Vec<_>>>()?
+        };
+        let res_w = t.next()?;
+        let dim = |v: u32| {
+            Some(match v {
+                0 => ImageDim::D1,
+                1 => ImageDim::D2,
+                2 => ImageDim::D3,
+                3 => ImageDim::Cube,
+                4 => ImageDim::D1Array,
+                5 => ImageDim::D2Array,
+                6 => ImageDim::D2Msaa,
+                7 => ImageDim::D2MsaaArray,
+                8 => ImageDim::CubeArray,
+                9 => ImageDim::D3OrD2,
+                _ => return None,
+            })
+        };
+        let class = |v: u32| {
+            Some(match v {
+                0 => NumClass::Float,
+                1 => NumClass::Sint,
+                2 => NumClass::Uint,
+                _ => return None,
+            })
+        };
+        let resources = if res_w == "-" {
+            Vec::new()
+        } else {
+            res_w
+                .split(',')
+                .map(|w| {
+                    if w == "s" {
+                        return Some(ResSpec::Sampler);
+                    }
+                    if w == "g" {
+                        return Some(ResSpec::Global);
+                    }
+                    if let Some(b) = w.strip_prefix('b') {
+                        let (a, d) = b.split_once('.')?;
+                        return Some(ResSpec::Buffer { format: a.parse().ok()?, dst_sel: d.parse().ok()? });
+                    }
+                    let i = w.strip_prefix('i')?;
+                    let n = i.split('.').map(|v| v.parse::<u32>().ok()).collect::<Option<Vec<u32>>>()?;
+                    if n.len() != 3 {
+                        return None;
+                    }
+                    Some(ResSpec::Image { dim: dim(n[0])?, class: class(n[1])?, depth: n[2] == 1 })
+                })
+                .collect::<Option<Vec<_>>>()?
+        };
+        if t.next().is_some() {
+            return None;
+        }
+        Some(Spec {
+            stage,
+            user_sgprs,
+            user_base,
+            code_base,
+            wave64: f(0),
+            ps_input_addr,
+            ps_inputs,
+            barycentric: f(1),
+            bary_gs: f(2),
+            mrt,
+            cs_local_size: [ls[0], ls[1], ls[2]],
+            cs_rsrc2,
+            resources,
+            binding_base,
+            probe,
+            dump,
+            force_dispatcher: f(3),
+            dispatcher_for_loops: f(4),
+            dom_nest: f(5),
+            reg_vars: f(6),
+            lane_guards: f(7),
+            mip_views: f(8),
+            lod_stats: f(9),
+            lod_lean: f(10),
+            early_tests: f(11),
+            early_ok: f(12),
+            per_lane: f(13),
+            lane_votes: f(14),
+            lockstep_off: f(15),
+            sg_waves: f(16),
+            sg_appends: f(17),
+            known_active: f(18),
+            hw_bounds: f(19),
+            base_instance_sgpr,
+            sgpr_pc,
+            addresses: f(20),
+            batched: f(21),
+            write_marks: f(22),
+            marks_untouched: f(23),
+            touch_test: f(24),
+            mark_twice: f(25),
+            touch_twice: f(26),
+            part_twice: f(27),
+            dep_loads: f(28),
+            marks_part: f(29),
+            marks_held: f(30),
+            sgpr_ubo,
+            gpu_loads,
+            gpu_res,
+            pt_linear: f(31),
+            outlier,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Spec::to_words` and `from_words`: every field away from its default comes back.
+    #[test]
+    fn spec_words_round_trip() {
+        let mut s = cs_spec([16, 4, 2]);
+        let mut flip = 0u32;
+        let mut b = || {
+            flip += 1;
+            flip % 3 != 0
+        };
+        s.stage = Stage::Compute;
+        s.user_sgprs = 12;
+        s.user_base = 3;
+        s.code_base = 0x10_0889_a200;
+        s.wave64 = b();
+        s.ps_input_addr = 0x7f;
+        s.ps_inputs = vec![PsInput { param: 3, flat: true, default: None }, PsInput { param: 7, flat: false, default: Some(2) }];
+        s.barycentric = b();
+        s.bary_gs = b();
+        s.mrt[0] = MrtSpec { export_format: 4, class: 2 };
+        s.mrt[7] = MrtSpec { export_format: 9, class: 1 };
+        s.cs_rsrc2 = 0x8984;
+        s.resources = vec![
+            ResSpec::Buffer { format: 20, dst_sel: 4 },
+            ResSpec::Image { dim: ImageDim::D2Array, class: NumClass::Uint, depth: true },
+            ResSpec::Image { dim: ImageDim::D3OrD2, class: NumClass::Sint, depth: false },
+            ResSpec::Sampler,
+            ResSpec::Global,
+        ];
+        s.binding_base = 5;
+        s.probe = Some((3, 9));
+        s.dump = Some((1, [2, 3, 4]));
+        s.force_dispatcher = b();
+        s.dispatcher_for_loops = b();
+        s.dom_nest = b();
+        s.reg_vars = b();
+        s.lane_guards = b();
+        s.mip_views = b();
+        s.lod_stats = b();
+        s.lod_lean = b();
+        s.early_tests = b();
+        s.early_ok = b();
+        s.per_lane = b();
+        s.lane_votes = b();
+        s.lockstep_off = b();
+        s.sg_waves = b();
+        s.sg_appends = b();
+        s.known_active = b();
+        s.hw_bounds = b();
+        s.base_instance_sgpr = Some(6);
+        s.sgpr_pc = Some(0x140);
+        s.addresses = b();
+        s.batched = b();
+        s.write_marks = b();
+        s.marks_untouched = b();
+        s.touch_test = b();
+        s.mark_twice = b();
+        s.touch_twice = b();
+        s.part_twice = b();
+        s.dep_loads = b();
+        s.marks_part = b();
+        s.marks_held = b();
+        s.sgpr_ubo = 7;
+        s.gpu_loads = 0xdead_beef_0000_1234;
+        s.gpu_res = 0x55;
+        s.pt_linear = b();
+        s.outlier = Some((11, 0xabc));
+        let w = s.to_words();
+        assert_eq!(Spec::from_words(&w).as_ref(), Some(&s), "{w}");
+        // The defaults too, and every flag on in turn (the mask's bits stay apart).
+        let d = cs_spec([8, 8, 1]);
+        assert_eq!(Spec::from_words(&d.to_words()).as_ref(), Some(&d));
+        assert!(Spec::from_words("s1 c 2").is_none());
+        assert!(Spec::from_words(&format!("{w} extra")).is_none());
+    }
 
     fn cs_spec(local: [u32; 3]) -> Spec {
         Spec {

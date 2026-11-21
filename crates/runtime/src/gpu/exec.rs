@@ -3494,6 +3494,7 @@ fn compute_pipe_create(tr: &super::shaders::Translated, addr: u64, push_mode: bo
     let t0 = std::time::Instant::now();
     let pipe = compute_pipeline(&tr.out, push_mode, Some(key))?;
     super::compile::note_program(addr);
+    super::precompile::note_compute_pipeline(addr, tr);
     PIPES_CREATED[0].fetch_add(1, Ordering::Relaxed);
     PIPES_NS[0].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     if pipe.push {

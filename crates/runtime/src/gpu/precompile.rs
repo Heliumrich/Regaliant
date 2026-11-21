@@ -218,6 +218,7 @@ fn load() {
     DONE_LOADING.call_once(|| {
         let mut m: HashMap<u64, (u32, Vec<Seen>)> = HashMap::new();
         let mut g = GfxLearned::default();
+        let mut exact: HashMap<(u64, u64), Spec> = HashMap::new();
         // (Read as text even with bytes that are not: a write cut by a power loss; such lines are
         // passed, the rest read.)
         if let Some(text) = STORE.get().and_then(|p| std::fs::read(p).ok()).map(|b| String::from_utf8_lossy(&b).into_owned()) {
@@ -227,6 +228,22 @@ fn load() {
                     if g.set.insert(r.clone()) {
                         add_recipe(&mut g, rank, r);
                         STATS[LOADED].fetch_add(1, Ordering::Relaxed);
+                    }
+                } else if let Some(rest) = line.strip_prefix("K ") {
+                    // (A compute pipeline's exact key spec, `note_compute_pipeline`: kept under the
+                    // hash its words give; one recorded under another counted, a sign that the
+                    // spec's words or the hasher changed.)
+                    let mut w = rest.splitn(3, ' ');
+                    if let (Some(Ok(h)), Some(Ok(sh)), Some(Some(spec))) = (w.next().map(|v| u64::from_str_radix(v, 16)), w.next().map(|v| u64::from_str_radix(v, 16)), w.next().map(Spec::from_words)) {
+                        let got = spec_hash_of(&spec);
+                        if got != sh {
+                            EXACT_STATS[2].fetch_add(1, Ordering::Relaxed);
+                        }
+                        if exact.insert((h, got), spec).is_none() {
+                            EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
+                        }
+                    } else {
+                        EXACT_STATS[3].fetch_add(1, Ordering::Relaxed);
                     }
                 } else if let Some((h, s)) = parse(line).filter(|(_, s)| local_ok(s.local)) {
                     let v = &mut m.entry(h).or_insert_with(|| (rank, Vec::new())).1;
@@ -250,7 +267,60 @@ fn load() {
         *LEARNED.lock() = Some(m);
         *GFX.lock() = Some(g);
         *CODES.lock() = Some(codes);
+        *EXACT.lock() = Some(exact);
     });
+}
+
+/// The exact key specs of the compute pipelines sessions made (`note_compute_pipeline`), by (code
+/// hash, spec hash): the store's `K` lines. [loaded, kept this session, loaded under another hash,
+/// lines not read].
+static EXACT: Mutex<Option<HashMap<(u64, u64), Spec>>> = Mutex::new(None);
+pub(crate) static EXACT_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// A spec's hash as pipeline keys take it.
+fn spec_hash_of(s: &Spec) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// A compute pipeline this session made (`exec::compute_pipe_create`, at a dispatch, in the
+/// background or ahead): its exact key spec kept once, with its program's code, so that the
+/// compute step makes it again after a driver update, a version that translates differently or a
+/// store the driver refuses (`exact_work`). Until 2026-11-21 only the learned specs were kept, and
+/// they cannot name batched programs' address variants, LOD-statistics variants or every
+/// buffer-format mix: a store the compute step made again left ~330 compute pipelines to the first
+/// session. The compute step's own pipelines (no program address) are not kept.
+pub(crate) fn note_compute_pipeline(addr: u64, tr: &super::shaders::Translated) {
+    if addr == 0 || tr.spec.stage != rdna::translate::Stage::Compute || !local_ok(tr.spec.cs_local_size) {
+        return;
+    }
+    load();
+    let sh = spec_hash_of(&tr.spec);
+    let plan_key = tr.key ^ sh.rotate_left(1);
+    let h = plan_key ^ (tr.spec.user_sgprs as u64) << 48 ^ (tr.spec.user_base as u64) << 56;
+    {
+        let mut g = EXACT.lock();
+        let m = g.get_or_insert_with(HashMap::new);
+        if m.contains_key(&(h, sh)) {
+            return;
+        }
+        m.insert((h, sh), tr.spec.clone());
+    }
+    keep_code(addr, h);
+    if !CODES.lock().as_ref().is_some_and(|c| c.contains_key(&h)) {
+        return;
+    }
+    EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
+    store_line(&format!("K {h:016x} {sh:016x} {}\n", tr.spec.to_words()));
+}
+
+/// The exact key specs sessions made whose program's code is kept (`--precompile-all`'s list).
+pub(crate) fn exact_work() -> Vec<(u64, std::sync::Arc<Vec<u32>>, Spec)> {
+    load();
+    let codes = CODES.lock().clone().unwrap_or_default();
+    EXACT.lock().as_ref().map(|m| m.iter().filter_map(|((h, _), s)| Some((*h, codes.get(h)?.clone(), s.clone()))).collect()).unwrap_or_default()
 }
 
 /// The code file's records ([code hash, word count, words], appended): each taken when its words

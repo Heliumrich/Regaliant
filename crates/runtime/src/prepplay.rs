@@ -851,6 +851,10 @@ impl Play {
             return Err(End::Failed("no character creation".into()));
         }
         self.step("character creation");
+        // (Its save is looked for from here: 2026-11-21 the cursor reached Finalise an entry early
+        // once, the character was saved 10 s before the Finalise press below, and the wait after
+        // that press found no save.)
+        let created_from = self.w.mark();
         self.sleep(3.0)?;
         // The entries below the name: class, gift, saved creations, foundation, appearance,
         // Finalise. Each but the saved creations is opened (Cross), changed (Right) and left
@@ -876,7 +880,10 @@ impl Play {
         let m = self.w.mark();
         self.press("cross", 300);
         if !self.wait_for("committed [\"SAVEDATA0PlayerProfile0\"]", m, 60.0)? {
-            return Err(End::Failed("the character was not saved".into()));
+            if !self.w.found("committed [\"SAVEDATA0PlayerProfile0\"]", created_from) {
+                return Err(End::Failed("the character was not saved".into()));
+            }
+            crate::warn!("prepare-play: the character was saved before the Finalise press (the cursor reached it early): going on");
         }
         // The opening cinematic, skipped (a prerecorded movie: its few pipelines are the attract
         // movie's; ~2.5 minutes).

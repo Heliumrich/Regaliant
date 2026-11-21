@@ -895,6 +895,22 @@ fn work_list(app: &std::path::Path, threads: usize) -> (Vec<Prog>, Vec<(usize, u
         progs.extend(extra);
     }
     let learned_n = progs.len() - guessed;
+    // The exact key specs sessions made (`precompile::exact_work`): every compute pipeline the game
+    // itself made, the variants the learned specs cannot name among them.
+    let exact_n = {
+        let have: std::collections::HashSet<(u64, u64)> = progs.iter().map(|p| (p.0, spec_hash(&p.2))).collect();
+        let mut extra: Vec<(u64, std::sync::Arc<Vec<u32>>, rdna::translate::Spec, usize)> = Vec::new();
+        for (h, code, spec) in super::precompile::exact_work() {
+            if !have.contains(&(h, spec_hash(&spec))) {
+                let n = code.len();
+                extra.push((h, code, spec, n));
+            }
+        }
+        extra.sort_by(|a, b| b.3.cmp(&a.3));
+        let n = extra.len();
+        progs.extend(extra);
+        n
+    };
     // (`DS_PRECOMPILE_LIMIT=<n>`, a test: the list cut to its first n compute items and n
     // graphics ones, before those stored are left out: a whole preparation's flow in minutes.)
     let mut recipes = recipes;
@@ -913,7 +929,7 @@ fn work_list(app: &std::path::Path, threads: usize) -> (Vec<Prog>, Vec<(usize, u
     let gfx_words: usize = recipes.iter().map(|r| r.1).sum();
     let total_words: usize = progs.iter().map(|p| p.3).sum::<usize>() + gfx_words;
     crate::info!(
-        "precompile all: {} compute pipelines left to make ({} code words; {held} of the {listed} listed held by the store already; the engine's image variants {} of the listed, {} words; the player's learned specs {learned_n}) and {} learned graphics pipelines on {threads} threads",
+        "precompile all: {} compute pipelines left to make ({} code words; {held} of the {listed} listed held by the store already; the engine's image variants {} of the listed, {} words; the player's learned specs {learned_n}, the exact specs sessions made {exact_n} more) and {} learned graphics pipelines on {threads} threads",
         progs.len(),
         total_words - gfx_words,
         variants[0],
