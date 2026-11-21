@@ -4995,7 +4995,7 @@ impl Images {
     }
 
     /// `note_meta_writes` for the writes of a fill of [base, base+len) whose `note_meta_fill`
-    /// follows: the metadata the fill answers for (the same surface, metadata and layers) is
+    /// follows (`fill_note_mode`): the metadata the fill answers for (the same surface, metadata and layers) is
     /// left to the fill, its stored value known. Noted first as a write of unknown data, each
     /// layer's fill of a layered depth surface made the value its earlier layers' fills had
     /// given unknown (one value an image: `merge_clear`), so the surface's uses drained the GPU
@@ -5005,17 +5005,12 @@ impl Images {
         if self.meta_of.is_empty() {
             return;
         }
-        // (Off by default since 2026-11-21 evening: every write noted, the fill's own range too,
-        // as before 619c3a5. With the fill's own range left out, turning at 1-1's Start lost
-        // the world's geometry in alternate flips (12-39 large flashes a turn window, none
-        // without: FINDINGS.md 2026-11-21 evening), which outweighs the Gatehouse Hall's x1.16.
-        // `DS_FILL_NOTE_NEW=1`: left out, to find the image it breaks.)
-        static NEW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*NEW.get_or_init(|| std::env::var("DS_FILL_NOTE_NEW").ok().as_deref() == Some("1")) {
+        let mode = fill_note_mode();
+        if mode == 0 {
             self.note_meta_writes(writes);
             return;
         }
-        let filled = self.meta_reach(base, base.saturating_add(len), true);
+        let filled: Vec<_> = self.meta_reach(base, base.saturating_add(len), true).into_iter().filter(|(_, k, _)| left_to_fill(mode, k)).collect();
         for &(b, n) in writes {
             for (meta, key, layers) in self.meta_reach(b, b.saturating_add(n), false) {
                 if filled.iter().any(|&(m, k, l)| m == meta && k == key && l == layers) {
@@ -5039,7 +5034,12 @@ impl Images {
     pub fn notes_for(&self, writes: &[(u64, u64)], sized: &[(u64, u64)], fill: Option<((u64, u64), u32)>) -> (Vec<(ImageKey, u64, Option<u32>, u128)>, Vec<ImageKey>) {
         let mut clears = Vec::new();
         if !self.meta_of.is_empty() {
-            let filled = fill.map(|((base, len), _)| self.meta_reach(base, base.saturating_add(len), true)).unwrap_or_default();
+            let mode = fill_note_mode();
+            let filled: Vec<_> = if mode == 0 {
+                Vec::new()
+            } else {
+                fill.map(|((base, len), _)| self.meta_reach(base, base.saturating_add(len), true)).unwrap_or_default().into_iter().filter(|(_, k, _)| left_to_fill(mode, k)).collect()
+            };
             for &(b, n) in writes {
                 for (meta, key, layers) in self.meta_reach(b, b.saturating_add(n), false) {
                     if filled.iter().any(|&(m, k, l)| m == meta && k == key && l == layers) {
@@ -7307,5 +7307,31 @@ impl Images {
             remaps.join(", "),
             super::slab::status()
         ) + &zero_census_line()
+    }
+}
+
+/// How a fill dispatch's writes are noted against the fast clears' metadata
+/// (`note_meta_writes_but_fill`, `notes_for`; `DS_FILL_NOTE`): 0 every write noted, the fill's
+/// own range too (the default since 2026-11-21 evening); 1 the fill's own range left to the fill
+/// for layered (array) images only, whose per-layer fills of one value keep it known (the shadow
+/// atlas at 1-2's Gatehouse Hall, x1.16 there); 2 left to the fill for every image (619c3a5's;
+/// `DS_FILL_NOTE_NEW=1` too), with which turning at 1-1's Start lost the world's geometry in
+/// alternate flips (FINDINGS.md 2026-11-21 evening).
+pub fn fill_note_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        if std::env::var("DS_FILL_NOTE_NEW").ok().as_deref() == Some("1") {
+            return 2;
+        }
+        std::env::var("DS_FILL_NOTE").ok().and_then(|v| v.trim().parse::<u8>().ok()).filter(|&m| m <= 2).unwrap_or(0)
+    })
+}
+
+/// Whether a fill's own write over `key`'s metadata is left to the fill in `mode`.
+fn left_to_fill(mode: u8, key: &ImageKey) -> bool {
+    match mode {
+        2 => true,
+        1 => key.layers > 1 && !key.ty3d,
+        _ => false,
     }
 }
