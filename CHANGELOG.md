@@ -9,6 +9,8 @@
   Gatehouse Hall in Boletaria 1-2): those clears no longer wait for the graphics card.
 - Fewer crashes while shaders are prepared: a shader whose preparation crashed the graphics
   driver is not prepared ahead again.
+- No more flicker right after loading: the world no longer vanishes in every other frame for
+  a moment.
 
 ## 0.1.0
 

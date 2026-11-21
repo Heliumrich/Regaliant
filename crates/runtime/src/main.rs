@@ -1091,13 +1091,14 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 // `maskwait off|on` (A/B, `cullread`): the title's walks of
                 // its GPU frustum culling masks wait for the GPU's writes.
                 match parts.next().unwrap_or("") {
-                    v @ ("on" | "1" | "off" | "0") => {
-                        let on = matches!(v, "on" | "1");
+                    v @ ("on" | "1" | "off" | "0" | "sub") => {
+                        let on = v != "off" && v != "0";
                         cullread::MASK_WAIT_ON.store(on, std::sync::atomic::Ordering::Relaxed);
-                        info!("control: maskwait {} at flip {flip}", if on { "on" } else { "off" });
+                        cullread::MASK_WAIT_SUB.store(v == "sub", std::sync::atomic::Ordering::Relaxed);
+                        info!("control: maskwait {} at flip {flip}", if v == "sub" { "sub" } else if on { "on" } else { "off" });
                         Ok(())
                     }
-                    other => Err(format!("maskwait: on or off, not {other:?}")),
+                    other => Err(format!("maskwait: on, off or sub, not {other:?}")),
                 }
             }
             "c4" => {

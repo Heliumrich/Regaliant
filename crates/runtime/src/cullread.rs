@@ -139,8 +139,15 @@ pub fn status() -> String {
     if w[0] > 0 {
         out += &format!("    culling results read by the title: {} reads waited for the GPU's writes ({} ms in all, {} after 100 ms)\n", w[0], w[1] / 1000, w[2]);
     }
-    if m[0] > 0 {
-        out += &format!("    view masks walked by the title: {} walks waited for the GPU's writes ({} ms in all, {} after 100 ms)\n", m[0], m[1] / 1000, m[2]);
+    let s: Vec<u64> = MASK_SUB_WAITS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    if m[0] > 0 || s[0] > 0 {
+        out += &format!(
+            "    view masks walked by the title: {} walks waited for the GPU's writes ({} ms in all, {} after 100 ms){}\n",
+            m[0],
+            m[1] / 1000,
+            m[2],
+            if s[0] > 0 || s[3] > 0 { format!("; `maskwait sub`: {} blank walks waited for the graphics CP to take up earlier submissions ({} ms in all, {} given up), {} left alone as known empty passes", s[0], s[1] / 1000, s[2], s[3]) } else { String::new() }
+        );
     }
     let d: Vec<u64> = DECAL_WAITS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     if d[0] > 0 {
@@ -201,23 +208,94 @@ fn masks_of(set: u64, ctx: u64, slots: &[Option<u64>]) -> (Vec<(u64, u64)>, u64)
 /// Whether the walks wait (the `maskwait` control command; on by default).
 pub static MASK_WAIT_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
+/// `maskwait sub` (the default since 2026-11-21; `maskwait on` without it): a walk whose masks
+/// are all blank first waits for the graphics command processor to take up the title's earlier
+/// submissions (at most 100 ms), as `decalwait sub` does: a cull the title submitted that our
+/// command processor has not recorded yet has no GPU write in flight to wait for, and after a
+/// level load, where it runs behind, the walks read masks it has not written yet (frames with
+/// no world geometry in alternate flips: FINDINGS.md 2026-11-21 afternoon).
+pub static MASK_WAIT_SUB: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// The sub waits: [walks that waited, us, given up (100 ms, or the command processor waiting),
+/// blank walks left alone as known empty passes].
+static MASK_SUB_WAITS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
 /// Waits until the GPU work in flight that writes these masks has completed (at most 100 ms).
 fn wait_masks(masks: &[(u64, u64)]) {
     if !MASK_WAIT_ON.load(Ordering::Relaxed) {
         return;
     }
+    // (Only when every mask is blank, as a cull's output reads before it is written, and not
+    // for masks found blank once the CP had caught up and their writes landed (empty passes):
+    // waiting at every walk cost 2-4% turning at Castlewall, run -140027, and at every blank
+    // one ~2%, run -141101.)
+    let flip = crate::gpu::FRAMES.load(Ordering::Relaxed);
+    // (A write the graphics CP recorded and the GPU has not finished is waited for below: its
+    // cull is taken up. One already done may be the last frame's.)
+    let done = crate::gpu::exec::done_now();
+    let recorded = masks.iter().any(|&(m, n)| crate::gpu::exec::pending_writes(m, n).is_some_and(|s| s > done));
+    let sub = MASK_WAIT_SUB.load(Ordering::Relaxed) && !recorded && !masks.is_empty() && masks.iter().all(|&(m, n)| bytes_blank(m, n));
+    let sub = sub && {
+        let known = masks.iter().all(|&(m, _)| known_blank(m, flip));
+        if known {
+            MASK_SUB_WAITS[3].fetch_add(1, Ordering::Relaxed);
+        }
+        !known
+    };
+    // (Whether the CP had taken up every submission made before this walk: then a cull of this
+    // mask, if the title made one, is recorded, and its write is waited for below.)
+    let mut caught = false;
+    if sub {
+        let t = std::time::Instant::now();
+        match crate::gpu::wait_gfx_caught_up(std::time::Duration::from_millis(100)) {
+            None => caught = true,
+            Some(ok) => {
+                caught = ok;
+                MASK_SUB_WAITS[0].fetch_add(1, Ordering::Relaxed);
+                MASK_SUB_WAITS[1].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+                if !ok {
+                    MASK_SUB_WAITS[2].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
     let latest = masks.iter().filter_map(|&(m, n)| crate::gpu::exec::pending_writes(m, n)).max();
-    let Some(seq) = latest else { return };
-    if seq <= crate::gpu::exec::done_now() {
-        return;
+    if let Some(seq) = latest.filter(|&s| s > crate::gpu::exec::done_now()) {
+        let t = std::time::Instant::now();
+        let ok = crate::gpu::exec::wait_done_for(seq, std::time::Duration::from_millis(100));
+        MASK_WAITS[0].fetch_add(1, Ordering::Relaxed);
+        MASK_WAITS[1].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if !ok {
+            MASK_WAITS[2].fetch_add(1, Ordering::Relaxed);
+        }
     }
-    let t = std::time::Instant::now();
-    let ok = crate::gpu::exec::wait_done_for(seq, std::time::Duration::from_millis(100));
-    MASK_WAITS[0].fetch_add(1, Ordering::Relaxed);
-    MASK_WAITS[1].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-    if !ok {
-        MASK_WAITS[2].fetch_add(1, Ordering::Relaxed);
+    // (Still blank once the CP had taken up the submissions before the walk and the writes
+    // landed: an empty pass, known for a while. Requiring no backlog at all marked few in steady
+    // play, where the CP is rarely idle: run -142932.)
+    if sub && caught && masks.iter().all(|&(m, n)| bytes_blank(m, n)) {
+        for &(m, _) in masks {
+            note_known_blank(m, flip);
+        }
     }
+}
+
+/// Masks found blank once the graphics CP had caught up and their GPU writes had landed (empty
+/// passes), by a hash of the address: (address >> 4) << 20 | flip (20 bits). Such a mask walked
+/// blank again within KNOWN_BLANK_FLIPS waits for nothing (a collision only costs a wait).
+static KNOWN_BLANK: [AtomicU64; 4096] = [const { AtomicU64::new(0) }; 4096];
+const KNOWN_BLANK_FLIPS: u64 = 120;
+
+fn known_blank_slot(m: u64) -> &'static AtomicU64 {
+    &KNOWN_BLANK[((m >> 4).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 52) as usize]
+}
+
+fn known_blank(m: u64, flip: u64) -> bool {
+    let v = known_blank_slot(m).load(Ordering::Relaxed);
+    v != 0 && v >> 20 == (m >> 4) & ((1 << 44) - 1) && flip.wrapping_sub(v) & 0xF_FFFF <= KNOWN_BLANK_FLIPS
+}
+
+fn note_known_blank(m: u64, flip: u64) {
+    known_blank_slot(m).store(((m >> 4) & ((1 << 44) - 1)) << 20 | (flip & 0xF_FFFF), Ordering::Relaxed);
 }
 
 /// The static sections' projected decals (2026-11-20, the equipment menu's wall flicker): each
@@ -276,6 +354,15 @@ pub extern "sysv64" fn decal_mask_wait(regs: *const u64, _arg: u32) {
     if mask_blank(mask, count as u64) {
         DECAL_WAITS[5].fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Whether the `n` bytes at `m` (at most 8 KiB) are all zero, read in place.
+fn bytes_blank(m: u64, n: u64) -> bool {
+    if n == 0 || n > 8192 || !crate::gpu::cp::guest_readable(m, n) {
+        return false;
+    }
+    let b = unsafe { std::slice::from_raw_parts(m as *const u8, n as usize) };
+    b.iter().all(|&x| x == 0)
 }
 
 /// Whether the first `count` bits at `m` (at most 65,536) are all clear, read in place.
