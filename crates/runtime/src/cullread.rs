@@ -146,7 +146,7 @@ pub fn status() -> String {
             m[0],
             m[1] / 1000,
             m[2],
-            if s[0] > 0 || s[3] > 0 { format!("; `maskwait sub`: {} blank walks waited for the graphics CP to take up earlier submissions ({} ms in all, {} given up), {} left alone as known empty passes", s[0], s[1] / 1000, s[2], s[3]) } else { String::new() }
+            if s[0] > 0 || s[3] > 0 { format!("; `maskwait sub`: {} blank walks waited for the graphics CP to take up earlier submissions ({} ms in all, {} given up, {} of them after 100 ms), {} left alone as known empty passes", s[0], s[1] / 1000, s[2], s[4], s[3]) } else { String::new() }
         );
     }
     let d: Vec<u64> = DECAL_WAITS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
@@ -217,11 +217,50 @@ pub static MASK_WAIT_ON: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 pub static MASK_WAIT_SUB: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// The sub waits: [walks that waited, us, given up (100 ms, or the command processor waiting),
-/// blank walks left alone as known empty passes].
-static MASK_SUB_WAITS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// blank walks left alone as known empty passes, given up after the full 100 ms].
+static MASK_SUB_WAITS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Whether `maskwait sub` trusts its table of known empty passes (`maskwait subhard`: not, every
+/// blank walk waits; diagnosis, 2026-11-21: flashes after teleports).
+pub static MASK_KNOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// `maskwait subload` (the default since 2026-11-21 evening; `maskwait sub` at every walk): the
+/// catch-up only within LOAD_WINDOW_FLIPS of the title's last level load (its "Loading world"
+/// line, `note_level_load`), where the walks meet masks our graphics CP has not recorded; at every
+/// walk it cost the 1-1 walk ~2-3% at 59.94 Hz (FINDINGS.md 2026-11-21 evening).
+pub static MASK_LOAD_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// The flip of the title's last level load (+1; 0: none yet).
+static LOAD_FLIP: AtomicU64 = AtomicU64::new(0);
+const LOAD_WINDOW_FLIPS: u64 = 1800;
+
+/// The title printed that it loads a world (`fs::console_write`).
+pub fn note_level_load() {
+    LOAD_FLIP.store(crate::gpu::FRAMES.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+}
+
+/// `maskwait suball` (diagnosis, 2026-11-21): every walk with no write of its masks in flight
+/// waits for the catch-up, blank or not, without the table: after a teleport the masks still
+/// hold the last view's bits, not blank.
+pub static MASK_ALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Waits until the GPU work in flight that writes these masks has completed (at most 100 ms).
+/// `DS_MASKWAIT=off|on|sub|subhard|suball` (boot): the `maskwait` control's setting from the start.
+fn mask_env() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let Ok(v) = std::env::var("DS_MASKWAIT") else { return };
+        let v = v.trim().to_string();
+        MASK_WAIT_ON.store(v != "off" && v != "0", Ordering::Relaxed);
+        MASK_WAIT_SUB.store(v.starts_with("sub"), Ordering::Relaxed);
+        MASK_KNOWN.store(v != "subhard", Ordering::Relaxed);
+        MASK_ALL.store(v == "suball", Ordering::Relaxed);
+        MASK_LOAD_ONLY.store(v == "subload", Ordering::Relaxed);
+        crate::info!("cullread: maskwait {v} (DS_MASKWAIT)");
+    });
+}
+
 fn wait_masks(masks: &[(u64, u64)]) {
+    mask_env();
     if !MASK_WAIT_ON.load(Ordering::Relaxed) {
         return;
     }
@@ -234,9 +273,14 @@ fn wait_masks(masks: &[(u64, u64)]) {
     // cull is taken up. One already done may be the last frame's.)
     let done = crate::gpu::exec::done_now();
     let recorded = masks.iter().any(|&(m, n)| crate::gpu::exec::pending_writes(m, n).is_some_and(|s| s > done));
-    let sub = MASK_WAIT_SUB.load(Ordering::Relaxed) && !recorded && !masks.is_empty() && masks.iter().all(|&(m, n)| bytes_blank(m, n));
+    let all = MASK_ALL.load(Ordering::Relaxed);
+    let in_window = !MASK_LOAD_ONLY.load(Ordering::Relaxed) || {
+        let l = LOAD_FLIP.load(Ordering::Relaxed);
+        l != 0 && flip < l + LOAD_WINDOW_FLIPS
+    };
+    let sub = MASK_WAIT_SUB.load(Ordering::Relaxed) && in_window && !recorded && !masks.is_empty() && (all || masks.iter().all(|&(m, n)| bytes_blank(m, n)));
     let sub = sub && {
-        let known = masks.iter().all(|&(m, _)| known_blank(m, flip));
+        let known = !all && MASK_KNOWN.load(Ordering::Relaxed) && masks.iter().all(|&(m, _)| known_blank(m, flip));
         if known {
             MASK_SUB_WAITS[3].fetch_add(1, Ordering::Relaxed);
         }
@@ -255,6 +299,9 @@ fn wait_masks(masks: &[(u64, u64)]) {
                 MASK_SUB_WAITS[1].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
                 if !ok {
                     MASK_SUB_WAITS[2].fetch_add(1, Ordering::Relaxed);
+                    if t.elapsed() >= std::time::Duration::from_millis(100) {
+                        MASK_SUB_WAITS[4].fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }

@@ -376,6 +376,10 @@ fn console_write(fd: i32, data: &[u8]) {
     let s = String::from_utf8_lossy(data);
     for line in s.trim_end_matches('\n').split('\n') {
         crate::info!("[guest fd{fd}] {line}");
+        // The title loads a world (its own line at every level load): `maskwait subload`'s window.
+        if line.contains("Loading world") {
+            crate::cullread::note_level_load();
+        }
         // Developer automation (tools/tour.py) asks for a screenshot by
         // printing `dsport-shot: <name>` (taken at the next flip).
         if let Some(rest) = line.split("dsport-shot:").nth(1) {

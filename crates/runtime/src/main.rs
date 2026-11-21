@@ -1091,14 +1091,17 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 // `maskwait off|on` (A/B, `cullread`): the title's walks of
                 // its GPU frustum culling masks wait for the GPU's writes.
                 match parts.next().unwrap_or("") {
-                    v @ ("on" | "1" | "off" | "0" | "sub") => {
+                    v @ ("on" | "1" | "off" | "0" | "sub" | "subhard" | "suball" | "subload") => {
                         let on = v != "off" && v != "0";
                         cullread::MASK_WAIT_ON.store(on, std::sync::atomic::Ordering::Relaxed);
-                        cullread::MASK_WAIT_SUB.store(v == "sub", std::sync::atomic::Ordering::Relaxed);
-                        info!("control: maskwait {} at flip {flip}", if v == "sub" { "sub" } else if on { "on" } else { "off" });
+                        cullread::MASK_WAIT_SUB.store(v.starts_with("sub"), std::sync::atomic::Ordering::Relaxed);
+                        cullread::MASK_KNOWN.store(v != "subhard", std::sync::atomic::Ordering::Relaxed);
+                        cullread::MASK_ALL.store(v == "suball", std::sync::atomic::Ordering::Relaxed);
+                        cullread::MASK_LOAD_ONLY.store(v == "subload", std::sync::atomic::Ordering::Relaxed);
+                        info!("control: maskwait {v} at flip {flip}");
                         Ok(())
                     }
-                    other => Err(format!("maskwait: on, off or sub, not {other:?}")),
+                    other => Err(format!("maskwait: on, off, sub, subhard, suball or subload, not {other:?}")),
                 }
             }
             "c4" => {

@@ -75,6 +75,15 @@ pub struct Watch {
     pending: Vec<Option<f64>>,
     pending_flip: Vec<u64>,
     flip_file: Option<std::fs::File>,
+    /// The graphics command processors' draw total when each frame was presented
+    /// (`<run dir>/frames-draws.bin`, u64 per frame in frames-flip.bin's order; 2026-11-21: a
+    /// flash frame's draws against its neighbours', the title's decision or the GPU's).
+    pending_draws: Vec<u64>,
+    draws_file: Option<std::fs::File>,
+    /// The draws left out so far while their pipelines compile (`async_gfx` and the inline
+    /// budget) when each frame was presented (`<run dir>/frames-leftout.bin`, same order).
+    pending_left: Vec<u64>,
+    left_file: Option<std::fs::File>,
     grids: VecDeque<(f64, [u8; CELLS])>,
     file: Option<std::fs::File>,
     logged: u32,
@@ -119,6 +128,8 @@ impl Watch {
             }
             let file = crate::run_dir().and_then(|d| std::fs::File::create(d.join("frames-luma.bin")).ok());
             let flip_file = crate::run_dir().and_then(|d| std::fs::File::create(d.join("frames-flip.bin")).ok());
+            let draws_file = crate::run_dir().and_then(|d| std::fs::File::create(d.join("frames-draws.bin")).ok());
+            let left_file = crate::run_dir().and_then(|d| std::fs::File::create(d.join("frames-leftout.bin")).ok());
             let mut ring = Vec::new();
             let (mut pool, mut one_shot, mut ring_buf) = (None, None, None);
             if SAVE.load(Relaxed) {
@@ -137,7 +148,7 @@ impl Watch {
                 }
             }
             crate::info!("frame watch: on (each presented frame's 16x9 brightness grid; one-frame flashes logged; frames-luma.bin{})", if ring.is_empty() { "" } else { "; large flashes' frames saved" });
-            Ok(Watch { image, memory, bufs, pending: vec![None; slots], pending_flip: vec![0; slots], flip_file, grids: VecDeque::new(), file, logged: 0, ring_t: vec![-1.0; ring.len()], ring, ring_next: 0, saved: 0, pool, one_shot, ring_buf })
+            Ok(Watch { image, memory, bufs, pending: vec![None; slots], pending_flip: vec![0; slots], flip_file, pending_draws: vec![0; slots], draws_file, pending_left: vec![0; slots], left_file, grids: VecDeque::new(), file, logged: 0, ring_t: vec![-1.0; ring.len()], ring, ring_next: 0, saved: 0, pool, one_shot, ring_buf })
         }
     }
 
@@ -212,6 +223,8 @@ impl Watch {
         }
         self.pending[slot] = Some(t);
         self.pending_flip[slot] = SHOWN_FLIP.load(Relaxed);
+        self.pending_draws[slot] = crate::gpu::cp::DRAWS.load(Relaxed);
+        self.pending_left[slot] = crate::gpu::exec::draw::ASYNC_GFX_STATS[0].load(Relaxed) + crate::gpu::exec::draw::INLINE_STATS[2].load(Relaxed);
     }
 
     /// Saves the kept frames at the log times `times` (`SAVE`) as `flash_<ms>_<tag>.png`: copied
@@ -286,6 +299,12 @@ impl Watch {
         }
         if let Some(f) = self.flip_file.as_mut() {
             let _ = f.write_all(&self.pending_flip[slot].to_le_bytes());
+        }
+        if let Some(f) = self.draws_file.as_mut() {
+            let _ = f.write_all(&self.pending_draws[slot].to_le_bytes());
+        }
+        if let Some(f) = self.left_file.as_mut() {
+            let _ = f.write_all(&self.pending_left[slot].to_le_bytes());
         }
         self.grids.push_back((t, grid));
         if self.grids.len() > 3 {
