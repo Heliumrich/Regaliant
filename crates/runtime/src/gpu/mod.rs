@@ -222,7 +222,7 @@ pub mod tune {
         Tunable { name: "vrr", env: "DS_VRR", default: 2, value: AtomicU64::new(UNSET) },
         Tunable { name: "tick_lead", env: "DS_TICK_LEAD", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "layer_clears", env: "DS_LAYER_CLEARS", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "arm_inline_max", env: "DS_ARM_INLINE_MAX", default: 0, value: AtomicU64::new(UNSET) },
+        Tunable { name: "arm_inline_max", env: "DS_ARM_INLINE_MAX", default: 1024, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1432,8 +1432,9 @@ pub mod tune {
 
     /// The checks of threads that arm as they take (all but the graphics CP's and queue
     /// 0x50's) arm runs of at most this many pages themselves and leave longer ones to the
-    /// armer behind them (`fe2::behind_thread`); 0: every run themselves (the default). Being
-    /// judged 2026-11-21 (FINDINGS.md 2026-11-21 afternoon). Live.
+    /// armer behind them (`fe2::behind_thread`); 0: every run themselves. 1024 the default since
+    /// 2026-11-21 (the walk x1.065, arrivals' p99 -13%; its extra arrival flashes were the
+    /// view-mask walks', gone with `maskwait sub`: FINDINGS.md 2026-11-21 afternoon). Live.
     #[inline]
     pub fn arm_inline_max() -> u64 {
         get(189)
