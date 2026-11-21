@@ -5,8 +5,6 @@
 - A shorter freeze when the world first appears after loading a save: large textures the game
   creates while arriving are prepared on the graphics card again.
 - 3D textures are prepared on the graphics card, which takes work off the processor while playing.
-- Faster frames where the game clears its shadow maps layer by layer (about 16% at the
-  Gatehouse Hall in Boletaria 1-2): those clears no longer wait for the graphics card.
 - Fewer crashes while shaders are prepared: a shader whose preparation crashed the graphics
   driver is not prepared ahead again.
 - No more flicker right after loading: the world no longer vanishes in every other frame for

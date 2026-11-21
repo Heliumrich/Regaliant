@@ -5005,6 +5005,16 @@ impl Images {
         if self.meta_of.is_empty() {
             return;
         }
+        // (Off by default since 2026-11-21 evening: every write noted, the fill's own range too,
+        // as before 619c3a5. With the fill's own range left out, turning at 1-1's Start lost
+        // the world's geometry in alternate flips (12-39 large flashes a turn window, none
+        // without: FINDINGS.md 2026-11-21 evening), which outweighs the Gatehouse Hall's x1.16.
+        // `DS_FILL_NOTE_NEW=1`: left out, to find the image it breaks.)
+        static NEW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*NEW.get_or_init(|| std::env::var("DS_FILL_NOTE_NEW").ok().as_deref() == Some("1")) {
+            self.note_meta_writes(writes);
+            return;
+        }
         let filled = self.meta_reach(base, base.saturating_add(len), true);
         for &(b, n) in writes {
             for (meta, key, layers) in self.meta_reach(b, b.saturating_add(n), false) {
