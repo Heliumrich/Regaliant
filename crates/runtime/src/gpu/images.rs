@@ -5035,14 +5035,13 @@ impl Images {
         let mut clears = Vec::new();
         if !self.meta_of.is_empty() {
             let mode = fill_note_mode();
-            let filled: Vec<_> = if mode == 0 {
-                Vec::new()
-            } else {
-                fill.map(|((base, len), _)| self.meta_reach(base, base.saturating_add(len), true)).unwrap_or_default().into_iter().filter(|(_, k, _)| left_to_fill(mode, k)).collect()
-            };
+            // Every entry the fill reaches takes its value after the writes' unknown ones; the
+            // writes leave out only those `left_to_fill` (e97f75a's mode 0 had pushed no fill
+            // values here, so a held stretch's clears all went unknown: drains at their uses).
+            let filled: Vec<_> = fill.map(|((base, len), _)| self.meta_reach(base, base.saturating_add(len), true)).unwrap_or_default();
             for &(b, n) in writes {
                 for (meta, key, layers) in self.meta_reach(b, b.saturating_add(n), false) {
-                    if filled.iter().any(|&(m, k, l)| m == meta && k == key && l == layers) {
+                    if left_to_fill(mode, &key) && filled.iter().any(|&(m, k, l)| m == meta && k == key && l == layers) {
                         continue;
                     }
                     clears.push((key, meta, None, layers));
@@ -5138,6 +5137,12 @@ impl Images {
                 crate::info!("trace clears: {:#x} ({:?} {}x{}) pending: fill {base:#x}+{len:#x} of {v:#x} covers its metadata {meta:#x} (layers {layers:#x}) (for flip {}, {})", key.base, key.format, key.width, key.height, crate::hle::libs::videoout::QUEUED_FLIP.load(std::sync::atomic::Ordering::Relaxed) + 1, std::thread::current().name().unwrap_or("?"));
             }
             merge_clear(&mut self.pending_clears, key, meta, Some(v), layers);
+            // Published for the draws' check without the lock (`pending_hit`). A fill's entry
+            // with no write noted before it in the same `with` (`fill_note_mode` 1 and 2) was
+            // missing from the published set: draws passed the image by, and the next parallel
+            // run's start (`Cp`, every pending clear) applied the clear over what they had drawn
+            // (1-1's Start lost the world's geometry in alternate flips, 2026-11-21).
+            self.pending_change += 1;
             // A write noted again over it makes it unknown again: not a
             // repeat for the memos of `note_writes` and `Exec::last_notes`.
             self.note_gen += 1;
@@ -7311,20 +7316,15 @@ impl Images {
 }
 
 /// How a fill dispatch's writes are noted against the fast clears' metadata
-/// (`note_meta_writes_but_fill`, `notes_for`; `DS_FILL_NOTE`): 0 every write noted, the fill's
-/// own range too (the default since 2026-11-21 evening); 1 the fill's own range left to the fill
-/// for layered (array) images only, whose per-layer fills of one value keep it known (the shadow
-/// atlas at 1-2's Gatehouse Hall, x1.16 there); 2 left to the fill for every image (619c3a5's;
-/// `DS_FILL_NOTE_NEW=1` too), with which turning at 1-1's Start lost the world's geometry in
-/// alternate flips (FINDINGS.md 2026-11-21 evening).
+/// (`note_meta_writes_but_fill`, `notes_for`; `DS_FILL_NOTE`): 2 the fill's own range left to the
+/// fill for every image, so per-layer fills of one value keep it known (619c3a5's form, the
+/// default again since 2026-11-21 night: 1-2's Gatehouse Hall 54.4 against 51.6 flips/s at
+/// 240 Hz); 1 the same for layered (array) images only; 0 every write noted, the fill's own
+/// range too. Its evening's flicker at 1-1's Start was a fill's clear left out of the draws'
+/// published set (`note_meta_fill`), not this noting (FINDINGS.md 2026-11-21 night).
 pub fn fill_note_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| {
-        if std::env::var("DS_FILL_NOTE_NEW").ok().as_deref() == Some("1") {
-            return 2;
-        }
-        std::env::var("DS_FILL_NOTE").ok().and_then(|v| v.trim().parse::<u8>().ok()).filter(|&m| m <= 2).unwrap_or(0)
-    })
+    *MODE.get_or_init(|| std::env::var("DS_FILL_NOTE").ok().and_then(|v| v.trim().parse::<u8>().ok()).filter(|&m| m <= 2).unwrap_or(2))
 }
 
 /// Whether a fill's own write over `key`'s metadata is left to the fill in `mode`.

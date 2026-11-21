@@ -9,6 +9,8 @@
   driver is not prepared ahead again.
 - No more flicker right after loading: the world no longer vanishes in every other frame for
   a moment.
+- Smoother frame rates where many shadows are drawn: clearing shadows no longer stalls the
+  graphics card.
 
 ## 0.1.0
 
