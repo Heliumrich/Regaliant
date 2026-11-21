@@ -345,7 +345,7 @@ pub(crate) fn note_compute_pipeline(addr: u64, tr: &super::shaders::Translated) 
     // (Not a diagnosis's variants: probes, dumps, outlier counts, exact ballasts; the review of
     // 2026-11-21.)
     let d = &tr.spec;
-    if d.probe.is_some() || d.dump.is_some() || d.outlier.is_some() || d.mark_twice || d.touch_twice || d.part_twice || d.pt_linear {
+    if d.probe.is_some() || d.dump.is_some() || d.outlier.is_some() || d.mark_twice || d.touch_twice || d.part_twice || d.pt_linear || d.dep_loads || d.marks_untouched {
         return;
     }
     load();
@@ -623,31 +623,42 @@ fn store_line(line: &str) {
     LINES.fetch_add(line.matches('\n').count().max(1) as u64, Ordering::Relaxed);
     if let Some(p) = STORE.get() {
         // (A store whose last line was cut short, by a power loss: this session's first line on a
-        // line of its own, not glued to it; the review of 2026-11-21.)
-        static TAIL: std::sync::Once = std::sync::Once::new();
-        static NEWLINE_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        TAIL.call_once(|| {
-            use std::io::{Read, Seek};
-            let cut = std::fs::File::open(p).ok().and_then(|mut f| {
-                let len = f.metadata().ok()?.len();
-                if len == 0 {
-                    return Some(false);
-                }
-                f.seek(std::io::SeekFrom::Start(len - 1)).ok()?;
-                let mut b = [0u8; 1];
-                f.read_exact(&mut b).ok()?;
-                Some(b[0] != b'\n')
-            });
-            NEWLINE_FIRST.store(cut == Some(true), Ordering::Relaxed);
-        });
-        let owned;
-        let line = if NEWLINE_FIRST.swap(false, Ordering::Relaxed) {
-            owned = format!("\n{line}");
-            owned.as_str()
+        // line of its own, not glued to it. Until the first line is written the appends go one
+        // at a time, so the first written is the one that gets the newline, spent only once
+        // written; then they go as they come. The reviews of 2026-11-21.)
+        static APPEND: Mutex<Option<bool>> = Mutex::new(None);
+        static SETTLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let append = |text: &str| std::fs::OpenOptions::new().create(true).append(true).open(p).and_then(|mut f| f.write_all(text.as_bytes()));
+        let r = if SETTLED.load(Ordering::Acquire) {
+            append(line)
         } else {
-            line
+            let mut cut = APPEND.lock();
+            if cut.is_none() {
+                use std::io::{Read, Seek};
+                *cut = Some(
+                    std::fs::File::open(p)
+                        .ok()
+                        .and_then(|mut f| {
+                            let len = f.metadata().ok()?.len();
+                            if len == 0 {
+                                return Some(false);
+                            }
+                            f.seek(std::io::SeekFrom::Start(len - 1)).ok()?;
+                            let mut b = [0u8; 1];
+                            f.read_exact(&mut b).ok()?;
+                            Some(b[0] != b'\n')
+                        })
+                        .unwrap_or(false),
+                );
+            }
+            let first = *cut == Some(true);
+            let r = if first { append(&format!("\n{line}")) } else { append(line) };
+            if !first || r.is_ok() {
+                *cut = Some(false);
+                SETTLED.store(true, Ordering::Release);
+            }
+            r
         };
-        let r = std::fs::OpenOptions::new().create(true).append(true).open(p).and_then(|mut f| f.write_all(line.as_bytes()));
         if let Err(e) = r {
             static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !WARNED.swap(true, Ordering::Relaxed) {

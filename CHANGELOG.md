@@ -33,6 +33,7 @@ player's own game files on Windows.
   that keep failing) the launcher says why and Play starts the game. An interrupted preparation
   goes on where it stopped, and after a graphics driver or port update only the compile is done
   again. Some graphics drivers stop taking prepared shaders after Windows events. The launcher
-  notices this when it starts and compiles them again.
+  notices this when it starts and compiles them again. On battery, Play starts the game without
+  preparing, and a preparation stops when the battery runs low.
 - Trophies as achievements with a pop-up and a list.
 - Saves are backed up before each session changes them.

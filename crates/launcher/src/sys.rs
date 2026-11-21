@@ -238,9 +238,38 @@ pub fn process_alive(pid: u32) -> bool {
     }
 }
 
+/// `DS_SIM_BATTERY=<percent>|<file>` (a test): on battery at that charge, or at the charge the
+/// file holds while it exists (none: on mains power), so that a test can unplug a running PC.
+fn sim_battery() -> Option<Option<u8>> {
+    let v = std::env::var("DS_SIM_BATTERY").ok().filter(|v| !v.is_empty())?;
+    Some(match v.parse::<u8>() {
+        Ok(p) => Some(p.min(100)),
+        Err(_) => std::fs::read_to_string(&v).ok().and_then(|t| t.trim().parse::<u8>().ok()).map(|p| p.min(100)),
+    })
+}
+
+/// The battery's charge (percent) while the PC runs on battery; None on mains power or unknown.
+pub fn battery() -> Option<u8> {
+    if let Some(sim) = sim_battery() {
+        return sim;
+    }
+    use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+    let mut s: SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };
+    if unsafe { GetSystemPowerStatus(&mut s) } == 0 || s.ACLineStatus != 0 {
+        return None;
+    }
+    Some(s.BatteryLifePercent.min(100))
+}
+
 /// Mains or battery, and the battery saver (the launcher's log: a laptop on battery prepares
 /// slower).
 pub fn power_text() -> String {
+    if let Some(sim) = sim_battery() {
+        return match sim {
+            Some(p) => format!("on battery, battery {p}% (DS_SIM_BATTERY, a test)"),
+            None => "on mains power (DS_SIM_BATTERY, a test)".into(),
+        };
+    }
     use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
     let mut s: SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };
     if unsafe { GetSystemPowerStatus(&mut s) } == 0 {

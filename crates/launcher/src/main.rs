@@ -168,8 +168,15 @@ pub fn play(app: &mut App) {
         }
         return;
     }
-    // (Not again after the player declined preparing for lack of space in this session.)
+    // (Not again after the player declined preparing for lack of space in this session. Not on
+    // battery either: an hour of the PC's full load would come before the game; the page says how
+    // to prepare later, 2026-11-21.)
     if app.launch.prepare_shaders && !app.shaders.space_declined && !shaders::prepared(app) {
+        if let Some(pct) = sys::battery() {
+            shaders::note_battery(app, pct);
+            start_game(app);
+            return;
+        }
         shaders::start(app, true);
         return;
     }

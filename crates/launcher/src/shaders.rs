@@ -228,10 +228,11 @@ fn start_probe(app: &App) {
     });
 }
 
-/// Waits for the probe to end (it is ended after `PROBE_SECS`, so it has an answer then).
+/// Waits for the probe to end (it is ended `PROBE_SECS` after its start, so it has an answer
+/// then; the margin covers a slow start of its process, the review of 2026-11-21).
 fn wait_probe() {
     let t = Instant::now();
-    while PROBE_STARTED.load(std::sync::atomic::Ordering::Relaxed) && PROBE.lock().unwrap_or_else(|e| e.into_inner()).is_none() && t.elapsed().as_secs() < PROBE_SECS + 5 {
+    while PROBE_STARTED.load(std::sync::atomic::Ordering::Relaxed) && PROBE.lock().unwrap_or_else(|e| e.into_inner()).is_none() && t.elapsed().as_secs() < 2 * PROBE_SECS {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
@@ -264,6 +265,12 @@ fn ensure_probe(app: &mut App) {
         return;
     }
     if !PROBE_STARTED.load(Relaxed) {
+        // (The check not answered yet, a slow drive's: the store cannot be judged, and the probe
+        // would run beside the check. Left to the check's timer, which starts it only when
+        // nothing runs; the review of 2026-11-21.)
+        if checked_translation().is_none() {
+            return;
+        }
         if !probe_due(app) {
             PROBE_HANDLED.store(true, Relaxed);
             return;
@@ -388,7 +395,7 @@ pub fn check_tick(app: &mut App) {
         // (The store's probe when it holds prepared shaders the driver should take; else none. Not
         // beside a preparation or the game: those began after `ensure_probe`, which ran it first,
         // or (Play without preparing) the game would turn it away.)
-        if !running(app) && app.running.is_none() && probe_due(app) {
+        if !PROBE_HANDLED.load(Relaxed) && !running(app) && app.running.is_none() && probe_due(app) {
             start_probe(app);
         } else if !PROBE_STARTED.load(Relaxed) {
             PROBE_HANDLED.store(true, Relaxed);
@@ -548,6 +555,21 @@ pub struct Page {
     /// When the launcher ended the step's process (a stop past 90 s, no progress): one that has
     /// not ended 30 s later is left behind (`tick`).
     killed_at: Option<Instant>,
+    /// The preparation was stopped for a low battery (`tick`): the page says so.
+    battery_stop: bool,
+}
+
+/// The battery's charge at which a preparation does not begin or stops (an hour of the PC's full
+/// load, hidden, would empty a laptop's battery; 2026-11-21).
+const BATTERY_LOW: u8 = 20;
+/// What the page says when the battery stopped or held back a preparation.
+const BATTERY_NOTE: &str = "The PC runs on battery, so the shaders are prepared later. Plug it in, then press Prepare now or Play.";
+
+/// On battery when Play would prepare first: the game starts now (the preparation's hour of full
+/// load would come before it), and the page says how to prepare later.
+pub fn note_battery(app: &mut App, pct: u8) {
+    log(app, &format!("preparation not begun on Play: the PC runs on battery ({pct}%)"));
+    app.set_status(BATTERY_NOTE);
 }
 
 fn h(v: usize) -> HWND {
@@ -1026,6 +1048,15 @@ pub fn start(app: &mut App, play_after: bool) {
             }
         }
     }
+    // (A low battery: not begun; Play starts the game.)
+    if let Some(pct) = sys::battery().filter(|&p| p <= BATTERY_LOW) {
+        log(app, &format!("preparation not begun: the battery is at {pct}%"));
+        finish(app, Some(BATTERY_NOTE.into()));
+        if play_after {
+            crate::start_game(app);
+        }
+        return;
+    }
     let _ = std::fs::create_dir_all(&dir);
     wait_check();
     if version_mismatch().is_some() {
@@ -1083,6 +1114,7 @@ pub fn start(app: &mut App, play_after: bool) {
     app.shaders.then_play = false;
     app.shaders.stalled = false;
     app.shaders.last_failed = false;
+    app.shaders.battery_stop = false;
     log(
         app,
         &format!(
@@ -1250,6 +1282,19 @@ pub fn tick(app: &mut App) {
         app.shaders.killed_at = Some(Instant::now());
     }
     let step = app.shaders.step.unwrap_or(Step::Compute);
+    // (The battery low while the PC runs on it: the step stops after what it compiles now, and the
+    // next preparation goes on from there.)
+    if exited.is_none() && app.shaders.stopping.is_none() && !app.shaders.battery_stop {
+        if let Some(pct) = sys::battery().filter(|&p| p <= BATTERY_LOW) {
+            app.shaders.battery_stop = true;
+            log(app, &format!("step {step:?}: the battery is at {pct}%: stopped"));
+            // (A preparation Play began: the game starts once the step has stopped.)
+            let play = app.shaders.play_after;
+            stop(app);
+            app.shaders.then_play |= play;
+            return;
+        }
+    }
     // (Ended, but its process does not go: a thread of it stuck in the graphics driver keeps it,
     // and its video memory, until Windows restarts (seen 2026-11-20). Left behind after 30 s:
     // the preparation ends, the player told to restart, and Play's game started (the release
@@ -1406,7 +1451,14 @@ pub fn tick(app: &mut App) {
             write_marker(app);
         }
         if stopped {
-            finish(app, Some(if paused { "Preparation paused: the game was started. The next one goes on from the step it stopped in." } else { "Preparation stopped. The next one goes on from the step it stopped in." }.into()));
+            let note = if std::mem::take(&mut app.shaders.battery_stop) {
+                BATTERY_NOTE
+            } else if paused {
+                "Preparation paused: the game was started. The next one goes on from the step it stopped in."
+            } else {
+                "Preparation stopped. The next one goes on from the step it stopped in."
+            };
+            finish(app, Some(note.into()));
             if std::mem::take(&mut app.shaders.then_play) {
                 crate::start_game(app);
             }

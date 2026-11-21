@@ -1125,7 +1125,8 @@ pub fn pb_check(phase: &str) -> i32 {
         let Ok(layout) = (unsafe { c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(&ranges), None) }) else { return 1 };
         let key = 0x5042_4348_4b00_0000u64 | k as u64;
         let fp = fingerprint(&[&code, &[k]]);
-        let stored_before = stored('q', key);
+        // (This mode's file only: one the other mode left says nothing about this one.)
+        let stored_before = stored_cheap('q', key);
         let pb = [PB[0].load(Ordering::Relaxed), PB[2].load(Ordering::Relaxed)];
         let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
         // (Cache data read: the driver must serve it without compiling, else the pipeline is not
@@ -1153,6 +1154,9 @@ pub fn pb_check(phase: &str) -> i32 {
             _ if !read => "made",
             (Ok(_), true) if from_bins => "from its binaries",
             (Ok(_), true) if refused => "its binaries refused, compiled again",
+            // (Stored, but not for this driver's key or the pipeline's fingerprint: stale, not
+            // missing; the review of 2026-11-21.)
+            (Ok(_), true) if stored_before => "its stored binaries did not serve it, compiled again",
             (Ok(_), true) => "no binaries stored, compiled",
             (Ok(_), false) => "served by its cache data",
             (Err(e), _) if e.contains("DEVICE_LOST") => "the device lost",
