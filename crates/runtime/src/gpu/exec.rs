@@ -16258,6 +16258,7 @@ impl Exec {
                 self.held_clears.remove(&x.0);
             }
             let clears = super::images::with(|im| mine.iter().filter_map(|&(k, m, v, kept, layers)| im.fast_clear_of(k, m, v, kept, layers)).collect::<Vec<_>>());
+            note_clear_resolve(self.rendering.is_some());
             self.end_rendering();
             self.record_fast_clears(clears, false);
             return;
@@ -16265,6 +16266,7 @@ impl Exec {
         if keys.is_empty() || !pending_for(keys) || !super::images::with(|im| im.clears_pending(keys)) {
             return;
         }
+        note_clear_resolve(self.rendering.is_some());
         self.end_rendering();
         // The metadata write may still be in flight: read it back after the
         // GPU work, unless the fill that wrote it gave its value (then the
@@ -22042,6 +22044,27 @@ impl Drop for Exec {
     }
 }
 
+/// Fast-clear resolutions (`Exec::resolve_fast_clears` taking clears) and those made while a
+/// rendering instance was active, which each ended it (its attachments stored, a full barrier)
+/// for the next draw to begin another (its attachments loaded): since 2026-11-21 night, for
+/// pricing the clears' breaks (FINDINGS.md 2026-11-21 night).
+static CLEAR_RESOLVES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+fn note_clear_resolve(rendering: bool) {
+    CLEAR_RESOLVES[0].fetch_add(1, Ordering::Relaxed);
+    if rendering {
+        CLEAR_RESOLVES[1].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn clear_pass_line() -> String {
+    format!(
+        "    fast-clear resolutions: {}, {} of them ending a rendering instance\n",
+        CLEAR_RESOLVES[0].load(Ordering::Relaxed),
+        CLEAR_RESOLVES[1].load(Ordering::Relaxed)
+    )
+}
+
 /// One status line for hang reports.
 pub fn status() -> String {
     format!(
@@ -22092,6 +22115,7 @@ pub fn status() -> String {
         super::cp::sync_summary()
     ) + &super::images::IMAGES.try_lock().and_then(|g| g.as_ref().map(|i| i.status())).unwrap_or_default()
         + &slot_mem_line()
+        + &clear_pass_line()
         + &fill_partial_line()
         + &super::track::status()
         + &crate::mem::remap_status()
