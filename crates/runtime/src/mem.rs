@@ -2081,6 +2081,24 @@ pub fn table_view_held(g0: u64) -> bool {
     MAP_GEN.load(std::sync::atomic::Ordering::SeqCst) == g0
 }
 
+/// `table_view_held` for one range: no mapping or protection change since generation `g0`
+/// touched guest [start, end) (the latest changes are kept, `CHANGES`; when they no longer
+/// reach back to `g0`, as `table_view_held`). A change elsewhere leaves the range's table view
+/// and import windows as they were: arrivals map and unmap memory many times a second, and
+/// textures uploaded meanwhile (the 1-1 arrival's 138 and 184 MB arrays) fell back to the CPU's
+/// detiling on the recording threads (2026-11-21).
+pub fn table_view_held_for(g0: u64, start: u64, end: u64) -> bool {
+    if MAP_GEN.load(std::sync::atomic::Ordering::SeqCst) == g0 {
+        return true;
+    }
+    let c = CHANGES.read();
+    // (Every change after g0 still listed: generations rise by one along the list.)
+    if c.front().is_none_or(|&(g, _, _)| g > g0 + 1) {
+        return false;
+    }
+    !c.iter().rev().take_while(|&&(g, _, _)| g > g0).any(|&(_, s, e)| s < end && start < e)
+}
+
 /// Whether every page of [a, a+len) is committed and readable now (operating
 /// system query; takes none of our locks).
 pub fn os_readable(a: u64, len: u64) -> bool {

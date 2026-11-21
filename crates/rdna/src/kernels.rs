@@ -1843,8 +1843,9 @@ pub const DETILE_PC_WORDS: usize = 28;
 /// with (x, y) the element's coordinates plus the mip-tail offsets (tx,
 /// ty); bytes from `src_len` (a multiple of 4) on read as zero. Push constants: {src_off,
 /// dst_off, w, h, tx, ty, pitch_blocks, block_log2 | lw << 8 | lh << 16 |
-/// elem_log2 << 24, count, stride, src_len, 0, then per address bit i < 16
-/// x mask | y mask << 16}.
+/// elem_log2 << 24, count, stride, src_len, a word XORed into every element's
+/// in-block offset (0 for a 2D part; a thick 3D slice's depth term, its slab's
+/// offset in `src_off`), then per address bit i < 16 x mask | y mask << 16}.
 pub fn detile() -> Vec<u32> {
     build_detile().expect("detile kernel")
 }
@@ -1945,6 +1946,7 @@ fn build_detile() -> Result<Vec<u32>, rspirv::dr::Error> {
             let p = b.shift_left_logical(u32t, None, p, k[i])?;
             inner = b.bitwise_or(u32t, None, inner, p)?;
         }
+        let inner = b.bitwise_xor(u32t, None, inner, pcw[11])?;
         let off = b.i_add(u32t, None, src_off, blk)?;
         b.i_add(u32t, None, off, inner)
     };

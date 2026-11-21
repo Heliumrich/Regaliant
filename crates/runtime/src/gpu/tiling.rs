@@ -164,8 +164,52 @@ pub fn layout_3d(sw: u32, elem_log2: u32, width: u32, height: u32, depth: u32) -
 }
 
 impl Layout3d {
+    /// The GPU detiler's masks (`rdna::kernels::detile`: bit i of an element's in-block offset the
+    /// parity of x mask_i & (x % block_w) and y mask_i & (y % block_h), the x mask in the low 16
+    /// bits, the y mask in the high), or None when the layout's x or y bits above the block take
+    /// part (a pipe XOR swizzle) or its blocks have more than 16 address bits: the CPU detiles
+    /// those. A slice's depth part is `slice_xor`, its slab's offset `slab_offset`.
+    pub fn gpu_masks(&self) -> Option<[u32; 16]> {
+        if self.block_log2 > 16 {
+            return None;
+        }
+        let (lw, lh) = (self.block_w.trailing_zeros(), self.block_h.trailing_zeros());
+        let mut m = [0u32; 16];
+        for (i, &b) in self.p.iter().take(self.block_log2 as usize).enumerate() {
+            let (mx, my) = ((b & 0xFFFF) as u32, ((b >> 16) & 0xFFFF) as u32);
+            if mx >> lw != 0 || my >> lh != 0 {
+                return None;
+            }
+            m[i] = mx | my << 16;
+        }
+        Some(m)
+    }
+
+    /// Slice z's part of its elements' in-block offsets (`gpu_masks`).
+    pub fn slice_xor(&self, z: u32) -> u32 {
+        self.zs[z as usize]
+    }
+
+    /// The byte offset of slice z's slab.
+    pub fn slab_offset(&self, z: u32) -> u64 {
+        (z / self.block_d) as u64 * self.slab_size()
+    }
+
+    /// Blocks in a row.
+    pub fn pitch_blocks(&self) -> u32 {
+        (self.pitch / self.block_w).max(1)
+    }
+
+    /// Slices z0..z1 detiled into `out` (packed, `(z1 - z0)` slices), from `src` holding the whole
+    /// volume's tiled bytes (the GPU detiler's check).
+    pub fn detile_slices(&self, src: &[u8], z0: u32, z1: u32, out: &mut [u8]) {
+        let slice = self.width as usize * self.height as usize * (1usize << self.elem_log2);
+        debug_assert_eq!(out.len(), slice * (z1 - z0) as usize);
+        self.slices(src, z0 as usize, out);
+    }
+
     /// Bytes of one slab of block_d slices.
-    fn slab_size(&self) -> u64 {
+    pub fn slab_size(&self) -> u64 {
         self.pitch as u64 * self.padded_height as u64 * self.block_d as u64 * (1u64 << self.elem_log2)
     }
 
@@ -657,6 +701,47 @@ mod tests {
         assert_eq!((l.block_w, l.block_h, l.block_d), (32, 16, 16));
         let l = layout_3d(5, 2, 64, 64, 64).unwrap();
         assert_eq!((l.block_w, l.block_h, l.block_d), (8, 16, 8));
+    }
+
+    /// The GPU detiler's addressing for thick 3D volumes (`rdna::kernels::detile` with
+    /// `Layout3d::gpu_masks`, `slice_xor` and `slab_offset`: images.rs `upload_gpu_3d`), emulated
+    /// here, against the CPU's `offset` for every element of volumes in each thick swizzle and
+    /// element size; the non-XOR swizzles must all be covered.
+    #[test]
+    fn gpu_masks_match_cpu_3d() {
+        let parity = |v: u32| v.count_ones() & 1;
+        let mut covered = 0;
+        for sw in [5u32, 9, 17, 21, 25] {
+            for el in 0..5u32 {
+                for &(w, h, d) in &[(37u32, 29u32, 19u32), (64, 64, 40), (214, 120, 72), (8, 8, 8)] {
+                    let Some(l) = layout_3d(sw, el, w, h, d) else { continue };
+                    let Some(m) = l.gpu_masks() else {
+                        assert!(is_xor(sw), "swizzle {sw}, element 2^{el}: no GPU masks");
+                        continue;
+                    };
+                    covered += 1;
+                    let (lw, lh) = (l.block_w.trailing_zeros(), l.block_h.trailing_zeros());
+                    let (mw, mh) = (l.block_w - 1, l.block_h - 1);
+                    for z in 0..d {
+                        let zx = l.slice_xor(z);
+                        let slab = l.slab_offset(z);
+                        for y in 0..h {
+                            for x in 0..w {
+                                let blk = (((y >> lh) * l.pitch_blocks() + (x >> lw)) as u64) << l.block_log2;
+                                let mut inner = 0u32;
+                                for (i, &mi) in m.iter().enumerate() {
+                                    let (mx, my) = (mi & 0xFFFF, mi >> 16);
+                                    inner |= (parity(mx & (x & mw)) ^ parity(my & (y & mh))) << i;
+                                }
+                                let gpu = slab + blk + (inner ^ zx) as u64;
+                                assert_eq!(gpu, l.offset(x, y, z), "swizzle {sw}, element 2^{el}, {w}x{h}x{d} at ({x}, {y}, {z})");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(covered >= 40, "{covered} layouts covered");
     }
 
     #[test]

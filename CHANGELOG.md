@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- A shorter freeze when the world first appears after loading a save: large textures the game
+  creates while arriving are prepared on the graphics card again.
+- 3D textures are prepared on the graphics card, which takes work off the processor while playing.
+
 ## 0.1.0
 
 The first version of Regaliant. It runs the PS5 game Demon's Souls (PPSA01341, version 01.007.000) from the
