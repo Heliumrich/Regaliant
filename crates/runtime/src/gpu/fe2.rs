@@ -2292,7 +2292,15 @@ fn take_run(a: u64, b: u64, ta: u64, tb: u64, frame: u64, arm: bool, armable: &A
     // 2026-11-06; the graphics CP, whose large checks of the title's ring
     // spent most of their time arming, x1.007 at the vista in four of four
     // cycles and level at Doran, 2026-11-08 evening.)
-    if arm && crate::hosted::on() && !matches!(super::prio::role(), 0 | 2) {
+    // (Runs longer than `tune arm_inline_max` pages armed behind on every thread: inside the
+    // take, an arrival's long runs held the thread and its take's followers for milliseconds.)
+    let inline_max = super::tune::arm_inline_max();
+    let long = inline_max != 0 && (b - a) / PAGE > inline_max;
+    if long && arm && crate::hosted::on() && !matches!(super::prio::role(), 0 | 2) {
+        LONG_BEHIND[0].fetch_add(1, Ordering::Relaxed);
+        LONG_BEHIND[1].fetch_add((b - a) / PAGE, Ordering::Relaxed);
+    }
+    if arm && crate::hosted::on() && !matches!(super::prio::role(), 0 | 2) && !long {
         let t = tsc();
         let tp = (slow_place_us() != 0).then(std::time::Instant::now);
         try_arm(a, b, frame, armable);
@@ -3483,6 +3491,9 @@ const AB_SKIPPED: usize = 10;
 const AB_OVER: usize = 11;
 /// Front end 2's reasons for the pages the armer offered and did not arm.
 static BEHIND_NOT_ARMED: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// Runs longer than `tune arm_inline_max` pages that threads arming as they take left to the
+/// armer: [runs, pages].
+static LONG_BEHIND: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 thread_local! {
     /// The armer's thread (`not_armed`, `arm_part` count for it).
@@ -3692,10 +3703,13 @@ fn behind_line() -> String {
     let v: [u64; 12] = std::array::from_fn(|k| BEHIND[k].load(Ordering::Relaxed));
     let na: [u64; 8] = std::array::from_fn(|k| BEHIND_NOT_ARMED[k].load(Ordering::Relaxed));
     format!(
-        "    front end 2's arming behind the graphics CP and queue 0x50 (`armbehind`{}, since boot; `tune behind_quiet` {}, `behind_us` {}): {} runs queued ({} dropped), {} rounds ({} out of time), {} merged runs offered ({} pages; {} skipped as offered lately), {} pages armed, {:.1} ms arming, {} takes after an arming ({} pages found written), {} disarmed by `armbehind off`; not armed: armed already {}, too few clean epochs {}, written lately {}, chunk held {}, no settled window {}, not plain read-write {}, import list busy {}\n",
+        "    front end 2's arming behind the graphics CP and queue 0x50 (`armbehind`{}, since boot; `tune behind_quiet` {}, `behind_us` {}; long runs of other threads, `tune arm_inline_max` {}: {} ({} pages)): {} runs queued ({} dropped), {} rounds ({} out of time), {} merged runs offered ({} pages; {} skipped as offered lately), {} pages armed, {:.1} ms arming, {} takes after an arming ({} pages found written), {} disarmed by `armbehind off`; not armed: armed already {}, too few clean epochs {}, written lately {}, chunk held {}, no settled window {}, not plain read-write {}, import list busy {}\n",
         if BEHIND_OFF.load(Ordering::Relaxed) { " off" } else { "" },
         super::tune::behind_quiet(),
         super::tune::behind_us(),
+        super::tune::arm_inline_max(),
+        LONG_BEHIND[0].load(Ordering::Relaxed),
+        LONG_BEHIND[1].load(Ordering::Relaxed),
         v[AB_QUEUED],
         v[AB_DROPPED],
         v[AB_ROUNDS],

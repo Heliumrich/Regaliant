@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 189] = [
+    static ALL: [Tunable; 190] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -222,6 +222,7 @@ pub mod tune {
         Tunable { name: "vrr", env: "DS_VRR", default: 2, value: AtomicU64::new(UNSET) },
         Tunable { name: "tick_lead", env: "DS_TICK_LEAD", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "layer_clears", env: "DS_LAYER_CLEARS", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "arm_inline_max", env: "DS_ARM_INLINE_MAX", default: 0, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -1427,6 +1428,15 @@ pub mod tune {
     #[inline]
     pub fn layer_clears() -> bool {
         get(188) != 0
+    }
+
+    /// The checks of threads that arm as they take (all but the graphics CP's and queue
+    /// 0x50's) arm runs of at most this many pages themselves and leave longer ones to the
+    /// armer behind them (`fe2::behind_thread`); 0: every run themselves (the default). Being
+    /// judged 2026-11-21 (FINDINGS.md 2026-11-21 afternoon). Live.
+    #[inline]
+    pub fn arm_inline_max() -> u64 {
+        get(189)
     }
 
     /// A stretch past a label wait whose check at its label (`Exec::past_current_for`) finds
