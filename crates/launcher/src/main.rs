@@ -186,8 +186,10 @@ pub fn start_game(app: &mut App) {
         unsafe { ui::message(app.hwnd, &format!("{} was not found next to the launcher.", dsconfig::paths::GAME_EXE), TITLE, MB_ICONERROR) };
         return;
     }
-    // (The translation check runs the game for a few seconds when the launcher opens.)
+    // (The translation check runs the game for a few seconds when the launcher opens, and the
+    // prepared shaders' probe after it.)
     shaders::wait_check();
+    shaders::settle_probe(app);
     let mut cmd = std::process::Command::new(&exe);
     cmd.current_dir(&app.paths.exe_dir);
     let safe = game::safe_mode(app);

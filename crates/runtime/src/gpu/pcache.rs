@@ -176,6 +176,10 @@ fn encode(data: &[u8]) -> Vec<u8> {
             return out;
         }
     }
+    // (The launcher's probe stores nothing, a shared block either; the review of 2026-11-21.)
+    if READ_ONLY.load(Ordering::Relaxed) {
+        return data.to_vec();
+    }
     let prev = LAST_WHOLE.lock().replace(data.to_vec());
     if let (Some(prev), Some(dir)) = (prev, DIR.get()) {
         if let Some(b) = discover(&prev, data) {
@@ -252,6 +256,10 @@ thread_local! {
 static TOUCH: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 fn touch_later(p: &Path) {
+    // (Nor does the probe change the files' times.)
+    if READ_ONLY.load(Ordering::Relaxed) {
+        return;
+    }
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         let _ = std::thread::Builder::new().name("pcache-touch".into()).spawn(|| loop {
@@ -426,6 +434,10 @@ pub fn set_dir(dir: PathBuf) {
     }
     let bin = dir.join("binaries");
     let bins = std::fs::create_dir_all(&bin).is_ok() && BIN_DIR.set(bin.clone()).is_ok();
+    // (The probe neither converts nor prunes.)
+    if READ_ONLY.load(Ordering::Relaxed) {
+        return;
+    }
     let _ = std::thread::Builder::new().name("pcache-prune".into()).spawn(move || {
         convert(&dir);
         prune(&dir, "bin", BUDGET);
@@ -442,9 +454,12 @@ fn prune(dir: &Path, ext: &str, budget: u64) {
         return;
     }
     let Ok(rd) = std::fs::read_dir(dir) else { return };
+    // (Not the store check's four pipelines (`q`): no session uses them, so they would go first,
+    // and the launcher's probe needs them to tell a store the driver refuses; the review of
+    // 2026-11-21.)
     let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = rd
         .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == ext))
+        .filter(|e| e.path().extension().is_some_and(|x| x == ext) && !e.file_name().to_string_lossy().starts_with('q'))
         .filter_map(|e| {
             let m = e.metadata().ok()?;
             Some((m.modified().ok()?, m.len(), e.path()))
@@ -1194,6 +1209,10 @@ pub fn pb_check(phase: &str) -> i32 {
         0
     } else if compiled > 0 && errors == 0 {
         20
+    } else if phase == "probe" && missing == 4 {
+        // (The check's pipelines are not in the store: the probe cannot tell; the launcher has the
+        // check run again at the next preparation.)
+        22
     } else {
         21
     };

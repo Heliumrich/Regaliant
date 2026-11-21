@@ -365,7 +365,7 @@ const FINGERPRINT_SAMPLE: u64 = 509;
 /// 2D or as 2D arrays keyed by their instructions' dimension, `shaders::d2_resources`, and every
 /// combination of up to three compared images' depth views, 2026-11-15; 9: programs noted in
 /// the special-mode lists before their guess, `shaders::note_program`, 2026-11-15 night).
-const PREPARATION_RULES: u32 = 9;
+pub(crate) const PREPARATION_RULES: u32 = 9;
 
 /// The translation fingerprint of the prepared shaders: a sample of the game's compute
 /// programs (`FINGERPRINT_SAMPLE`) translated as `precompile_all` translates them, their

@@ -47,7 +47,7 @@ const STAGE_UNWRITABLE: i32 = 16;
 /// would stop there again), the drive full (15), the game files, the CPU, a start too early, no
 /// graphics card (3, 8, 10, 11), the game's modules not loaded (`EXIT_START`, 0xD502).
 fn worth_retry(code: i32) -> bool {
-    !matches!(code, 0 | 3 | 8 | 9 | 10 | 11 | STAGE_STOPPED | 13 | STAGE_DISK_FULL | STAGE_UNWRITABLE | 20 | 21 | 0xD502)
+    !matches!(code, 0 | 3 | 8 | 9 | 10 | 11 | STAGE_STOPPED | 13 | STAGE_DISK_FULL | STAGE_UNWRITABLE | 20 | 21 | 22 | 0xD502)
 }
 
 /// An exit status as the player is told it: small ones in decimal, Windows' exception codes in
@@ -195,8 +195,11 @@ static PROBE_HANDLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// The translation check's line logged (`check_tick`).
 static CHECK_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The longest the probe may take (4 small pipelines: a few seconds; ended after it).
+const PROBE_SECS: u64 = 30;
+
 /// Starts the probe on a thread of its own (after the translation check: one game process at a
-/// time), waited for 60 s at most.
+/// time), ended after `PROBE_SECS`.
 fn start_probe(app: &App) {
     if PROBE_STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
@@ -213,7 +216,7 @@ fn start_probe(app: &App) {
             loop {
                 match c.try_wait() {
                     Ok(Some(s)) => break s.code(),
-                    Ok(None) if t.elapsed().as_secs() < 60 => std::thread::sleep(std::time::Duration::from_millis(50)),
+                    Ok(None) if t.elapsed().as_secs() < PROBE_SECS => std::thread::sleep(std::time::Duration::from_millis(50)),
                     _ => {
                         let _ = c.kill();
                         break None;
@@ -225,13 +228,51 @@ fn start_probe(app: &App) {
     });
 }
 
-/// Waits for the probe to end (20 s at most): Play starts the game only once it is known
-/// whether the store still holds.
+/// Waits for the probe to end (it is ended after `PROBE_SECS`, so it has an answer then).
 fn wait_probe() {
     let t = Instant::now();
-    while PROBE_STARTED.load(std::sync::atomic::Ordering::Relaxed) && PROBE.lock().unwrap_or_else(|e| e.into_inner()).is_none() && t.elapsed().as_secs() < 20 {
+    while PROBE_STARTED.load(std::sync::atomic::Ordering::Relaxed) && PROBE.lock().unwrap_or_else(|e| e.into_inner()).is_none() && t.elapsed().as_secs() < PROBE_SECS + 5 {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+}
+
+/// A probe in flight waited for and its answer handled (the game started now, the launcher's own
+/// choice or the player's, does not run beside it). Nothing when none was started.
+pub fn settle_probe(app: &mut App) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if PROBE_STARTED.load(Relaxed) && !PROBE_HANDLED.load(Relaxed) {
+        ensure_probe(app);
+    }
+}
+
+/// Whether the probe is due: the store holds prepared shaders the driver should take.
+fn probe_due(app: &App) -> bool {
+    version_mismatch().is_none() && compute_state(app).0 && matches!(check_state(app).as_deref(), Some("binaries" | "cache")) && outcome(app).is_none()
+}
+
+/// Before a preparation begins and before Play starts the game: the probe run when it is due and
+/// its answer handled, so that a store the driver refuses is set aside first and the probe never
+/// runs beside a step or the game (the review of 2026-11-21: started by the check's timer alone,
+/// it could run beside the first step of a preparation begun during the check, or beside the
+/// game Play had started meanwhile, and a refusal found then was never acted on).
+fn ensure_probe(app: &mut App) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if let Some(r) = checked_translation() {
+        log_check_line(app, &r);
+    }
+    if PROBE_HANDLED.load(Relaxed) {
+        return;
+    }
+    if !PROBE_STARTED.load(Relaxed) {
+        if !probe_due(app) {
+            PROBE_HANDLED.store(true, Relaxed);
+            return;
+        }
+        start_probe(app);
+    }
+    wait_probe();
+    let probe = *PROBE.lock().unwrap_or_else(|e| e.into_inner());
+    handle_probe(app, probe.unwrap_or(-1));
 }
 
 /// The store's refusals (`store-refused.txt`): the times (Unix seconds, UTC stamps) the probe
@@ -269,10 +310,18 @@ fn handle_probe(app: &mut App, code: i32) {
     let what = match code {
         0 => "the driver takes them",
         20 => "the driver refuses them now",
+        22 => "the store check's pipelines are not in the store",
         9 => "a game session runs",
         _ => "no answer",
     };
     log(app, &format!("the prepared shaders' probe: status {} ({what})", code_text(code)));
+    // (Nothing to probe with: the check runs again at the next preparation and stores them, so
+    // that later probes can tell; the store itself is taken as it is.)
+    if code == 22 {
+        let _ = std::fs::remove_file(check_file(app));
+        log(app, "the store check runs again at the next preparation");
+        return;
+    }
     if code != 20 {
         return;
     }
@@ -296,6 +345,18 @@ fn handle_probe(app: &mut App, code: i32) {
     app.update_play();
 }
 
+/// The launcher's start line with the game's check, once: from the check's timer, or first from
+/// `ensure_probe` when Play or Prepare now came before the timer saw the answer (the probe's line
+/// had come before it, 2026-11-21).
+fn log_check_line(app: &App, r: &Result<String, String>) {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let id = GAME_ID.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    log(app, &format!("launcher {} started; the game's check: translation {}; game {}", dsconfig::VERSION, r.as_deref().unwrap_or_else(|e| e), id.map_or("unknown".to_string(), |(v, d, r)| if d.is_empty() { format!("{v}, no graphics card reported") } else { format!("{v} on {d}, driver {r}") })));
+}
+
 /// The check's answer once it has one.
 fn checked_translation() -> Option<Result<String, String>> {
     CHECK.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -317,18 +378,19 @@ pub fn check_tick(app: &mut App) {
     }
     if let Some(r) = checked_translation() {
         CHECK_LOGGED.store(true, Relaxed);
-        let id = GAME_ID.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        log(app, &format!("launcher {} started; the game's check: translation {}; game {}", dsconfig::VERSION, r.as_deref().unwrap_or_else(|e| e), id.map_or("unknown".to_string(), |(v, d, r)| if d.is_empty() { format!("{v}, no graphics card reported") } else { format!("{v} on {d}, driver {r}") })));
+        log_check_line(app, &r);
         if let Some(t) = version_mismatch() {
             log(app, &t);
             app.set_status(&t);
         }
         refresh(app);
         app.update_play();
-        // (The store's probe when it holds prepared shaders the driver should take; else none.)
-        if version_mismatch().is_none() && compute_state(app).0 && matches!(check_state(app).as_deref(), Some("binaries" | "cache")) && outcome(app).is_none() {
+        // (The store's probe when it holds prepared shaders the driver should take; else none. Not
+        // beside a preparation or the game: those began after `ensure_probe`, which ran it first,
+        // or (Play without preparing) the game would turn it away.)
+        if !running(app) && app.running.is_none() && probe_due(app) {
             start_probe(app);
-        } else {
+        } else if !PROBE_STARTED.load(Relaxed) {
             PROBE_HANDLED.store(true, Relaxed);
         }
     }
@@ -534,6 +596,9 @@ fn retire_stale_store(app: &App) -> bool {
     let recorded = [store_identity_file(app), marker(app), played_file(app)].into_iter().map(|f| read_kv(&f)).find(|kv| !kv.is_empty());
     // (Refused by the driver since the marker was written: stale whatever the identity says.)
     let refused = refused_after(app, &get(&read_kv(&marker(app)), "date"));
+    // (Why the store's pipelines were set aside, while none are prepared again: kept across the
+    // identity's rewrites, for the page's text.)
+    let mut set_aside = if read_kv(&marker(app)).is_empty() { set_aside_reason(app) } else { None };
     if let Some(kv) = recorded {
         let same = get(&kv, "translation") == translation && get(&kv, "device") == device && get(&kv, "driver") == driver && !refused;
         let dir = shaders.join("pipelines");
@@ -546,6 +611,26 @@ fn retire_stale_store(app: &App) -> bool {
                     let _ = std::fs::create_dir_all(&dir);
                     let _ = std::fs::write(dir.join("binaries-mode.txt"), m);
                 }
+                // (The marker described the pipelines set aside: none are prepared until the
+                // compile is done again, and a preparation stopped before then goes on from
+                // there at the next start (the review of 2026-11-21: the marker had stayed, a
+                // refusal after its date set every new start's store aside again, and the store
+                // check's record, kept, left the new store without the check's pipelines, so
+                // the probe could no longer tell). The check runs again and stores them.)
+                let _ = std::fs::remove_file(marker(app));
+                let _ = std::fs::remove_file(check_file(app));
+                set_aside = Some(
+                    if refused {
+                        "refused"
+                    } else if get(&kv, "translation") != translation {
+                        "translation"
+                    } else if get(&kv, "device") != device {
+                        "card"
+                    } else {
+                        "driver"
+                    }
+                    .to_string(),
+                );
             } else {
                 // (A file in it held open, e.g. by a game or a virus scanner: its pipelines stay,
                 // and the steps take none of them as made; the identity stays the old one, so the
@@ -567,11 +652,18 @@ fn retire_stale_store(app: &App) -> bool {
             }
         });
     }
+    let why = set_aside.map_or(String::new(), |w| format!("set_aside = {w}\n"));
     write_record(
         &store_identity_file(app),
-        &format!("# The translation, graphics card and driver the stored pipelines are made for; written by the launcher at a preparation's start\ntranslation = {translation}\ndevice = {device}\ndriver = {driver}\n"),
+        &format!("# The translation, graphics card and driver the stored pipelines are made for; written by the launcher at a preparation's start\ntranslation = {translation}\ndevice = {device}\ndriver = {driver}\n{why}"),
     );
     true
+}
+
+/// Why the store's pipelines were last set aside (`retire_stale_store`: refused, translation,
+/// card, driver), from the identity record.
+fn set_aside_reason(app: &App) -> Option<String> {
+    read_kv(&store_identity_file(app)).into_iter().find(|(k, _)| k == "set_aside").map(|(_, v)| v).filter(|v| !v.is_empty())
 }
 
 /// Whether the compute shaders are prepared for this graphics card, driver and translation; the
@@ -583,7 +675,18 @@ fn compute_state(app: &App) -> (bool, String) {
     }
     let kv = read_kv(&marker(app));
     if kv.is_empty() {
-        return (false, "The shaders are not prepared on this PC yet.".into());
+        // (Set aside at a preparation's start and not compiled again yet: why.)
+        return (
+            false,
+            match set_aside_reason(app).as_deref() {
+                Some("refused") => "The graphics driver no longer takes the prepared shaders. Prepare them again.",
+                Some("translation") => "The game was updated since the shaders were prepared. Prepare them again.",
+                Some("card") => "The graphics card changed since the shaders were prepared. Prepare them again.",
+                Some("driver") => "The graphics driver changed since the shaders were prepared. Prepare them again.",
+                _ => "The shaders are not prepared on this PC yet.",
+            }
+            .into(),
+        );
     }
     let get = |k: &str| kv.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone()).unwrap_or_default();
     let date = get("date");
@@ -655,6 +758,14 @@ fn rules_of(t: &str) -> &str {
 /// The self-play played to its end for this card and the preparation's rules.
 fn played_complete(p: &Played) -> bool {
     p.newgame == Some(0) && p.tour.is_some_and(|c| c != STAGE_STOPPED)
+}
+
+/// The self-play's attempt ended for this card and the preparation's rules: played to its end, or
+/// a new game that could not go on (twice: the compute step then made what it could). A stale
+/// store then needs the compile alone (the review of 2026-11-21: after such a new game, a refusal
+/// or a new driver replayed it).
+fn played_ended(p: &Played) -> bool {
+    played_complete(p) || p.newgame.is_some_and(|c| c != 0 && c != STAGE_STOPPED)
 }
 
 /// The record of a preparation that could not finish (`record_outcome`): Play starts the game
@@ -797,7 +908,7 @@ pub fn state(app: &App) -> (bool, String) {
     let (ok, text) = compute_state(app);
     if !ok {
         // (A new driver or version: the self-play's learning holds, only the compile is redone.)
-        if app.game.ok && played_complete(&played(app)) && text.ends_with("Prepare them again.") {
+        if app.game.ok && played_ended(&played(app)) && text.ends_with("Prepare them again.") {
             return (false, text.replace("Prepare them again.", "Prepare now compiles them again, without the game playing again."));
         }
         return (ok, text);
@@ -817,13 +928,7 @@ pub fn state(app: &App) -> (bool, String) {
 pub fn prepared(app: &mut App) -> bool {
     wait_check();
     // (The probe's answer, before Play decides: a store the driver refuses is prepared again.)
-    if CHECK_LOGGED.load(std::sync::atomic::Ordering::Relaxed) {
-        wait_probe();
-        let probe = *PROBE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(code) = probe {
-            handle_probe(app, code);
-        }
-    }
+    ensure_probe(app);
     state(app).0
 }
 
@@ -929,6 +1034,8 @@ pub fn start(app: &mut App, play_after: bool) {
         }
         return;
     }
+    // (The probe first: a store the driver refuses is set aside below, not taken as made.)
+    ensure_probe(app);
     let _ = std::fs::remove_file(outcome_file(app));
     app.shaders.untrusted = !retire_stale_store(app);
     // (The next part of the levels when the new game was played for this version, card and
@@ -937,7 +1044,7 @@ pub fn start(app: &mut App, play_after: bool) {
     let save = app.paths.cache.join("prepare").join("user").join("saves");
     // (The self-play played to its end, the compiled pipelines stale: a new driver or version.
     // The compute step alone makes again everything learned; the game does not play again.)
-    let recompile = played_complete(&p) && !compute_state(app).0;
+    let recompile = played_ended(&p) && !compute_state(app).0;
     let first = match p {
         _ if recompile => Step::Compute,
         Played { newgame: Some(0), parts, tour, .. } if parts < LEVEL_PARTS && tour != Some(0) && has_save(&save, 4) => Step::Levels(parts + 1),
@@ -1242,7 +1349,10 @@ pub fn tick(app: &mut App) {
         // every step hung waited for each of them, twice.)
         // (A new game that could not go on runs once more too: the levels need its save, and its
         // menus' navigation can slip, 2026-11-21: once in about fifteen new games.)
-        let failed = !stopped && (worth_retry(code) || (step == Step::NewGame && code == 13 && !app.shaders.crash_retried.contains(&step)));
+        // (The slip is not the PC's failure: it is not counted against the step before, the review
+        // of 2026-11-21: a store check that crashed, then one slip, had ended the preparation.)
+        let failed = !stopped && worth_retry(code);
+        let slip = !stopped && step == Step::NewGame && code == 13;
         if failed && app.shaders.last_failed {
             record_outcome(app, &format!("its steps kept failing, the last because {why}"));
             finish(app, None);
@@ -1251,7 +1361,7 @@ pub fn tick(app: &mut App) {
             }
             return;
         }
-        if failed && matches!(step, Step::NewGame | Step::Levels(_) | Step::Compute) && !app.shaders.crash_retried.contains(&step) {
+        if (failed || slip) && matches!(step, Step::NewGame | Step::Levels(_) | Step::Compute) && !app.shaders.crash_retried.contains(&step) {
             app.shaders.crash_retried.push(step);
             log(app, &format!("step {step:?} begun again: {why}"));
             // (In the launcher's status line: the page's own is the new step's at once.)

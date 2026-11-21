@@ -614,7 +614,31 @@ impl Watch {
         self.poll();
         self.since(at).filter(|l| matches(l, pat)).count()
     }
+
+    /// Which of `pats` the last line from `at` on that matches one of them matches.
+    fn last_of(&mut self, pats: &[&str], at: usize) -> Option<usize> {
+        self.poll();
+        let mut last = None;
+        for l in self.since(at) {
+            if let Some(i) = pats.iter().position(|p| matches(l, p)) {
+                last = Some(i);
+            }
+        }
+        last
+    }
 }
+
+/// Character creation's entries below the name, by the help text the one under the cursor shows
+/// (the title logs each text it sets): class, gift, saved creations, foundation, appearance,
+/// Finalise.
+const CREATION_ENTRIES: [&str; 6] = [
+    "text: Select a character class.",
+    "text: Choose a starting gift.",
+    "text: Save the current character creation or load a character creation.",
+    "text: Define the foundation of the character.",
+    "text: Change the overall appearance of the character.",
+    "text: Finalise your character.",
+];
 
 /// `pat`'s parts (split at `.*`) in `line`, in order.
 fn matches(line: &str, pat: &str) -> bool {
@@ -723,6 +747,39 @@ impl Play {
         if let Err(e) = crate::input::press_for(names, Duration::from_millis(ms)) {
             crate::warn!("prepare-play: press {names}: {e}");
         }
+    }
+
+    /// A press held for `flips` of the game's frames, whatever their time (`input::press_flips`).
+    fn press_flips(&self, names: &str, flips: u64) {
+        if let Err(e) = crate::input::press_flips(names, flips) {
+            crate::warn!("prepare-play: press {names}: {e}");
+        }
+    }
+
+    /// Places character creation's cursor on entry `want` (`CREATION_ENTRIES`; `from`: the entry
+    /// it is on, None above them), a press at a time, by the help text the entry under the cursor
+    /// shows: an entry too far is undone with a press up, a press not taken is made again
+    /// (2026-11-21: after a 462 ms frame the menu took one press down as two, the gift and the
+    /// saved creations 274 ms apart, every press after it landed an entry off and the character
+    /// was not saved). Directions are held for two of the game's frames, whatever their time:
+    /// a long frame no longer holds them long enough for the menu's own repeat.
+    fn to_entry(&mut self, want: usize, from: Option<usize>) -> Result<bool, End> {
+        let mut at = from;
+        for _ in 0..8 {
+            let dir = match at {
+                Some(i) if i == want => return Ok(true),
+                Some(i) if i > want => "up",
+                _ => "down",
+            };
+            let m = self.w.mark();
+            self.press_flips(dir, 2);
+            // (The entry's help text; a second move's too, if the menu took the press twice.)
+            if self.wait_any(&CREATION_ENTRIES, m, 5.0)? {
+                self.sleep(1.0)?;
+                at = self.w.last_of(&CREATION_ENTRIES, m);
+            }
+        }
+        Ok(at == Some(want))
     }
 
     /// Cross until a line matching `pat` comes (at most `tries` presses, 6 s apart).
@@ -857,12 +914,20 @@ impl Play {
         let created_from = self.w.mark();
         self.sleep(3.0)?;
         // The entries below the name: class, gift, saved creations, foundation, appearance,
-        // Finalise. Each but the saved creations is opened (Cross), changed (Right) and left
-        // (Circle): their previews. (Cross on an empty saved-creation slot opens nothing, and
-        // Circle there would open the quit prompt: that row is only passed.)
-        for e in ["class", "gift", "saveload", "foundation", "appearance"] {
-            self.press("down", 300);
-            self.sleep(2.0)?;
+        // Finalise (`CREATION_ENTRIES`), the cursor placed on each by its help text (`to_entry`).
+        // Each but the saved creations is opened (Cross), changed (Right) and left (Circle): their
+        // previews. (Cross on an empty saved-creation slot opens nothing, and Circle there would
+        // open the quit prompt: that row is only passed.) An entry the cursor could not be placed
+        // on is passed too.
+        let mut at = None;
+        for (i, e) in ["class", "gift", "saveload", "foundation", "appearance"].into_iter().enumerate() {
+            if !self.to_entry(i, at)? {
+                crate::warn!("prepare-play: the cursor could not be placed on character creation's {e}");
+                at = self.w.last_of(&CREATION_ENTRIES, created_from);
+                continue;
+            }
+            at = Some(i);
+            self.sleep(1.0)?;
             if e == "saveload" {
                 continue;
             }
@@ -871,9 +936,7 @@ impl Play {
                 self.sleep(3.0)?;
             }
         }
-        self.press("down", 300);
-        self.sleep(2.0)?;
-        if !self.w.found("Finalise your character.", m) {
+        if !self.to_entry(5, at)? {
             crate::warn!("prepare-play: the cursor may not be on Finalise");
         }
         self.step("the character made");

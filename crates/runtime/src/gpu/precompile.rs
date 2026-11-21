@@ -230,20 +230,28 @@ fn load() {
                         STATS[LOADED].fetch_add(1, Ordering::Relaxed);
                     }
                 } else if let Some(rest) = line.strip_prefix("K ") {
-                    // (A compute pipeline's exact key spec, `note_compute_pipeline`: kept under the
-                    // hash its words give; one recorded under another counted, a sign that the
-                    // spec's words or the hasher changed.)
-                    let mut w = rest.splitn(3, ' ');
-                    if let (Some(Ok(h)), Some(Ok(sh)), Some(Some(spec))) = (w.next().map(|v| u64::from_str_radix(v, 16)), w.next().map(|v| u64::from_str_radix(v, 16)), w.next().map(Spec::from_words)) {
-                        let got = spec_hash_of(&spec);
-                        if got != sh {
-                            EXACT_STATS[2].fetch_add(1, Ordering::Relaxed);
+                    // (A compute pipeline's exact key spec, `note_compute_pipeline`: taken whole only
+                    // (its checksum: a line cut short by a power loss could read as another spec),
+                    // for this build's preparation rules (others' key specs are not this one's: a
+                    // change of how key specs are formed changes the rules, and the whole
+                    // preparation is made again), kept under the hash its words give; one
+                    // recorded under another counted, a sign that the hasher changed.)
+                    match parse_exact(rest) {
+                        Some(Ok((h, sh, spec))) => {
+                            let got = spec_hash_of(&spec);
+                            if got != sh {
+                                EXACT_STATS[2].fetch_add(1, Ordering::Relaxed);
+                            }
+                            if exact.insert((h, got), spec).is_none() {
+                                EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
+                            }
                         }
-                        if exact.insert((h, got), spec).is_none() {
-                            EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
+                        Some(Err(())) => {
+                            EXACT_STATS[4].fetch_add(1, Ordering::Relaxed);
                         }
-                    } else {
-                        EXACT_STATS[3].fetch_add(1, Ordering::Relaxed);
+                        None => {
+                            EXACT_STATS[3].fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 } else if let Some((h, s)) = parse(line).filter(|(_, s)| local_ok(s.local)) {
                     let v = &mut m.entry(h).or_insert_with(|| (rank, Vec::new())).1;
@@ -273,9 +281,38 @@ fn load() {
 
 /// The exact key specs of the compute pipelines sessions made (`note_compute_pipeline`), by (code
 /// hash, spec hash): the store's `K` lines. [loaded, kept this session, loaded under another hash,
-/// lines not read].
+/// lines not read (cut short, damaged, unknown words), lines of other preparation rules].
 static EXACT: Mutex<Option<HashMap<(u64, u64), Spec>>> = Mutex::new(None);
-pub(crate) static EXACT_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+pub(crate) static EXACT_STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// FNV-1a over `b` (a `K` line's checksum).
+fn fnv64(b: &[u8]) -> u64 {
+    b.iter().fold(0xcbf2_9ce4_8422_2325u64, |a, &x| (a ^ x as u64).wrapping_mul(0x100_0000_01b3))
+}
+
+/// A `K` line (without its `K `): `<code hash> <spec hash> r<rules> <spec words> <checksum>`.
+/// Some(Ok): its code hash, spec hash and spec; Some(Err): whole, of other preparation rules;
+/// None: not read.
+fn parse_exact(rest: &str) -> Option<Result<(u64, u64, Spec), ()>> {
+    let (body, sum) = rest.rsplit_once(' ')?;
+    if u64::from_str_radix(sum, 16).ok()? != fnv64(body.as_bytes()) {
+        return None;
+    }
+    let mut w = body.splitn(4, ' ');
+    let h = u64::from_str_radix(w.next()?, 16).ok()?;
+    let sh = u64::from_str_radix(w.next()?, 16).ok()?;
+    let rules: u32 = w.next()?.strip_prefix('r')?.parse().ok()?;
+    if rules != super::compbench::PREPARATION_RULES {
+        return Some(Err(()));
+    }
+    Some(Ok((h, sh, Spec::from_words(w.next()?)?)))
+}
+
+/// A `K` line for `parse_exact`.
+fn exact_line(h: u64, sh: u64, spec: &Spec) -> String {
+    let body = format!("{h:016x} {sh:016x} r{} {}", super::compbench::PREPARATION_RULES, spec.to_words());
+    format!("K {body} {:016x}\n", fnv64(body.as_bytes()))
+}
 
 /// A spec's hash as pipeline keys take it.
 fn spec_hash_of(s: &Spec) -> u64 {
@@ -291,9 +328,24 @@ fn spec_hash_of(s: &Spec) -> u64 {
 /// store the driver refuses (`exact_work`). Until 2026-11-21 only the learned specs were kept, and
 /// they cannot name batched programs' address variants, LOD-statistics variants or every
 /// buffer-format mix: a store the compute step made again left ~330 compute pipelines to the first
-/// session. The compute step's own pipelines (no program address) are not kept.
+/// session. The compute step's own pipelines (no program address) are not kept. Only the check
+/// and a queue's push here, on the creating thread (a command processor's, often): the code and
+/// the store's line are written by a thread of their own (`exact_writer`; done inline at first,
+/// the character creation's frames hitched 5 times as much and the self-play's menu presses
+/// repeated).
 pub(crate) fn note_compute_pipeline(addr: u64, tr: &super::shaders::Translated) {
+    // (`DS_EXACT_SPECS=0`, a test: none kept.)
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var("DS_EXACT_SPECS").ok().as_deref() == Some("0")) {
+        return;
+    }
     if addr == 0 || tr.spec.stage != rdna::translate::Stage::Compute || !local_ok(tr.spec.cs_local_size) {
+        return;
+    }
+    // (Not a diagnosis's variants: probes, dumps, outlier counts, exact ballasts; the review of
+    // 2026-11-21.)
+    let d = &tr.spec;
+    if d.probe.is_some() || d.dump.is_some() || d.outlier.is_some() || d.mark_twice || d.touch_twice || d.part_twice || d.pt_linear {
         return;
     }
     load();
@@ -308,12 +360,73 @@ pub(crate) fn note_compute_pipeline(addr: u64, tr: &super::shaders::Translated) 
         }
         m.insert((h, sh), tr.spec.clone());
     }
-    keep_code(addr, h);
-    if !CODES.lock().as_ref().is_some_and(|c| c.contains_key(&h)) {
-        return;
+    EXACT_JOBS.lock().push_back((addr, h, sh, tr.spec.clone()));
+    if !EXACT_WRITER.swap(true, Ordering::Relaxed) {
+        let _ = std::thread::Builder::new().name("exact-specs".into()).spawn(exact_writer);
     }
-    EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
-    store_line(&format!("K {h:016x} {sh:016x} {}\n", tr.spec.to_words()));
+    EXACT_CV.notify_one();
+}
+
+/// The exact specs waiting for their code and line (`note_compute_pipeline`).
+static EXACT_JOBS: Mutex<std::collections::VecDeque<(u64, u64, u64, Spec)>> = Mutex::new(std::collections::VecDeque::new());
+static EXACT_CV: Condvar = Condvar::new();
+static EXACT_WRITER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Keeps each queued spec's program code and writes their lines, those queued together in one
+/// append, below normal priority.
+fn exact_writer() {
+    crate::log::set_thread_name("exact-specs");
+    unsafe {
+        windows_sys::Win32::System::Threading::SetThreadPriority(windows_sys::Win32::System::Threading::GetCurrentThread(), windows_sys::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL);
+    }
+    loop {
+        let busy = EXACT_BUSY.lock();
+        let jobs: Vec<(u64, u64, u64, Spec)> = {
+            let mut g = EXACT_JOBS.lock();
+            if g.is_empty() {
+                drop(busy);
+                while g.is_empty() {
+                    EXACT_CV.wait(&mut g);
+                }
+                continue;
+            }
+            g.drain(..).collect()
+        };
+        exact_write(jobs);
+        drop(busy);
+    }
+}
+
+/// Held while queued specs are written (`exact_flush` waits for a batch in hand).
+static EXACT_BUSY: Mutex<()> = Mutex::new(());
+
+/// The queued specs' code kept and their lines written. A spec whose code could not be kept (its
+/// program unmapped or replaced meanwhile) leaves the map, so that its next creation queues it
+/// again (the review of 2026-11-21).
+fn exact_write(jobs: Vec<(u64, u64, u64, Spec)>) {
+    let mut lines = String::new();
+    for (addr, h, sh, spec) in jobs {
+        keep_code(addr, h);
+        if CODES.lock().as_ref().is_some_and(|c| c.contains_key(&h)) {
+            EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
+            lines.push_str(&exact_line(h, sh, &spec));
+        } else if let Some(m) = EXACT.lock().as_mut() {
+            m.remove(&(h, sh));
+        }
+    }
+    if !lines.is_empty() {
+        store_line(&lines);
+    }
+}
+
+/// At the session's end: the specs still queued written (the writer's batch in hand first, 2 s at
+/// most: a writer held up does not hold the end).
+pub(crate) fn exact_flush() {
+    let Some(_busy) = EXACT_BUSY.try_lock_for(std::time::Duration::from_secs(2)) else { return };
+    let jobs: Vec<(u64, u64, u64, Spec)> = EXACT_JOBS.lock().drain(..).collect();
+    if !jobs.is_empty() {
+        exact_write(jobs);
+    }
 }
 
 /// The exact key specs sessions made whose program's code is kept (`--precompile-all`'s list).
@@ -506,8 +619,34 @@ fn gfx_learned<R>(f: impl FnOnce(&mut GfxLearned) -> R) -> R {
 
 /// Appends a line to the store.
 fn store_line(line: &str) {
-    LINES.fetch_add(1, Ordering::Relaxed);
+    // (Lines written together count each: the next learned spec's rank.)
+    LINES.fetch_add(line.matches('\n').count().max(1) as u64, Ordering::Relaxed);
     if let Some(p) = STORE.get() {
+        // (A store whose last line was cut short, by a power loss: this session's first line on a
+        // line of its own, not glued to it; the review of 2026-11-21.)
+        static TAIL: std::sync::Once = std::sync::Once::new();
+        static NEWLINE_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        TAIL.call_once(|| {
+            use std::io::{Read, Seek};
+            let cut = std::fs::File::open(p).ok().and_then(|mut f| {
+                let len = f.metadata().ok()?.len();
+                if len == 0 {
+                    return Some(false);
+                }
+                f.seek(std::io::SeekFrom::Start(len - 1)).ok()?;
+                let mut b = [0u8; 1];
+                f.read_exact(&mut b).ok()?;
+                Some(b[0] != b'\n')
+            });
+            NEWLINE_FIRST.store(cut == Some(true), Ordering::Relaxed);
+        });
+        let owned;
+        let line = if NEWLINE_FIRST.swap(false, Ordering::Relaxed) {
+            owned = format!("\n{line}");
+            owned.as_str()
+        } else {
+            line
+        };
         let r = std::fs::OpenOptions::new().create(true).append(true).open(p).and_then(|mut f| f.write_all(line.as_bytes()));
         if let Err(e) = r {
             static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1466,7 +1605,7 @@ pub fn status() -> String {
     f.sort_by(|a, b| b.1.cmp(&a.1));
     let f: Vec<String> = f.iter().take(12).map(|((fm, ds), n)| format!("{fm}/{ds:#x} {n}")).collect();
     format!(
-        "    compute shader objects (`precompile`): {} created; specs {} loaded, {} learned; translated at their dispatch with specs learned {} ({} of them with a learned spec giving the same key spec, {} with none); programs' code {} loaded, {} kept; {} jobs queued at the start; {} programs translated first ({} later translations with another spec), {} of them from an object: guess equal {}, equal but for format-accessed buffers {} ({}), different {} ({}); dispatch modifier bit 15 set: wave64 {}, wave32 {}; clear: wave64 {}, wave32 {}{made}\n",
+        "    compute shader objects (`precompile`): {} created; specs {} loaded, {} learned; translated at their dispatch with specs learned {} ({} of them with a learned spec giving the same key spec, {} with none); programs' code {} loaded, {} kept; exact key specs {} loaded ({} under another hash, {} of other preparation rules, {} lines not read), {} kept; {} jobs queued at the start; {} programs translated first ({} later translations with another spec), {} of them from an object: guess equal {}, equal but for format-accessed buffers {} ({}), different {} ({}); dispatch modifier bit 15 set: wave64 {}, wave32 {}; clear: wave64 {}, wave32 {}{made}\n",
         s[OBJECTS],
         s[LOADED],
         s[LEARNT],
@@ -1475,6 +1614,11 @@ pub fn status() -> String {
         MISSES[2].load(Ordering::Relaxed),
         s[CODES_LOADED],
         s[CODES_KEPT],
+        EXACT_STATS[0].load(Ordering::Relaxed),
+        EXACT_STATS[2].load(Ordering::Relaxed),
+        EXACT_STATS[4].load(Ordering::Relaxed),
+        EXACT_STATS[3].load(Ordering::Relaxed),
+        EXACT_STATS[1].load(Ordering::Relaxed),
         s[EARLY],
         s[FIRSTS],
         s[LATER],
@@ -1552,6 +1696,26 @@ mod tests {
         assert!(t == s);
         assert!(parse("zz 1 2 3 4 1").is_none());
         assert!(parse("12 84 64 1 1 1 q7").is_none());
+    }
+
+    #[test]
+    fn exact_lines_round_trip() {
+        // (Words as a session of 2026-11-21 recorded them.)
+        let words = "s1 c 12 0 0 0 614c01e1 64,1,1 152 0 - - - - 1 0 0 - 0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0 - b0.0,b20.4,b20.4";
+        let spec = Spec::from_words(words).expect("words read");
+        let (h, sh) = (0x6825_ea61_efbc_0222u64, 0x475a_b4e0_6b9f_07cfu64);
+        let line = exact_line(h, sh, &spec);
+        assert!(line.ends_with('\n'));
+        let rest = line.trim_end().strip_prefix("K ").unwrap();
+        let (h2, sh2, back) = parse_exact(rest).unwrap().unwrap();
+        assert_eq!((h2, sh2), (h, sh));
+        assert_eq!(back.to_words(), spec.to_words());
+        // (Cut short, or a word changed: not read.)
+        assert!(parse_exact(&rest[..rest.len() - 20]).is_none());
+        assert!(parse_exact(&rest.replace("b20.4,b20.4", "b20.4,b20.1")).is_none());
+        // (Whole, but of other preparation rules.)
+        let body = format!("{:016x} {:016x} r{} {words}", 1u64, 2u64, crate::gpu::compbench::PREPARATION_RULES + 1);
+        assert!(matches!(parse_exact(&format!("{body} {:016x}", fnv64(body.as_bytes()))), Some(Err(()))));
     }
 
     #[test]

@@ -299,6 +299,20 @@ pub fn press_for(names: &str, dur: std::time::Duration) -> Result<(), String> {
     Ok(())
 }
 
+/// A press held for `flips` of the game's frames from the first it reads it at, whatever their
+/// time (the self-play's menu moves: a hold that spans a long frame lets a menu repeat the
+/// direction, 2026-11-21).
+pub fn press_flips(names: &str, flips: u64) -> Result<(), String> {
+    let steps = parse_script(&format!("0:{names}:1"))?;
+    note_device(DEVICE_PAD);
+    let now = std::time::Instant::now();
+    let mut live = LIVE_TIMED.lock();
+    let flip = crate::gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+    live.retain(|x| x.0 > now || x.2 == u64::MAX || flip < x.2 + x.3);
+    live.extend(steps.into_iter().map(|s| (now, s, u64::MAX, flips.max(1))));
+    Ok(())
+}
+
 /// Sticks held at a tilt by the control channel (`hold_stick`): until when,
 /// right stick, x, y, and under `FLIP_TIMED` the flip it was first read at and its flips (0:
 /// held by the wall clock).

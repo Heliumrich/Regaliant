@@ -2066,6 +2066,8 @@ pub fn shutdown(code: i32) -> ! {
     session_ended();
     hle::libs::videoout::wait_shots();
     gpu::shutdown();
+    // (The exact key specs still queued: written, the session's last ones.)
+    gpu::precompile::exact_flush();
     info!("shutdown with status {code}\n{}", thread_summary());
     crate::log::flush();
     pgo_write();
@@ -2358,8 +2360,12 @@ This happens when other software takes that range. Restart the PC and try again.
     if cfg.precompile_all.is_none() && cfg.compile_bench.is_none() && cfg.pb_check.is_none() {
         hle::libs::savedata::init(pcsettings::saves::start(&cfg.paths, &hle::libs::savedata::title_id()));
     }
-    // Translations kept across runs (`gpu::trcache`).
-    gpu::trcache::set_dir(cache_root.join("translations"));
+    // Translations kept across runs (`gpu::trcache`). (Not by the launcher's probe, which translates
+    // nothing: the store's pruning would delete another process's translations in progress; the
+    // review of 2026-11-21.)
+    if cfg.pb_check.as_deref() != Some("probe") {
+        gpu::trcache::set_dir(cache_root.join("translations"));
+    }
     // DS_SPECS=<file name under the cache, or a path>: where the shader
     // programs' learned specs and code are kept (`gpu::precompile`).
     let specs = std::env::var("DS_SPECS").ok().filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
