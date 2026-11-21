@@ -7119,12 +7119,18 @@ impl Cp {
             // is noted then, a note now would let another queue's use apply it first.)
             let held = self.held.is_some();
             super::images::with(|im| {
-                im.note_meta_writes(&[(dst, if daic { 4 } else { bytes as u64 })]);
-                im.note_overwrites(&[(dst, if daic { 4 } else { bytes as u64 })]);
                 // A fill of memory with an immediate dword of one byte value (a clear code): a
                 // fast clear over metadata it covers has that value, no read after the GPU
                 // work; other dwords are other data, read at the image's use (2026-11-18 night).
-                if !held && src_sel == 2 && dst_sel == 0 && !das && !daic && super::images::uniform_word(&[src as u32]).is_some() {
+                // (Its own range noted as the fill alone: `note_meta_writes_but_fill`.)
+                let fill = !held && src_sel == 2 && dst_sel == 0 && !das && !daic && super::images::uniform_word(&[src as u32]).is_some();
+                if fill {
+                    im.note_meta_writes_but_fill(&[(dst, bytes as u64)], dst, bytes as u64);
+                } else {
+                    im.note_meta_writes(&[(dst, if daic { 4 } else { bytes as u64 })]);
+                }
+                im.note_overwrites(&[(dst, if daic { 4 } else { bytes as u64 })]);
+                if fill {
                     im.note_meta_fill(dst, bytes, src as u32);
                 }
             });

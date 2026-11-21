@@ -306,6 +306,17 @@ fn note_gens() -> [u64; 4] {
 /// Fast clears resolved without waiting for the GPU (metadata value known
 /// from the fill that wrote it).
 pub static FAST_CLEARS_KNOWN: AtomicU64 = AtomicU64::new(0);
+/// `DS_CLEAR_CHECK=1` (diagnosis, 2026-11-21): known fast clears' layers checked against their
+/// metadata read after the GPU work, and those that differed.
+pub static FAST_CLEARS_CHECKED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// `DS_CLEAR_CHECK=1`: fast clears with known values are checked as `DS_GPU_VERIFY=1` checks
+/// them (the GPU work drained first, the metadata read back), every layer of a layered run, and
+/// nothing else of that mode's (it slows a boot to a crawl).
+fn clear_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_CLEAR_CHECK").is_ok_and(|v| v == "1"))
+}
 /// Pending clears whose metadata, read from memory, held more than one code (other data, not
 /// a clear; `Exec::record_fast_clears`): refused, and applied with the value of the fill
 /// whose clear an unknown write had replaced (`images::PendingClear`'s kept value).
@@ -16224,8 +16235,8 @@ impl Exec {
         // The metadata write may still be in flight: read it back after the
         // GPU work, unless the fill that wrote it gave its value (then the
         // clear needs no wait; ~8 per courtyard frame drained the GPU).
-        // DS_GPU_VERIFY=1: known values are compared with the read-back one.
-        let check = verify::enabled();
+        // DS_GPU_VERIFY=1 or DS_CLEAR_CHECK=1: known values are compared with the read-back one.
+        let check = verify::enabled() || clear_check();
         if check || !super::images::with(|im| im.clears_known(keys)) {
             self.flush_for("fast clear");
             if self.stopped {
@@ -16273,11 +16284,25 @@ impl Exec {
             let v = match c.known {
                 Some(v) => {
                     FAST_CLEARS_KNOWN.fetch_add(1, Ordering::Relaxed);
-                    if check && super::cp::guest_readable(c.meta, 4) {
-                        let read = unsafe { std::ptr::read_volatile(c.meta as *const u32) };
+                    // (Every layer of a layered run: its own block's first dword.)
+                    let (count, per) = match run {
+                        Some((_, n)) => (n as u64, super::images::meta_layer_bytes(&c.key).unwrap_or(0)),
+                        None => (1, 0),
+                    };
+                    let checks = if check { count } else { 0 };
+                    for l in 0..checks {
+                        let at = c.meta + l * per;
+                        if !super::cp::guest_readable(at, 4) {
+                            continue;
+                        }
+                        let read = unsafe { std::ptr::read_volatile(at as *const u32) };
+                        FAST_CLEARS_CHECKED[0].fetch_add(1, Ordering::Relaxed);
                         static MISMATCH: AtomicU64 = AtomicU64::new(0);
-                        if read != v && MISMATCH.fetch_add(1, Ordering::Relaxed) < 20 {
-                            crate::warn!("images: fast clear of {:#x}: metadata {:#x} reads {read:#x}, the fill wrote {v:#x}", c.key.base, c.meta);
+                        if read != v {
+                            FAST_CLEARS_CHECKED[1].fetch_add(1, Ordering::Relaxed);
+                            if MISMATCH.fetch_add(1, Ordering::Relaxed) < 20 {
+                                crate::warn!("images: fast clear of {:#x}: metadata {at:#x} reads {read:#x}, the fill wrote {v:#x}", c.key.base);
+                            }
                         }
                     }
                     v
@@ -21183,11 +21208,12 @@ impl Exec {
                         self.held_fill(base, len, v)
                     } else {
                         super::images::with(|im| {
+                        // (Its own range noted as the fill alone: `note_meta_writes_but_fill`.)
+                        im.note_meta_writes_but_fill(&[(base, len)], base, len);
                         let z = if v == 0 && super::tune::zero_fill_clears() {
-                            im.note_meta_writes(&[(base, len)]);
                             im.zero_filled(base, len)
                         } else {
-                            im.note_writes(&[(base, len)], &[(base, len)]);
+                            im.note_overwrites(&[(base, len)]);
                             Vec::new()
                         };
                         im.note_meta_fill(base, len, v);
@@ -21302,11 +21328,14 @@ impl Exec {
                 self.held_note(&writes_here, &sized_here, fill);
             }
         } else if !repeat && (fill.is_some() || super::images::may_note(&writes_here)) {
-            super::images::with(|im| {
-                im.note_writes(&writes_here, &sized_here);
-                if let Some(((base, len), v)) = fill {
+            super::images::with(|im| match fill {
+                // (The fill's own range noted as the fill alone: `note_meta_writes_but_fill`.)
+                Some(((base, len), v)) => {
+                    im.note_meta_writes_but_fill(&writes_here, base, len);
+                    im.note_overwrites(&sized_here);
                     im.note_meta_fill(base, len, v);
                 }
+                None => im.note_writes(&writes_here, &sized_here),
             });
         }
         lap.mark(9);
@@ -21982,7 +22011,7 @@ impl Drop for Exec {
 /// One status line for hang reports.
 pub fn status() -> String {
     format!(
-        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them from a resident shadow, {} of them behind a barrier of their own; {} render passes ended into the next full barrier; draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU, {} title timestamps written by the CPU, left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges ({} before an in-place use), {} skipped; {} draws executed ({} reading their arguments on the GPU, {} repeating the draw before (chains ended by opcode: {}), {} barriers before a dispatch rewrote them), {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait; read from memory and not one code throughout: {} refused, {} with the value of the fill an unknown write had replaced; {} of layers alone), {} fill-kernel dispatches recorded as buffer fills ({} of them only clearing the GPU-written images they cover, {} MiB not stored), {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
+        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them from a resident shadow, {} of them behind a barrier of their own; {} render passes ended into the next full barrier; draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU, {} title timestamps written by the CPU, left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges ({} before an in-place use), {} skipped; {} draws executed ({} reading their arguments on the GPU, {} repeating the draw before (chains ended by opcode: {}), {} barriers before a dispatch rewrote them), {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait{}; read from memory and not one code throughout: {} refused, {} with the value of the fill an unknown write had replaced; {} of layers alone), {} fill-kernel dispatches recorded as buffer fills ({} of them only clearing the GPU-written images they cover, {} MiB not stored), {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
         EXECUTED.load(Ordering::Relaxed),
         GPU_INDIRECT.load(Ordering::Relaxed),
         SHADOW_ARGS.load(Ordering::Relaxed),
@@ -22016,6 +22045,7 @@ pub fn status() -> String {
         WATCHDOG_STOPS.load(Ordering::Relaxed),
         FAST_CLEARS.load(Ordering::Relaxed),
         FAST_CLEARS_KNOWN.load(Ordering::Relaxed),
+        if clear_check() { format!(" ({} layers checked against their metadata, {} differing)", FAST_CLEARS_CHECKED[0].load(Ordering::Relaxed), FAST_CLEARS_CHECKED[1].load(Ordering::Relaxed)) } else { String::new() },
         FAST_CLEARS_NOT_UNIFORM[0].load(Ordering::Relaxed),
         FAST_CLEARS_NOT_UNIFORM[1].load(Ordering::Relaxed),
         FAST_CLEARS_LAYERED.load(Ordering::Relaxed),

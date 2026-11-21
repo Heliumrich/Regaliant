@@ -319,9 +319,10 @@ mod clear_tests {
         assert_eq!(c[&atlas], (m, Some(0), None, 1 << 3 | 1 << 5));
         merge_clear(&mut c, atlas, m, Some(u32::MAX), 1 << 3 | 1 << 5 | 1 << 7);
         assert_eq!(c[&atlas], (m, Some(u32::MAX), None, 1 << 3 | 1 << 5 | 1 << 7));
-        // As callers note a fill (its range an unknown write first, then the fill): another
-        // layer's fill of the same value leaves no one value (each run reads its own back when
-        // recorded: a flush at the use, never another layer's value).
+        // A layer's unknown write, then its fill, then another layer's: no one value (each run
+        // reads its own back when recorded: a flush at the use, never another layer's value).
+        // (Since 2026-11-21 callers note a fill's own range as the fill alone,
+        // `note_meta_writes_but_fill`: per-layer fills of one value merge as just above.)
         c.clear();
         merge_clear(&mut c, atlas, m, None, 1 << 3);
         merge_clear(&mut c, atlas, m, Some(0), 1 << 3);
@@ -4993,21 +4994,52 @@ impl Images {
         }
     }
 
+    /// `note_meta_writes` for the writes of a fill of [base, base+len) whose `note_meta_fill`
+    /// follows: the metadata the fill answers for (the same surface, metadata and layers) is
+    /// left to the fill, its stored value known. Noted first as a write of unknown data, each
+    /// layer's fill of a layered depth surface made the value its earlier layers' fills had
+    /// given unknown (one value an image: `merge_clear`), so the surface's uses drained the GPU
+    /// to read its metadata back: the shadow atlas three times a flip at 1-2's Gatehouse Hall,
+    /// ~1.6 ms each (2026-11-21).
+    pub fn note_meta_writes_but_fill(&mut self, writes: &[(u64, u64)], base: u64, len: u64) {
+        if self.meta_of.is_empty() {
+            return;
+        }
+        let filled = self.meta_reach(base, base.saturating_add(len), true);
+        for &(b, n) in writes {
+            for (meta, key, layers) in self.meta_reach(b, b.saturating_add(n), false) {
+                if filled.iter().any(|&(m, k, l)| m == meta && k == key && l == layers) {
+                    continue;
+                }
+                merge_clear(&mut self.pending_clears, key, meta, None, layers);
+                self.pending_change += 1;
+                if trace_clears() {
+                    crate::info!("trace clears: {:#x} ({:?} {}x{}) pending: write {b:#x}+{n:#x} beside a fill covers its metadata {meta:#x} (layers {layers:#x}) (for flip {}, {})", key.base, key.format, key.width, key.height, crate::hle::libs::videoout::QUEUED_FLIP.load(std::sync::atomic::Ordering::Relaxed) + 1, std::thread::current().name().unwrap_or("?"));
+                }
+            }
+        }
+    }
+
     /// What `note_writes` (then `note_meta_fill` for a fill of `fill`)
     /// would note, without noting it (held executors keep their
     /// own: `Exec::held_note`): the fast clears made pending (image,
     /// metadata address, the value when the fill gives it; later entries
-    /// win) and the GPU-owned images overwritten.
+    /// win; the writes' metadata the fill answers for left to the fill, as
+    /// `note_meta_writes_but_fill`) and the GPU-owned images overwritten.
     pub fn notes_for(&self, writes: &[(u64, u64)], sized: &[(u64, u64)], fill: Option<((u64, u64), u32)>) -> (Vec<(ImageKey, u64, Option<u32>, u128)>, Vec<ImageKey>) {
         let mut clears = Vec::new();
         if !self.meta_of.is_empty() {
+            let filled = fill.map(|((base, len), _)| self.meta_reach(base, base.saturating_add(len), true)).unwrap_or_default();
             for &(b, n) in writes {
                 for (meta, key, layers) in self.meta_reach(b, b.saturating_add(n), false) {
+                    if filled.iter().any(|&(m, k, l)| m == meta && k == key && l == layers) {
+                        continue;
+                    }
                     clears.push((key, meta, None, layers));
                 }
             }
-            if let Some(((base, len), v)) = fill {
-                for (meta, key, layers) in self.meta_reach(base, base.saturating_add(len), true) {
+            if let Some(((_, _), v)) = fill {
+                for (meta, key, layers) in filled {
                     clears.push((key, meta, Some(v), layers));
                 }
             }
