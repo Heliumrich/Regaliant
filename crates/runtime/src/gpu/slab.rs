@@ -28,6 +28,20 @@ pub struct Mem {
 }
 
 const OWN: u32 = u32::MAX;
+/// An allocation of its own in system memory (`vk::SYSTEM_STATS`: video memory was full).
+const SYS: u32 = u32::MAX - 1;
+
+impl Mem {
+    /// Whether it is system memory (`SYS`), not video memory.
+    pub fn in_system(&self) -> bool {
+        self.slab == SYS
+    }
+
+    /// Its size, bytes.
+    pub fn bytes(&self) -> u64 {
+        self.size
+    }
+}
 
 struct Slab {
     memory: vk::DeviceMemory,
@@ -123,12 +137,20 @@ static DEDICATED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 pub fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // (`DS_GPU_COMPAT` takes AMD's or Intel's limit as given.)
-    *ON.get_or_init(|| ctx().device_heap_size() >= 16 << 30 || ctx().limits.max_memory_allocation_count < 1 << 20 || super::vk::gpu_compat().is_some())
+    *ON.get_or_init(|| card_size() >= 16 << 30 || ctx().limits.max_memory_allocation_count < 1 << 20 || super::vk::gpu_compat().is_some())
+}
+
+/// The card's video memory as these choices see it: under `DS_SIM_VRAM_MIB` the smaller card it
+/// stands for. Until 2026-11-22 the 7 GB tours kept this 24 GB card's slabs, which a card under
+/// 16 GB never uses: evicted images left holes there (679 MiB of 2,816 in one tour) that a
+/// real small card gives back.
+fn card_size() -> u64 {
+    ctx().device_heap_size().min(super::vk::sim_vram_limit().unwrap_or(u64::MAX))
 }
 
 fn slab_size() -> u64 {
     static SIZE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *SIZE.get_or_init(|| (ctx().device_heap_size() / 64).clamp(64 << 20, 256 << 20) & !((1 << 20) - 1))
+    *SIZE.get_or_init(|| (card_size() / 64).clamp(64 << 20, 256 << 20) & !((1 << 20) - 1))
 }
 
 fn allocate(ty: u32, size: u64) -> Result<vk::DeviceMemory, vk::Result> {
@@ -146,10 +168,14 @@ fn allocate(ty: u32, size: u64) -> Result<vk::DeviceMemory, vk::Result> {
     r
 }
 
-/// Memory of its own, as images had before slabs.
+/// Memory of its own, as images had before slabs; system memory when video memory fails
+/// (`system`).
 fn own(req: vk::MemoryRequirements) -> Result<Mem, String> {
     let t0 = std::time::Instant::now();
-    let memory = ctx().alloc(req, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+    let memory = match ctx().alloc(req, vk::MemoryPropertyFlags::DEVICE_LOCAL) {
+        Ok(m) => m,
+        Err(e) => return system(req).ok_or(e),
+    };
     STATS[9].fetch_add(1, Relaxed);
     STATS[10].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
     STATS[2].fetch_add(1, Relaxed);
@@ -157,13 +183,32 @@ fn own(req: vk::MemoryRequirements) -> Result<Mem, String> {
     Ok(Mem { memory, offset: 0, size: req.size, slab: OWN })
 }
 
-/// Memory for an image with requirements `req` (bound at `offset` of `memory`).
-pub fn alloc(req: vk::MemoryRequirements, requires_own: bool, prefers_own: bool) -> Result<Mem, String> {
+/// An image's memory in system memory, video memory being full (`vk::SYSTEM_STATS`): slower for
+/// the GPU to read and write, where an image not made leaves its draws out or wrong.
+fn system(req: vk::MemoryRequirements) -> Option<Mem> {
+    let (memory, ty) = ctx().system_alloc(req.memory_type_bits, req.size, false)?;
+    if super::vk::SYSTEM_STATS[1].fetch_add(1, Relaxed) == 0 {
+        crate::warn!("images: video memory full or under pressure: images go to system memory (memory type {ty}, the image's type bits {:#x}) while it lasts, slower to draw from than video memory", req.memory_type_bits);
+    }
+    let now = super::vk::SYSTEM_STATS[0].fetch_add(req.size, Relaxed) + req.size;
+    super::vk::SYSTEM_PEAK.fetch_max(now, Relaxed);
+    Some(Mem { memory, offset: 0, size: req.size, slab: SYS })
+}
+
+/// Memory for an image with requirements `req` (bound at `offset` of `memory`); with
+/// `system_first` system memory before video memory (`system`: a texture while video memory is
+/// under pressure).
+pub fn alloc(req: vk::MemoryRequirements, requires_own: bool, prefers_own: bool, system_first: bool) -> Result<Mem, String> {
     if requires_own {
         DEDICATED[0].fetch_add(1, Relaxed);
     }
     if prefers_own {
         DEDICATED[1].fetch_add(1, Relaxed);
+    }
+    if system_first {
+        if let Some(m) = system(req) {
+            return Ok(m);
+        }
     }
     if !on() || requires_own {
         return own(req);
@@ -280,6 +325,11 @@ fn helper() {
 
 /// Frees an image's memory (its batches are done).
 pub fn free(m: Mem) {
+    if m.slab == SYS {
+        unsafe { ctx().device.free_memory(m.memory, None) };
+        super::vk::SYSTEM_STATS[0].fetch_sub(m.size, Relaxed);
+        return;
+    }
     if m.slab == OWN {
         unsafe { ctx().device.free_memory(m.memory, None) };
         STATS[2].fetch_sub(1, Relaxed);

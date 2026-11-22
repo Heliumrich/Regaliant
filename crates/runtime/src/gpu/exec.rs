@@ -919,27 +919,43 @@ fn reap_dead_images() {
     let oldest_open = EXEC_GENS.lock().iter().map(|g| g.load(Ordering::SeqCst)).min().unwrap_or(u64::MAX);
     let next = NEXT_SEQ.load(Ordering::SeqCst);
     let done = done_seq();
-    let mut g = IMAGE_GRAVE.lock();
-    g.retain_mut(|d| {
-        if d.seq.is_none() && oldest_open >= d.generation {
-            d.seq = Some(next - 1);
-        }
-        match d.seq {
-            Some(s) if done >= s && !DEVICE_LOST.load(Ordering::Relaxed) => {
-                unsafe {
-                    for &v in &d.img.views {
-                        ctx().device.destroy_image_view(v, None);
-                    }
-                    ctx().device.destroy_image(d.img.image, None);
-                    super::slab::free(d.img.mem);
-                }
-                false
+    // (Taken out under the grave's lock and destroyed outside it, at most `REAP_IMAGE_BYTES` a
+    // pass, the rest at the next: until 2026-11-22 they were destroyed under it, and the 7 GB
+    // tour's reaper spent 139 ms freeing images there, every thread burying one waiting behind
+    // it, while a queue submit waited 137 ms in the driver.)
+    let ready: Vec<super::images::Evicted> = {
+        let mut g = IMAGE_GRAVE.lock();
+        let (mut out, mut bytes, mut i) = (Vec::new(), 0u64, 0usize);
+        let lost = DEVICE_LOST.load(Ordering::Relaxed);
+        while i < g.len() {
+            let d = &mut g[i];
+            if d.seq.is_none() && oldest_open >= d.generation {
+                d.seq = Some(next - 1);
             }
-            _ => true,
+            if matches!(d.seq, Some(s) if done >= s) && !lost && bytes < REAP_IMAGE_BYTES {
+                let d = g.swap_remove(i);
+                bytes += d.img.mem.bytes();
+                out.push(d.img);
+            } else {
+                i += 1;
+            }
         }
-    });
-    IMAGE_GRAVE_LEN.store(g.len() as u64, Ordering::Release);
+        IMAGE_GRAVE_LEN.store(g.len() as u64, Ordering::Release);
+        out
+    };
+    for img in ready {
+        unsafe {
+            for &v in &img.views {
+                ctx().device.destroy_image_view(v, None);
+            }
+            ctx().device.destroy_image(img.image, None);
+            super::slab::free(img.mem);
+        }
+    }
 }
+
+/// The most image memory one reaper pass frees (`reap_dead_images`), bytes.
+const REAP_IMAGE_BYTES: u64 = 256 << 20;
 
 fn reap_dead_spans() {
     if GRAVEYARD_LEN.load(Ordering::Acquire) == 0 {
@@ -13315,11 +13331,14 @@ impl Exec {
     /// `report` as an error line (front end 2's coherence failures), the
     /// first `example` given with it.
     fn report_error(&mut self, msg: &str, example: impl FnOnce() -> String) {
-        let n = self.reported.entry(msg.to_string()).or_insert(0);
-        *n += 1;
-        if *n == 1 {
-            crate::error!("gpu[{}]: {msg} (first: {})", self.name, example());
+        // (A repeat costs no allocation: the 7 GB tours of 2026-11-22 reported the mirror's
+        // zero placements ~260,000 times a second.)
+        if let Some(n) = self.reported.get_mut(msg) {
+            *n += 1;
+            return;
         }
+        self.reported.insert(msg.to_string(), 1);
+        crate::error!("gpu[{}]: {msg} (first: {})", self.name, example());
     }
 
     #[track_caller]
@@ -22144,6 +22163,7 @@ pub fn status() -> String {
         + &clear_pass_line()
         + &super::images::pressure_line()
         + &super::vk::gate_line()
+        + &super::vk::system_line()
         + &super::resident::spare_line()
         + &fill_partial_line()
         + &super::track::status()

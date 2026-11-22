@@ -17,7 +17,9 @@
 - When the graphics driver crashes on a shader, the preparation leaves that shader out and goes
   on. Play does the same.
 - When the graphics card runs out of memory, the game no longer slows to a crawl or stops
-  responding. Some things may look wrong until memory frees up.
+  responding.
+- When graphics memory runs short, textures now go to system memory instead of being left out,
+  so the picture stays whole. The frame rate can drop in busy places.
 - A long preparation that runs short of graphics memory goes on in a fresh session.
 - A preparation step that finished its work is no longer run again when it is slow to close.
 - Prepare now on prepared shaders gives shaders that once crashed the graphics driver another

@@ -1772,9 +1772,10 @@ fn make_mirror() -> Result<Mirror, String> {
     // `vk::describe_address`.)
     let va = if c.device_addresses { c.buffer_address(buf) } else { 0 };
     crate::info!(
-        "resident: mirror of guest {MIRROR_BASE:#x}..{MIRROR_END:#x} ({} GiB, sparse pages of {} KiB, memory type {mem_type}; device sparse address space {} GiB; device address {va:#x})",
+        "resident: mirror of guest {MIRROR_BASE:#x}..{MIRROR_END:#x} ({} GiB, sparse pages of {} KiB, memory type {mem_type} of type bits {:#x}; device sparse address space {} GiB; device address {va:#x})",
         size >> 30,
         req.alignment >> 10,
+        req.memory_type_bits,
         c.limits.sparse_address_space_size >> 30
     );
     let words = pages.div_ceil(64);

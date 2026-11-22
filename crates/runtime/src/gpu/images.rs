@@ -1273,8 +1273,25 @@ static EVICTED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::
 /// broke every level (the title maps its direct memory again with its
 /// contents; 2026-10-19).
 const EVICT_AGE: u64 = 120;
+/// The age for a texture in video memory while video memory is under pressure (`under_pressure`,
+/// with the system-memory fallback on): it comes back in system memory (`create_texture`), so
+/// the video memory it held goes to the mirror. Tried without the fallback on 2026-11-22 small
+/// hours, when evicted textures came back in video memory: no effect above the tour's spread
+/// (TRIED.md).
+const EVICT_AGE_PRESSURE: u64 = 30;
 /// Video-memory budget checks at most this often.
 const EVICT_CHECK_MS: u64 = 500;
+/// Textures moved back from system memory a check at most (`promote`), bytes: each comes back at
+/// its next use as an upload.
+const PROMOTE_MAX: u64 = 128 << 20;
+/// A texture used within this many flips stays where it is (`promote`).
+const PROMOTE_AGE: u64 = 2;
+/// This process over its eviction mark (`tune vram_high` percent of its budget) at the last
+/// check (`maybe_evict`): textures then go to system memory first (`create_texture`), the mark's
+/// last 15% left to the mirror. With pressure alone (an allocation failed in the last 10 s) the
+/// 7 GB tour of 2026-11-22 morning still bound 1.2 million mirror placements as zeros: each spell
+/// ended, new textures filled video memory again and the mirror's next block failed.
+static OVER_HIGH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// The share of the budget other processes' memory never pushes eviction
 /// below (percent). With others at ~24.5 GB the 1-1 walk's Castlewall and
 /// Front ran level without that eviction (44.5 / 54.1 against 44.2 / 55.3
@@ -1324,7 +1341,11 @@ pub fn pressure_line() -> String {
     if n == 0 {
         return String::new();
     }
-    format!("    video memory under pressure {n} times (spells of 10 s or more: textures alone could not bring this process under its mark, or an allocation failed; the mirror's cold pages given back sooner)\n")
+    format!(
+        "    video memory under pressure {n} times (spells of 10 s or more: textures alone could not bring this process under its mark, or an allocation failed; the mirror's cold pages given back sooner); in all {} mirror placements bound as zeros, {} images not made\n",
+        ZERO_PLACEMENTS.load(std::sync::atomic::Ordering::Relaxed),
+        IMAGE_FAILS.load(std::sync::atomic::Ordering::Relaxed)
+    )
 }
 
 /// Whether video memory is under pressure now (`PRESSURE_UNTIL_MS`).
@@ -1410,6 +1431,22 @@ pub fn maybe_evict() {
             low = low.min(room.saturating_sub(margin + (1 << 30)).max(floor.saturating_sub(1 << 30)));
         }
     }
+    OVER_HIGH.store(budget > 0 && used > high, Relaxed);
+    // (Room again under the low mark, no pressure: textures in system memory move back, as many
+    // as fit under it, `PROMOTE_MAX` a check at most: evicted, they come back to video memory at
+    // their next use.)
+    if budget > 0 && used < low && !under_pressure() && super::vk::SYSTEM_STATS[0].load(Relaxed) > 0 {
+        if let Some(mut g) = IMAGES.try_lock() {
+            if let Some(im) = g.as_mut() {
+                let out = im.promote(frame, (low - used).min(PROMOTE_MAX));
+                drop(g);
+                if !out.is_empty() {
+                    super::vk::SYSTEM_STATS[3].fetch_add(out.len() as u64, Relaxed);
+                    super::exec::bury_images(out);
+                }
+            }
+        }
+    }
     if budget == 0 || used <= high {
         return;
     }
@@ -1429,11 +1466,12 @@ pub fn maybe_evict() {
         let (dz, df) = (z - SEEN[0].swap(z, Relaxed), f - SEEN[1].swap(f, Relaxed));
         let last = if df > 0 { LAST_IMAGE_FAIL.lock().map(|k| format!(" (the last {}x{}x{} {:?} at {:#x})", k.width, k.height, k.layers, k.format, k.base)).unwrap_or_default() } else { String::new() };
         crate::info!(
-            "images: GPU-written {} MiB, {} MiB of it unused for 600 flips or more; textures {} MiB, ~{} MiB of it the top mips of large ones; since the last: {dz} placements bound as zeros, {df} images not made{last} (at flip {frame})",
+            "images: GPU-written {} MiB, {} MiB of it unused for 600 flips or more; textures {} MiB, ~{} MiB of it the top mips of large ones; since the last: {dz} placements bound as zeros, {df} images not made{last}; images in system memory now {} MiB (at flip {frame})",
             all >> 20,
             cold >> 20,
             tex >> 20,
-            top >> 20
+            top >> 20,
+            super::vk::SYSTEM_STATS[0].load(Relaxed) >> 20
         );
     }
     // (Textures alone could not bring it under the high mark: the rest is memory images the GPU
@@ -3231,7 +3269,22 @@ impl Images {
     /// Creates the VkImage for `key` (GENERAL layout, contents undefined); a failure counted with
     /// its key (`IMAGE_FAILS`, `LAST_IMAGE_FAIL`: the census beside the over-budget warning).
     fn create(&mut self, key: ImageKey) -> Result<(vk::Image, super::slab::Mem, u64), String> {
-        let r = self.create_inner(key);
+        self.create_in(key, false)
+    }
+
+    /// `create` for a texture: while video memory is under pressure (`under_pressure`) or this
+    /// process is over its eviction mark (`OVER_HIGH`) its memory is system memory first
+    /// (`slab::alloc`), video memory left to what cannot go there (the mirror: NVIDIA's sparse
+    /// buffers take video memory only) or costs more there (the images the GPU writes). It comes
+    /// back once video memory has room (`maybe_evict`). Not for a storage binding (`storage`):
+    /// the GPU writes such an image, which then never leaves its memory (the review of
+    /// 2026-11-22 morning).
+    fn create_texture(&mut self, key: ImageKey, storage: bool) -> Result<(vk::Image, super::slab::Mem, u64), String> {
+        self.create_in(key, !storage && (under_pressure() || OVER_HIGH.load(std::sync::atomic::Ordering::Relaxed)))
+    }
+
+    fn create_in(&mut self, key: ImageKey, system_first: bool) -> Result<(vk::Image, super::slab::Mem, u64), String> {
+        let r = self.create_inner(key, system_first);
         if r.is_err() {
             IMAGE_FAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             *LAST_IMAGE_FAIL.lock() = Some(key);
@@ -3239,7 +3292,7 @@ impl Images {
         r
     }
 
-    fn create_inner(&mut self, key: ImageKey) -> Result<(vk::Image, super::slab::Mem, u64), String> {
+    fn create_inner(&mut self, key: ImageKey, system_first: bool) -> Result<(vk::Image, super::slab::Mem, u64), String> {
         let c = ctx();
         let props = unsafe { c.instance.get_physical_device_format_properties(c.pdev, key.format) };
         let f = props.optimal_tiling_features;
@@ -3287,8 +3340,10 @@ impl Images {
         // (Inside the refusal window after a failed allocation, `vk::gate_refuses`, an image whose
         // smallest possible size (half a byte a texel, one level) would be refused is not made:
         // while memory was out every draw sampling a texture not made yet tried again.)
+        // (With the system-memory fallback such an image is made there, unless the fallback
+        // refused moments ago too: `vk::system_refusing`.)
         let least = (key.width as u64 * key.height as u64 * key.layers.max(1) as u64) / 2;
-        if least >= 64 << 10 && super::vk::gate_refuses(least) {
+        if least >= 64 << 10 && (super::vk::system_refusing(least) || super::vk::images_lack_system_type()) && super::vk::gate_refuses(least) {
             return Err(format!("image {}x{}x{} {:?}: video memory ran out moments ago (refused with no driver call)", key.width, key.height, key.layers, key.format));
         }
         unsafe {
@@ -3299,12 +3354,13 @@ impl Images {
             let mut req2 = vk::MemoryRequirements2::default().push_next(&mut ded);
             c.device.get_image_memory_requirements2(&vk::ImageMemoryRequirementsInfo2::default().image(image), &mut req2);
             let req = req2.memory_requirements;
+            c.note_image_bits(req.memory_type_bits);
             let (requires, prefers) = (ded.requires_dedicated_allocation != 0, ded.prefers_dedicated_allocation != 0);
             let t1 = std::time::Instant::now();
             // (The image destroyed when its memory fails: until 2026-11-21 night each failure left
             // its VkImage behind, and while memory was out every draw sampling a texture not made
             // yet failed again.)
-            let mem = match super::slab::alloc(req, requires, prefers) {
+            let mem = match super::slab::alloc(req, requires, prefers, system_first) {
                 Ok(m) => m,
                 Err(e) => {
                     c.device.destroy_image(image, None);
@@ -5389,7 +5445,7 @@ impl Images {
         }
         let ts = timed();
         let t_first = std::time::Instant::now();
-        let (image, mem, bytes) = self.create(key)?;
+        let (image, mem, bytes) = self.create_texture(key, storage)?;
         let t_created = std::time::Instant::now();
         note_step(1, ts);
         // A texture detiled on the CPU: its first upload after the lock, as
@@ -5677,15 +5733,42 @@ impl Images {
         parts.join(", ")
     }
 
+    /// Textures in system memory (`slab::Mem::in_system`), none written by the GPU or holding
+    /// GPU-written blocks, none with an upload pending (`refreshing`: its commit would find the
+    /// image gone and release its waiters, a batch that bound it sampling what was there) or used
+    /// in the last `PROMOTE_AGE` flips, evicted up to `room` bytes, most recently used first: they
+    /// come back to video memory at their next use (`create_texture`, no pressure then).
+    fn promote(&mut self, frame: u64, room: u64) -> Vec<Evicted> {
+        let mut cands: Vec<(u64, ImageKey, u64)> = self
+            .map
+            .iter()
+            .filter(|(k, i)| i.mem.in_system() && !i.gpu_written && i.gpu_parts.is_empty() && !self.refreshing.contains_key(*k) && frame.saturating_sub(i.used.get()) >= PROMOTE_AGE)
+            .map(|(k, i)| (i.used.get(), *k, i.bytes))
+            .collect();
+        cands.sort_unstable_by_key(|c| std::cmp::Reverse(c.0));
+        let (mut out, mut moved) = (Vec::new(), 0u64);
+        for (_, k, bytes) in cands {
+            if moved + bytes > room {
+                continue;
+            }
+            if let Some((e, b, _)) = self.drop_image(&k) {
+                moved += b;
+                out.push(e);
+            }
+        }
+        out
+    }
+
     pub fn evict(&mut self, frame: u64, want: u64) -> (Vec<Evicted>, u64, usize) {
         // (Not a texture holding blocks GPU work wrote through block views (`gpu_parts`): guest
         // memory never holds those, so a re-upload after eviction would lose them, as evicting the
         // images the GPU wrote lost 4-2's architecture, 2026-10-19. Added 2026-11-22 small hours;
         // the 7 GB tours could not measure it either way: TRIED.md.)
+        let demote = under_pressure() && super::vk::system_fallback();
         let mut cands: Vec<(u64, ImageKey)> = self
             .map
             .iter()
-            .filter(|(_, i)| !i.gpu_written && i.gpu_parts.is_empty() && frame.saturating_sub(i.used.get()) >= EVICT_AGE)
+            .filter(|(_, i)| !i.gpu_written && i.gpu_parts.is_empty() && frame.saturating_sub(i.used.get()) >= if !i.mem.in_system() && demote { EVICT_AGE_PRESSURE } else { EVICT_AGE })
             .map(|(k, i)| (i.used.get(), *k))
             .collect();
         cands.sort_unstable_by_key(|c| c.0);
@@ -5695,7 +5778,10 @@ impl Images {
                 break;
             }
             if let Some((e, bytes, _)) = self.drop_image(&k) {
-                freed += bytes;
+                // (An image in system memory frees none of the video memory wanted.)
+                if !e.mem.in_system() {
+                    freed += bytes;
+                }
                 out.push(e);
             }
         }

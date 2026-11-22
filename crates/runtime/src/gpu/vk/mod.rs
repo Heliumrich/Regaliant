@@ -947,6 +947,7 @@ fn init_inner() -> Result<(), String> {
         }
         CTX.set(ctx).ok();
         crate::info!("Vulkan memory heaps: {}", ctx_heaps());
+        crate::info!("Vulkan memory types: {}", ctx_types());
         Ok(())
     }
 }
@@ -1005,7 +1006,7 @@ impl Ctx {
         let props = p2.memory_properties;
         let i = (0..props.memory_heap_count as usize).filter(|&i| props.memory_heaps[i].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL)).max_by_key(|&i| props.memory_heaps[i].size)?;
         drop(p2);
-        Some((budget.heap_usage[i], budget.heap_budget[i].min(vram_cap()).min(sim_vram_limit().unwrap_or(u64::MAX))))
+        Some((budget.heap_usage[i].saturating_sub(sim_system_bytes()), budget.heap_budget[i].min(vram_cap()).min(sim_vram_limit().unwrap_or(u64::MAX))))
     }
 
     /// `DS_SIM_VRAM_MIB` (a test, `sim_vram_limit`): whether an allocation of `size` bytes in
@@ -1027,7 +1028,7 @@ impl Ctx {
         let mut p2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
         unsafe { self.instance.get_physical_device_memory_properties2(self.pdev, &mut p2) };
         drop(p2);
-        let fails = budget.heap_usage[heap].saturating_add(size) > limit;
+        let fails = budget.heap_usage[heap].saturating_sub(sim_system_bytes()).saturating_add(size) > limit;
         if fails {
             SIM_VRAM_FAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -1219,6 +1220,104 @@ pub fn budget_share(div: u64, max: u64) -> u64 {
 /// `Ctx::heap_report` of the initialized context ("" before).
 pub fn ctx_heaps() -> String {
     CTX.get().map(|c| c.heap_report()).unwrap_or_default()
+}
+
+/// Each memory type: its heap and property flags.
+pub fn ctx_types() -> String {
+    let Some(c) = CTX.get() else { return String::new() };
+    let p = &c.mem_props;
+    (0..p.memory_type_count as usize).map(|i| format!("{i}: heap {} {:?}", p.memory_types[i].heap_index, p.memory_types[i].property_flags)).collect::<Vec<_>>().join("; ")
+}
+
+/// The system-memory fallback (2026-11-22): when video memory is full, an image or a block of the
+/// mirror's pages goes to a memory type outside the device-local heaps, system memory the GPU
+/// reaches across the bus (slower to draw from, the picture right), instead of being left out or
+/// bound as zeros. The 8-level tour in a 7 GB room had bound 55.5 million mirror placements as
+/// zeros and failed 1.04 million image creations (the shadow atlas's depth targets among them),
+/// its pictures wrong for good from the first failure. NVIDIA's sparse buffers take video memory
+/// only (the mirror's type bits 0x2), so the mirror cannot use it: textures go to system memory
+/// first while video memory is under pressure or over its mark (`images::create_texture`),
+/// leaving video memory to the mirror, and come back once it has room (`images::maybe_evict`).
+/// [images' bytes there now, images placed there in all, refusals for want of room or a failed
+/// allocation, textures moved back to video memory].
+pub static SYSTEM_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// The most images held there at once, bytes (the preparation's health line).
+pub static SYSTEM_PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The fallback's room: at most this much in all, and its heap never past three quarters of its
+/// budget (`Ctx::system_room`): the title's own memory is system memory too.
+const SYSTEM_CAP: u64 = 4 << 30;
+/// When the fallback last refused for want of room or a failed allocation (`gate_clock_ms`; 0:
+/// never) and the smallest size refused since: for `GATE_MS` after it requests of at least that
+/// size are refused with no driver call (`system_refusing`), smaller ones still tried.
+static SYSTEM_REFUSED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SYSTEM_REFUSED_SIZE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+/// Whether images have a memory type for the fallback (`note_image_bits`): 0 not known yet, 1 yes,
+/// 2 none seen (a card whose heaps are all device-local: the refusal window's pre-check for images
+/// stays as before the fallback, `images::create_inner`).
+static IMAGE_SYSTEM_TYPE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// `DS_SYSTEM_FALLBACK=0`: no system-memory fallback (as before 2026-11-22). On a card with room
+/// the driver keeps the fallback's type-0 allocations in its free video memory (the 7 GB tours
+/// of 2026-11-22 on the 24 GB card: heap 0's usage held them), so this card cannot show what
+/// reading them across the bus costs; NVIDIA's optimal images take types 0 and 1 only (type bits
+/// 0x3), none the driver must keep in system memory.
+pub fn system_fallback() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_SYSTEM_FALLBACK").ok().as_deref() != Some("0"))
+}
+
+/// Under `DS_SIM_VRAM_MIB`, the bytes this process placed in system memory for want of video
+/// memory (`SYSTEM_STATS`), which the driver of a card with room may keep in its video memory
+/// and count in the device-local heap's usage: on the smaller card the test stands for, they are
+/// not there. 0 without the simulation (the driver's count is the truth then).
+fn sim_system_bytes() -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    if sim_vram_limit().is_none() {
+        return 0;
+    }
+    SYSTEM_STATS[0].load(Relaxed)
+}
+
+/// Whether the fallback refuses a request of `size` bytes now: it is off, or it refused one of
+/// that size or less in the last `GATE_MS` (`SYSTEM_REFUSED_SIZE`).
+pub fn system_refusing(size: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let at = SYSTEM_REFUSED_AT.load(Relaxed);
+    !system_fallback() || (at != 0 && size >= SYSTEM_REFUSED_SIZE.load(Relaxed) && gate_clock_ms() < at + GATE_MS)
+}
+
+fn system_refused(size: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    SYSTEM_STATS[2].fetch_add(1, Relaxed);
+    let (now, at) = (gate_clock_ms(), SYSTEM_REFUSED_AT.load(Relaxed));
+    if at == 0 || now >= at + GATE_MS {
+        SYSTEM_REFUSED_SIZE.store(size, Relaxed);
+        SYSTEM_REFUSED_AT.store(now, Relaxed);
+    } else {
+        SYSTEM_REFUSED_SIZE.fetch_min(size, Relaxed);
+    }
+}
+
+/// Whether images are known to have no memory type for the fallback (`IMAGE_SYSTEM_TYPE`).
+pub fn images_lack_system_type() -> bool {
+    IMAGE_SYSTEM_TYPE.load(std::sync::atomic::Ordering::Relaxed) == 2
+}
+
+/// The fallback's status line ("" when it was never needed).
+pub fn system_line() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let s: Vec<u64> = SYSTEM_STATS.iter().map(|c| c.load(Relaxed)).collect();
+    if s[1] == 0 && s[2] == 0 {
+        return String::new();
+    }
+    format!(
+        "    system memory for want of video memory: images {} MiB now ({} placed there in all, at most {} MiB at once, {} textures moved back); refused {} times for want of room or a failed allocation (each refusing that size and more for {GATE_MS} ms)\n",
+        s[0] >> 20,
+        s[1],
+        SYSTEM_PEAK.load(Relaxed) >> 20,
+        s[3],
+        s[2]
+    )
 }
 
 /// Checkpoint marker kinds (high byte of the marker value).
@@ -1462,6 +1561,74 @@ impl Ctx {
     pub fn memory_type(&self, bits: u32, want: vk::MemoryPropertyFlags) -> Option<u32> {
         (0..self.mem_props.memory_type_count)
             .find(|&i| bits & (1 << i) != 0 && self.mem_props.memory_types[i as usize].property_flags.contains(want))
+    }
+
+    /// A memory type for `bits` in a heap that is not device-local (`SYSTEM_STATS`): one the CPU
+    /// cannot map first (NVIDIA's type 0), else any. None when the fallback is off or every heap
+    /// is device-local (integrated GPUs, whose memory is system memory already).
+    pub fn system_type(&self, bits: u32) -> Option<u32> {
+        if !system_fallback() {
+            return None;
+        }
+        let p = &self.mem_props;
+        let ok = |i: u32| bits & (1 << i) != 0 && !p.memory_heaps[p.memory_types[i as usize].heap_index as usize].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL);
+        (0..p.memory_type_count)
+            .find(|&i| ok(i) && !p.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE))
+            .or_else(|| (0..p.memory_type_count).find(|&i| ok(i)))
+    }
+
+    /// An image's memory type bits seen (`images::create_inner`): whether images have a type for
+    /// the fallback (`IMAGE_SYSTEM_TYPE`; one that has wins over one that has not).
+    pub fn note_image_bits(&self, bits: u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if IMAGE_SYSTEM_TYPE.load(Relaxed) == 1 || !system_fallback() {
+            return;
+        }
+        IMAGE_SYSTEM_TYPE.store(if self.system_type(bits).is_some() { 1 } else { 2 }, Relaxed);
+    }
+
+    /// Memory of `size` bytes from the system-memory fallback for requirements' type bits `bits`
+    /// (device addresses with `addressed`): None when it has no type for them, or no room
+    /// (`SYSTEM_CAP`, three quarters of its heap's budget) or the allocation failed, these two
+    /// counted and refusing that size and more for `GATE_MS` (`system_refusing`, no driver call
+    /// then). A request with no type refuses nothing else (in the fallback's first form the
+    /// mirror, which has none on NVIDIA, kept images from it so for 250 ms at each failure). The
+    /// caller counts what it placed (`SYSTEM_STATS`).
+    pub fn system_alloc(&self, bits: u32, size: u64, addressed: bool) -> Option<(vk::DeviceMemory, u32)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let ty = self.system_type(bits)?;
+        if system_refusing(size) {
+            return None;
+        }
+        let held = SYSTEM_STATS[0].load(Relaxed);
+        let mut room = held + size <= SYSTEM_CAP;
+        if room && self.memory_budget {
+            let heap = self.mem_props.memory_types[ty as usize].heap_index as usize;
+            let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+            let mut p2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+            unsafe { self.instance.get_physical_device_memory_properties2(self.pdev, &mut p2) };
+            drop(p2);
+            room = budget.heap_usage[heap] + size <= budget.heap_budget[heap] / 4 * 3;
+        }
+        if !room {
+            system_refused(size);
+            return None;
+        }
+        let mut fl = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let ai = vk::MemoryAllocateInfo::default().allocation_size(size).memory_type_index(ty);
+        let ai = if addressed && self.device_addresses { ai.push_next(&mut fl) } else { ai };
+        let t0 = std::time::Instant::now();
+        let r = unsafe { self.device.allocate_memory(&ai, None) };
+        note_alloc("system memory for want of video memory", size, t0);
+        match r {
+            Ok(m) => Some((m, ty)),
+            Err(e) => {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| crate::warn!("gpu: system memory for want of video memory failed ({size} bytes, memory type {ty}): {e}"));
+                system_refused(size);
+                None
+            }
+        }
     }
 
     pub fn alloc(&self, req: vk::MemoryRequirements, want: vk::MemoryPropertyFlags) -> Result<vk::DeviceMemory, String> {
