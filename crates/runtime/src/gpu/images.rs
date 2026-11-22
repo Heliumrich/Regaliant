@@ -5764,7 +5764,7 @@ impl Images {
         // memory never holds those, so a re-upload after eviction would lose them, as evicting the
         // images the GPU wrote lost 4-2's architecture, 2026-10-19. Added 2026-11-22 small hours;
         // the 7 GB tours could not measure it either way: TRIED.md.)
-        let demote = under_pressure() && super::vk::system_fallback();
+        let demote = under_pressure() && super::vk::system_can_take(1 << 20);
         let mut cands: Vec<(u64, ImageKey)> = self
             .map
             .iter()

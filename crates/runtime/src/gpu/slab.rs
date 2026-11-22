@@ -192,6 +192,7 @@ fn system(req: vk::MemoryRequirements) -> Option<Mem> {
     }
     let now = super::vk::SYSTEM_STATS[0].fetch_add(req.size, Relaxed) + req.size;
     super::vk::SYSTEM_PEAK.fetch_max(now, Relaxed);
+    super::vk::SYSTEM_COUNT.fetch_add(1, Relaxed);
     Some(Mem { memory, offset: 0, size: req.size, slab: SYS })
 }
 
@@ -205,7 +206,9 @@ pub fn alloc(req: vk::MemoryRequirements, requires_own: bool, prefers_own: bool,
     if prefers_own {
         DEDICATED[1].fetch_add(1, Relaxed);
     }
-    if system_first {
+    // (With slabs, a slab's free room costs no new memory: taken before system memory, below.)
+    let slabbed = on() && !requires_own && req.size <= slab_size() / 8;
+    if system_first && !slabbed {
         if let Some(m) = system(req) {
             return Ok(m);
         }
@@ -232,6 +235,14 @@ pub fn alloc(req: vk::MemoryRequirements, requires_own: bool, prefers_own: bool,
     if let Some((i, memory, at)) = found {
         drop(g);
         return Ok(placed(i, memory, at, req.size));
+    }
+    // (A texture under pressure: system memory before a new slab.)
+    if system_first {
+        drop(g);
+        if let Some(m) = system(req) {
+            return Ok(m);
+        }
+        g = STATE.lock();
     }
     // A new slab: the spare, else one allocated here.
     let memory = match g.spare.iter().position(|s| s.0 == ty) {
@@ -328,6 +339,7 @@ pub fn free(m: Mem) {
     if m.slab == SYS {
         unsafe { ctx().device.free_memory(m.memory, None) };
         super::vk::SYSTEM_STATS[0].fetch_sub(m.size, Relaxed);
+        super::vk::SYSTEM_COUNT.fetch_sub(1, Relaxed);
         return;
     }
     if m.slab == OWN {

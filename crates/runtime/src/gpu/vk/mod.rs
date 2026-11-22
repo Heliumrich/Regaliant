@@ -1243,6 +1243,27 @@ pub fn ctx_types() -> String {
 pub static SYSTEM_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 /// The most images held there at once, bytes (the preparation's health line).
 pub static SYSTEM_PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The fallback's allocations live now (one per image, `slab::system`). At most a quarter of the
+/// driver's limit on allocations (`system_count_limit`): AMD's Windows driver allows 4,096 in all,
+/// a boot's images, slabs and buffers among them (the pre-release review of 2026-11-22).
+pub static SYSTEM_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn system_count_limit() -> u64 {
+    CTX.get().map_or(1024, |c| (c.limits.max_memory_allocation_count as u64 / 4).max(64))
+}
+
+/// Whether the fallback could take a texture of `size` bytes now: on, a type for images (or not
+/// known yet), its room and its count not spent, not refusing that size. Textures in video memory
+/// are evicted sooner under pressure only then (`images::Images::evict`): otherwise they would
+/// come back in video memory, an upload for nothing (the pre-release review of 2026-11-22).
+pub fn system_can_take(size: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    system_fallback()
+        && !images_lack_system_type()
+        && SYSTEM_STATS[0].load(Relaxed) + size + (256 << 20) <= SYSTEM_CAP
+        && SYSTEM_COUNT.load(Relaxed) < system_count_limit()
+        && !system_refusing(size)
+}
 /// The fallback's room: at most this much in all, and its heap never past three quarters of its
 /// budget (`Ctx::system_room`): the title's own memory is system memory too.
 const SYSTEM_CAP: u64 = 4 << 30;
@@ -1598,6 +1619,10 @@ impl Ctx {
         use std::sync::atomic::Ordering::Relaxed;
         let ty = self.system_type(bits)?;
         if system_refusing(size) {
+            return None;
+        }
+        if SYSTEM_COUNT.load(Relaxed) >= system_count_limit() {
+            SYSTEM_STATS[2].fetch_add(1, Relaxed);
             return None;
         }
         let held = SYSTEM_STATS[0].load(Relaxed);
