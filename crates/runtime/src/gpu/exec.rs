@@ -886,6 +886,7 @@ fn reap_spans() {
     let t = std::time::Instant::now();
     reap_dead_spans();
     import_age_census();
+    evict_cold_imports();
     let t_spans = t.elapsed();
     reap_dead_images();
     reap_dead_pipes();
@@ -1853,7 +1854,7 @@ fn revalidate_spans() {
         SPAN_GEN.fetch_add(1, Ordering::AcqRel);
         return;
     }
-    reimport_dropped(ranges_dead);
+    reimport_dropped(ranges_dead, REIMPORT_COLD_FLIPS, true);
 }
 
 /// A dropped window to import again (`reimport_dropped`): its range, its
@@ -1873,9 +1874,20 @@ struct Reimport {
 /// buried. Batches recorded before the drop and submitted after it read
 /// them through the table (commands bind windows themselves, and keep the
 /// dropped one until they complete).
-fn reimport_dropped(mut ranges_dead: Vec<Reimport>) {
+fn reimport_dropped(mut ranges_dead: Vec<Reimport>, cold_flips: u32, remapped: bool) {
     if super::pagetable::made() && !DEVICE_LOST.load(Ordering::Relaxed) {
         for r in ranges_dead.iter_mut() {
+            // (A window unused for `REIMPORT_COLD_FLIPS`: no batch in flight can reach it, so its
+            // pages leave the table now and are imported again at their next use, as after a
+            // failed re-import. Until 2026-11-22 every dropped window was imported again at once,
+            // the old and the new pinned together at a level load: ~12 GB here for a moment, more
+            // than a 16 GB PC's graphics share of memory.)
+            if (!remapped || reimport_cold_on()) && window_cold(r.start, r.end, cold_flips) {
+                if remapped {
+                    REIMPORTS_SKIPPED.fetch_add(1, Ordering::Relaxed);
+                }
+                continue;
+            }
             let t0 = std::time::Instant::now();
             let (made, failed) = import_mappings(r.start, r.end, &mut r.covered);
             REIMPORTS.fetch_add(made + failed, Ordering::Relaxed);
@@ -1887,15 +1899,31 @@ fn reimport_dropped(mut ranges_dead: Vec<Reimport>) {
         // dropped windows. (What covers them is known here, not looked up
         // again: a window listed now may have been dropped since, its pages'
         // entries held for its own re-import.)
+        // (Whatever covers them, of every dropped window here: one's re-import may cover
+        // another's pages, which that one's own list does not hold. Until 2026-11-22 evening each
+        // window's own list alone was asked, and a window left to its next use unmapped pages
+        // that another's re-import had just mapped, which stayed listed: their write-backs were
+        // lost, 22-482,639 pages a first session.)
+        let mut all: Vec<(u64, u64)> = ranges_dead.iter().flat_map(|r| r.covered.iter().copied()).collect();
+        all.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(all.len());
+        for (s, e) in all {
+            match merged.last_mut() {
+                Some(l) if s <= l.1 => l.1 = l.1.max(e),
+                _ => merged.push((s, e)),
+            }
+        }
         for r in &ranges_dead {
             let mut x = r.start;
             while x < r.end {
-                match r.covered.iter().filter(|c| c.0 <= x && x < c.1).map(|c| c.1).max() {
-                    Some(end) => x = end,
-                    None => {
-                        let next = r.covered.iter().filter(|c| x < c.0 && c.0 < r.end).map(|c| c.0).min().unwrap_or(r.end);
-                        super::pagetable::unmap(x, next - x);
-                        x = next;
+                // (The first covered run ending past x.)
+                let i = merged.partition_point(|c| c.1 <= x);
+                match merged.get(i) {
+                    Some(&(s, e)) if s <= x => x = e,
+                    next => {
+                        let n = next.map_or(r.end, |c| c.0.min(r.end));
+                        super::pagetable::unmap(x, n - x);
+                        x = n;
                     }
                 }
             }
@@ -2731,6 +2759,151 @@ static WIN_USE: std::sync::OnceLock<Box<[std::sync::atomic::AtomicU32]>> = std::
 
 fn win_use() -> &'static [std::sync::atomic::AtomicU32] {
     WIN_USE.get_or_init(|| (0..((crate::mem::GUEST_END - crate::mem::GUEST_BASE) / window_bytes())).map(|_| std::sync::atomic::AtomicU32::new(0)).collect())
+}
+
+/// A dropped window's re-import is left to its next use when every import window over it went
+/// unused this many flips (`reimport_dropped`); windows left so (`REIMPORTS_SKIPPED`).
+const REIMPORT_COLD_FLIPS: u32 = 600;
+pub static REIMPORTS_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// `DS_REIMPORT_COLD=0`: every window a remap drops is imported again at once, as before
+/// 2026-11-22 evening (`reimport_dropped`; evictions are `DS_EVICT_COLD`).
+fn reimport_cold_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_REIMPORT_COLD").ok().as_deref() != Some("0"))
+}
+
+/// Whether every import window over [start, end) went unused for `flips` flips (`WIN_USE`); never
+/// in a session's first `flips` flips.
+fn window_cold(start: u64, end: u64, flips: u32) -> bool {
+    if start < crate::mem::GUEST_BASE || end > crate::mem::GUEST_END || end <= start {
+        return false;
+    }
+    let now = super::FRAMES.load(Ordering::Relaxed);
+    if now < flips as u64 {
+        return false;
+    }
+    let now = now as u32;
+    let w = window_bytes();
+    let uses = win_use();
+    ((start - crate::mem::GUEST_BASE) / w..=(end - 1 - crate::mem::GUEST_BASE) / w).all(|i| uses.get(i as usize).is_some_and(|a| now.wrapping_sub(a.load(Ordering::Relaxed)) >= flips))
+}
+
+/// Imports dropped for being cold while the host heap ran short (`evict_cold_imports`): [windows,
+/// bytes, passes that dropped some].
+pub static COLD_EVICTED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// The room `evict_cold_imports` keeps in the host heap's budget: a level load's re-imports pinned
+/// up to ~1.9 GB more than play here (2026-11-22, a first session: 11.5 GB against 9.6).
+const HOST_ROOM: u64 = 3 << 30;
+
+/// `DS_EVICT_COLD=0` turns `evict_cold_imports` off.
+fn evict_cold_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_EVICT_COLD").ok().as_deref() != Some("0"))
+}
+
+/// The room under which `evict_cold_imports` runs every second and drops windows unused for
+/// `EVICT_TIGHT_FLIPS`: at a level load in a 16 GB PC's share (`DS_SIM_HOST_MIB=7600`) the
+/// heap passed its budget by ~265 MiB within a second, and the old level's windows went cold
+/// only 600 flips after their last use, 5-10 s later (2026-11-22 evening).
+const HOST_TIGHT: u64 = 1 << 30;
+const EVICT_TIGHT_FLIPS: u32 = 120;
+
+/// While this process's use of the host heap is within `HOST_ROOM` of its budget, every 5 s (within
+/// `HOST_TIGHT`: every second, windows unused for `EVICT_TIGHT_FLIPS`): the listed imports whose
+/// windows went unused `REIMPORT_COLD_FLIPS` flips are dropped as a remap drops them
+/// (`revalidate_spans`, its guest pages unchanged), their pages imported again at their next use.
+/// For PCs with 16 GB of memory (2026-11-22): their graphics share of it, about half, is less than
+/// normal play pinned here (~8 GB), and failed imports froze the game and hung the GPU.
+fn evict_cold_imports() {
+    // (The budget asked at most every second; a pass every 5 s unless tight.)
+    static LAST: Mutex<(Option<std::time::Instant>, Option<std::time::Instant>)> = Mutex::new((None, None));
+    let now = std::time::Instant::now();
+    {
+        let l = LAST.lock();
+        if l.0.is_some_and(|t| now.duration_since(t).as_millis() < 1000) {
+            return;
+        }
+    }
+    LAST.lock().0 = Some(now);
+    if !evict_cold_on() || !super::pagetable::made() || DEVICE_LOST.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some((used, budget)) = ctx().host_budget() else { return };
+    if used.saturating_add(HOST_ROOM) <= budget {
+        return;
+    }
+    let tight = used.saturating_add(HOST_TIGHT) > budget;
+    {
+        let mut l = LAST.lock();
+        if !tight && l.1.is_some_and(|t| now.duration_since(t).as_secs() < 5) {
+            return;
+        }
+        l.1 = Some(now);
+    }
+    let flips = if tight { EVICT_TIGHT_FLIPS } else { REIMPORT_COLD_FLIPS };
+    // (Looked for under the read lock first: the list's write lock stops every lookup.)
+    if !spans_read().iter().any(|s| s.valid && window_cold(s.start, s.end, flips)) {
+        return;
+    }
+    let importing: Vec<(u64, u64)> = IMPORTING.lock().iter().map(|m| (m.start, m.end)).collect();
+    let mut g = SPANS.write();
+    let mut dead = Vec::new();
+    let mut i = 0;
+    while i < g.len() {
+        let s = &g[i];
+        if s.valid && window_cold(s.start, s.end, flips) && !importing.iter().any(|&(a, b)| a < s.end && s.start < b) {
+            dead.push(g.swap_remove(i));
+        } else {
+            i += 1;
+        }
+    }
+    if dead.is_empty() {
+        return;
+    }
+    // Windows still listed over a dropped one's pages map them again (as at a remap).
+    let mut covers: Vec<Vec<(u64, u64)>> = Vec::with_capacity(dead.len());
+    for d in &dead {
+        let mut c = Vec::new();
+        for v in g.iter().filter(|v| v.valid && v.start < d.end && d.start < v.end) {
+            super::pagetable::map(v.start, v.end - v.start, ctx().buffer_address(v.buffer));
+            c.push((v.start, v.end));
+        }
+        covers.push(c);
+    }
+    DROP_GEN.fetch_add(1, Ordering::AcqRel);
+    CACHE_GEN.fetch_add(1, Ordering::AcqRel);
+    drop(g);
+    let bytes: u64 = dead.iter().map(|d| d.end - d.start).sum();
+    let n = dead.len() as u64;
+    let passes = COLD_EVICTED[2].fetch_add(1, Ordering::Relaxed);
+    COLD_EVICTED[0].fetch_add(n, Ordering::Relaxed);
+    COLD_EVICTED[1].fetch_add(bytes, Ordering::Relaxed);
+    if passes < 10 || passes % 100 == 0 {
+        crate::info!("gpu: {n} cold imports dropped ({} MiB, unused {flips}+ flips): the host heap's use {} MiB of a budget of {} (pass {})", bytes >> 20, used >> 20, budget >> 20, passes + 1);
+    }
+    let ranges_dead: Vec<Reimport> = dead.iter().zip(covers).map(|(d, covered)| Reimport { start: d.start, end: d.end, buffer: d.buffer, covered }).collect();
+    {
+        let mut gy = GRAVEYARD.lock();
+        gy.extend(dead.into_iter().map(|mut span| {
+            span.valid = false;
+            super::vk::note_gpu_dropped(span.buffer);
+            Dead { span, generation: u64::MAX, seq: None, held: true }
+        }));
+        GRAVEYARD_LEN.store(gy.len() as u64, Ordering::Release);
+    }
+    // (Cold, they are all left to their next use there; one used meanwhile is imported again.)
+    reimport_dropped(ranges_dead, flips, false);
+}
+
+/// Flips since the import window over `addr` was last used (`WIN_USE`; None: never stamped or
+/// outside guest memory).
+pub(super) fn window_age(addr: u64) -> Option<u32> {
+    if !(crate::mem::GUEST_BASE..crate::mem::GUEST_END).contains(&addr) {
+        return None;
+    }
+    let a = win_use().get(((addr - crate::mem::GUEST_BASE) / window_bytes()) as usize)?.load(Ordering::Relaxed);
+    (a != 0).then(|| (super::FRAMES.load(Ordering::Relaxed) as u32).wrapping_sub(a))
 }
 
 fn note_window_use(start: u64, end: u64) {
@@ -15731,6 +15904,11 @@ impl Exec {
         if written {
             self.owned.push((lo, hi));
         }
+        // (In use, `window_cold`: the write-back stores a placement's marked dwords through the
+        // guest page table into the import windows over it. Until 2026-11-22 only `span` stamped
+        // windows, and those written through the mirror alone looked cold: leaving them out at a
+        // drop lost 482,639 pages of write-backs in a first session.)
+        note_window_use(lo, hi);
         // Deferred CP writes into the range not performed yet: the batch is
         // submitted after them and copies what they changed at its close.
         if let Some(s) = CP_WRITES.latest(&[(base, size)]) {

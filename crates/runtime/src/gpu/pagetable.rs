@@ -325,12 +325,16 @@ pub fn status() -> String {
         String::new()
     };
     format!(
-        "    guest page table: {} pages mapped, {} cleared, {} update submissions ({} KiB), windows imported again right after a drop {} ({} ms); shader reads through unmapped pages {n} (last {last:#x}{why})\n",
+        "    guest page table: {} pages mapped, {} cleared, {} update submissions ({} KiB), windows imported again right after a drop {} ({} ms), left to their next use for being cold {}; imports dropped for being cold while the host heap ran short {} ({} MiB, {} passes); shader reads through unmapped pages {n} (last {last:#x}{why})\n",
         STATS[0].load(Ordering::Relaxed),
         STATS[1].load(Ordering::Relaxed),
         STATS[2].load(Ordering::Relaxed),
         STATS[3].load(Ordering::Relaxed) >> 10,
         super::exec::REIMPORTS.load(Ordering::Relaxed),
-        super::exec::REIMPORT_NS.load(Ordering::Relaxed) / 1_000_000
+        super::exec::REIMPORT_NS.load(Ordering::Relaxed) / 1_000_000,
+        super::exec::REIMPORTS_SKIPPED.load(Ordering::Relaxed),
+        super::exec::COLD_EVICTED[0].load(Ordering::Relaxed),
+        super::exec::COLD_EVICTED[1].load(Ordering::Relaxed) >> 20,
+        super::exec::COLD_EVICTED[2].load(Ordering::Relaxed)
     )
 }

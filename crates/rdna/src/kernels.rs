@@ -1219,6 +1219,28 @@ fn build_scatter(reset: bool, count: bool, hold: bool, same: u8, split: bool, sk
         None => c1,
     };
     b.atomic_i_add(u32t, None, pcnt, scope_dev, sem_none, one_page)?;
+    // (The last page counted lost, its number + 1 in counter 7: the runtime's status names its
+    // address. Counters 6 and 7 are written by no variant otherwise.)
+    {
+        let lost = b.logical_not(bool_, None, mapped)?;
+        let lost = match held {
+            Some(h) => {
+                let not_held = b.logical_not(bool_, None, h)?;
+                b.logical_and(bool_, None, lost, not_held)?
+            }
+            None => lost,
+        };
+        let (l_lost, l_lostd) = (b.id(), b.id());
+        b.selection_merge(l_lostd, SelectionControl::NONE)?;
+        b.branch_conditional(lost, l_lost, l_lostd, [])?;
+        b.begin_block(Some(l_lost))?;
+        let c7l = c(&mut b, 7);
+        let p7 = b.access_chain(p_u, None, counters, [c0, c7l])?;
+        let v = b.i_add(u32t, None, page, c1)?;
+        b.atomic_exchange(u32t, None, p7, scope_dev, sem_none, v)?;
+        b.branch(l_lostd)?;
+        b.begin_block(Some(l_lostd))?;
+    }
     b.branch(l_pbd)?;
     b.begin_block(Some(l_pbd))?;
     b.branch(l_end)?;
@@ -1727,6 +1749,24 @@ mod tests {
         if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
             let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
             std::fs::write(std::path::Path::new(&dir).join("mirror_scatter.spv"), bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn scatter_variants_assemble() {
+        let all = [
+            ("mirror_scatter_reset", super::mirror_scatter_reset()),
+            ("mirror_scatter_counting", super::mirror_scatter_counting()),
+            ("mirror_scatter_hold_census", super::mirror_scatter_hold_census()),
+            ("mirror_scatter_split", super::mirror_scatter_split()),
+            ("mirror_scatter_held", super::mirror_scatter_held()),
+        ];
+        for (name, w) in all {
+            assert_eq!(w[0], 0x0723_0203);
+            if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
+                let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+                std::fs::write(std::path::Path::new(&dir).join(format!("{name}.spv")), bytes).unwrap();
+            }
         }
     }
 

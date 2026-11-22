@@ -5506,6 +5506,19 @@ pub fn census_sample() {
         let prev = WB64[6 + i].swap(now as u64, Ordering::Relaxed) as u32;
         WB64[i].fetch_add(now.wrapping_sub(prev) as u64, Ordering::Relaxed);
     }
+    // (Counter 7: the last page the write-back found no table entry for, its number + 1.)
+    static LAST_LOST: AtomicU32 = AtomicU32::new(0);
+    static LOST_LOGGED: AtomicU32 = AtomicU32::new(0);
+    if k[7] != 0 && LAST_LOST.swap(k[7], Ordering::Relaxed) != k[7] && LOST_LOGGED.fetch_add(1, Ordering::Relaxed) < 40 {
+        let a = rdna::translate::PT_BASE + (((k[7] - 1) as u64) << rdna::translate::PT_PAGE_SHIFT);
+        crate::info!(
+            "fe2: write-back lost page {a:#x} (engine owner {}; its import window last used {}; a listed import over it now: {}; {} pages lost so far)",
+            crate::engine::owner(a),
+            super::exec::window_age(a).map_or("never".to_string(), |n| format!("{n} flips ago")),
+            super::exec::spans_guard().window(a).is_some(),
+            k[2]
+        );
+    }
 }
 
 /// The write-back's counters (pages, dwords, pages without a mapping,
@@ -6022,7 +6035,7 @@ pub fn status() -> String {
         .collect();
     let w: Vec<u64> = WB64.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
-        "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed; {} view pages armed at the residency's takes adopted), {} armings ended by writes, {} writes found on pages armed and taken since (holes); checks that followed another's take {} ({} pages uploaded without a take of their own, {} took anyway); faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed), {} more pages unarmed with a faulted page's word; invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost), {} lists past their capacity (before GPU-performed CP writes {}, at batch closes {}, {} of them with no label write and no completion action; CP writes with work to write back {} of labels a CP of ours waits on, {} left to the batch's close, {} with their guest-memory copy at the close); CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}; imports {} live ({} uploaded from, {} settled for arming); views synchronized {} times ({} raised; by the graphics CP's own synchronization {}, the compute queues' {}; epochs ended by {} title submissions, {} waits the CPU released, {} REWIND, {} waits passed on GPU writes ended none, {} passed again on a counter's value, {} gone past ended none); the mirror's video memory {} MiB (no placement in the last 1,800 flips: {} MiB; unbound since boot {} MiB, {} blocks freed, {} cold words kept by placements), its written-bit maps' {} MiB\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
+        "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed; {} view pages armed at the residency's takes adopted), {} armings ended by writes, {} writes found on pages armed and taken since (holes); checks that followed another's take {} ({} pages uploaded without a take of their own, {} took anyway); faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed), {} more pages unarmed with a faulted page's word; invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost{}), {} lists past their capacity (before GPU-performed CP writes {}, at batch closes {}, {} of them with no label write and no completion action; CP writes with work to write back {} of labels a CP of ours waits on, {} left to the batch's close, {} with their guest-memory copy at the close); CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}; imports {} live ({} uploaded from, {} settled for arming); views synchronized {} times ({} raised; by the graphics CP's own synchronization {}, the compute queues' {}; epochs ended by {} title submissions, {} waits the CPU released, {} REWIND, {} waits passed on GPU writes ended none, {} passed again on a counter's value, {} gone past ended none); the mirror's video memory {} MiB (no placement in the last 1,800 flips: {} MiB; unbound since boot {} MiB, {} blocks freed, {} cold words kept by placements), its written-bit maps' {} MiB\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
         s[S_ENSURES],
         s[S_ENSURE_PAGES],
         s[S_FAST],
@@ -6063,6 +6076,7 @@ pub fn status() -> String {
         w[0],
         w[1],
         k[2],
+        if k[7] != 0 { format!(", the last at {:#x}", rdna::translate::PT_BASE + (((k[7] - 1) as u64) << rdna::translate::PT_PAGE_SHIFT)) } else { String::new() },
         k[3],
         super::exec::SCATTER_SITES[0].load(Ordering::Relaxed),
         super::exec::SCATTER_SITES[1].load(Ordering::Relaxed),

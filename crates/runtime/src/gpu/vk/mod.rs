@@ -1009,6 +1009,22 @@ impl Ctx {
         Some((budget.heap_usage[i].saturating_sub(sim_system_bytes()), budget.heap_budget[i].min(vram_cap()).min(sim_vram_limit().unwrap_or(u64::MAX))))
     }
 
+    /// This process's usage of the largest heap that is not device-local (imported guest memory
+    /// and the system-memory fallback are there) and its budget, the budget at most
+    /// `DS_SIM_HOST_MIB`, bytes (None without VK_EXT_memory_budget or such a heap).
+    pub fn host_budget(&self) -> Option<(u64, u64)> {
+        if !self.memory_budget {
+            return None;
+        }
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let mut p2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+        unsafe { self.instance.get_physical_device_memory_properties2(self.pdev, &mut p2) };
+        let props = p2.memory_properties;
+        let i = (0..props.memory_heap_count as usize).filter(|&i| !props.memory_heaps[i].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL)).max_by_key(|&i| props.memory_heaps[i].size)?;
+        drop(p2);
+        Some((budget.heap_usage[i], budget.heap_budget[i].min(sim_host_limit().unwrap_or(u64::MAX))))
+    }
+
     /// `DS_SIM_VRAM_MIB` (a test, `sim_vram_limit`): whether an allocation of `size` bytes in
     /// memory type `ty` fails as on a card whose room for this process ends at the limit: the
     /// type's heap is the largest device-local one and this process's usage of it plus the
@@ -1175,8 +1191,19 @@ pub fn sim_host_limit() -> Option<u64> {
     *LIMIT.get_or_init(|| std::env::var("DS_SIM_HOST_MIB").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&m| m >= 1024).map(|m| m << 20))
 }
 
-/// Imports and fallback allocations failed by `DS_SIM_HOST_MIB`.
+/// Imports and fallback allocations failed by `DS_SIM_HOST_MIB` (with `DS_SIM_HOST_COUNT=1`: that
+/// would have failed), and the most bytes one would have passed its budget by.
 pub static SIM_HOST_FAILS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SIM_HOST_OVER_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `DS_SIM_HOST_COUNT=1` with `DS_SIM_HOST_MIB` (2026-11-22): what would pass the simulated budget
+/// is counted, not failed (`sim_host_fails`): a smaller PC's shortfall measured without failing
+/// imports, which hung and reset the GPU here (GPU writes into ranges without imports never reach
+/// guest memory, labels among them).
+pub fn sim_host_count_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_SIM_HOST_COUNT").ok().as_deref() == Some("1"))
+}
 
 /// Device-local allocations failed by `DS_SIM_VRAM_MIB`.
 pub static SIM_VRAM_FAILS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1222,7 +1249,11 @@ pub fn gate_line() -> String {
     if failed == 0 && host == 0 {
         return String::new();
     }
-    let host = if host > 0 { format!("; imports and fallback allocations failed by DS_SIM_HOST_MIB {host}") } else { String::new() };
+    let host = match host {
+        0 => String::new(),
+        n if sim_host_count_only() => format!("; imports and fallback allocations that would have failed under DS_SIM_HOST_MIB {n} (counted only; by at most {} MiB)", SIM_HOST_OVER_MAX.load(Relaxed) >> 20),
+        n => format!("; imports and fallback allocations failed by DS_SIM_HOST_MIB {n} (by at most {} MiB)", SIM_HOST_OVER_MAX.load(Relaxed) >> 20),
+    };
     format!("    video-memory allocations failed {failed} times ({} of them by DS_SIM_VRAM_MIB); {refused} requests refused with no driver call in the {GATE_MS} ms after a failure{host}\n", SIM_VRAM_FAILS.load(Relaxed))
 }
 
@@ -1640,11 +1671,23 @@ impl Ctx {
         let mut p2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
         unsafe { self.instance.get_physical_device_memory_properties2(self.pdev, &mut p2) };
         drop(p2);
-        let fails = budget.heap_usage[heap].saturating_add(size) > limit;
+        let need = budget.heap_usage[heap].saturating_add(size);
+        let fails = need > limit;
         if fails {
-            SIM_HOST_FAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let n = SIM_HOST_FAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            SIM_HOST_OVER_MAX.fetch_max(need - limit, std::sync::atomic::Ordering::Relaxed);
+            if n < 8 || n % 1000 == 0 {
+                crate::info!(
+                    "gpu: DS_SIM_HOST_MIB: {} MiB more would pass the simulated budget ({} MiB used of {}){} ({} so far)",
+                    size >> 20,
+                    budget.heap_usage[heap] >> 20,
+                    limit >> 20,
+                    if sim_host_count_only() { ", counted only" } else { "" },
+                    n + 1
+                );
+            }
         }
-        fails
+        fails && !sim_host_count_only()
     }
 
     /// An image's memory type bits seen (`images::create_inner`): whether images have a type for
