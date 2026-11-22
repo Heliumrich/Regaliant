@@ -80,9 +80,10 @@ fn pc_text() -> String {
             }
             // (Measured in smaller rooms simulated on a 24 GB card, 2026-11-22: from 7 GB of room
             // the picture stays right with textures in system memory in busy places; 4 GB of room
-            // still draws right in the 8-level tour, at 52-150 ms a frame there; less is untested.)
+            // and 3.5 GB (what a 4 GB card leaves a game) draw right in the 8-level tour, slowly; what a
+            // 3 GB card leaves drew parts of some levels wrong.)
             if g.vram < 3584 << 20 {
-                lines.push("Cards with less than 4 GB of video memory are untested. The game may not run on this card.".into());
+                lines.push("Cards with less than 4 GB of video memory are not supported. Parts of the game can draw wrong.".into());
             } else if g.vram < 5632 << 20 {
                 lines.push("This card has little video memory for this game. It runs, but slowly. The Low preset in the game's PC tab helps.".into());
             } else if g.vram < 11 << 30 {
