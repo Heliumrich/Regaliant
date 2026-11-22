@@ -5515,7 +5515,7 @@ pub fn census_sample() {
             "fe2: write-back lost page {a:#x} (engine owner {}; its import window last used {}; a listed import over it now: {}; {} pages lost so far)",
             crate::engine::owner(a),
             super::exec::window_age(a).map_or("never".to_string(), |n| format!("{n} flips ago")),
-            super::exec::spans_guard().window(a).is_some(),
+            super::exec::listed_over(a).map_or("not known (the list busy)".to_string(), |b| b.to_string()),
             k[2]
         );
     }

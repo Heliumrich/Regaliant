@@ -1876,13 +1876,14 @@ struct Reimport {
 /// dropped one until they complete).
 fn reimport_dropped(mut ranges_dead: Vec<Reimport>, cold_flips: u32, remapped: bool) {
     if super::pagetable::made() && !DEVICE_LOST.load(Ordering::Relaxed) {
+        let oldest_open = oldest_open_gen();
         for r in ranges_dead.iter_mut() {
-            // (A window unused for `REIMPORT_COLD_FLIPS`: no batch in flight can reach it, so its
-            // pages leave the table now and are imported again at their next use, as after a
-            // failed re-import. Until 2026-11-22 every dropped window was imported again at once,
-            // the old and the new pinned together at a level load: ~12 GB here for a moment, more
-            // than a 16 GB PC's graphics share of memory.)
-            if (!remapped || reimport_cold_on()) && window_cold(r.start, r.end, cold_flips) {
+            // (A window unused for `REIMPORT_COLD_FLIPS` and by every batch still open
+            // (`window_cold`): its pages leave the table now and are imported again at their next
+            // use, as after a failed re-import. Until 2026-11-22 every dropped window was imported
+            // again at once, the old and the new pinned together at a level load: ~12 GB here for
+            // a moment, more than a 16 GB PC's graphics share of memory.)
+            if (!remapped || reimport_cold_on()) && window_cold(r.start, r.end, cold_flips, oldest_open) {
                 if remapped {
                     REIMPORTS_SKIPPED.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1893,18 +1894,22 @@ fn reimport_dropped(mut ranges_dead: Vec<Reimport>, cold_flips: u32, remapped: b
             REIMPORTS.fetch_add(made + failed, Ordering::Relaxed);
             REIMPORT_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
-        // Pages of the dropped windows that neither a window listed over them
-        // at the drop nor their re-import covers leave the table (an import
-        // that failed, mappings gone meanwhile): their entries led into the
-        // dropped windows. (What covers them is known here, not looked up
-        // again: a window listed now may have been dropped since, its pages'
-        // entries held for its own re-import.)
-        // (Whatever covers them, of every dropped window here: one's re-import may cover
-        // another's pages, which that one's own list does not hold. Until 2026-11-22 evening each
-        // window's own list alone was asked, and a window left to its next use unmapped pages
-        // that another's re-import had just mapped, which stayed listed: their write-backs were
-        // lost, 22-482,639 pages a first session.)
+        // Pages of the dropped windows that nothing covers leave the table (an import that
+        // failed, mappings gone meanwhile, a window left to its next use): their entries led into
+        // the dropped windows. What covers them: every dropped window's list here (the windows
+        // listed over it at the drop, which were mapped again then, and its re-import; one's
+        // re-import may cover another's pages, which that one's own list does not hold), and the
+        // windows listed now, looked up under the list's read lock held through the clears: an
+        // import lists and maps its window under the write lock, so one another thread made over
+        // a window left out after its drop is met here, and one made later maps after these
+        // clears. (A window listed now has not been dropped: its entries lead to it.) Until
+        // 2026-11-22 evening each window's own list alone was asked, and a window left out
+        // unmapped pages another window's re-import had just mapped, which stayed listed: their
+        // write-backs were lost, 22-482,639 pages a first session (the evening's review found the
+        // other thread's case).
+        let listed = spans_read();
         let mut all: Vec<(u64, u64)> = ranges_dead.iter().flat_map(|r| r.covered.iter().copied()).collect();
+        all.extend(listed.iter().filter(|v| v.valid && ranges_dead.iter().any(|r| v.start < r.end && r.start < v.end)).map(|v| (v.start, v.end)));
         all.sort_unstable();
         let mut merged: Vec<(u64, u64)> = Vec::with_capacity(all.len());
         for (s, e) in all {
@@ -1928,6 +1933,7 @@ fn reimport_dropped(mut ranges_dead: Vec<Reimport>, cold_flips: u32, remapped: b
                 }
             }
         }
+        drop(listed);
     }
     // Buried now the table no longer leads to them (the maps and clears
     // above apply before the next batch): batches begun until now may still
@@ -2773,9 +2779,12 @@ fn reimport_cold_on() -> bool {
     *ON.get_or_init(|| std::env::var("DS_REIMPORT_COLD").ok().as_deref() != Some("0"))
 }
 
-/// Whether every import window over [start, end) went unused for `flips` flips (`WIN_USE`); never
-/// in a session's first `flips` flips.
-fn window_cold(start: u64, end: u64, flips: u32) -> bool {
+/// Whether every import window over [start, end) went unused for `flips` flips (`WIN_USE`) and
+/// by every batch still open: its last use's SPAN_GEN (`WIN_GEN`) older than the oldest open
+/// batch's beginning (`oldest_open`, `oldest_open_gen`): flips alone missed a batch held open
+/// past a label wait for longer (the evening's review, 2026-11-22). Never in a session's first
+/// `flips` flips. (A stamp of a flip after `now` reads as used: a signed difference.)
+fn window_cold(start: u64, end: u64, flips: u32, oldest_open: u64) -> bool {
     if start < crate::mem::GUEST_BASE || end > crate::mem::GUEST_END || end <= start {
         return false;
     }
@@ -2785,8 +2794,23 @@ fn window_cold(start: u64, end: u64, flips: u32) -> bool {
     }
     let now = now as u32;
     let w = window_bytes();
-    let uses = win_use();
-    ((start - crate::mem::GUEST_BASE) / w..=(end - 1 - crate::mem::GUEST_BASE) / w).all(|i| uses.get(i as usize).is_some_and(|a| now.wrapping_sub(a.load(Ordering::Relaxed)) >= flips))
+    let (uses, gens) = (win_use(), win_gen());
+    ((start - crate::mem::GUEST_BASE) / w..=(end - 1 - crate::mem::GUEST_BASE) / w).all(|i| {
+        uses.get(i as usize).is_some_and(|a| now.wrapping_sub(a.load(Ordering::Acquire)) as i32 >= flips as i32)
+            && gens.get(i as usize).is_some_and(|g| g.load(Ordering::Acquire) < oldest_open)
+    })
+}
+
+/// SPAN_GEN when the oldest batch not yet submitted began, of every executor (u64::MAX: none).
+fn oldest_open_gen() -> u64 {
+    EXEC_GENS.lock().iter().map(|g| g.load(Ordering::SeqCst)).min().unwrap_or(u64::MAX)
+}
+
+/// Each import window's last use's SPAN_GEN (`note_window_use`, `window_cold`).
+static WIN_GEN: std::sync::OnceLock<Box<[AtomicU64]>> = std::sync::OnceLock::new();
+
+fn win_gen() -> &'static [AtomicU64] {
+    WIN_GEN.get_or_init(|| (0..((crate::mem::GUEST_END - crate::mem::GUEST_BASE) / window_bytes())).map(|_| AtomicU64::new(0)).collect())
 }
 
 /// Imports dropped for being cold while the host heap ran short (`evict_cold_imports`): [windows,
@@ -2842,8 +2866,13 @@ fn evict_cold_imports() {
         l.1 = Some(now);
     }
     let flips = if tight { EVICT_TIGHT_FLIPS } else { REIMPORT_COLD_FLIPS };
+    // (A new generation each pass: windows used before it and batches begun after it then
+    // differ, as they do after any burial, so a window cold now is droppable at the next pass
+    // once the batches open now are submitted.)
+    SPAN_GEN.fetch_add(1, Ordering::AcqRel);
+    let oldest_open = oldest_open_gen();
     // (Looked for under the read lock first: the list's write lock stops every lookup.)
-    if !spans_read().iter().any(|s| s.valid && window_cold(s.start, s.end, flips)) {
+    if !spans_read().iter().any(|s| s.valid && window_cold(s.start, s.end, flips, oldest_open)) {
         return;
     }
     let importing: Vec<(u64, u64)> = IMPORTING.lock().iter().map(|m| (m.start, m.end)).collect();
@@ -2852,7 +2881,7 @@ fn evict_cold_imports() {
     let mut i = 0;
     while i < g.len() {
         let s = &g[i];
-        if s.valid && window_cold(s.start, s.end, flips) && !importing.iter().any(|&(a, b)| a < s.end && s.start < b) {
+        if s.valid && window_cold(s.start, s.end, flips, oldest_open) && !importing.iter().any(|&(a, b)| a < s.end && s.start < b) {
             dead.push(g.swap_remove(i));
         } else {
             i += 1;
@@ -2896,6 +2925,12 @@ fn evict_cold_imports() {
     reimport_dropped(ranges_dead, flips, false);
 }
 
+/// Whether a listed (not dropped) import covers guest page `addr` (None: the list busy).
+pub(super) fn listed_over(addr: u64) -> Option<bool> {
+    let g = SPANS.try_read()?;
+    Some(g.iter().any(|s| s.valid && s.start <= addr && addr < s.end))
+}
+
 /// Flips since the import window over `addr` was last used (`WIN_USE`; None: never stamped or
 /// outside guest memory).
 pub(super) fn window_age(addr: u64) -> Option<u32> {
@@ -2911,12 +2946,21 @@ fn note_window_use(start: u64, end: u64) {
         return;
     }
     let w = window_bytes();
+    // (The generation first: `window_cold` reads it after the flip.)
+    let g = SPAN_GEN.load(Ordering::Acquire);
     let f = super::FRAMES.load(Ordering::Relaxed) as u32;
-    let uses = win_use();
+    let (uses, gens) = (win_use(), win_gen());
     for i in ((start - crate::mem::GUEST_BASE) / w)..=((end - 1 - crate::mem::GUEST_BASE) / w) {
+        // (Only ever raised: a thread preempted between reading and storing wrote an older
+        // stamp over a newer one. A load first: most uses find this flip's stamp there.)
+        if let Some(x) = gens.get(i as usize) {
+            if x.load(Ordering::Relaxed) < g {
+                x.fetch_max(g, Ordering::AcqRel);
+            }
+        }
         if let Some(a) = uses.get(i as usize) {
-            if a.load(Ordering::Relaxed) != f {
-                a.store(f, Ordering::Relaxed);
+            if (f.wrapping_sub(a.load(Ordering::Relaxed)) as i32) > 0 {
+                a.fetch_max(f, Ordering::AcqRel);
             }
         }
     }
@@ -15904,10 +15948,9 @@ impl Exec {
         if written {
             self.owned.push((lo, hi));
         }
-        // (In use, `window_cold`: the write-back stores a placement's marked dwords through the
-        // guest page table into the import windows over it. Until 2026-11-22 only `span` stamped
-        // windows, and those written through the mirror alone looked cold: leaving them out at a
-        // drop lost 482,639 pages of write-backs in a first session.)
+        // (Mirror mode, `DS_RESIDENT=2`: its placements count as uses of the windows over them
+        // (`window_cold`). Front end 2's placements stamp through `span`, a written one's
+        // `import_written` among them.)
         note_window_use(lo, hi);
         // Deferred CP writes into the range not performed yet: the batch is
         // submitted after them and copies what they changed at its close.
