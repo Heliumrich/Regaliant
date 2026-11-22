@@ -158,17 +158,31 @@ Tested on one PC: Ryzen 9 5900X (12 cores), 32 GB of memory, NVIDIA RTX 4090 wit
 610.88, Windows 11.
 
 Memory, measured there: the game reserves about 35 to 40 GB of memory and page file. While you
-play an area it keeps about 4 to 5 GB in active use. With 16 GB of memory it should run if
-Windows manages the page file size (the default) and the system drive has about 30 GB free. It
-then pages more during loads. 32 GB is recommended. 16 GB has not been tested.
+play an area it keeps about 4 to 5 GB in active use. 32 GB is recommended. The graphics card
+reads part of the game's memory directly, and Windows lets it use about half of the installed
+memory for that. 16 GB has not been tested on a real PC. In a simulation of a 16 GB PC on the
+tested PC, the game played every tested level, at the same frame rates once a level had
+loaded. The first level loads of a session took longer. With 16 GB, keep Windows' page file
+on automatic and about 30 GB free on the system drive.
 
-Estimated, not tested:
-- Graphics: Vulkan 1.3 and about 12 GB of video memory. The game used 17 to 18 GB on the
-  tested card. With an 8 GB budget simulated it kept its textures within it and ran at the
-  same frame rates, but its other GPU memory brought it to about 11 GB, so an 8 GB card
-  would slow down. AMD and Intel graphics cards have not been tested.
-- Processor: limited to 6 of its 12 cores, the tested processor kept 91 to 94% of its frame
-  rate. A slower processor lowers the frame rate in proportion to its single-core speed.
+Graphics card: Vulkan 1.3. Only an RTX 4090 was tested. Smaller cards were simulated on it by
+giving the game less video memory. That shows how much memory the game needs, but not how fast
+a smaller card is.
+- 12 GB or more: the game fits.
+- 8 to 12 GB: in busy places the game keeps some textures in system memory. The picture stays
+  right. The frame rate there can drop.
+- 6 GB: the game fits once some textures go to system memory. In the tested levels it drew
+  right, at the same frame rates as with 7 GB on the 4090.
+- 4 GB: the game runs and draws right in the tested levels, but even on the 4090 it ran at
+  about 9 to 30 frames a second with what a 4 GB card leaves a game. Cards with 4 GB are
+  usually slow graphics chips too, so expect low frame rates. The Low preset in the game's PC
+  tab lowers the graphics card's work. A 4 GB card in a PC with 16 GB of memory has not been
+  tested.
+- Less than 4 GB: not supported. Parts of some levels drew wrong in the simulation.
+AMD and Intel graphics cards have not been tested.
+
+Processor: limited to 6 of its 12 cores, the tested processor kept 91 to 94% of its frame
+rate. A slower processor lowers the frame rate in proportion to its single-core speed.
 
 
 Known issues
@@ -191,6 +205,13 @@ Known issues
   to a percentage. Visual Mode shows it whole.
 - HDR has not been seen on an HDR screen yet.
 - AMD and Intel graphics cards have not been tested.
+- On graphics cards with 12 GB or less the game can run short of graphics memory in busy
+  places. It then keeps some textures in system memory, and the frame rate there can drop.
+- On cards with 4 or 5 GB the game keeps its large images in system memory from the start. It
+  runs, but slowly.
+- PCs with 16 GB of memory have not been tested on a real PC. In a simulation of one, the game
+  played the tested levels, but the first level loads of a session were slower. 32 GB is
+  recommended.
 - Graphics cards without fragment shader barycentrics draw some surfaces through an extra
   shader stage, which costs some speed. NVIDIA's GTX 10 series and older and Intel Arc A-series,
   Meteor Lake and Arrow Lake graphics are among them. This was only simulated on an NVIDIA card.

@@ -25,6 +25,9 @@
 - Fixed a crash when graphics memory ran out while the game made room for its work.
 - The launcher says what to expect on a card with little video memory.
 - A long preparation that runs short of graphics memory goes on in a fresh session.
+- PCs with 16 GB of memory: in a simulation of one, the game no longer freezes at level loads.
+  When the graphics card's share of memory runs short, the game frees memory it has not used
+  lately.
 - A preparation step that finished its work is no longer run again when it is slow to close.
 - Prepare now on prepared shaders gives shaders that once crashed the graphics driver another
   chance.
