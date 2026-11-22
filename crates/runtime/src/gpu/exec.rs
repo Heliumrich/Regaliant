@@ -14961,6 +14961,7 @@ impl Exec {
         }
         if let Err(e) = super::resident::back(lo, hi - lo) {
             self.report_error("front end 2: no video memory for the mirror (bound as zeros)", || format!("{lo:#x}..{hi:#x}: {e}"));
+            super::images::ZERO_PLACEMENTS.fetch_add(1, Ordering::Relaxed);
             // (No pressure noted here: a real failure noted it (`vk::note_alloc_fail`), and a page
             // gone without while the spare block was made had renewed the spell, which kept pages
             // going without: the review of 2026-11-21 night.)

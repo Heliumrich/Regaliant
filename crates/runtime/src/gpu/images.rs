@@ -1282,6 +1282,14 @@ const EVICT_CHECK_MS: u64 = 500;
 /// and its detiling about halved (FINDINGS.md 2026-11-15 late night).
 const OTHERS_FLOOR_PCT: u64 = 50;
 
+/// Images not made for want of memory (or another failure of their creation) and the last such key;
+/// front end 2's placements whose mirror pages were bound as zeros (`exec`). Counted for the census
+/// beside the over-budget warning, whose own messages stop at their cap early in a session (the 7 GB
+/// tours of 2026-11-22: a session went wrong for good at World 8 with no line saying why).
+pub static IMAGE_FAILS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static ZERO_PLACEMENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAST_IMAGE_FAIL: parking_lot::Mutex<Option<ImageKey>> = parking_lot::Mutex::new(None);
+
 /// Video memory under pressure until this time (`pressure_clock_ms`): set when evicting textures
 /// left this process over the high mark (`maybe_evict`), read by the mirror's cold-page thread
 /// (`resident::maybe_unback`), which then gives cold pages back sooner. And how often it was set.
@@ -1415,7 +1423,18 @@ pub fn maybe_evict() {
         LAST_CENSUS.store(ms, Relaxed);
         let (all, cold) = im.gpu_written_census(frame, 600);
         let (tex, top) = im.texture_census();
-        crate::info!("images: GPU-written {} MiB, {} MiB of it unused for 600 flips or more; textures {} MiB, ~{} MiB of it the top mips of large ones (at flip {frame})", all >> 20, cold >> 20, tex >> 20, top >> 20);
+        // (Since the last census: placements drawn from zeros, images not made, the last of them.)
+        static SEEN: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+        let (z, f) = (ZERO_PLACEMENTS.load(Relaxed), IMAGE_FAILS.load(Relaxed));
+        let (dz, df) = (z - SEEN[0].swap(z, Relaxed), f - SEEN[1].swap(f, Relaxed));
+        let last = if df > 0 { LAST_IMAGE_FAIL.lock().map(|k| format!(" (the last {}x{}x{} {:?} at {:#x})", k.width, k.height, k.layers, k.format, k.base)).unwrap_or_default() } else { String::new() };
+        crate::info!(
+            "images: GPU-written {} MiB, {} MiB of it unused for 600 flips or more; textures {} MiB, ~{} MiB of it the top mips of large ones; since the last: {dz} placements bound as zeros, {df} images not made{last} (at flip {frame})",
+            all >> 20,
+            cold >> 20,
+            tex >> 20,
+            top >> 20
+        );
     }
     // (Textures alone could not bring it under the high mark: the rest is memory images the GPU
     // wrote, the mirror and the like. The mirror then gives its cold pages back sooner for a while,
@@ -3209,8 +3228,18 @@ impl Images {
         }
     }
 
-    /// Creates the VkImage for `key` (GENERAL layout, contents undefined).
+    /// Creates the VkImage for `key` (GENERAL layout, contents undefined); a failure counted with
+    /// its key (`IMAGE_FAILS`, `LAST_IMAGE_FAIL`: the census beside the over-budget warning).
     fn create(&mut self, key: ImageKey) -> Result<(vk::Image, super::slab::Mem, u64), String> {
+        let r = self.create_inner(key);
+        if r.is_err() {
+            IMAGE_FAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            *LAST_IMAGE_FAIL.lock() = Some(key);
+        }
+        r
+    }
+
+    fn create_inner(&mut self, key: ImageKey) -> Result<(vk::Image, super::slab::Mem, u64), String> {
         let c = ctx();
         let props = unsafe { c.instance.get_physical_device_format_properties(c.pdev, key.format) };
         let f = props.optimal_tiling_features;
