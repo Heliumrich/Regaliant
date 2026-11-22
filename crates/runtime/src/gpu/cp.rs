@@ -7607,6 +7607,11 @@ impl Cp {
                 let len = 4 * (n + 3);
                 let mut r = crate::hle::libs::videoout::reserve_flip(handle, index, arg);
                 if r == Err(crate::hle::libs::videoout::ERR_FLIP_QUEUE_FULL) {
+                    // (The open batch submitted first: the flips filling the queue commit once
+                    // the batches holding them complete, and one may be this one: see below.)
+                    if let Some(e) = self.exec.as_mut() {
+                        e.submit_for("flip slot wait");
+                    }
                     set_state(&self.name, format!("flip of buffer {index}: waiting for a free flip slot"));
                     while r == Err(crate::hle::libs::videoout::ERR_FLIP_QUEUE_FULL) && !crate::gpu::shutting_down() {
                         std::thread::sleep(Duration::from_micros(500));
@@ -7663,6 +7668,14 @@ impl Cp {
             pop::WAIT_SAFE_FOR_RENDERING => {
                 let (handle, index) = (a(0) as i32, a(1) as i32);
                 if crate::hle::libs::videoout::buffer_busy(handle, index) && !super::replay::replaying() {
+                    // (The open batch submitted first. An asynchronous flip commits once the batch
+                    // holding it completes (`effect`), and that batch can be this queue's own, still
+                    // being recorded: the wait then waited for itself. A self-play part was found
+                    // hung so on 2026-11-22 small hours: the GPU done through the last submission,
+                    // this queue recording with the flip that queued the buffer in its batch.)
+                    if let Some(e) = self.exec.as_mut() {
+                        e.submit_for("display buffer wait");
+                    }
                     let what = format!("WaitUntilSafeForRendering: display buffer {index} is displayed or queued");
                     return self.poll_until(at, &what, || !crate::hle::libs::videoout::buffer_busy(handle, index));
                 }
