@@ -104,21 +104,34 @@ foreach ($f in $programs.Keys) {
     $k = $n.ToLowerInvariant()
     if ($text.Contains($k) -or $wide.Contains($k)) { Write-Host "$f contains a path or name of this machine ($n); not packaged"; exit 1 }
   }
-  # (The executable sections blanked for the name: the PE section table's executable flag.)
+  # (The executable sections blanked for the name: the PE section table's executable flag. And a
+  # match whose four bytes, read as an address, point into those sections is an address in a
+  # table (the exception directory's function entries, unwind data), not text: 2026-11-22 a
+  # function's start 0x566350 read "PcV" in .pdata and the unwind data of .rdata.)
   $data = [byte[]]$bytes.Clone()
   $pe = [BitConverter]::ToInt32($data, 0x3c)
   $nsec = [BitConverter]::ToUInt16($data, $pe + 6)
   $opt = [BitConverter]::ToUInt16($data, $pe + 20)
+  $code = @()
   for ($i = 0; $i -lt $nsec; $i++) {
     $s = $pe + 24 + $opt + 40 * $i
     $size = [BitConverter]::ToInt32($data, $s + 16); $at = [BitConverter]::ToInt32($data, $s + 20)
-    if (([BitConverter]::ToUInt32($data, $s + 36) -band 0x20000000) -and $at -lt $data.Length) { [Array]::Clear($data, $at, [Math]::Min($size, $data.Length - $at)) }
+    if (([BitConverter]::ToUInt32($data, $s + 36) -band 0x20000000) -and $at -lt $data.Length) {
+      [Array]::Clear($data, $at, [Math]::Min($size, $data.Length - $at))
+      $va = [BitConverter]::ToUInt32($data, $s + 12); $vs = [BitConverter]::ToUInt32($data, $s + 8)
+      $code += , @($va, ($va + $vs))
+    }
   }
+  $isCodeAddress = { param([int]$o) if ($o + 4 -gt $data.Length) { return $false }; $v = [BitConverter]::ToUInt32($data, $o); foreach ($r in $code) { if ($v -ge $r[0] -and $v -lt $r[1]) { return $true } }; return $false }
   $text = [Text.Encoding]::GetEncoding(28591).GetString($data).ToLowerInvariant()
   $wide = [Text.Encoding]::Unicode.GetString($data).ToLowerInvariant()
   foreach ($n in $words) {
     $re = '(?<![a-z0-9])' + [regex]::Escape($n.ToLowerInvariant()) + '(?![a-z0-9])'
-    if ([regex]::IsMatch($text, $re) -or [regex]::IsMatch($wide, $re)) { Write-Host "$f contains the name of this machine ($n); not packaged"; exit 1 }
+    $hits = @([regex]::Matches($text, $re) | Where-Object { -not (& $isCodeAddress $_.Index) })
+    $hits += @([regex]::Matches($wide, $re) | Where-Object { -not (& $isCodeAddress (2 * $_.Index)) })
+    if ($hits.Count) { Write-Host "$f contains the name of this machine ($n) at byte $(if ($hits[0].Index) { $hits[0].Index } else { 0 }); not packaged"; exit 1 }
+    $skipped = @([regex]::Matches($text, $re)).Count
+    if ($skipped) { Write-Host "${f}: $skipped matches of the machine's name are addresses into its code (tables), not text" }
   }
 }
 # README.txt: the player README, the notices, the license (CRLF, UTF-8).
