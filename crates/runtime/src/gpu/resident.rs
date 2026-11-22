@@ -1551,6 +1551,15 @@ pub fn mirror_bytes() -> Option<u64> {
     Some((g.mems.iter().filter(|&&x| x != vk::DeviceMemory::null()).count() as u64 + g.spare.is_some() as u64) * BLOCK)
 }
 
+/// `take_page`'s answer while another thread makes the spare block under pressure: `back_in` then
+/// waits for it with the backing's lock released (`SPARE_WAIT`) and claims on.
+const SPARE_BUSY: &str = "vkAllocateMemory (mirror block): the spare block is still being made";
+/// The longest `back_in` waits for a spare block in the making before its pages go without.
+/// (Until 2026-11-22 small hours a page went without at once: the PGO training's walk on this PC,
+/// its card shared and near its budget, drew mirror pages from zeros whenever a refill was in
+/// flight; the review of 2026-11-21 night had named it as a risk.)
+const SPARE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The spare block's status line (`SPARE_STATS`).
 pub fn spare_line() -> String {
     let (taken, made, refused) = (SPARE_STATS[0].load(Ordering::Relaxed), SPARE_STATS[1].load(Ordering::Relaxed), SPARE_STATS[2].load(Ordering::Relaxed));
@@ -1637,7 +1646,7 @@ fn take_page(g: &mut Backing, m: &Mirror, alloc_ns: &mut u64, marks: bool) -> Re
                 // page goes without, as when memory runs out; the review of 2026-11-21 night.
                 // Without pressure a refill takes milliseconds, and the allocation below is safe.)
                 SPARE_STATS[2].fetch_add(1, Ordering::Relaxed);
-                return Err("vkAllocateMemory (mirror block): the spare block is still being made".into());
+                return Err(SPARE_BUSY.into());
             } else {
                 let c = ctx();
                 let mut fl = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
@@ -1942,14 +1951,32 @@ fn back_in(m: &Mirror, base: u64, len: u64, count: &AtomicU64) -> Result<(), Str
         }
         Ok(())
     };
-    claim(&mut *g, g0, g1)?;
+    // (A page's block while another thread makes the spare under pressure (`SPARE_BUSY`): waited
+    // for with the lock released, at most `SPARE_WAIT`, then the claim goes on from where it
+    // stopped (claimed pages stay claimed); no driver call is made under the lock.)
+    let mut claim_on = |g: &mut parking_lot::MutexGuard<'_, Backing>, a: u64, b: u64| -> Result<(), String> {
+        let t = std::time::Instant::now();
+        loop {
+            match claim(&mut **g, a, b) {
+                Err(e) if e == SPARE_BUSY && t.elapsed() < SPARE_WAIT => {
+                    parking_lot::MutexGuard::unlocked(g, || {
+                        while SPARE_FILLING.load(Ordering::Acquire) && t.elapsed() < SPARE_WAIT {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                    });
+                }
+                r => return r,
+            }
+        }
+    };
+    claim_on(&mut g, g0, g1)?;
     loop {
         if (first..=last).all(backed) {
             break;
         }
         if !g.binding && g.pending.is_empty() {
             // (Pages a failed bind gave up: claimed again.)
-            claim(&mut *g, first, last)?;
+            claim_on(&mut g, first, last)?;
         }
         if g.binding || g.pending.is_empty() {
             m.bound.wait(&mut g);
