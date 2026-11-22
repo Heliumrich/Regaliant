@@ -1010,6 +1010,20 @@ fn reap_dead_images() {
 /// The most image memory one reaper pass frees (`reap_dead_images`), bytes.
 const REAP_IMAGE_BYTES: u64 = 256 << 20;
 
+/// Dropped imports freed a reaper pass at most (`reap_dead_spans`; `DS_REAP_SPAN_MIB=<n>`, an
+/// experiment, off by default: no limit). The driver unpins their pages as they are freed. Tried
+/// 2026-11-22 evening against the 2.3-7.1 s frames at the Castlewall arrival in a 16 GB PC's share
+/// (eviction thrashing there): 256 MiB a pass gave worst frames of 1.3 s and 0.23 s there (FINDINGS.md); not yet tried
+/// on the full card, and the thrashing itself is the next step. The reaper runs after every
+/// batch's completion.
+fn reap_span_bytes() -> u64 {
+    static B: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *B.get_or_init(|| match std::env::var("DS_REAP_SPAN_MIB").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(m) if m > 0 => m << 20,
+        _ => u64::MAX,
+    })
+}
+
 fn reap_dead_spans() {
     if GRAVEYARD_LEN.load(Ordering::Acquire) == 0 {
         return;
@@ -1026,13 +1040,16 @@ fn reap_dead_spans() {
         let mut g = GRAVEYARD.lock();
         let mut out = Vec::new();
         let mut i = 0;
+        // (At most `REAP_SPAN_BYTES` a pass; the rest at the next.)
+        let mut bytes = 0u64;
         while i < g.len() {
             let d = &mut g[i];
             if !d.held && d.seq.is_none() && oldest_open >= d.generation {
                 // Every batch that may use it was submitted by now.
                 d.seq = Some(next - 1);
             }
-            if !d.held && d.seq.is_some_and(|s| done >= s) && !DEVICE_LOST.load(Ordering::Relaxed) {
+            if !d.held && d.seq.is_some_and(|s| done >= s) && !DEVICE_LOST.load(Ordering::Relaxed) && bytes < reap_span_bytes() {
+                bytes += d.span.end - d.span.start;
                 out.push(g.swap_remove(i).span);
             } else {
                 i += 1;
