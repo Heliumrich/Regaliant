@@ -6035,7 +6035,7 @@ pub fn status() -> String {
         .collect();
     let w: Vec<u64> = WB64.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     format!(
-        "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed; {} view pages armed at the residency's takes adopted), {} armings ended by writes, {} writes found on pages armed and taken since (holes); checks that followed another's take {} ({} pages uploaded without a take of their own, {} took anyway); faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed), {} more pages unarmed with a faulted page's word; invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost{}), {} lists past their capacity (before GPU-performed CP writes {}, at batch closes {}, {} of them with no label write and no completion action; CP writes with work to write back {} of labels a CP of ours waits on, {} left to the batch's close, {} with their guest-memory copy at the close); CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}; imports {} live ({} uploaded from, {} settled for arming); views synchronized {} times ({} raised; by the graphics CP's own synchronization {}, the compute queues' {}; epochs ended by {} title submissions, {} waits the CPU released, {} REWIND, {} waits passed on GPU writes ended none, {} passed again on a counter's value, {} gone past ended none); the mirror's video memory {} MiB (no placement in the last 1,800 flips: {} MiB; unbound since boot {} MiB, {} blocks freed, {} cold words kept by placements), its written-bit maps' {} MiB\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
+        "    front end 2: {} placement checks ({} pages; {} needed nothing; {} chunks passed by their summary, {} placements by the range cache), {} takes ({} pages written, {} failed; {:.1} ms), checking {:.1} ms; uploads {} ({} pages, {} MiB; runs written lately, without a take: {}, {} pages), {} failed, {} pages valid once queued ({} raced a write); hosted arming: {} pages in {} runs ({} failed; {} view pages armed at the residency's takes adopted), {} armings ended by writes, {} writes found on pages armed and taken since (holes); checks that followed another's take {} ({} pages uploaded without a take of their own, {} took anyway); faults read {} ({} ending an arming of ours, {} outside the span, {} ring overflows), {} chunk bursts ({} pages disarmed), {} more pages unarmed with a faulted page's word; invalidated: {} ranges, {} pages by takes; write-backs recorded {}: {} pages, {} dwords, {} pages unmapped (lost to the write-back, their marks kept{}), {} lists past their capacity (before GPU-performed CP writes {}, at batch closes {}, {} of them with no label write and no completion action; CP writes with work to write back {} of labels a CP of ours waits on, {} left to the batch's close, {} with their guest-memory copy at the close); CP writes also into the mirror {}, pages copied by the CPU {}, written bindings without an import {}; imports {} live ({} uploaded from, {} settled for arming); views synchronized {} times ({} raised; by the graphics CP's own synchronization {}, the compute queues' {}; epochs ended by {} title submissions, {} waits the CPU released, {} REWIND, {} waits passed on GPU writes ended none, {} passed again on a counter's value, {} gone past ended none); the mirror's video memory {} MiB (no placement in the last 1,800 flips: {} MiB; unbound since boot {} MiB, {} blocks freed, {} cold words kept by placements), its written-bit maps' {} MiB\n    front end 2's placement checks by size: {}\n    front end 2's pages taken but not armed: {}\n",
         s[S_ENSURES],
         s[S_ENSURE_PAGES],
         s[S_FAST],
@@ -7457,6 +7457,188 @@ fn c4_release_pages(pages: &[u64]) -> Result<(), String> {
     C4X[X_ROUNDS].fetch_add(1, Ordering::Relaxed);
     C4X[X_RELEASED].fetch_add(pages.len() as u64, Ordering::Relaxed);
     C4X[X_NOW].fetch_sub(pages.len() as u64, Ordering::Relaxed);
+    Ok(())
+}
+
+/// The CPU's stores of write-backs that had no page-table entry (`release_unimported`): [calls,
+/// pages stored, dwords stored, pages left out (remapped since, or held), failures].
+pub static UNIMPORTED_WB: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// The status line of `UNIMPORTED_WB` ("" with none).
+pub fn unimported_line() -> String {
+    let v: Vec<u64> = UNIMPORTED_WB.iter().map(|x| x.load(Ordering::Relaxed)).collect();
+    if v[0] == 0 {
+        return String::new();
+    }
+    format!("    front end 2's write-backs without an import, stored by the CPU after their batch: {} calls, {} pages ({} dwords), {} pages left out (remapped since or held), {} failures\n", v[0], v[1], v[2], v[3], v[4])
+}
+
+/// Stores the GPU's marked dwords of the pages of `ranges` once the batch that wrote them
+/// completed: written ranges whose import failed at their placement (`Exec`'s
+/// `import_written`), `since` the repage sequence then (`mem::repage_seq`). The write-back
+/// found no page-table entry for them and kept their mask words (`rdna::kernels::build_scatter`),
+/// so their dwords reach guest memory here through host memory, as a held page's do
+/// (`c4_release_pages`): the mirror pages and both maps' mask words copied out and the masks
+/// cleared, then the marked dwords stored. Pages remapped since (`mem::repaged_since`) or held
+/// are left out. Until 2026-11-22 night these writes were lost: in a 16 GB PC's share simulated with
+/// failing imports, labels shaders wrote there were never seen, and the GPU hung (FINDINGS.md
+/// 2026-11-22 afternoon).
+pub fn release_unimported(ranges: &[(u64, u64)], since: u64) {
+    if !on() {
+        return;
+    }
+    let mut pages: Vec<u64> = Vec::new();
+    for &(lo, hi) in ranges {
+        let mut p = lo.max(MIRROR_BASE) & !(PAGE - 1);
+        let e = hi.min(MIRROR_END);
+        while p < e {
+            pages.push(p);
+            p += PAGE;
+        }
+    }
+    pages.sort_unstable();
+    pages.dedup();
+    let before = pages.len();
+    pages.retain(|&p| !c4_held(p) && !crate::mem::repaged_since(p, p + PAGE, since));
+    UNIMPORTED_WB[0].fetch_add(1, Ordering::Relaxed);
+    UNIMPORTED_WB[3].fetch_add((before - pages.len()) as u64, Ordering::Relaxed);
+    for part in pages.chunks(UNIMPORTED_PART) {
+        if let Err(e) = release_unimported_pages(part) {
+            if UNIMPORTED_WB[4].fetch_add(1, Ordering::Relaxed) < 8 {
+                crate::warn!("fe2: storing {} pages from {:#x} without an import failed: {e}", part.len(), part[0]);
+            }
+        }
+    }
+}
+
+/// Pages `release_unimported_pages` takes at a time, and its staging buffer, made once and kept:
+/// when imports fail the host heap is at its budget, where a new allocation may fail too.
+const UNIMPORTED_PART: usize = 1024;
+struct Stage {
+    buf: vk::Buffer,
+    ptr: *mut u8,
+}
+unsafe impl Send for Stage {}
+static UNIMPORTED_STAGE: Mutex<Option<Stage>> = Mutex::new(None);
+
+/// Makes `release_unimported`'s staging buffer now (at the first failed import of a written
+/// range, while there may still be room; `Exec`).
+pub fn unimported_stage_ready() -> bool {
+    let mut g = UNIMPORTED_STAGE.lock();
+    if g.is_none() {
+        let bytes = UNIMPORTED_PART as u64 * (PAGE + 2 * 128);
+        match ctx().host_buffer(bytes, vk::BufferUsageFlags::TRANSFER_DST) {
+            Ok((buf, _mem, ptr)) => *g = Some(Stage { buf, ptr }),
+            Err(e) => {
+                if UNIMPORTED_WB[4].fetch_add(1, Ordering::Relaxed) < 8 {
+                    crate::warn!("fe2: no staging for write-backs without an import: {e}");
+                }
+            }
+        }
+    }
+    g.is_some()
+}
+
+fn release_unimported_pages(pages: &[u64]) -> Result<(), String> {
+    if !unimported_stage_ready() {
+        return Err("no staging buffer".into());
+    }
+    let stage = UNIMPORTED_STAGE.lock();
+    let Some(st) = stage.as_ref() else { return Err("no staging buffer".into()) };
+    let (sbuf, sptr) = (st.buf, st.ptr);
+    let _readers = crate::mem::GUEST_READERS.read_recursive();
+    let _arming = super::resident::arm_guard();
+    let c = ctx();
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    for &p in pages {
+        match ranges.last_mut() {
+            Some(l) if l.0 + l.1 == p => l.1 += PAGE,
+            _ => ranges.push((p, PAGE)),
+        }
+    }
+    // No batch that writes the pages in flight, none pushed meanwhile (as `c4_release_pages`:
+    // 50 ms at most, then beside it).
+    let gate = loop {
+        let g = super::exec::NOTE_GATE.write();
+        if let Some(seq) = super::exec::inflight_latest(&ranges) {
+            drop(g);
+            if !super::exec::wait_done_for(seq, std::time::Duration::from_millis(50)) {
+                break super::exec::NOTE_GATE.write();
+            }
+            continue;
+        }
+        break g;
+    };
+    let maps: Vec<vk::Buffer> = [false, true].iter().filter_map(|&on_c| super::resident::marks_for(on_c)).collect();
+    let (mbuf, _) = super::resident::mirror_buffer().ok_or("no mirror")?;
+    let n = pages.len() as u64;
+    let mask_at = n * PAGE;
+    let r = super::resident::one_off_now(|cmd| unsafe {
+        let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
+        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+        let regions: Vec<vk::BufferCopy> = pages.iter().enumerate().map(|(j, &p)| vk::BufferCopy { src_offset: p - MIRROR_BASE, dst_offset: j as u64 * PAGE, size: PAGE }).collect();
+        c.device.cmd_copy_buffer(cmd, mbuf, sbuf, &regions);
+        for (mi, &m) in maps.iter().enumerate() {
+            let regions: Vec<vk::BufferCopy> = pages.iter().enumerate().map(|(j, &p)| vk::BufferCopy { src_offset: (p - MIRROR_BASE) / PAGE * 128, dst_offset: mask_at + (mi as u64 * n + j as u64) * 128, size: 128 }).collect();
+            c.device.cmd_copy_buffer(cmd, m, sbuf, &regions);
+        }
+        let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+        // (Their mask words cleared: the dwords are stored below.)
+        for &m in &maps {
+            for &p in pages {
+                c.device.cmd_fill_buffer(cmd, m, (p - MIRROR_BASE) / PAGE * 128, 128, 0);
+            }
+        }
+        // (Guest memory's copies of the pages change: their zero-known bits cleared.)
+        for &p in pages {
+            super::zk::clear(cmd, p, PAGE);
+        }
+        let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ | vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+    });
+    if let Err(e) = r {
+        drop(gate);
+        return Err(format!("the copy: {e}"));
+    }
+    // The marked dwords stored, each page writable around its stores and its protection back.
+    let lock = crate::hosted::arm_lock();
+    use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_READWRITE};
+    let (mut n_pg, mut n_dw) = (0u64, 0u64);
+    for (j, &p) in pages.iter().enumerate() {
+        let mut m = [0u32; 32];
+        for mi in 0..maps.len() {
+            let at = unsafe { sptr.add((mask_at + (mi as u64 * n + j as u64) * 128) as usize) } as *const u32;
+            for (w, mw) in m.iter_mut().enumerate() {
+                *mw |= unsafe { std::ptr::read_volatile(at.add(w)) };
+            }
+        }
+        if m.iter().all(|&w| w == 0) {
+            continue;
+        }
+        let mut old = 0u32;
+        if unsafe { VirtualProtect(p as _, PAGE as usize, PAGE_READWRITE, &mut old) } == 0 {
+            continue;
+        }
+        let src = unsafe { sptr.add(j * PAGE as usize) } as *const u32;
+        for (w, &mw) in m.iter().enumerate() {
+            let mut mm = mw;
+            while mm != 0 {
+                let d = w * 32 + mm.trailing_zeros() as usize;
+                unsafe { std::ptr::write_volatile((p + 4 * d as u64) as *mut u32, std::ptr::read_volatile(src.add(d))) };
+                n_dw += 1;
+                mm &= mm - 1;
+            }
+        }
+        let mut tmp = 0u32;
+        unsafe { VirtualProtect(p as _, PAGE as usize, old, &mut tmp) };
+        n_pg += 1;
+    }
+    drop(lock);
+    drop(gate);
+    drop(stage);
+    UNIMPORTED_WB[1].fetch_add(n_pg, Ordering::Relaxed);
+    UNIMPORTED_WB[2].fetch_add(n_dw, Ordering::Relaxed);
     Ok(())
 }
 

@@ -1010,20 +1010,6 @@ fn reap_dead_images() {
 /// The most image memory one reaper pass frees (`reap_dead_images`), bytes.
 const REAP_IMAGE_BYTES: u64 = 256 << 20;
 
-/// Dropped imports freed a reaper pass at most (`reap_dead_spans`; `DS_REAP_SPAN_MIB=<n>`, an
-/// experiment, off by default: no limit). The driver unpins their pages as they are freed. Tried
-/// 2026-11-22 evening against the 2.3-7.1 s frames at the Castlewall arrival in a 16 GB PC's share
-/// (eviction thrashing there): 256 MiB a pass gave worst frames of 1.3 s and 0.23 s there (FINDINGS.md); not yet tried
-/// on the full card, and the thrashing itself is the next step. The reaper runs after every
-/// batch's completion.
-fn reap_span_bytes() -> u64 {
-    static B: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *B.get_or_init(|| match std::env::var("DS_REAP_SPAN_MIB").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
-        Some(m) if m > 0 => m << 20,
-        _ => u64::MAX,
-    })
-}
-
 fn reap_dead_spans() {
     if GRAVEYARD_LEN.load(Ordering::Acquire) == 0 {
         return;
@@ -1040,16 +1026,13 @@ fn reap_dead_spans() {
         let mut g = GRAVEYARD.lock();
         let mut out = Vec::new();
         let mut i = 0;
-        // (At most `REAP_SPAN_BYTES` a pass; the rest at the next.)
-        let mut bytes = 0u64;
         while i < g.len() {
             let d = &mut g[i];
             if !d.held && d.seq.is_none() && oldest_open >= d.generation {
                 // Every batch that may use it was submitted by now.
                 d.seq = Some(next - 1);
             }
-            if !d.held && d.seq.is_some_and(|s| done >= s) && !DEVICE_LOST.load(Ordering::Relaxed) && bytes < reap_span_bytes() {
-                bytes += d.span.end - d.span.start;
+            if !d.held && d.seq.is_some_and(|s| done >= s) && !DEVICE_LOST.load(Ordering::Relaxed) {
                 out.push(g.swap_remove(i).span);
             } else {
                 i += 1;
@@ -2818,6 +2801,22 @@ fn window_cold(start: u64, end: u64, flips: u32, oldest_open: u64) -> bool {
     })
 }
 
+/// Flips since the last use of any import window over [start, end) (`WIN_USE`; 0 outside guest
+/// memory): `evict_cold_imports` drops the longest idle first.
+fn window_idle(start: u64, end: u64) -> u32 {
+    if start < crate::mem::GUEST_BASE || end > crate::mem::GUEST_END || end <= start {
+        return 0;
+    }
+    let now = super::FRAMES.load(Ordering::Relaxed) as u32;
+    let w = window_bytes();
+    let uses = win_use();
+    ((start - crate::mem::GUEST_BASE) / w..=(end - 1 - crate::mem::GUEST_BASE) / w)
+        .filter_map(|i| uses.get(i as usize))
+        .map(|a| (now.wrapping_sub(a.load(Ordering::Acquire)) as i32).max(0) as u32)
+        .min()
+        .unwrap_or(0)
+}
+
 /// SPAN_GEN when the oldest batch not yet submitted began, of every executor (u64::MAX: none).
 fn oldest_open_gen() -> u64 {
     EXEC_GENS.lock().iter().map(|g| g.load(Ordering::SeqCst)).min().unwrap_or(u64::MAX)
@@ -2833,9 +2832,18 @@ fn win_gen() -> &'static [AtomicU64] {
 /// Imports dropped for being cold while the host heap ran short (`evict_cold_imports`): [windows,
 /// bytes, passes that dropped some].
 pub static COLD_EVICTED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
-/// The room `evict_cold_imports` keeps in the host heap's budget: a level load's re-imports pinned
-/// up to ~1.9 GB more than play here (2026-11-22, a first session: 11.5 GB against 9.6).
-const HOST_ROOM: u64 = 3 << 30;
+/// `evict_cold_imports` acts once this process's use of the host heap, less the dropped imports
+/// waiting to be freed, is within `HOST_ROOM` of its budget, and drops the coldest imports until
+/// it is `HOST_TARGET` below it; windows unused for only `EVICT_MIN_FLIPS` go too within
+/// `HOST_URGENT`. In a 16 GB PC's share, counted (2026-11-22/23), play there sits at ~5.5-6 GB
+/// of 7.6: every pass within 3 GiB dropping all windows unused for 600 flips (within 1 GiB, every
+/// second, all unused for 120) thrashed, ~11.5 GB dropped in a five-minute walk where ~5 GB was
+/// live, and froze the Castlewall arrival for 2.3-7.1 s in four boots of four (0.1 s on the full
+/// card); dropping the coldest down to 2.5 GiB below the budget each second, a target out of
+/// reach, dropped 13.9 GB and froze it for 9.4 s.
+const HOST_ROOM: u64 = 1 << 30;
+const HOST_TARGET: u64 = 1536 << 20;
+const HOST_URGENT: u64 = 512 << 20;
 
 /// `DS_EVICT_COLD=0` turns `evict_cold_imports` off.
 fn evict_cold_on() -> bool {
@@ -2843,46 +2851,42 @@ fn evict_cold_on() -> bool {
     *ON.get_or_init(|| std::env::var("DS_EVICT_COLD").ok().as_deref() != Some("0"))
 }
 
-/// The room under which `evict_cold_imports` runs every second and drops windows unused for
-/// `EVICT_TIGHT_FLIPS`: at a level load in a 16 GB PC's share (`DS_SIM_HOST_MIB=7600`) the
-/// heap passed its budget by ~265 MiB within a second, and the old level's windows went cold
-/// only 600 flips after their last use, 5-10 s later (2026-11-22 evening).
-const HOST_TIGHT: u64 = 1 << 30;
-const EVICT_TIGHT_FLIPS: u32 = 120;
+/// How long a window must have gone unused to be dropped by `evict_cold_imports` (and by every
+/// open batch: `window_cold`): `EVICT_COLD_FLIPS`, within `HOST_URGENT` of the budget
+/// `EVICT_MIN_FLIPS`; the coldest go first.
+const EVICT_COLD_FLIPS: u32 = 600;
+const EVICT_MIN_FLIPS: u32 = 120;
 
-/// While this process's use of the host heap is within `HOST_ROOM` of its budget, every 5 s (within
-/// `HOST_TIGHT`: every second, windows unused for `EVICT_TIGHT_FLIPS`): the listed imports whose
-/// windows went unused `REIMPORT_COLD_FLIPS` flips are dropped as a remap drops them
-/// (`revalidate_spans`, its guest pages unchanged), their pages imported again at their next use.
-/// For PCs with 16 GB of memory (2026-11-22): their graphics share of it, about half, is less than
-/// normal play pinned here (~8 GB), and failed imports froze the game and hung the GPU.
+/// Every second while this process's use of the host heap is within `HOST_ROOM` of its budget: the
+/// listed imports unused for `EVICT_MIN_FLIPS` or more are dropped, the coldest first, until the
+/// use is `HOST_TARGET` below the budget, as a remap drops them (`revalidate_spans`, its guest
+/// pages unchanged); their pages are imported again at their next use. For PCs with 16 GB of
+/// memory (2026-11-22): their graphics share of it, about half, is less than normal play pinned
+/// here (~8 GB), and failed imports froze the game and hung the GPU.
 fn evict_cold_imports() {
-    // (The budget asked at most every second; a pass every 5 s unless tight.)
-    static LAST: Mutex<(Option<std::time::Instant>, Option<std::time::Instant>)> = Mutex::new((None, None));
+    // (The budget asked at most every second.)
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     let now = std::time::Instant::now();
     {
-        let l = LAST.lock();
-        if l.0.is_some_and(|t| now.duration_since(t).as_millis() < 1000) {
+        let mut l = LAST.lock();
+        if l.is_some_and(|t| now.duration_since(t).as_millis() < 1000) {
             return;
         }
+        *l = Some(now);
     }
-    LAST.lock().0 = Some(now);
     if !evict_cold_on() || !super::pagetable::made() || DEVICE_LOST.load(Ordering::Relaxed) {
         return;
     }
-    let Some((used, budget)) = ctx().host_budget() else { return };
+    let Some((heap_used, budget)) = ctx().host_budget() else { return };
+    // (Dropped imports waiting to be freed leave the heap soon on their own.)
+    let pending: u64 = GRAVEYARD.lock().iter().map(|d| d.span.end - d.span.start).sum();
+    let used = heap_used.saturating_sub(pending);
     if used.saturating_add(HOST_ROOM) <= budget {
         return;
     }
-    let tight = used.saturating_add(HOST_TIGHT) > budget;
-    {
-        let mut l = LAST.lock();
-        if !tight && l.1.is_some_and(|t| now.duration_since(t).as_secs() < 5) {
-            return;
-        }
-        l.1 = Some(now);
-    }
-    let flips = if tight { EVICT_TIGHT_FLIPS } else { REIMPORT_COLD_FLIPS };
+    // (What to drop: down to the target.)
+    let excess = used.saturating_add(HOST_TARGET).saturating_sub(budget);
+    let flips = if used.saturating_add(HOST_URGENT) > budget { EVICT_MIN_FLIPS } else { EVICT_COLD_FLIPS };
     // (A new generation each pass: windows used before it and batches begun after it then
     // differ, as they do after any burial, so a window cold now is droppable at the next pass
     // once the batches open now are submitted.)
@@ -2894,16 +2898,26 @@ fn evict_cold_imports() {
     }
     let importing: Vec<(u64, u64)> = IMPORTING.lock().iter().map(|m| (m.start, m.end)).collect();
     let mut g = SPANS.write();
-    let mut dead = Vec::new();
-    let mut i = 0;
-    while i < g.len() {
-        let s = &g[i];
-        if s.valid && window_cold(s.start, s.end, flips, oldest_open) && !importing.iter().any(|&(a, b)| a < s.end && s.start < b) {
-            dead.push(g.swap_remove(i));
-        } else {
-            i += 1;
+    // (The cold ones by their windows' last use, the oldest first, up to `excess` bytes; taken out
+    // by descending index, so that each `swap_remove` moves only an element not chosen.)
+    let mut cand: Vec<(u32, usize)> = g
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.valid && window_cold(s.start, s.end, flips, oldest_open) && !importing.iter().any(|&(a, b)| a < s.end && s.start < b))
+        .map(|(i, s)| (window_idle(s.start, s.end), i))
+        .collect();
+    cand.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    let mut chosen: Vec<usize> = Vec::new();
+    let mut sum = 0u64;
+    for &(_, i) in &cand {
+        if sum >= excess {
+            break;
         }
+        sum += g[i].end - g[i].start;
+        chosen.push(i);
     }
+    chosen.sort_unstable_by(|a, b| b.cmp(a));
+    let dead: Vec<Span> = chosen.into_iter().map(|i| g.swap_remove(i)).collect();
     if dead.is_empty() {
         return;
     }
@@ -2926,7 +2940,7 @@ fn evict_cold_imports() {
     COLD_EVICTED[0].fetch_add(n, Ordering::Relaxed);
     COLD_EVICTED[1].fetch_add(bytes, Ordering::Relaxed);
     if passes < 10 || passes % 100 == 0 {
-        crate::info!("gpu: {n} cold imports dropped ({} MiB, unused {flips}+ flips): the host heap's use {} MiB of a budget of {} (pass {})", bytes >> 20, used >> 20, budget >> 20, passes + 1);
+        crate::info!("gpu: {n} cold imports dropped ({} MiB of {} wanted, the coldest of {} unused {flips}+ flips): the host heap's use {} MiB ({} of it dropped, waiting to be freed) of a budget of {} (pass {})", bytes >> 20, excess >> 20, cand.len(), heap_used >> 20, pending >> 20, budget >> 20, passes + 1);
     }
     let ranges_dead: Vec<Reimport> = dead.iter().zip(covers).map(|(d, covered)| Reimport { start: d.start, end: d.end, buffer: d.buffer, covered }).collect();
     {
@@ -11573,6 +11587,10 @@ pub struct Exec {
     /// Scratch: the runs of an upload this batch claimed (`fe2::run_claim`).
     fe2_claimed: Vec<(u64, u64)>,
     fe2_marked: bool,
+    /// Written ranges this batch placed whose import failed, and the repage sequence at the first:
+    /// the CPU stores their write-back after the batch (`fe2::release_unimported`).
+    unimported: Vec<(u64, u64)>,
+    unimported_since: u64,
     /// `wb_empty_census`: the owners (a bit per engine allocator id) of the
     /// batch's written ranges not all held when placed.
     wb_unheld: u64,
@@ -13496,6 +13514,8 @@ impl Exec {
                 fe2_mine: Default::default(),
                 fe2_claimed: Vec::new(),
                 fe2_marked: false,
+                unimported: Vec::new(),
+                unimported_since: 0,
                 wb_unheld: 0,
                 fe2_memo: Default::default(),
                 place_memo: Box::new([PlaceMemo::default(); PLACE_MEMO_SLOTS]),
@@ -14345,6 +14365,11 @@ impl Exec {
         // (A prologue on the compute queue runs after the main queue's work queued meanwhile
         // may have used the mirror: its uploads count for other batches once it completed.)
         let mut actions = actions;
+        // (Front end 2's written ranges without an import: the CPU stores their write-back.)
+        if !self.unimported.is_empty() {
+            let (r, since) = (std::mem::take(&mut self.unimported), self.unimported_since);
+            actions.push(Box::new(move || super::fe2::release_unimported(&r, since)));
+        }
         if pre_on_c && !self.fe2_up.is_empty() {
             let (up, gens) = (self.fe2_up.clone(), self.fe2_gens.clone());
             actions.push(Box::new(move || super::fe2::uploaded(&up, &gens, fe2_ep)));
@@ -15369,7 +15394,12 @@ impl Exec {
         if written {
             if !import_written(lo, hi) {
                 super::fe2::note_unscatterable();
-                self.report_error("front end 2: a written range cannot be imported (its GPU writes do not reach guest memory)", || format!("{lo:#x}..{hi:#x}"));
+                self.report_error("front end 2: a written range cannot be imported (the CPU stores its GPU writes after the batch)", || format!("{lo:#x}..{hi:#x}"));
+                if self.unimported.is_empty() {
+                    self.unimported_since = crate::mem::repage_seq();
+                    super::fe2::unimported_stage_ready();
+                }
+                self.unimported.push((lo, hi));
             }
             self.fe2_marked = true;
             if wb_census() {
@@ -22545,6 +22575,7 @@ pub fn status() -> String {
         + &clear_pass_line()
         + &super::images::pressure_line()
         + &super::vk::gate_line()
+        + &super::fe2::unimported_line()
         + &super::vk::system_line()
         + &super::resident::spare_line()
         + &fill_partial_line()

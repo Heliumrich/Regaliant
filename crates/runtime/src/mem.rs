@@ -827,7 +827,41 @@ pub fn readable(a: u64, len: u64) -> bool {
 static REPAGED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 static REPAGED_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Every repaged range with its sequence, the last `REPAGE_LOG` of them (`repaged_since`).
+static REPAGE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REPAGE_RING: Mutex<std::collections::VecDeque<(u64, u64, u64)>> = Mutex::new(std::collections::VecDeque::new());
+const REPAGE_LOG: usize = 8192;
+
+/// The repage sequence now (`repaged_since`).
+pub fn repage_seq() -> u64 {
+    REPAGE_SEQ.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Whether guest [lo, hi) had pages committed or decommitted after repage sequence `since`
+/// (true too when the log no longer reaches back that far). For the GPU's write-backs stored by
+/// the CPU after their batch (`gpu::fe2::release_unimported`): a page remapped meanwhile is
+/// another page.
+pub fn repaged_since(lo: u64, hi: u64, since: u64) -> bool {
+    let r = REPAGE_RING.lock();
+    if REPAGE_SEQ.load(std::sync::atomic::Ordering::Acquire) <= since {
+        return false;
+    }
+    if r.front().is_none_or(|&(first, _, _)| first > since + 1) {
+        return true;
+    }
+    r.iter().rev().take_while(|e| e.0 > since).any(|&(_, a, b)| a < hi && lo < b)
+}
+
 fn repaged(addr: u64, size: u64) {
+    {
+        let mut ring = REPAGE_RING.lock();
+        let seq = REPAGE_SEQ.load(std::sync::atomic::Ordering::Relaxed) + 1;
+        if ring.len() >= REPAGE_LOG {
+            ring.pop_front();
+        }
+        ring.push_back((seq, addr, addr + size));
+        REPAGE_SEQ.store(seq, std::sync::atomic::Ordering::Release);
+    }
     let mut r = REPAGED.lock();
     if r.len() >= 1024 {
         // Nobody collected them (no GPU work in between): one covering range.

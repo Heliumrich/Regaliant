@@ -1181,6 +1181,10 @@ fn build_scatter(reset: bool, count: bool, hold: bool, same: u8, split: bool, sk
     // Every mask word read before any is cleared.
     b.control_barrier(scope_wg, scope_wg, sem_wg)?;
     let first32 = b.u_less_than(bool_, None, lid, c32)?;
+    // (A page with no table entry keeps its mask words too: its dwords are pending, stored by
+    // the CPU after the batch (the runtime's `fe2::release_unimported`) or by a later write-back
+    // once the page is mapped; until 2026-11-22 night they were cleared, the dwords lost.)
+    let first32 = b.logical_and(bool_, None, first32, mapped)?;
     // (A held page keeps its mask words: its dwords are pending.)
     let first32 = match held {
         Some(h) => {
