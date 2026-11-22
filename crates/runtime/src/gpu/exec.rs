@@ -13420,7 +13420,9 @@ impl Exec {
                 true
             }
             Err(e) => {
-                crate::warn!("gpu[{}]: no video memory for batch-start copies ({e})", self.name);
+                // (Once a message: tried again each batch since 2026-11-22, a refusal logged each
+                // time made 271,582 lines in one 3.5 GB tour.)
+                self.report(format!("no video memory for batch-start copies ({e})"));
                 self.pre_failed = true;
                 false
             }
@@ -13468,6 +13470,11 @@ impl Exec {
     fn begin_batch(&mut self) {
         self.batch_count += 1;
         self.repeat = None;
+        // (Its batch-start copy segment tried again in each batch: a refusal in the window after a
+        // failed allocation had turned them off for the session, on every executor of each 3.5-4 GB
+        // tour (the pre-release review of 2026-11-22 afternoon); the window refuses with no driver
+        // call, so a try costs nothing while memory is out.)
+        self.pre_failed = false;
         self.label_open = false;
         // Imports looked up from now on belong to this batch (`reap_spans`).
         if self.open_gen.load(Ordering::Relaxed) == u64::MAX {

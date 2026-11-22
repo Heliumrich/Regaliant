@@ -1311,7 +1311,10 @@ fn big_on_small_card(key: &ImageKey) -> bool {
     }
     let card = super::vk::card_size();
     let line = if card < TINY_CARD { BIG_IMAGE_TINY } else if card < SMALL_CARD { BIG_IMAGE } else { return false };
-    key.width as u64 * key.height as u64 * key.layers.max(1) as u64 * texel_bytes(key.format).max(1) as u64 >= line
+    // (Block-compressed formats: `texel_bytes` is a 4x4 block's; until the pre-release review of
+    // 2026-11-22 afternoon a texel was counted as a block, every BC texture 16 times its size.)
+    let (w, h) = if is_compressed(key.format) { (key.width.div_ceil(4), key.height.div_ceil(4)) } else { (key.width, key.height) };
+    w as u64 * h as u64 * key.layers.max(1) as u64 * texel_bytes(key.format).max(1) as u64 >= line
 }
 /// A texture used within this many flips stays where it is (`promote`).
 const PROMOTE_AGE: u64 = 2;
@@ -5791,7 +5794,7 @@ impl Images {
         let mut cands: Vec<(u64, ImageKey, u64)> = self
             .map
             .iter()
-            .filter(|(k, i)| i.mem.in_system() && !i.gpu_written && i.gpu_parts.is_empty() && !self.refreshing.contains_key(*k) && frame.saturating_sub(i.used.get()) >= PROMOTE_AGE)
+            .filter(|(k, i)| i.mem.in_system() && !i.gpu_written && i.gpu_parts.is_empty() && !self.refreshing.contains_key(*k) && frame.saturating_sub(i.used.get()) >= PROMOTE_AGE && !big_on_small_card(k))
             .map(|(k, i)| (i.used.get(), *k, i.bytes))
             .collect();
         cands.sort_unstable_by_key(|c| std::cmp::Reverse(c.0));
