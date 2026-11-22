@@ -885,6 +885,7 @@ fn reap_spans() {
     // (Timed: a long one is a hitch cause, `gpu::hitch`.)
     let t = std::time::Instant::now();
     reap_dead_spans();
+    import_age_census();
     let t_spans = t.elapsed();
     reap_dead_images();
     reap_dead_pipes();
@@ -2688,7 +2689,8 @@ fn span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
     let generation = CACHE_GEN.load(Ordering::Acquire);
     let end = base.saturating_add(size);
     let hit = span_cached(generation, base, end);
-    if hit.is_some() {
+    if let Some((_, st, e)) = hit {
+        note_window_use(st, e);
         return hit;
     }
     let found = spans_read().iter().find(|s| s.valid && s.start <= base && end <= s.end).map(|s| (s.buffer, s.start, s.end));
@@ -2715,8 +2717,76 @@ fn span(base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
     });
     if let Some((b, st, e)) = r {
         span_cache_put(generation, st, e, b);
+        note_window_use(st, e);
     }
     r
+}
+
+/// Each import window's last use, the flip (`span`, which uploads, bindings without the mirror and
+/// written ranges' imports all go through): how much of the imports' pinned host memory is cold
+/// (`import_age_census`). Added 2026-11-22 for 16 GB PCs: normal play pinned ~8.3 GB there, more
+/// than such a PC's graphics share of memory (about half the installed memory); dropping cold
+/// imports only helps if much of it is cold.
+static WIN_USE: std::sync::OnceLock<Box<[std::sync::atomic::AtomicU32]>> = std::sync::OnceLock::new();
+
+fn win_use() -> &'static [std::sync::atomic::AtomicU32] {
+    WIN_USE.get_or_init(|| (0..((crate::mem::GUEST_END - crate::mem::GUEST_BASE) / window_bytes())).map(|_| std::sync::atomic::AtomicU32::new(0)).collect())
+}
+
+fn note_window_use(start: u64, end: u64) {
+    if start < crate::mem::GUEST_BASE || end > crate::mem::GUEST_END || end <= start {
+        return;
+    }
+    let w = window_bytes();
+    let f = super::FRAMES.load(Ordering::Relaxed) as u32;
+    let uses = win_use();
+    for i in ((start - crate::mem::GUEST_BASE) / w)..=((end - 1 - crate::mem::GUEST_BASE) / w) {
+        if let Some(a) = uses.get(i as usize) {
+            if a.load(Ordering::Relaxed) != f {
+                a.store(f, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Every 60 s: the live imports' pinned bytes by how long ago their windows were last used.
+fn import_age_census() {
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    {
+        let mut l = LAST.lock();
+        if l.is_some_and(|t| t.elapsed().as_secs() < 60) {
+            return;
+        }
+        *l = Some(std::time::Instant::now());
+    }
+    let now = super::FRAMES.load(Ordering::Relaxed) as u32;
+    let w = window_bytes();
+    let uses = win_use();
+    let mut buckets = [0u64; 5];
+    let Some(g) = SPANS.try_read() else { return };
+    for s in g.iter().filter(|s| s.valid) {
+        if s.start < crate::mem::GUEST_BASE || s.end > crate::mem::GUEST_END || s.end <= s.start {
+            continue;
+        }
+        let last = ((s.start - crate::mem::GUEST_BASE) / w..=(s.end - 1 - crate::mem::GUEST_BASE) / w).filter_map(|i| uses.get(i as usize)).map(|a| now.wrapping_sub(a.load(Ordering::Relaxed))).min().unwrap_or(u32::MAX);
+        let k = match last {
+            0..=59 => 0,
+            60..=599 => 1,
+            600..=3599 => 2,
+            3600..=36000 => 3,
+            _ => 4,
+        };
+        buckets[k] += s.end - s.start;
+    }
+    drop(g);
+    crate::info!(
+        "gpu: live imports by their windows' last use: {} MiB within 60 flips, {} within 600, {} within 3600, {} older, {} never or long ago (at flip {now})",
+        buckets[0] >> 20,
+        buckets[1] >> 20,
+        buckets[2] >> 20,
+        buckets[3] >> 20,
+        buckets[4] >> 20
+    );
 }
 
 /// Front end 2: whether written guest [lo, hi) is imported, one import per
