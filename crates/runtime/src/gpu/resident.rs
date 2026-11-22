@@ -1539,7 +1539,13 @@ struct Backing {
 /// blocks taken from it and made for it (status).
 static SPARE_EMPTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static SPARE_FILLING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// [taken, made, pages refused while one was being made].
+/// The refill is inside its vkAllocateMemory (not one the refusal window turns down at once):
+/// `take_page`'s busy answer and `back_in`'s wait. With `SPARE_FILLING` there, every refill
+/// attempt made pages busy, most of them refused in microseconds, and under pressure threads kept
+/// waiting for refills that never reached the driver (the short injected run of 2026-11-22 small
+/// hours: its new game's frozen time 83 against 29 s).
+static SPARE_ALLOCATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// [taken, made, pages gone without after waiting for one in the making].
 pub static SPARE_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// Video memory the mirror's blocks hold now (its pages, the written-bit maps' pages and the
@@ -1587,7 +1593,10 @@ fn refill_spare(m: &Mirror) {
         let ai = vk::MemoryAllocateInfo::default().allocation_size(BLOCK).memory_type_index(m.mem_type);
         let ai = if c.device_addresses { ai.push_next(&mut fl) } else { ai };
         let ta = std::time::Instant::now();
-        if let Ok(mem) = unsafe { c.device.allocate_memory(&ai, None) } {
+        SPARE_ALLOCATING.store(true, Release);
+        let r = unsafe { c.device.allocate_memory(&ai, None) };
+        SPARE_ALLOCATING.store(false, Release);
+        if let Ok(mem) = r {
             super::vk::note_alloc("a spare mirror block", BLOCK, ta);
             let mut g = m.blocks.lock();
             if g.spare.is_none() {
@@ -1639,13 +1648,12 @@ fn take_page(g: &mut Backing, m: &Mirror, alloc_ns: &mut u64, marks: bool) -> Re
                 SPARE_EMPTY.store(true, Ordering::Release);
                 SPARE_STATS[0].fetch_add(1, Ordering::Relaxed);
                 mem
-            } else if SPARE_FILLING.load(Ordering::Acquire) && super::images::under_pressure() {
+            } else if SPARE_ALLOCATING.load(Ordering::Acquire) && super::images::under_pressure() {
                 // (Under video-memory pressure another thread is making the spare and has not
                 // finished in `back`'s wait: the driver is slow to give memory, and an allocation
                 // here would hold the lock while it waits, every recording thread behind it. The
                 // page goes without, as when memory runs out; the review of 2026-11-21 night.
                 // Without pressure a refill takes milliseconds, and the allocation below is safe.)
-                SPARE_STATS[2].fetch_add(1, Ordering::Relaxed);
                 return Err(SPARE_BUSY.into());
             } else {
                 let c = ctx();
@@ -1960,10 +1968,14 @@ fn back_in(m: &Mirror, base: u64, len: u64, count: &AtomicU64) -> Result<(), Str
             match claim(&mut **g, a, b) {
                 Err(e) if e == SPARE_BUSY && t.elapsed() < SPARE_WAIT => {
                     parking_lot::MutexGuard::unlocked(g, || {
-                        while SPARE_FILLING.load(Ordering::Acquire) && t.elapsed() < SPARE_WAIT {
+                        while SPARE_ALLOCATING.load(Ordering::Acquire) && t.elapsed() < SPARE_WAIT {
                             std::thread::sleep(std::time::Duration::from_millis(1));
                         }
                     });
+                }
+                Err(e) if e == SPARE_BUSY => {
+                    SPARE_STATS[2].fetch_add(1, Ordering::Relaxed);
+                    return Err(e);
                 }
                 r => return r,
             }
