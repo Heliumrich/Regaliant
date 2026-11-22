@@ -1409,6 +1409,14 @@ pub fn maybe_evict() {
     let Some(mut g) = IMAGES.try_lock() else { return };
     let Some(im) = g.as_mut() else { return };
     let out = im.evict(frame, want);
+    // (Over budget: the GPU-written images' census beside the warning, at most every 10 s.)
+    static LAST_CENSUS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if raw_used > budget && ms >= LAST_CENSUS.load(Relaxed) + 10_000 {
+        LAST_CENSUS.store(ms, Relaxed);
+        let (all, cold) = im.gpu_written_census(frame, 600);
+        let (tex, top) = im.texture_census();
+        crate::info!("images: GPU-written {} MiB, {} MiB of it unused for 600 flips or more; textures {} MiB, ~{} MiB of it the top mips of large ones (at flip {frame})", all >> 20, cold >> 20, tex >> 20, top >> 20);
+    }
     // (Textures alone could not bring it under the high mark: the rest is memory images the GPU
     // wrote, the mirror and the like. The mirror then gives its cold pages back sooner for a while,
     // `under_pressure`: the other PC's 12 GB card ran 2 GB over its budget with 45 MiB of textures
@@ -5612,6 +5620,23 @@ impl Images {
     /// bytes, images left). A texture evicted is uploaded again from guest
     /// memory at its next use.
     /// The `n` largest cached images, one clause each (eviction reports).
+    /// Images the GPU wrote (kept for the session): [their bytes, those unused for `age` flips
+    /// or more] (the over-budget warning: what moving cold ones to system memory could free).
+    fn gpu_written_census(&self, frame: u64, age: u64) -> (u64, u64) {
+        self.map.values().filter(|i| i.gpu_written).fold((0, 0), |(all, cold), i| (all + i.bytes, cold + if frame.saturating_sub(i.used.get()) >= age { i.bytes } else { 0 }))
+    }
+
+    /// Textures (not GPU-written): [their bytes, about those of the top mip of the large ones (1024
+    /// texels or more on a side, two levels or more: 3/4 of a full chain's bytes)] (the over-budget
+    /// census: what fewer mips on small cards could free).
+    fn texture_census(&self) -> (u64, u64) {
+        self.map.values().filter(|i| !i.gpu_written).fold((0, 0), |(all, top), i| {
+            let k = &i.key;
+            let large = (k.width >= 1024 || k.height >= 1024) && k.levels >= 2 && !k.ty3d;
+            (all + i.bytes, top + if large { i.bytes / 4 * 3 } else { 0 })
+        })
+    }
+
     fn largest(&self, n: usize) -> String {
         let mut v: Vec<(&ImageKey, &Image)> = self.map.iter().collect();
         v.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes));
@@ -5624,10 +5649,14 @@ impl Images {
     }
 
     pub fn evict(&mut self, frame: u64, want: u64) -> (Vec<Evicted>, u64, usize) {
+        // (Not a texture holding blocks GPU work wrote through block views (`gpu_parts`): guest
+        // memory never holds those, so a re-upload after eviction would lose them, as evicting the
+        // images the GPU wrote lost 4-2's architecture, 2026-10-19. Added 2026-11-22 small hours;
+        // the 7 GB tours could not measure it either way: TRIED.md.)
         let mut cands: Vec<(u64, ImageKey)> = self
             .map
             .iter()
-            .filter(|(_, i)| !i.gpu_written && frame.saturating_sub(i.used.get()) >= EVICT_AGE)
+            .filter(|(_, i)| !i.gpu_written && i.gpu_parts.is_empty() && frame.saturating_sub(i.used.get()) >= EVICT_AGE)
             .map(|(k, i)| (i.used.get(), *k))
             .collect();
         cands.sort_unstable_by_key(|c| c.0);
