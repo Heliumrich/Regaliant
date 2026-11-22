@@ -13372,9 +13372,13 @@ impl Exec {
             return false;
         }
         let cap = if self.seg_full { SHADOW_BYTES } else { self.seg_want[0] };
-        self.free_slot_seg(0);
+        // (The old buffer freed only once the new one is made: until 2026-11-22 it was freed first,
+        // and when video memory refused the new one the slot was left with none while the command
+        // being recorded still counted on the old capacity: its next shadowed binding recorded a
+        // copy into a destroyed buffer and NVIDIA's driver faulted in it (the 4 GB tour, -113852).)
         match ctx().device_buffer(cap, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDIRECT_BUFFER) {
             Ok((b, m)) => {
+                self.free_slot_seg(0);
                 let s = &mut self.slots[self.cur];
                 (s.shadow, s.shadow_mem, s.shadow_cap) = (b, m, cap);
                 SLOT_MEM[1].fetch_add(cap, Ordering::Relaxed);
@@ -13406,9 +13410,10 @@ impl Exec {
             return false;
         }
         let cap = if self.seg_full { PRE_SEG } else { self.seg_want[1] };
-        self.free_slot_seg(1);
+        // (As `shadow_room`: the old buffer freed only once the new one is made.)
         match ctx().device_buffer(cap, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDEX_BUFFER) {
             Ok((b, m)) => {
+                self.free_slot_seg(1);
                 let s = &mut self.slots[self.cur];
                 (s.pre_buf, s.pre_mem, s.pre_cap) = (Some(b), m, cap);
                 SLOT_MEM[2].fetch_add(cap, Ordering::Relaxed);

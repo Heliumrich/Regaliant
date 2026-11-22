@@ -60,6 +60,9 @@ fn gpu_query() -> Result<Gpu, String> {
             if chosen.is_none() || discrete {
                 let m = instance.get_physical_device_memory_properties(pd);
                 let vram = m.memory_heaps[..m.memory_heap_count as usize].iter().filter(|h| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL)).map(|h| h.size).max().unwrap_or(0);
+                // (`DS_SIM_VRAM_MIB=<n>`, a test of a smaller card, as the game reads it: the card
+                // shown with that much.)
+                let vram = std::env::var("DS_SIM_VRAM_MIB").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&m| m >= 512).map_or(vram, |m| vram.min(m << 20));
                 let has_ext = instance.enumerate_device_extension_properties(pd).unwrap_or_default().iter().any(|e| std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) == ash::khr::fragment_shader_barycentric::NAME);
                 let barycentric = has_ext && {
                     let mut b = vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR::default();

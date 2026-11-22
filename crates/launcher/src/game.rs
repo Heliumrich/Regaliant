@@ -74,8 +74,15 @@ fn pc_text() -> String {
             if g.vendor == sys::VENDOR_AMD || g.vendor == sys::VENDOR_INTEL {
                 lines.push("AMD and Intel graphics cards are untested with this port. Please report how it runs.".into());
             }
-            if g.vram < 11 << 30 {
-                lines.push("The game uses about 12 GB of video memory. On this card it may run slowly.".into());
+            // (Measured in smaller rooms simulated on a 24 GB card, 2026-11-22: from 7 GB of room
+            // the picture stays right with textures in system memory in busy places; 4 GB of room
+            // still draws right in the 8-level tour, at 52-150 ms a frame there; less is untested.)
+            if g.vram < 3584 << 20 {
+                lines.push("Cards with less than 4 GB of video memory are untested. The game may not run on this card.".into());
+            } else if g.vram < 5632 << 20 {
+                lines.push("This card has little video memory for this game. It runs, but slowly. The Low preset in the game's PC tab helps.".into());
+            } else if g.vram < 11 << 30 {
+                lines.push("On this card the game keeps some textures in system memory. Busy places can run slower.".into());
             }
         }
         Err(e) => lines.push(e),

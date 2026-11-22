@@ -1284,6 +1284,26 @@ const EVICT_CHECK_MS: u64 = 500;
 /// Textures moved back from system memory a check at most (`promote`), bytes: each comes back at
 /// its next use as an upload.
 const PROMOTE_MAX: u64 = 128 << 20;
+
+/// On a card with less than `SMALL_CARD` of video memory (`vk::card_size`), an image of
+/// `BIG_IMAGE` bytes or more is made in system memory from the start (render targets, grown depth
+/// images, storage images and textures; `create_in`): the shadow atlas's depth (320 MiB), the
+/// lighting volumes (~280 MiB), texture arrays (342 and 86 MiB) and the title's 3840x2160 RGBA16F
+/// targets (63 MiB each) among them. The mirror then has the room it needs to draw right
+/// (NVIDIA's sparse buffers take video memory only). In a 4 GB room the mirror got ~1.8 of its
+/// ~2.5 GB: 82-116 million placements went without it over a tour and one of three tours drew
+/// 8-2 with most of its geometry missing (2026-11-22); at 64 MiB the census still found 1.11 GB
+/// of GPU-written images and 0.51 GB of textures in video memory. The cost: the GPU reads and
+/// writes those images across the bus on such a card.
+const SMALL_CARD: u64 = 5632 << 20;
+const BIG_IMAGE: u64 = 32 << 20;
+
+/// Whether `key` is such an image on such a card (`SMALL_CARD`, with the fallback on).
+fn big_on_small_card(key: &ImageKey) -> bool {
+    super::vk::system_fallback()
+        && super::vk::card_size() < SMALL_CARD
+        && key.width as u64 * key.height as u64 * key.layers.max(1) as u64 * texel_bytes(key.format).max(1) as u64 >= BIG_IMAGE
+}
 /// A texture used within this many flips stays where it is (`promote`).
 const PROMOTE_AGE: u64 = 2;
 /// This process over its eviction mark (`tune vram_high` percent of its budget) at the last
@@ -1459,6 +1479,7 @@ pub fn maybe_evict() {
     if raw_used > budget && ms >= LAST_CENSUS.load(Relaxed) + 10_000 {
         LAST_CENSUS.store(ms, Relaxed);
         let (all, cold) = im.gpu_written_census(frame, 600);
+        let (vgw, vtex, vtop) = im.video_census(4);
         let (tex, top) = im.texture_census();
         // (Since the last census: placements drawn from zeros, images not made, the last of them.)
         static SEEN: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
@@ -1466,12 +1487,14 @@ pub fn maybe_evict() {
         let (dz, df) = (z - SEEN[0].swap(z, Relaxed), f - SEEN[1].swap(f, Relaxed));
         let last = if df > 0 { LAST_IMAGE_FAIL.lock().map(|k| format!(" (the last {}x{}x{} {:?} at {:#x})", k.width, k.height, k.layers, k.format, k.base)).unwrap_or_default() } else { String::new() };
         crate::info!(
-            "images: GPU-written {} MiB, {} MiB of it unused for 600 flips or more; textures {} MiB, ~{} MiB of it the top mips of large ones; since the last: {dz} placements bound as zeros, {df} images not made{last}; images in system memory now {} MiB (at flip {frame})",
+            "images: GPU-written {} MiB, {} MiB of it unused for 600 flips or more; textures {} MiB, ~{} MiB of it the top mips of large ones; since the last: {dz} placements bound as zeros, {df} images not made{last}; images in system memory now {} MiB; in video memory GPU-written {} MiB, textures {} MiB, the largest {vtop} (at flip {frame})",
             all >> 20,
             cold >> 20,
             tex >> 20,
             top >> 20,
-            super::vk::SYSTEM_STATS[0].load(Relaxed) >> 20
+            super::vk::SYSTEM_STATS[0].load(Relaxed) >> 20,
+            vgw >> 20,
+            vtex >> 20
         );
     }
     // (Textures alone could not bring it under the high mark: the rest is memory images the GPU
@@ -3280,7 +3303,7 @@ impl Images {
     /// the GPU writes such an image, which then never leaves its memory (the review of
     /// 2026-11-22 morning).
     fn create_texture(&mut self, key: ImageKey, storage: bool) -> Result<(vk::Image, super::slab::Mem, u64), String> {
-        self.create_in(key, !storage && (under_pressure() || OVER_HIGH.load(std::sync::atomic::Ordering::Relaxed)))
+        self.create_in(key, big_on_small_card(&key) || (!storage && (under_pressure() || OVER_HIGH.load(std::sync::atomic::Ordering::Relaxed))))
     }
 
     fn create_in(&mut self, key: ImageKey, system_first: bool) -> Result<(vk::Image, super::slab::Mem, u64), String> {
@@ -4816,7 +4839,7 @@ impl Images {
     /// work that used `old`.
     pub fn grow_depth(&mut self, old: ImageKey, layers: u32) -> Result<ImageKey, String> {
         let new_key = ImageKey { layers, ..old };
-        let (image, mem, bytes) = self.create(new_key)?;
+        let (image, mem, bytes) = self.create_in(new_key, big_on_small_card(&new_key))?;
         self.to_general(image, new_key.format);
         let Some(prev) = self.map_remove(&old) else { return Err("grow_depth: image gone".into()) };
         let aspect = aspects(old.format);
@@ -5711,6 +5734,23 @@ impl Images {
         self.map.values().filter(|i| i.gpu_written).fold((0, 0), |(all, cold), i| (all + i.bytes, cold + if frame.saturating_sub(i.used.get()) >= age { i.bytes } else { 0 }))
     }
 
+    /// Bytes in video memory of [images the GPU wrote, textures], and the `n` largest images there
+    /// (the over-budget census: what holds video memory on a small card).
+    fn video_census(&self, n: usize) -> (u64, u64, String) {
+        let (mut gw, mut tex) = (0u64, 0u64);
+        let mut v: Vec<(&ImageKey, &Image)> = Vec::new();
+        for (k, i) in self.map.iter() {
+            if i.mem.in_system() {
+                continue;
+            }
+            if i.gpu_written { gw += i.bytes } else { tex += i.bytes }
+            v.push((k, i));
+        }
+        v.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes));
+        let top = v.iter().take(n).map(|(k, i)| format!("{}x{}x{} {:?} {} MiB{}", k.width, k.height, k.layers, k.format, i.bytes >> 20, if i.gpu_written { " GPU-written" } else { "" })).collect::<Vec<_>>().join(", ");
+        (gw, tex, top)
+    }
+
     /// Textures (not GPU-written): [their bytes, about those of the top mip of the large ones (1024
     /// texels or more on a side, two levels or more: 3/4 of a full chain's bytes)] (the over-budget
     /// census: what fewer mips on small cards could free).
@@ -6261,7 +6301,7 @@ impl Images {
         } else if let Some(k) = self.alias(&key, false) {
             k
         } else {
-            let (image, mem, bytes) = self.create(key)?;
+            let (image, mem, bytes) = self.create_in(key, big_on_small_card(&key))?;
             self.to_general(image, key.format);
             self.map_insert(key, Image { image, key, views: HashMap::default(), gpu_written: true, source: None, source_gen: None, hashes: [0; SLICES], checked_frame: 0, write_gen: 0, block_gen: 0, gpu_parts: Vec::new(), mip_gens: Vec::new(), span: 0, layout: None, overwritten: false, writer: 0, mem, bytes, used: UseStamp::new(super::FRAMES.load(std::sync::atomic::Ordering::Relaxed)) });
             self.gpu_bases.insert(key.base);
