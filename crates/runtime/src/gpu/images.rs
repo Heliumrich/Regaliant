@@ -1295,14 +1295,23 @@ const PROMOTE_MAX: u64 = 128 << 20;
 /// 8-2 with most of its geometry missing (2026-11-22); at 64 MiB the census still found 1.11 GB
 /// of GPU-written images and 0.51 GB of textures in video memory. The cost: the GPU reads and
 /// writes those images across the bus on such a card.
+/// Under `TINY_CARD` (a 4 GB card leaves a game ~3.5 GB) the line is `BIG_IMAGE_TINY`: at 3.5 GB
+/// the 32 MiB line left 0.82 GB of render targets in video memory, the mirror got 1.73 GB and 8-2
+/// drew wrong (19.2), 85 million placements without the mirror (-115433); nearly every render
+/// target then goes to system memory, read and written across the bus on such a card.
 const SMALL_CARD: u64 = 5632 << 20;
 const BIG_IMAGE: u64 = 32 << 20;
+const TINY_CARD: u64 = 4608 << 20;
+const BIG_IMAGE_TINY: u64 = 8 << 20;
 
 /// Whether `key` is such an image on such a card (`SMALL_CARD`, with the fallback on).
 fn big_on_small_card(key: &ImageKey) -> bool {
-    super::vk::system_fallback()
-        && super::vk::card_size() < SMALL_CARD
-        && key.width as u64 * key.height as u64 * key.layers.max(1) as u64 * texel_bytes(key.format).max(1) as u64 >= BIG_IMAGE
+    if !super::vk::system_fallback() {
+        return false;
+    }
+    let card = super::vk::card_size();
+    let line = if card < TINY_CARD { BIG_IMAGE_TINY } else if card < SMALL_CARD { BIG_IMAGE } else { return false };
+    key.width as u64 * key.height as u64 * key.layers.max(1) as u64 * texel_bytes(key.format).max(1) as u64 >= line
 }
 /// A texture used within this many flips stays where it is (`promote`).
 const PROMOTE_AGE: u64 = 2;
