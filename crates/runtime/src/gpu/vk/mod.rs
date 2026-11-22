@@ -1157,6 +1157,14 @@ pub fn sim_vram_limit() -> Option<u64> {
     *LIMIT.get_or_init(|| std::env::var("DS_SIM_VRAM_MIB").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&m| m >= 512).map(|m| m << 20))
 }
 
+/// The card's video memory as the choices made by its size see it (image slabs, the mirror's
+/// backing granule): the largest device-local heap (at most `vram_cap`), under `DS_SIM_VRAM_MIB`
+/// the smaller card it stands for. Until 2026-11-22 the simulation kept this 24 GB card's slabs
+/// and its 1 MiB backing granules, which a card under 16 GB never uses (~30% more mirror).
+pub fn card_size() -> u64 {
+    CTX.get().map_or(0, |c| c.device_heap_size()).min(sim_vram_limit().unwrap_or(u64::MAX))
+}
+
 /// Device-local allocations failed by `DS_SIM_VRAM_MIB`.
 pub static SIM_VRAM_FAILS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1264,9 +1272,13 @@ pub fn system_can_take(size: u64) -> bool {
         && SYSTEM_COUNT.load(Relaxed) < system_count_limit()
         && !system_refusing(size)
 }
-/// The fallback's room: at most this much in all, and its heap never past three quarters of its
-/// budget (`Ctx::system_room`): the title's own memory is system memory too.
-const SYSTEM_CAP: u64 = 4 << 30;
+/// The fallback's room: at most this much in all, and its heap's budget left with the larger of
+/// `SYSTEM_SPARE` and an eighth of it free (`Ctx::system_alloc`): the title's imported memory is
+/// in that heap too and grows at arrivals. 4 GiB and three quarters of the budget until the
+/// 4-6 GB cards of 2026-11-22: in a 4 GB room textures and render targets need more there, and
+/// the imports alone held 9.3 of this PC's 15.5 GB budget, which left the old rule ~2 GB.
+const SYSTEM_CAP: u64 = 8 << 30;
+const SYSTEM_SPARE: u64 = 2 << 30;
 /// When the fallback last refused for want of room or a failed allocation (`gate_clock_ms`; 0:
 /// never) and the smallest size refused since: for `GATE_MS` after it requests of at least that
 /// size are refused with no driver call (`system_refusing`), smaller ones still tried.
@@ -1610,7 +1622,7 @@ impl Ctx {
 
     /// Memory of `size` bytes from the system-memory fallback for requirements' type bits `bits`
     /// (device addresses with `addressed`): None when it has no type for them, or no room
-    /// (`SYSTEM_CAP`, three quarters of its heap's budget) or the allocation failed, these two
+    /// (`SYSTEM_CAP`, its heap's spare room `SYSTEM_SPARE`) or the allocation failed, these two
     /// counted and refusing that size and more for `GATE_MS` (`system_refusing`, no driver call
     /// then). A request with no type refuses nothing else (in the fallback's first form the
     /// mirror, which has none on NVIDIA, kept images from it so for 250 ms at each failure). The
@@ -1633,7 +1645,8 @@ impl Ctx {
             let mut p2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
             unsafe { self.instance.get_physical_device_memory_properties2(self.pdev, &mut p2) };
             drop(p2);
-            room = budget.heap_usage[heap] + size <= budget.heap_budget[heap] / 4 * 3;
+            let spare = SYSTEM_SPARE.max(budget.heap_budget[heap] / 8);
+            room = budget.heap_usage[heap] + size + spare <= budget.heap_budget[heap];
         }
         if !room {
             system_refused(size);

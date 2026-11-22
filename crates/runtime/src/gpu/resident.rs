@@ -2112,11 +2112,9 @@ fn back_granule() -> u64 {
     match super::tune::fe2_back_granule() {
         0 => {
             static AUTO: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-            *AUTO.get_or_init(|| {
-                let p = &ctx().mem_props;
-                let big = (0..p.memory_heap_count as usize).filter(|&i| p.memory_heaps[i].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL)).map(|i| p.memory_heaps[i].size).max().unwrap_or(0);
-                if big >= 16 << 30 { 16 } else { 1 }
-            })
+            // (The card's size as `vk::card_size` sees it: under `DS_SIM_VRAM_MIB` the smaller
+            // card's single pages, as on a real one.)
+            *AUTO.get_or_init(|| if super::vk::card_size() >= 16 << 30 { 16 } else { 1 })
         }
         g => g.clamp(1, 4096).next_power_of_two(),
     }

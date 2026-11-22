@@ -140,12 +140,12 @@ pub fn on() -> bool {
     *ON.get_or_init(|| card_size() >= 16 << 30 || ctx().limits.max_memory_allocation_count < 1 << 20 || super::vk::gpu_compat().is_some())
 }
 
-/// The card's video memory as these choices see it: under `DS_SIM_VRAM_MIB` the smaller card it
-/// stands for. Until 2026-11-22 the 7 GB tours kept this 24 GB card's slabs, which a card under
-/// 16 GB never uses: evicted images left holes there (679 MiB of 2,816 in one tour) that a
-/// real small card gives back.
+/// The card's video memory as these choices see it (`vk::card_size`: under `DS_SIM_VRAM_MIB` the
+/// smaller card it stands for). Until 2026-11-22 the 7 GB tours kept this 24 GB card's slabs,
+/// which a card under 16 GB never uses: evicted images left holes there (679 MiB of 2,816 in one
+/// tour) that a real small card gives back.
 fn card_size() -> u64 {
-    ctx().device_heap_size().min(super::vk::sim_vram_limit().unwrap_or(u64::MAX))
+    super::vk::card_size()
 }
 
 fn slab_size() -> u64 {
