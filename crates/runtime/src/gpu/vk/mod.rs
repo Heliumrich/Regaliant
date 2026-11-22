@@ -1165,6 +1165,19 @@ pub fn card_size() -> u64 {
     CTX.get().map_or(0, |c| c.device_heap_size()).min(sim_vram_limit().unwrap_or(u64::MAX))
 }
 
+/// `DS_SIM_HOST_MIB=<n>` (a test of a PC with less memory, 2026-11-22): the budget of the heap
+/// that imported guest memory and the system-memory fallback use is at most n MiB, as on a PC
+/// whose graphics share of memory (Windows gives about half the installed memory) is that small:
+/// an import or a fallback allocation that would pass it fails (`sim_host_fails`), as the
+/// driver's did on this PC when that heap reached its budget. A 16 GB PC: about 7600.
+pub fn sim_host_limit() -> Option<u64> {
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| std::env::var("DS_SIM_HOST_MIB").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&m| m >= 1024).map(|m| m << 20))
+}
+
+/// Imports and fallback allocations failed by `DS_SIM_HOST_MIB`.
+pub static SIM_HOST_FAILS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Device-local allocations failed by `DS_SIM_VRAM_MIB`.
 pub static SIM_VRAM_FAILS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1205,10 +1218,12 @@ pub fn gate_refuses(size: u64) -> bool {
 pub fn gate_line() -> String {
     use std::sync::atomic::Ordering::Relaxed;
     let (refused, failed) = (GATE_STATS[0].load(Relaxed), GATE_STATS[1].load(Relaxed));
-    if failed == 0 {
+    let host = SIM_HOST_FAILS.load(Relaxed);
+    if failed == 0 && host == 0 {
         return String::new();
     }
-    format!("    video-memory allocations failed {failed} times ({} of them by DS_SIM_VRAM_MIB); {refused} requests refused with no driver call in the {GATE_MS} ms after a failure\n", SIM_VRAM_FAILS.load(Relaxed))
+    let host = if host > 0 { format!("; imports and fallback allocations failed by DS_SIM_HOST_MIB {host}") } else { String::new() };
+    format!("    video-memory allocations failed {failed} times ({} of them by DS_SIM_VRAM_MIB); {refused} requests refused with no driver call in the {GATE_MS} ms after a failure{host}\n", SIM_VRAM_FAILS.load(Relaxed))
 }
 
 pub fn vram_cap() -> u64 {
@@ -1610,6 +1625,28 @@ impl Ctx {
             .or_else(|| (0..p.memory_type_count).find(|&i| ok(i)))
     }
 
+    /// `DS_SIM_HOST_MIB`: whether `size` more bytes in memory type `ty` would pass the simulated
+    /// budget of its heap (a heap that is not device-local only), counted in `SIM_HOST_FAILS`.
+    pub fn sim_host_fails(&self, ty: u32, size: u64) -> bool {
+        let Some(limit) = sim_host_limit() else { return false };
+        if !self.memory_budget || ty >= self.mem_props.memory_type_count {
+            return false;
+        }
+        let heap = self.mem_props.memory_types[ty as usize].heap_index as usize;
+        if self.mem_props.memory_heaps[heap].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL) {
+            return false;
+        }
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let mut p2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+        unsafe { self.instance.get_physical_device_memory_properties2(self.pdev, &mut p2) };
+        drop(p2);
+        let fails = budget.heap_usage[heap].saturating_add(size) > limit;
+        if fails {
+            SIM_HOST_FAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        fails
+    }
+
     /// An image's memory type bits seen (`images::create_inner`): whether images have a type for
     /// the fallback (`IMAGE_SYSTEM_TYPE`; one that has wins over one that has not).
     pub fn note_image_bits(&self, bits: u32) {
@@ -1645,8 +1682,9 @@ impl Ctx {
             let mut p2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
             unsafe { self.instance.get_physical_device_memory_properties2(self.pdev, &mut p2) };
             drop(p2);
-            let spare = SYSTEM_SPARE.max(budget.heap_budget[heap] / 8);
-            room = budget.heap_usage[heap] + size + spare <= budget.heap_budget[heap];
+            let heap_budget = budget.heap_budget[heap].min(sim_host_limit().unwrap_or(u64::MAX));
+            let spare = SYSTEM_SPARE.max(heap_budget / 8);
+            room = budget.heap_usage[heap] + size + spare <= heap_budget;
         }
         if !room {
             system_refused(size);
@@ -1820,6 +1858,10 @@ impl Ctx {
                 self.device.destroy_buffer(buf, None);
                 return Err(format!("no memory type for imported host memory (bits {bits:#x})"));
             };
+            if self.sim_host_fails(ty, size) {
+                self.device.destroy_buffer(buf, None);
+                return Err(format!("vkAllocateMemory(import {size:#x}): {} (DS_SIM_HOST_MIB)", vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
+            }
             let mut imp = vk::ImportMemoryHostPointerInfoEXT::default().handle_type(ht).host_pointer(ptr as *mut std::ffi::c_void);
             let mut fl = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
             let ai = vk::MemoryAllocateInfo::default().allocation_size(size).memory_type_index(ty).push_next(&mut imp);

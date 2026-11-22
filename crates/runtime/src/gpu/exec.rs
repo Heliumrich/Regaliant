@@ -773,6 +773,7 @@ pub fn import_backlog() -> String {
 fn backlog_watch(oldest_open: u64) {
     let waiting = GRAVEYARD_LEN.load(Ordering::Relaxed);
     let now = std::time::Instant::now();
+    backlog_census(oldest_open, waiting, now);
     let mut g = BACKLOG_SEEN.lock();
     if g.0 != oldest_open {
         *g = (oldest_open, Some(now), g.2);
@@ -791,6 +792,56 @@ fn backlog_watch(oldest_open: u64) {
         "gpu: {waiting} dropped imports wait to be freed: the oldest open batch began at generation {oldest_open} (now {}), {held_for:.0} s ago, on {}; memory: {}",
         SPAN_GEN.load(Ordering::Relaxed),
         holders.join(", "),
+        super::vk::ctx_heaps()
+    );
+}
+
+/// Every 30 s while more than 256 dropped imports wait to be freed (`backlog_watch` names only a
+/// generation held 30 s unchanged): what each waits for, held for its re-import, for every
+/// executor's open batch to pass its generation (the slowest named, with its generation's
+/// distance), or for the GPU to complete the batches that may use it; their bytes. Added
+/// 2026-11-22: the PGO training's cold cutscene boot kept 1,375 dropped imports (5.6 GB of
+/// pinned host memory) unfreed for minutes with no warning, and new imports then failed at the
+/// host heap's budget.
+fn backlog_census(oldest_open: u64, waiting: u64, now: std::time::Instant) {
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    if waiting <= 256 {
+        return;
+    }
+    {
+        let mut l = LAST.lock();
+        if l.is_some_and(|t| now.duration_since(t).as_secs() < 30) {
+            return;
+        }
+        *l = Some(now);
+    }
+    let done = done_seq();
+    let (mut held, mut gen_wait, mut gpu_wait, mut bytes) = (0u64, 0u64, 0u64, 0u64);
+    let mut oldest_needed = u64::MAX;
+    {
+        let g = GRAVEYARD.lock();
+        for d in g.iter() {
+            bytes += d.span.end - d.span.start;
+            if d.held {
+                held += 1;
+            } else if d.seq.is_none() {
+                gen_wait += 1;
+                oldest_needed = oldest_needed.min(d.generation);
+            } else if d.seq.is_some_and(|s| done < s) {
+                gpu_wait += 1;
+            }
+        }
+    }
+    let gens: Vec<u64> = EXEC_GENS.lock().iter().map(|a| a.load(Ordering::SeqCst)).collect();
+    let names = EXEC_GEN_NAMES.lock().clone();
+    let holders: Vec<String> = gens.iter().enumerate().filter(|&(_, v)| *v == oldest_open && *v != u64::MAX).map(|(i, _)| names.get(i).cloned().unwrap_or_else(|| format!("#{i}"))).collect();
+    crate::warn!(
+        "gpu: {waiting} dropped imports wait to be freed ({} MiB of pinned host memory): {held} held for their re-import, {gen_wait} for every open batch to pass their generation (the oldest needed {}, the oldest open {} on {}, now {}), {gpu_wait} for the GPU to complete their batches (done {done}); memory: {}",
+        bytes >> 20,
+        if oldest_needed == u64::MAX { "-".to_string() } else { oldest_needed.to_string() },
+        if oldest_open == u64::MAX { "none".to_string() } else { oldest_open.to_string() },
+        if holders.is_empty() { "-".to_string() } else { holders.join(", ") },
+        SPAN_GEN.load(Ordering::Relaxed),
         super::vk::ctx_heaps()
     );
 }
@@ -15406,24 +15457,35 @@ impl Exec {
                     x = e;
                 }
                 None => {
-                    if super::fe2::c4_any_held(x, x + PAGE) {
-                        super::fe2::c4_note_upload_skips(1);
+                    // (The rest of this window page by page through the CPU, its import not asked
+                    // for again: until 2026-11-22 every page asked anew, and once imports failed
+                    // for want of memory each page past the failed window's 250 ms hold tried
+                    // another (a 16 GB PC simulated, `DS_SIM_HOST_MIB=7600`: checks of 120 MiB
+                    // took ~11 s each, 10,504 imports failed, frames took 27-38 s). The readability
+                    // map answers for the part at once, with no system call: a VirtualQuery a page
+                    // waited on the address-space lock the title's streaming holds at level loads,
+                    // ~0.44 ms a page there.)
+                    let mapped = crate::mem::rg_readable(x, e - x) == Some(true);
+                    while x < e {
+                        if super::fe2::c4_any_held(x, x + PAGE) {
+                            super::fe2::c4_note_upload_skips(1);
+                            x += PAGE;
+                            continue;
+                        }
+                        if !(mapped || crate::mem::os_readable(x, PAGE)) || self.mirror_stage(mbuf, x).is_none() {
+                            let readable = crate::mem::os_readable(x, PAGE);
+                            self.report_error("front end 2: a page to copy into the mirror has no import window and cannot be copied by the CPU", || format!("{x:#x} (run {a:#x}..{b:#x}; readable {readable})"));
+                            return false;
+                        }
+                        super::fe2::note_memcpy(1);
+                        super::fe2::upload_census(x, x + PAGE);
+                        if self.held {
+                            // (Read now: checked when held work settles.)
+                            self.held_reads.push((x, PAGE));
+                            self.note_kinds(2, 1);
+                        }
                         x += PAGE;
-                        continue;
                     }
-                    if !crate::mem::os_readable(x, PAGE) || self.mirror_stage(mbuf, x).is_none() {
-                        let readable = crate::mem::os_readable(x, PAGE);
-                        self.report_error("front end 2: a page to copy into the mirror has no import window and cannot be copied by the CPU", || format!("{x:#x} (run {a:#x}..{b:#x}; readable {readable})"));
-                        return false;
-                    }
-                    super::fe2::note_memcpy(1);
-                    super::fe2::upload_census(x, x + PAGE);
-                    if self.held {
-                        // (Read now: checked when held work settles.)
-                        self.held_reads.push((x, PAGE));
-                        self.note_kinds(2, 1);
-                    }
-                    x += PAGE;
                 }
             }
         }
