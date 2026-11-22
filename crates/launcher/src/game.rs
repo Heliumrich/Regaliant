@@ -47,7 +47,11 @@ pub fn build(app: &mut App) {
         let r = (16, 360, 748, 40);
         app.game.safe = app.put(0, b.check("Start in safe mode once: default settings for that session, in a window, without an upscaler. Use it when the game does not start.", r, ID_SAFE), r) as usize;
         ui::set_check(h(app.game.safe), app.launch.safe_mode);
-        ui::set_text(h(app.game.pc), &pc_text());
+        // (Also in the launcher's log: what the player was told about this PC, in bug reports and
+        // the small-card tests.)
+        let pc = pc_text();
+        ui::set_text(h(app.game.pc), &pc);
+        crate::shaders::log(app, &format!("this PC: {}", pc.replace('\n', " | ")));
     }
     if dir.is_empty() {
         unsafe { ui::set_text(h(app.game.status), "Choose the game's folder: the PS5 game Demon's Souls (PPSA01341), version 01.007.000, with its executable decrypted.") };

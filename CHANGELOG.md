@@ -20,6 +20,10 @@
   responding.
 - When graphics memory runs short, textures now go to system memory instead of being left out,
   so the picture stays whole. The frame rate can drop in busy places.
+- Graphics cards with 4 to 6 GB of video memory: the game runs there and draws the whole
+  picture, slowly. On cards with 4 or 5 GB, large images stay in system memory from the start.
+- Fixed a crash when graphics memory ran out while the game made room for its work.
+- The launcher says what to expect on a card with little video memory.
 - A long preparation that runs short of graphics memory goes on in a fresh session.
 - A preparation step that finished its work is no longer run again when it is slow to close.
 - Prepare now on prepared shaders gives shaders that once crashed the graphics driver another
