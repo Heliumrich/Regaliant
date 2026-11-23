@@ -44,6 +44,15 @@ This is an early version.
 
 See [all known issues](docs/known-issues.md). Found a bug? Here is [how to report a bug](docs/report-a-bug.md).
 
+## Roadmap
+
+Goals, roughly in order. They are aims, not promises or dates.
+
+- A steady 60 fps everywhere, the busiest places included, then higher frame rates for high-refresh screens.
+- Shorter shader preparation, then none. Shaders get compiled in the background while you play, without stutter.
+- Mod support: a mods folder whose files the game loads in place of its own, so mods never change your game files.
+- Online play: messages, bloodstains, co-op and invasions through a community server. This is the biggest goal and the furthest off.
+
 ## More
 
 - [Install, update and uninstall](docs/install.md)
