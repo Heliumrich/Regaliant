@@ -1,0 +1,31 @@
+# Controls
+
+[Back to the main page](../README.md)
+
+Xbox controllers and other XInput controllers work like the PS5 pad, with their own button prompts. A DualSense or DualShock 4 works through Steam Input, which presents it as an Xbox controller.
+
+## Keyboard and mouse
+
+Defaults, Dark Souls III-style:
+
+| Action | Keys |
+| --- | --- |
+| Move | W A S D |
+| Walk | Left Alt |
+| Camera | Mouse, or I J K L |
+| Dash (hold), roll, back in menus | Space |
+| Attack / strong attack | Left click / Shift + left click |
+| Guard / parry | Right click / Left Ctrl |
+| Two-hand | F |
+| Use item | R |
+| Interact, confirm | E or Enter |
+| Lock on | Q or middle click |
+| Tool belt | G |
+| Menu | Escape |
+| Switch spells, items and weapons | Arrow keys, mouse wheel |
+| Free the mouse | F1 |
+| Fullscreen | Alt+Enter |
+
+In menus the mouse pointer selects what it points at, the left button confirms and the right button goes back. Every key can be changed in the game: SETTINGS > PC > Key Bindings.
+
+Your character's name is typed into a box in the game's window. With a controller the box shows a keyboard: the d-pad moves, A types, X erases and Menu confirms.

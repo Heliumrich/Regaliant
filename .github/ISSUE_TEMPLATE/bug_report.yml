@@ -1,0 +1,47 @@
+name: Bug report
+description: Something doesn't work or looks wrong.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you see, and what did you expect? Where in the game was it?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: How can it be made to happen again? Leave it empty if you don't know.
+      placeholder: |
+        1.
+        2.
+        3.
+  - type: input
+    id: version
+    attributes:
+      label: Regaliant version
+      description: Shown in the launcher's title bar.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: textarea
+    id: pc
+    attributes:
+      label: PC specs
+      value: |
+        Windows version:
+        CPU:
+        GPU and driver version:
+        RAM:
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: In the launcher, click Open logs, zip the newest folder and drag the zip here.
+  - type: markdown
+    attributes:
+      value: Please don't share game files, keys, decrypted files or download links.

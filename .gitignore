@@ -1,0 +1,21 @@
+# Build output and project-local caches
+/target/
+/.cargo-home/
+
+# Local files of a development checkout: game files, saves, logs, caches, downloads (never in Git)
+/local-data/
+/Game/
+
+# Player packages built locally (scripts\package.ps1)
+/dist/
+
+# The export's manifest (the development checkout writes it)
+/.export-files
+
+# Editor and OS noise
+*.swp
+.DS_Store
+Thumbs.db
+.vs/
+.idea/
+__pycache__/
