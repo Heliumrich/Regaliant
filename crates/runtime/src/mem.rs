@@ -2325,16 +2325,12 @@ fn host_decommit(addr: u64, size: u64) {
             HOST_CALLS[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             continue;
         }
-        let tw = std::time::Instant::now();
         let _readers_out = GUEST_READERS.write();
         let _arm = crate::gpu::resident::remap_guard();
-        let th = std::time::Instant::now();
         for (a, e) in host_pieces(addr, addr + size) {
             unsafe { VirtualFree(a as _, (e - a) as usize, MEM_DECOMMIT) };
         }
         crate::gpu::resident::settled(addr, size);
-        // (Long ones are hitch causes: the guest memory's readers wait meanwhile.)
-        crate::gpu::hitch::note_since(crate::gpu::hitch::Kind::Mirror, tw, || format!("a decommit of {addr:#x}+{size:#x}: {} ms waiting for the guest memory's readers, {} ms holding them out", (th - tw).as_millis(), th.elapsed().as_millis()));
         decommitted = true;
     }
     // (Counted as before: deferred decommits are counted apart.)
