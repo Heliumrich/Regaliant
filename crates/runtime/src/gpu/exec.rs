@@ -2878,6 +2878,7 @@ fn evict_cold_imports() {
         return;
     }
     let Some((heap_used, budget)) = ctx().host_budget() else { return };
+    super::fe2::fallback_reserve(budget);
     // (Dropped imports waiting to be freed leave the heap soon on their own.)
     let pending: u64 = GRAVEYARD.lock().iter().map(|d| d.span.end - d.span.start).sum();
     let used = heap_used.saturating_sub(pending);
@@ -3048,9 +3049,10 @@ fn import_written(lo: u64, hi: u64) -> bool {
     let was = WRITTEN_IMPORT.with(|c| c.replace(true));
     let mut ok = true;
     let mut a = lo;
+    let force = fallback_force();
     while a < hi {
         let (_, e) = crate::mem::same_backing(a, a, hi);
-        if e <= a || span(a, e - a).is_none() && !import_narrow(a, e - a) {
+        if e <= a || (force && e - a <= FORCE_MAX && !listed_over_any(a, e) && force_unmapped(a, e)) || (span(a, e - a).is_none() && !import_narrow(a, e - a)) {
             ok = false;
             break;
         }
@@ -3063,6 +3065,28 @@ fn import_written(lo: u64, hi: u64) -> bool {
 thread_local! {
     /// This thread imports for a written range (`import_written`).
     static WRITTEN_IMPORT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `DS_FB_FORCE=1` (a test of the write-back fallback, `fe2::record_fallback`): a written range
+/// of at most `FORCE_MAX` that no listed import overlaps is not imported, as if its import had
+/// failed: its pages have no page-table entry, so its GPU writes reach guest memory only through
+/// the fallback's CPU stores. (The failing simulation's written ranges were 4 KiB to 18 MiB.)
+fn fallback_force() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_FB_FORCE").is_ok_and(|v| v == "1"))
+}
+const FORCE_MAX: u64 = 4 << 20;
+
+/// Whether a listed import overlaps guest [a, e).
+fn listed_over_any(a: u64, e: u64) -> bool {
+    spans_read().iter().any(|s| s.valid && s.start < e && a < s.end)
+}
+
+/// `DS_FB_FORCE`: [a, e)'s pages leave the guest page table (entries into dropped imports held for
+/// their re-import), so that the batch's write-back finds them unmapped. True.
+fn force_unmapped(a: u64, e: u64) -> bool {
+    super::pagetable::unmap(a, e - a);
+    true
 }
 
 /// Import windows the driver refused lately: [start, end) and when. An
@@ -11587,10 +11611,12 @@ pub struct Exec {
     /// Scratch: the runs of an upload this batch claimed (`fe2::run_claim`).
     fe2_claimed: Vec<(u64, u64)>,
     fe2_marked: bool,
-    /// Written ranges this batch placed whose import failed, and the repage sequence at the first:
-    /// the CPU stores their write-back after the batch (`fe2::release_unimported`).
-    unimported: Vec<(u64, u64)>,
-    unimported_since: u64,
+    /// Written ranges this batch placed whose import failed, each with the repage sequence at
+    /// its placement: copied out after the batch's last write-back (`fallback`) and stored by the
+    /// CPU at its completion (`fe2::record_fallback`, `fe2::store_fallback`).
+    unimported: Vec<(u64, u64, u64)>,
+    /// The batch's copies of `unimported` (recorded at its close), stored at its completion.
+    fallback: Option<super::fe2::Fallback>,
     /// `wb_empty_census`: the owners (a bit per engine allocator id) of the
     /// batch's written ranges not all held when placed.
     wb_unheld: u64,
@@ -13139,6 +13165,8 @@ unsafe impl Send for Exec {}
 /// A batch a deferred executor closed (see `Exec::deferred`).
 struct Closed {
     slot: usize,
+    /// Its write-backs without an import (`Exec::fallback`), stored at its completion.
+    fallback: Option<super::fe2::Fallback>,
     pre: Option<vk::CommandBuffer>,
     shared: Vec<(u64, u64, u64, bool)>,
     /// `Exec::copy_wait` of the batch.
@@ -13515,7 +13543,7 @@ impl Exec {
                 fe2_claimed: Vec::new(),
                 fe2_marked: false,
                 unimported: Vec::new(),
-                unimported_since: 0,
+                fallback: None,
                 wb_unheld: 0,
                 fe2_memo: Default::default(),
                 place_memo: Box::new([PlaceMemo::default(); PLACE_MEMO_SLOTS]),
@@ -14199,6 +14227,19 @@ impl Exec {
                 super::vk::defer::seam_mark(self.cmd(), super::vk::defer::SEAM_WB, false);
             }
         }
+        // Written ranges whose import failed: their pages and mask words copied out after the
+        // last write-back, for the CPU to store at the batch's completion (`fe2::record_fallback`).
+        if !self.unimported.is_empty() {
+            let ranges = std::mem::take(&mut self.unimported);
+            if self.batch_lists {
+                super::vk::defer::seam_mark(self.cmd(), super::vk::defer::SEAM_WB, true);
+            }
+            let cmd = self.cmd();
+            self.fallback = super::fe2::record_fallback(cmd, self.batch_c, &ranges);
+            if self.batch_lists {
+                super::vk::defer::seam_mark(self.cmd(), super::vk::defer::SEAM_WB, false);
+            }
+        }
         // Seamless chunks: a part of a parallel run with
         // nothing in it that its neighbours' order or its own completion
         // matters to is pure: the fused replay may run it back to back with
@@ -14216,7 +14257,7 @@ impl Exec {
                 o[OP_FILLS] != 0,
                 o[OP_FAST_CLEARS] != 0,
                 o[OP_WRITE_BACK_BYTES] != 0,
-                !self.actions.is_empty(),
+                !self.actions.is_empty() || self.fallback.is_some(),
                 !self.pending_promises.is_empty(),
                 !self.mm_cp.is_empty() || !self.owned.is_empty(),
                 self.held || self.past || seg_stamps(),
@@ -14310,7 +14351,7 @@ impl Exec {
             let cpu = self.span_cpu();
             super::timeline::end(&self.name, self.begun_mark.take(), || format!("chunk batch, {} commands ({why}{cpu})", self.batch_shaders.len()));
             let lists = std::mem::take(&mut self.batch_lists).then(super::vk::defer::release);
-            self.closed.push(Closed { slot: i, pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, cpu_wait: std::mem::take(&mut self.cpu_wait), kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), watch_tags: std::mem::take(&mut self.watch_tags), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises, fe2_up: Vec::new(), fe2_spans: Vec::new(), lists, xq: (self.xq_dep, self.xq_why, self.xq_img), on_c: self.batch_c, pre_on_c });
+            self.closed.push(Closed { slot: i, fallback: self.fallback.take(), pre, shared: std::mem::take(&mut self.shared_pending), copy_wait, cpu_wait: std::mem::take(&mut self.cpu_wait), kept: std::mem::take(&mut self.shared_kept), ops: self.ops, writes: std::mem::take(&mut self.pending), checks, shaders: std::mem::take(&mut self.batch_shaders), watch_tags: std::mem::take(&mut self.watch_tags), races: std::mem::take(&mut self.race_pending), forward_ids: std::mem::take(&mut self.forward_ids), segs: std::mem::take(&mut self.segs), res_pages: std::mem::take(&mut self.res_pages), eager_action: self.eager_action.take(), mm_own: self.mm_own.take(), promises, fe2_up: Vec::new(), fe2_spans: Vec::new(), lists, xq: (self.xq_dep, self.xq_why, self.xq_img), on_c: self.batch_c, pre_on_c });
             (self.xq_dep, self.xq_why, self.xq_img) = (0, 0, false);
             self.res_mine.clear();
             if let Some(b) = self.closed.last_mut() {
@@ -14365,11 +14406,14 @@ impl Exec {
         // (A prologue on the compute queue runs after the main queue's work queued meanwhile
         // may have used the mirror: its uploads count for other batches once it completed.)
         let mut actions = actions;
-        // (Front end 2's written ranges without an import: the CPU stores their write-back.)
-        if !self.unimported.is_empty() {
-            let (r, since) = (std::mem::take(&mut self.unimported), self.unimported_since);
-            actions.push(Box::new(move || super::fe2::release_unimported(&r, since)));
-        }
+        // (Front end 2's written ranges without an import: the CPU stores their write-back first,
+        // before the batch's CP effects, and the batch counts as one with CPU effects.)
+        let fb_id = self.fallback.take().map(|f| {
+            let id = f.id();
+            actions.insert(0, Box::new(move || super::fe2::store_fallback(f)));
+            id
+        });
+        let has_actions = has_actions || fb_id.is_some();
         if pre_on_c && !self.fe2_up.is_empty() {
             let (up, gens) = (self.fe2_up.clone(), self.fe2_gens.clone());
             actions.push(Box::new(move || super::fe2::uploaded(&up, &gens, fe2_ep)));
@@ -14398,6 +14442,9 @@ impl Exec {
             l.push_back((seq, cpu_wait));
         }
         st.mark(5);
+        if let Some(id) = fb_id {
+            super::fe2::fallback_pushed(id, seq);
+        }
         if std::mem::take(&mut self.gpu_writes_open) {
             self.last_gpu_write_seq = seq;
         }
@@ -15396,10 +15443,9 @@ impl Exec {
                 super::fe2::note_unscatterable();
                 self.report_error("front end 2: a written range cannot be imported (the CPU stores its GPU writes after the batch)", || format!("{lo:#x}..{hi:#x}"));
                 if self.unimported.is_empty() {
-                    self.unimported_since = crate::mem::repage_seq();
-                    super::fe2::unimported_stage_ready();
+                    super::fe2::fallback_ready();
                 }
-                self.unimported.push((lo, hi));
+                self.unimported.push((lo, hi, crate::mem::repage_seq()));
             }
             self.fe2_marked = true;
             if wb_census() {
@@ -15408,6 +15454,12 @@ impl Exec {
             if wb_empty_census() && !super::fe2::c4_all_held(lo, hi) {
                 self.wb_unheld |= 1u64 << crate::engine::owner(lo).min(63);
             }
+        }
+        // (Pages an earlier batch's write-back without an import has not stored yet: this batch
+        // waits on the GPU for those CPU stores, `fe2::fallback_over`.)
+        let fb = super::fe2::fallback_over(lo, hi);
+        if fb != 0 {
+            self.cpu_wait = self.cpu_wait.max(fb);
         }
         let t2 = tsc();
         // (Read before any take: what its pages are stamped with.)
@@ -17288,6 +17340,9 @@ impl Exec {
     /// follow it on the device queue, CP writes are deferred behind it.
     /// `by_cpu`: the CPU writes that value after the batch completed.
     pub fn depend_on(&mut self, seq: u64, by_cpu: bool) {
+        // (Batches up to `seq` whose write-backs without an import the CPU has not stored yet:
+        // their stores come with their CPU effects.)
+        let by_cpu = by_cpu || super::fe2::fallback_pending_upto(seq);
         self.last_seq = self.last_seq.max(seq);
         self.last_action_seq = self.last_action_seq.max(seq);
         if by_cpu {
@@ -17948,6 +18003,14 @@ impl Exec {
     /// queue). `label`: a value other queues may wait for (promised when the
     /// batch is submitted). False: not possible here.
     pub fn gpu_cp_write(&mut self, a: u64, data: &[u32], label: Option<(u64, u8)>, end_of_pipe: bool) -> bool {
+        // (A written range without an import in the batch: its GPU writes reach guest memory when
+        // the CPU stores them at the batch's completion; a label written here by the GPU would
+        // be seen before them.)
+        // (Not in a parallel worker, whose CP effects are performed at once; a held stretch
+        // refused ends, and the write becomes a CPU effect after it.)
+        if !self.unimported.is_empty() && (!self.deferred || self.held) {
+            return false;
+        }
         watch_note(|| format!("{} CP write {:x?}", self.name, &data[..data.len().min(8)]), a, 4 * data.len() as u64);
         let bytes = 4 * data.len() as u64;
         if bytes == 0 || bytes > 65536 || a % 4 != 0 || DEVICE_LOST.load(Ordering::Relaxed) || super::homes::overlaps(a, bytes) {
@@ -19457,7 +19520,9 @@ impl Exec {
             let on_c = b.on_c;
             // (Its wait for an earlier batch's CPU effects, on the GPU: as
             // `submit_for` registers it.)
-            let mut cpu_wait = b.cpu_wait;
+            // (After batches whose write-backs without an import the CPU has not stored yet: their
+            // stores first, `fe2::fallback_newest_pending`.)
+            let mut cpu_wait = b.cpu_wait.max(super::fe2::fallback_newest_pending());
             if cpu_wait > 0 {
                 CPU_WAIT_REQ.fetch_max(cpu_wait, Ordering::SeqCst);
                 if DONE_ATOMIC.load(Ordering::SeqCst) >= cpu_wait {
@@ -19479,6 +19544,12 @@ impl Exec {
             let xq = xq_tracking().then_some(XqBatch { compute: self.xq_c, on_c, acb: acb_id(&self.name), writes: &b.writes, ups: &b.fe2_up, dep: xdep, why: xwhy, images: b.xq.2, pre_on_c });
             let note_gate = super::fe2::c4_on().then(|| NOTE_GATE.read_recursive());
             let mut acts: Vec<Action> = b.eager_action.into_iter().collect();
+            // (Its write-backs without an import: stored first, `fe2::store_fallback`.)
+            let fb_id = b.fallback.map(|f| {
+                let id = f.id();
+                acts.insert(0, Box::new(move || super::fe2::store_fallback(f)));
+                id
+            });
             // (A prologue on the compute queue: its uploads count once it completed.)
             if pre_on_c && !b.fe2_up.is_empty() {
                 let (up, gens) = (b.fe2_up.clone(), self.fe2_gens.clone());
@@ -19502,6 +19573,10 @@ impl Exec {
                 l.push_back((seq, cpu_wait));
             }
             self.slots[b.slot].seq = seq;
+            if let Some(id) = fb_id {
+                super::fe2::fallback_pushed(id, seq);
+                self.cpu_action_seq = self.cpu_action_seq.max(seq);
+            }
             if !b.fe2_up.is_empty() && !pre_on_c {
                 super::fe2::uploaded(&b.fe2_up, &self.fe2_gens, fe2_ep);
             }

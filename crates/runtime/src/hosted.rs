@@ -318,6 +318,11 @@ pub fn arm_lock() -> parking_lot::ReentrantMutexGuard<'static, ()> {
     ARM_LOCK.lock()
 }
 
+/// `arm_lock` within `d`, else None.
+pub fn try_arm_lock_for(d: std::time::Duration) -> Option<parking_lot::ReentrantMutexGuard<'static, ()>> {
+    ARM_LOCK.try_lock_for(d)
+}
+
 /// Arms guest [base, base+len) (whole pages) against writes: its bits set,
 /// then read-only.
 pub fn arm(base: u64, len: u64) -> Result<(), String> {

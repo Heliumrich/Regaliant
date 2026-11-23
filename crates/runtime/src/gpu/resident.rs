@@ -1476,6 +1476,11 @@ pub fn arm_guard() -> parking_lot::RwLockReadGuard<'static, ()> {
     ARM_LOCK.read_recursive()
 }
 
+/// `arm_guard` within `d`, else None.
+pub fn try_arm_guard_for(d: std::time::Duration) -> Option<parking_lot::RwLockReadGuard<'static, ()>> {
+    ARM_LOCK.try_read_recursive_for(d)
+}
+
 /// The mirror: a sparse buffer over [MIRROR_BASE, MIRROR_END).
 struct Mirror {
     buf: vk::Buffer,
