@@ -7,7 +7,6 @@ use crate::hle::Registry;
 use crate::{fixed, reg, sysv};
 use parking_lot::Mutex;
 use std::time::{Duration, Instant};
-use windows_sys::Win32::UI::Input::XboxController::{XInputSetState, XINPUT_VIBRATION};
 
 // ---------------------------------------------------------------------------
 // AudioOut
@@ -311,7 +310,7 @@ sysv! {
     // ---- Pad
     fn scePadOpen(user: i32, kind: i32, index: i32, param: *const u8) -> i32 {
         if user != super::app::USER_ID { return 0x80920005u32 as i32; }
-        crate::info!("scePadOpen user {user} type {kind} index {index} -> 1 (XInput {}; keyboard via window)", if crate::input::xinput_state().is_some() { "connected" } else { "not detected" });
+        crate::info!("scePadOpen user {user} type {kind} index {index} -> 1 (a controller {}; keyboard via window)", if crate::input::xinput_state().is_some() { "connected" } else { "not connected yet" });
         1
     }
     fn scePadReadState(h: i32, data: *mut PadData) -> i32 {
@@ -332,9 +331,15 @@ sysv! {
         if user != super::app::USER_ID { return 0x80920005u32 as i32; }
         1
     }
-    /// DualSense light bar / adaptive triggers / motion sensors: accepted; the host
-    /// controller (XInput) has no equivalent (logged once).
-    fn scePadSetLightBar(h: i32, color: *const u8) -> i32 { crate::hle::stub_log("scePadSetLightBar (no host light bar)", 0); 0 }
+    /// The light bar's colour (ScePadLightBarParam: red, green, blue): a PlayStation controller's
+    /// light bar (`pspad`); XInput controllers have none. Adaptive triggers and motion sensors:
+    /// accepted, not mapped (logged once).
+    fn scePadSetLightBar(h: i32, color: *const u8) -> i32 {
+        if !color.is_null() && !crate::input::SYSTEM_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::pspad::set_lightbar(Some([*color, *color.add(1), *color.add(2)]));
+        }
+        0
+    }
     fn scePadSetTriggerEffect(h: i32, param: *const u8) -> i32 { crate::hle::stub_log("scePadSetTriggerEffect (no adaptive triggers on the host pad)", 0); 0 }
     fn scePadSetMotionSensorState(h: i32, enable: i32) -> i32 { crate::hle::stub_log("scePadSetMotionSensorState (no motion sensors mapped)", 0); 0 }
     fn scePadGetControllerInformation(h: i32, info: *mut u8) -> i32 {
@@ -352,9 +357,9 @@ sysv! {
     }
     fn scePadSetVibration(h: i32, param: *const u8) -> i32 {
         // (The shader preparation's self-play leaves the player's controller alone.)
+        // (Every controller: the XInput ones and the PlayStation ones, `input::rumble`.)
         if !param.is_null() && !crate::input::SYSTEM_OFF.load(std::sync::atomic::Ordering::Relaxed) {
-            let mut v = XINPUT_VIBRATION { wLeftMotorSpeed: (*param as u16) * 257, wRightMotorSpeed: (*param.add(1) as u16) * 257 };
-            XInputSetState(0, &mut v);
+            crate::input::rumble((*param as u16) * 257, (*param.add(1) as u16) * 257);
         }
         0
     }

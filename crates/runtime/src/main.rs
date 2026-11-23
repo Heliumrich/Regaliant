@@ -23,6 +23,7 @@ mod hostload;
 mod hle;
 mod input;
 mod loader;
+mod pspad;
 mod mem;
 mod sections;
 mod spatial;
@@ -2080,6 +2081,8 @@ pub fn hung(why: &str, code: i32) -> ! {
 }
 
 pub fn shutdown(code: i32) -> ! {
+    // (A PlayStation controller keeps its last vibration after the game ends otherwise.)
+    pspad::motors_off();
     display::restore_on_exit();
     session_ended();
     hle::libs::videoout::wait_shots();
@@ -2129,6 +2132,13 @@ fn read_proc_param(m: &loader::LoadedModule) -> (u64, String, i32) {
 }
 
 fn main() {
+    // Per-monitor DPI awareness for the whole process, before any window, monitor or surface is
+    // asked about (a player's report, 2026-11-23: at 175% Windows scaling the picture covered the
+    // top-left 2194x1234 of a 3840x2160 fullscreen. Only the window's thread was aware; the
+    // swapchain, made on the vblank thread, took the surface's size as Windows scales it for an
+    // unaware thread).
+    let aware = unsafe { windows_sys::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(windows_sys::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) } != 0;
+    gpu::vk::window::PROCESS_DPI_AWARE.store(aware, std::sync::atomic::Ordering::Relaxed);
     // A run without a window (the launcher's preparation and checks, the drivers' runs) known
     // from the command line before anything can fail: no message box (`player_error`) and none
     // of Windows' own error popups, which a hidden run would leave waiting for a click (the

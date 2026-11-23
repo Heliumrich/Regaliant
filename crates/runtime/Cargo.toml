@@ -63,6 +63,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Cryptography_Catalog",
     "Win32_Security_Cryptography_Sip",
     "Win32_Security_WinTrust",
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_System_IO",
 ] }
 
 [build-dependencies]

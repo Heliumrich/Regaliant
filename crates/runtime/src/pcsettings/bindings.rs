@@ -156,7 +156,8 @@ pub fn capture_option() -> u32 {
 /// The controller rows' options: the pad buttons (`input::PAD_BUTTONS`), then "-" (a target no
 /// button has: a file edited so) and "Press a button".
 pub fn pad_options() -> Vec<String> {
-    input::PAD_BUTTONS.iter().map(|(_, label, _)| label.to_string()).chain(["-".to_string(), "Press a button".to_string()]).collect()
+    // (A PlayStation controller in use: its buttons' names, `input::pad_label`.)
+    (0..input::PAD_BUTTONS.len()).map(|i| input::pad_label(i).to_string()).chain(["-".to_string(), "Press a button".to_string()]).collect()
 }
 
 /// The controller rows' "-" and "Press a button" options.

@@ -333,14 +333,23 @@ pub static MODE: AtomicU8 = AtomicU8::new(0);
 fn shown() -> u8 {
     match MODE.load(Relaxed) {
         m @ 1..=3 => m,
+        // (A PlayStation controller in use shows the title's own glyphs, since 2026-11-23.)
         _ => match input::last_device() {
             input::DEVICE_KBM => 3,
-            input::DEVICE_PAD => 2,
-            _ => {
-                if input::pad_connected() {
-                    2
+            input::DEVICE_PAD => {
+                if input::pad_is_playstation() {
+                    1
                 } else {
+                    2
+                }
+            }
+            _ => {
+                if !input::pad_connected() {
                     3
+                } else if input::pad_is_playstation() {
+                    1
+                } else {
+                    2
                 }
             }
         },

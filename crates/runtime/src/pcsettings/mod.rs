@@ -1036,7 +1036,7 @@ fn pad_binding_items() -> Vec<Item> {
         .map(|(n, (_, name))| Item {
             id: format!("PadBind{n}"),
             label: name.to_string(),
-            tooltip: "Press A, then the new button. Esc cancels.".into(),
+            tooltip: "Press A or Cross, then the new button. Esc cancels.".into(),
             kind: ItemKind::PadBinding(n as u16),
         })
         .collect()

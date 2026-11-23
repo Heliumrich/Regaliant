@@ -47,6 +47,9 @@ pub struct Window {
 static WINDOW: OnceLock<Window> = OnceLock::new();
 pub static CLOSED: AtomicBool = AtomicBool::new(false);
 pub static RESIZED: AtomicBool = AtomicBool::new(false);
+/// The whole process was made per-monitor DPI aware at its start (`main`): every thread sees
+/// the screen's real pixels, the swapchain's thread too.
+pub static PROCESS_DPI_AWARE: AtomicBool = AtomicBool::new(false);
 pub static CLIENT_W: AtomicU32 = AtomicU32::new(1280);
 pub static CLIENT_H: AtomicU32 = AtomicU32::new(720);
 /// Virtual-key states (true = down).
@@ -801,7 +804,12 @@ unsafe fn place_initial(hwnd: HWND, style: WINDOW_STYLE, width: u32, height: u32
         GetClientRect(hwnd, &mut c);
         CLIENT_W.store((c.right - c.left).max(1) as u32, Ordering::Relaxed);
         CLIENT_H.store((c.bottom - c.top).max(1) as u32, Ordering::Relaxed);
-        crate::info!("window: client {}x{} at DPI {dpi}", c.right - c.left, c.bottom - c.top);
+        crate::info!(
+            "window: client {}x{} at DPI {dpi} (the process {})",
+            c.right - c.left,
+            c.bottom - c.top,
+            if PROCESS_DPI_AWARE.load(Ordering::Relaxed) { "per-monitor DPI aware" } else { "not DPI aware: Windows scaling may shrink the picture" }
+        );
     }
 }
 

@@ -28,7 +28,7 @@ This is an early version.
 - A frame rate limit of 30, 60 or uncapped. The game keeps its normal speed at any frame rate.
 - Even frame pacing at any refresh rate, with G-SYNC and FreeSync.
 - Keyboard and mouse with raw mouse look, a mouse pointer in menus and prompts for the keys you bound. Every key can be changed in the game.
-- Xbox controllers with Xbox button prompts.
+- Xbox and PlayStation controllers with their own button prompts. A DualSense works directly over USB or Bluetooth, without Steam Input.
 - 5.1 and 7.1 sound, and headphone output of the game's 3D sound, also through Windows Sonic or Dolby Atmos for Headphones.
 - Trophies as achievements with a pop-up and a list.
 - A launcher that checks your game files, sets the display before the game starts, prepares the shaders ahead (the game plays itself in the background, hidden and silent, once: about an hour on a fast PC, longer on others), backs up and restores saves, and offers a safe mode.

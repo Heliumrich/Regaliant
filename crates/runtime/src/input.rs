@@ -24,7 +24,7 @@ use std::collections::VecDeque;
 use std::sync::OnceLock;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
-use windows_sys::Win32::UI::Input::XboxController::{XINPUT_STATE, XInputGetState};
+use windows_sys::Win32::UI::Input::XboxController::{XINPUT_GAMEPAD, XINPUT_STATE, XINPUT_VIBRATION, XInputGetState, XInputSetState};
 
 pub const BTN_L3: u32 = 0x2;
 pub const BTN_R3: u32 = 0x4;
@@ -403,24 +403,145 @@ fn scripted(st: &mut PadState, flip: u64, quiet: bool) {
 /// and sticks given through `press_for`, `hold_stick` and the control channel still reach the game.
 pub static SYSTEM_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The XInput controllers seen: connected at the last ask, their report number when found,
+/// whether they changed since (in use), and when a missing one is asked for again.
+struct Xi {
+    on: [bool; 4],
+    first: [u32; 4],
+    active: [bool; 4],
+    retry: [Option<Instant>; 4],
+}
+static XI: Mutex<Xi> = Mutex::new(Xi { on: [false; 4], first: [0; 4], active: [false; 4], retry: [None; 4] });
+/// The XInput controllers connected at the last poll (bit i: user index i): the vibration goes
+/// to each.
+static XI_ON: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// The pad in use is a PlayStation controller: the prompts and the bindings name its buttons.
+static PAD_PS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The pad in use is a PlayStation controller (read directly or behind Steam Input's pad).
+pub fn pad_is_playstation() -> bool {
+    PAD_PS.load(Relaxed)
+}
+
+/// A controller's input past the dead zones: a button, a trigger past 40 of 255, a stick.
+fn pad_busy(g: &XINPUT_GAMEPAD) -> bool {
+    let stick = |v: i16| (v as i32).abs() > 12000;
+    g.wButtons != 0 || g.bLeftTrigger > 40 || g.bRightTrigger > 40 || stick(g.sThumbLX) || stick(g.sThumbLY) || stick(g.sThumbRX) || stick(g.sThumbRY)
+}
+
+/// `g` into the merged pad `m`: its buttons, each trigger's and each stick's strongest.
+fn pad_merge(m: &mut XINPUT_GAMEPAD, g: &XINPUT_GAMEPAD) {
+    m.wButtons |= g.wButtons;
+    m.bLeftTrigger = m.bLeftTrigger.max(g.bLeftTrigger);
+    m.bRightTrigger = m.bRightTrigger.max(g.bRightTrigger);
+    let far = |x: i16, y: i16| (x as i32).abs() + (y as i32).abs();
+    if far(g.sThumbLX, g.sThumbLY) > far(m.sThumbLX, m.sThumbLY) {
+        (m.sThumbLX, m.sThumbLY) = (g.sThumbLX, g.sThumbLY);
+    }
+    if far(g.sThumbRX, g.sThumbRY) > far(m.sThumbRX, m.sThumbRY) {
+        (m.sThumbRX, m.sThumbRY) = (g.sThumbRX, g.sThumbRY);
+    }
+}
+
+/// Every controller as one pad (the game's one player): the XInput controllers (Xbox and
+/// compatible, Steam Input's and DS4Windows' virtual pads too) and the PlayStation controllers
+/// read directly (`pspad`, since 2026-11-23: no Steam Input needed), the buttons of all, each
+/// trigger's and each stick's strongest. A controller counts once its state has changed since it
+/// was found, so a device that only ever reports one state (a stuck trigger or stick) does not
+/// drive the game, and a second device for the same controller (Steam Input's pad beside the
+/// DualSense itself) presses nothing twice. None when no controller is connected.
 pub fn xinput_state() -> Option<XINPUT_STATE> {
     if SYSTEM_OFF.load(Relaxed) {
         return None;
     }
-    for i in 0..4 {
+    let mut x = XI.lock();
+    let now = Instant::now();
+    let mut any = false;
+    let mut m: XINPUT_GAMEPAD = unsafe { std::mem::zeroed() };
+    let mut packets = 0u32;
+    let (mut used_ps, mut used_xbox) = (false, false);
+    let mut bits = 0u32;
+    for i in 0..4usize {
+        if !x.on[i] && x.retry[i].is_some_and(|t| now < t) {
+            continue;
+        }
         let mut s: XINPUT_STATE = unsafe { std::mem::zeroed() };
-        if unsafe { XInputGetState(i, &mut s) } == 0 {
-            PAD_INDEX.store(i, Relaxed);
-            return Some(s);
+        let on = unsafe { XInputGetState(i as u32, &mut s) } == 0;
+        if on {
+            bits |= 1 << i;
+            any = true;
+            if !x.on[i] {
+                x.first[i] = s.dwPacketNumber;
+                x.active[i] = false;
+                crate::info!("controller: XInput controller {i} connected");
+            } else if s.dwPacketNumber != x.first[i] {
+                x.active[i] = true;
+            }
+            if x.active[i] {
+                pad_merge(&mut m, &s.Gamepad);
+                packets = packets.wrapping_add(s.dwPacketNumber);
+                used_xbox |= pad_busy(&s.Gamepad);
+            }
+        } else {
+            if x.on[i] {
+                crate::info!("controller: XInput controller {i} disconnected");
+            }
+            // (Asking for a controller that is not there can take long: once a second.)
+            x.retry[i] = Some(now + Duration::from_secs(1));
+        }
+        x.on[i] = on;
+    }
+    drop(x);
+    for p in crate::pspad::states() {
+        any = true;
+        if p.active {
+            let g = XINPUT_GAMEPAD { wButtons: p.pad.buttons, bLeftTrigger: p.pad.lt, bRightTrigger: p.pad.rt, sThumbLX: p.pad.lx, sThumbLY: p.pad.ly, sThumbRX: p.pad.rx, sThumbRY: p.pad.ry };
+            pad_merge(&mut m, &g);
+            packets = packets.wrapping_add(p.packet);
+            used_ps |= pad_busy(&g);
         }
     }
-    None
+    XI_ON.store(bits, Relaxed);
+    // The kind of pad in use: the one with input now, a PlayStation controller first (Steam
+    // Input's pad for the same controller has the same input); with none yet, a PlayStation
+    // controller alone counts as one.
+    if used_ps || (!used_xbox && bits == 0 && any) {
+        PAD_PS.store(true, Relaxed);
+    } else if used_xbox {
+        PAD_PS.store(false, Relaxed);
+    }
+    any.then_some(XINPUT_STATE { dwPacketNumber: packets, Gamepad: m })
 }
 
-/// The XInput user index the pad answered at (the rumble goes there).
-static PAD_INDEX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// The motor speeds set last (left << 16 | right).
 static RUMBLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The motors of every controller (XInput's speeds; left the strong motor): the XInput
+/// controllers connected and the PlayStation controllers (`pspad`). Speeds already set are not
+/// sent again.
+pub fn rumble(left: u16, right: u16) {
+    let packed = (left as u32) << 16 | right as u32;
+    if RUMBLE.swap(packed, Relaxed) == packed {
+        return;
+    }
+    let bits = XI_ON.load(Relaxed);
+    for i in 0..4u32 {
+        if bits & (1 << i) != 0 {
+            let mut v = XINPUT_VIBRATION { wLeftMotorSpeed: left, wRightMotorSpeed: right };
+            unsafe { XInputSetState(i, &mut v) };
+        }
+    }
+    crate::pspad::set_motors((left >> 8) as u8, (right >> 8) as u8);
+}
+
+/// The pad buttons' names on a PlayStation controller (`PAD_BUTTONS` order).
+pub const PS_LABELS: [&str; 16] =
+    ["Cross", "Circle", "Square", "Triangle", "L1", "R1", "L2", "R2", "L3", "R3", "Touch Pad", "Options", "D-pad Up", "D-pad Down", "D-pad Left", "D-pad Right"];
+
+/// Pad button `i`'s name on the controller in use (`PAD_BUTTONS` order).
+pub fn pad_label(i: usize) -> &'static str {
+    if pad_is_playstation() { PS_LABELS.get(i).copied().unwrap_or("?") } else { PAD_BUTTONS.get(i).map(|b| b.1).unwrap_or("?") }
+}
 
 /// The title's haptic waveform (the DualSense actuators' audio port, `audio2`), one grain's RMS per
 /// side (0 to 1 full scale): an Xbox controller's motors at that strength (left the heavy
@@ -435,13 +556,7 @@ pub fn haptics(left: f32, right: f32) {
         let x = (rms * 4.5).clamp(0.0, 1.0).powf(0.8);
         if x < 0.06 { 0 } else { (x * 65535.0) as u16 }
     };
-    let (l, r) = (speed(left), speed(right));
-    let packed = (l as u32) << 16 | r as u32;
-    if RUMBLE.swap(packed, Relaxed) == packed {
-        return;
-    }
-    let mut v = windows_sys::Win32::UI::Input::XboxController::XINPUT_VIBRATION { wLeftMotorSpeed: l, wRightMotorSpeed: r };
-    unsafe { windows_sys::Win32::UI::Input::XboxController::XInputSetState(PAD_INDEX.load(Relaxed), &mut v) };
+    rumble(speed(left), speed(right));
 }
 
 fn axis(v: i16, invert: bool) -> u8 {

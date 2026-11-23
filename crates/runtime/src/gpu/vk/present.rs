@@ -383,6 +383,19 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
         if extent.width == 0 || extent.height == 0 {
             return Err("window minimized".into());
         }
+        // (The surface's size against the window's client, measured on the window's thread: they
+        // differ when Windows scales the size for this thread, as on 2026-11-23 before the process
+        // was made DPI aware; the swapchain must take the surface's. Logged once per size, five
+        // times at most: a resize in progress can differ for a moment too.)
+        {
+            static WARNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            static TIMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let (cw, ch) = (window::CLIENT_W.load(std::sync::atomic::Ordering::Relaxed), window::CLIENT_H.load(std::sync::atomic::Ordering::Relaxed));
+            let key = (extent.width as u64) << 32 | extent.height as u64;
+            if (cw, ch) != (extent.width, extent.height) && WARNED.swap(key, std::sync::atomic::Ordering::Relaxed) != key && TIMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
+                crate::warn!("swapchain: the surface is {}x{}, the window's client {cw}x{ch} (Windows display scaling applied to this thread?)", extent.width, extent.height);
+            }
+        }
         let count = (caps.min_image_count + 1).min(if caps.max_image_count == 0 { u32::MAX } else { caps.max_image_count });
         let old = p.swapchain;
         // Exclusive fullscreen: held by the swapchain when the window asks for it (the PC tab's

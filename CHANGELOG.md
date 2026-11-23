@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- PlayStation controllers work directly, without Steam Input: DualSense, DualSense Edge and
+  DUALSHOCK 4, over USB or Bluetooth, also when connected while the game runs. While you use one,
+  the game shows its own PlayStation buttons. Vibration and the light bar work on them.
+- All connected controllers play together as one pad. Before, only the first Xbox controller was
+  read.
+- Fullscreen fills the whole screen when Windows display scaling is above 100%. Before, the picture
+  could cover only the top-left part of the screen, as on a 4K screen at 175%.
+
 ## 0.1.0
 
 The first version of Regaliant. It runs the PS5 game Demon's Souls (PPSA01341, version 01.007.000) from the

@@ -44,9 +44,10 @@ Getting started
 
 Controls
 --------
-Controllers: Xbox controllers and other XInput controllers. A DualSense or DualShock 4 works
-through Steam Input, which presents it as an Xbox controller. The prompts show the
-controller's own buttons.
+Controllers: Xbox and other XInput controllers, and PlayStation controllers (DualSense,
+DualSense Edge, DUALSHOCK 4) over USB or Bluetooth, without Steam Input. Connect them at any
+time. All connected controllers play as one. The prompts show the controller's own buttons.
+Vibration works on both, and a PlayStation controller's light bar follows the game.
 
 Keyboard and mouse (defaults, Dark Souls III-style):
   W A S D            move                      Left Alt         walk
