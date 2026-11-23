@@ -33,9 +33,14 @@ This is an early version.
 - Trophies as achievements with a pop-up and a list.
 - A launcher that checks your game files, sets the display before the game starts, prepares the shaders ahead (the game plays itself in the background, hidden and silent, once: about an hour on a fast PC, longer on others), backs up and restores saves, and offers a safe mode.
 
+## Performance
+
+The game runs at 60 fps or close to it in many places, and lower in the busiest ones: about 40 to 55 fps there on the main test PC (Ryzen 9 5900X, RTX 4090). The processor's single-core speed matters most.
+
+Shader preparation happens once. The first time you press Play, the game plays itself in the background, hidden and silent, to prepare its shaders: about an hour on a fast PC, longer on others. After that the game starts right away. After a graphics driver or port update, the launcher only compiles them again, without the self-play.
+
 ## Known issues
 
-- The frame rate is below 60 in the busiest places: about 40 to 55 fps on the tested PC.
 - In a window on a 144 or 165 Hz screen the game shows an even 48 or 55 fps. Borderless or fullscreen with G-SYNC or FreeSync, or a 120 Hz screen, gives 60 ([more](docs/settings.md#frame-rate-and-refresh-rate)).
 - Shaders the preparation did not meet (rare effects, spells) still compile on first sight, and a level's first arrival can pause briefly.
 - A full playthrough has not been tested.
