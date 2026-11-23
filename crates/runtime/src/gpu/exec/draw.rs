@@ -1841,6 +1841,10 @@ impl Exec {
             }
             Ok(false) => {
                 DRAW_NOOP.fetch_add(1, Ordering::Relaxed);
+                // (Nothing recorded: the last recorded draw is no longer this state's, so the
+                // next draw is not its repeat (`draw_repeat_cpu`); a dropped absurd draw's
+                // followers went that way unchecked: the review of 2026-11-23.)
+                self.repeat = None;
                 "no effect".into()
             }
             Err(e) if e == super::STOPPED => "stopped (parallel run)".into(),
@@ -1895,6 +1899,14 @@ impl Exec {
         if count == 0 || instances == 0 {
             // Nothing to draw (the full path's "no effect").
             DRAW_NOOP.fetch_add(1, Ordering::Relaxed);
+            self.repeat = Some(r);
+            return true;
+        }
+        // (A draw of absurd size dropped here too, as on the full path: `ABSURD_DRAW`.)
+        if count as u64 * instances as u64 >= ABSURD_DRAW {
+            if ABSURD_DROPPED.fetch_add(1, Ordering::Relaxed) < 16 {
+                crate::warn!("gpu[{}]: a repeated draw of {count} x {instances} vertex invocations: dropped", self.name);
+            }
             self.repeat = Some(r);
             return true;
         }

@@ -2788,14 +2788,6 @@ fn window_cold(start: u64, end: u64, flips: u32, oldest_open: u64) -> bool {
     if start < crate::mem::GUEST_BASE || end > crate::mem::GUEST_END || end <= start {
         return false;
     }
-    // (A window holding front end 4's pages is never cold: left out after a remap or dropped by
-    // the eviction, its held pages had no import to be released through, and each such release
-    // copied through host memory with every other thread suspended: 60-555 ms frames with the
-    // audio running dry on the full card, up to 34 s in all in a 16 GB boot. Before these rules,
-    // 4 runs of 428 met that path. FINDINGS.md 2026-11-23.)
-    if super::fe2::c4_any_held(start, end) {
-        return false;
-    }
     let now = super::FRAMES.load(Ordering::Relaxed);
     if now < flips as u64 {
         return false;
@@ -2803,10 +2795,17 @@ fn window_cold(start: u64, end: u64, flips: u32, oldest_open: u64) -> bool {
     let now = now as u32;
     let w = window_bytes();
     let (uses, gens) = (win_use(), win_gen());
-    ((start - crate::mem::GUEST_BASE) / w..=(end - 1 - crate::mem::GUEST_BASE) / w).all(|i| {
+    let unused = ((start - crate::mem::GUEST_BASE) / w..=(end - 1 - crate::mem::GUEST_BASE) / w).all(|i| {
         uses.get(i as usize).is_some_and(|a| now.wrapping_sub(a.load(Ordering::Acquire)) as i32 >= flips as i32)
             && gens.get(i as usize).is_some_and(|g| g.load(Ordering::Acquire) < oldest_open)
-    })
+    });
+    // (A window holding front end 4's pages is never cold: left out after a remap or dropped by
+    // the eviction, its held pages had no import to be released through, and each such release
+    // copied through host memory with every other thread suspended: 60-555 ms frames with the
+    // audio running dry on the full card, up to 34 s in all in a 16 GB boot. Before these rules,
+    // 4 runs of 428 met that path. FINDINGS.md 2026-11-23. Asked last: the held map's scan costs
+    // more than the stamps.)
+    unused && !super::fe2::c4_any_held(start, end)
 }
 
 /// Flips since the last use of any import window over [start, end) (`WIN_USE`; 0 outside guest
