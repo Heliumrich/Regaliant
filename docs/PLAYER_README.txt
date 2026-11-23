@@ -1,4 +1,4 @@
-Regaliant 0.1.1 - an unofficial PC port of Demon's Souls for Windows (64-bit)
+Regaliant 0.1.2 - an unofficial PC port of Demon's Souls for Windows (64-bit)
 =============================================================================
 
 Regaliant is an unofficial PC port of Demon's Souls (PS5, PPSA01341). It is not rebuilt from the game's
@@ -136,7 +136,8 @@ The launcher
   as a backup first.
 - Reset settings puts the PC settings, display choices and key bindings back to their
   defaults. The old files are kept as .bak files.
-- Open logs opens the folder with each session's log.
+- Open logs opens the logs folder with the newest session's folder selected. The launcher's own
+  quick checks keep their logs in its checks folder.
 
 
 Saving disk space
