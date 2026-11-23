@@ -1,37 +1,5 @@
 # Changelog
 
-## Unreleased
-
-- A shorter freeze when the world first appears after loading a save: large textures the game
-  creates while arriving are prepared on the graphics card again.
-- 3D textures are prepared on the graphics card, which takes work off the processor while playing.
-- Fewer crashes while shaders are prepared: a shader whose preparation crashed the graphics
-  driver is not prepared ahead again.
-- No more flicker right after loading: the world no longer vanishes in every other frame for
-  a moment.
-- Smoother frame rates where many shadows are drawn: clearing shadows no longer stalls the
-  graphics card.
-- No more flicker while turning the camera at the start of the first level.
-- The shader preparation finishes on more PCs. Pressing Prepare or Play while the launcher
-  checks the game now waits for the check. An old preparation is never taken as done.
-- When the graphics driver crashes on a shader, the preparation leaves that shader out and goes
-  on. Play does the same.
-- When the graphics card runs out of memory, the game no longer slows to a crawl or stops
-  responding.
-- When graphics memory runs short, textures now go to system memory instead of being left out,
-  so the picture stays whole. The frame rate can drop in busy places.
-- Graphics cards with 4 to 6 GB of video memory: the game runs there and draws the whole
-  picture, slowly. On cards with 4 or 5 GB, large images stay in system memory from the start.
-- Fixed a crash when graphics memory ran out while the game made room for its work.
-- The launcher says what to expect on a card with little video memory.
-- A long preparation that runs short of graphics memory goes on in a fresh session.
-- PCs with 16 GB of memory: in a simulation of one, the game no longer freezes at level loads.
-  When the graphics card's share of memory runs short, the game frees memory it has not used
-  lately.
-- A preparation step that finished its work is no longer run again when it is slow to close.
-- Prepare now on prepared shaders gives shaders that once crashed the graphics driver another
-  chance.
-
 ## 0.1.0
 
 The first version of Regaliant. It runs the PS5 game Demon's Souls (PPSA01341, version 01.007.000) from the
@@ -69,3 +37,35 @@ player's own game files on Windows.
   preparing, and a preparation stops when the battery runs low.
 - Trophies as achievements with a pop-up and a list.
 - Saves are backed up before each session changes them.
+
+Fixed and added while 0.1.0 was prepared, before it was published:
+
+- A shorter freeze when the world first appears after loading a save: large textures the game
+  creates while arriving are prepared on the graphics card again.
+- 3D textures are prepared on the graphics card, which takes work off the processor while playing.
+- Fewer crashes while shaders are prepared: a shader whose preparation crashed the graphics
+  driver is not prepared ahead again.
+- No more flicker right after loading: the world no longer vanishes in every other frame for
+  a moment.
+- Smoother frame rates where many shadows are drawn: clearing shadows no longer stalls the
+  graphics card.
+- No more flicker while turning the camera at the start of the first level.
+- The shader preparation finishes on more PCs. Pressing Prepare or Play while the launcher
+  checks the game now waits for the check. An old preparation is never taken as done.
+- When the graphics driver crashes on a shader, the preparation leaves that shader out and goes
+  on. Play does the same.
+- When the graphics card runs out of memory, the game no longer slows to a crawl or stops
+  responding.
+- When graphics memory runs short, textures now go to system memory instead of being left out,
+  so the picture stays whole. The frame rate can drop in busy places.
+- Graphics cards with 4 to 6 GB of video memory: the game runs there and draws the whole
+  picture, slowly. On cards with 4 or 5 GB, large images stay in system memory from the start.
+- Fixed a crash when graphics memory ran out while the game made room for its work.
+- The launcher says what to expect on a card with little video memory.
+- A long preparation that runs short of graphics memory goes on in a fresh session.
+- PCs with 16 GB of memory: in a simulation of one, the game no longer freezes at level loads.
+  When the graphics card's share of memory runs short, the game frees memory it has not used
+  lately.
+- A preparation step that finished its work is no longer run again when it is slow to close.
+- Prepare now on prepared shaders gives shaders that once crashed the graphics driver another
+  chance.
