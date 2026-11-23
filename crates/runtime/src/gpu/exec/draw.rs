@@ -401,7 +401,7 @@ impl Exec {
         }
         let ps = ((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8;
         crate::warn!(
-            "gpu[{}]: a draw of {} x {} vertex invocations at packet {:#x} (vs {:#x} ps {ps:#x}, index {:?}, base vertex {:?}, first instance {})",
+            "gpu[{}]: a draw of {} x {} vertex invocations at packet {:#x} (vs {:#x} ps {ps:#x}, index {:?}, base vertex {:?}, first instance {}){}",
             self.name,
             a.count,
             a.instances,
@@ -409,10 +409,18 @@ impl Exec {
             shaders::ngg_addr(cp),
             a.index,
             a.base_vertex,
-            a.first_instance
+            a.first_instance,
+            if a.count as u64 * a.instances as u64 >= ABSURD_DRAW { ": dropped" } else { "" }
         );
     }
 }
+
+/// Vertex invocations (count x instances) from which a draw is dropped (`ABSURD_DROPPED`): no frame
+/// of the title draws a billion vertices, and such a draw, its count read from stale data, held
+/// the GPU until the device was lost (2026-11-23, a failing 16 GB first session: 1,056,800,768 x
+/// 1,029 at a level load).
+const ABSURD_DRAW: u64 = 1 << 30;
+pub static ABSURD_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// `draw` outcome when the vertex stage needs the start instance on the CPU
 /// (`shaders::uses_user_word`): the command processor reads the arguments
@@ -2156,6 +2164,10 @@ impl Exec {
         // ~20-draw worker batches of 385-487 ms each, unexplained.
         if a.count as u64 * a.instances as u64 >= HUGE_DRAW {
             self.note_huge_draw(cp, a);
+            if a.count as u64 * a.instances as u64 >= ABSURD_DRAW {
+                ABSURD_DROPPED.fetch_add(1, Ordering::Relaxed);
+                return Ok(false);
+            }
         }
         // Phase times (DS_PROFILE_GPU only: a clock read costs ~20 ns).
         let t0 = super::profiling().then(std::time::Instant::now);

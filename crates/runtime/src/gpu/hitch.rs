@@ -402,6 +402,12 @@ pub fn note(kind: Kind, start: u64, end: u64, what: impl FnOnce() -> String) {
     s.events.push_back(e);
 }
 
+/// How many of a hitch's longest events its line names (`DS_HITCH_TOP=<n>`, diagnosis; 4).
+fn shown_top() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("DS_HITCH_TOP").ok().and_then(|v| v.parse().ok()).unwrap_or(4).clamp(1, 200))
+}
+
 /// `note` for work that started at `t0` and ends now.
 pub fn note_since(kind: Kind, t0: std::time::Instant, what: impl FnOnce() -> String) {
     let us = t0.elapsed().as_micros() as u64;
@@ -480,9 +486,10 @@ pub fn flip(n: u64, us: u64) {
     // of them is (background compiles at a level load crowd out what the
     // command processors met).
     let background = |e: &Event| e.thread.starts_with("gpu-compile") || e.thread.starts_with("gpu-async") || e.thread.starts_with("gpu-precompile");
-    let mut shown: Vec<&(u64, &Event)> = over.iter().take(4).collect();
+    let top = shown_top();
+    let mut shown: Vec<&(u64, &Event)> = over.iter().take(top).collect();
     if shown.iter().all(|x| background(x.1)) {
-        shown.extend(over.iter().skip(4).find(|x| !background(x.1)));
+        shown.extend(over.iter().skip(top).find(|x| !background(x.1)));
     }
     let longest: Vec<String> = shown.iter().map(|(o, e)| format!("{} {:.0} ms on {} ({})", NAMES[e.kind as usize], *o as f64 / 1e3, e.thread, e.what)).collect();
     crate::info!(
