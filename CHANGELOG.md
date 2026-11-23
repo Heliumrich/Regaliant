@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.2
 
 - On RTX 50-series graphics cards (and AMD and Intel ones) the game's shaders now tell the driver
   to keep each group of shader threads together after they take different paths. The game's
