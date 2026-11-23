@@ -41,7 +41,7 @@ body:
     id: logs
     attributes:
       label: Logs
-      description: In the launcher, click Open logs, zip the newest folder and drag the zip here.
+      description: In the launcher, click Open logs (the newest session's folder is selected), zip that folder and drag the zip here.
   - type: markdown
     attributes:
       value: Please don't share game files, keys, decrypted files or download links.

@@ -1728,16 +1728,17 @@ fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, 
             // (The barycentric geometry shader's version and inputs: pipelines
             // without one keep their fingerprints.)
             match bary_gs_of(key, vs, ps) {
-                Some((_, batch)) => crate::gpu::pcache::fingerprint(&[&vs.0.out.spirv, &gs, ps_code, &[BARY_GS_VERSION, batch as u32]]),
-                None => crate::gpu::pcache::fingerprint(&[&vs.0.out.spirv, &gs, ps_code]),
+                Some((_, batch)) => crate::gpu::pcache::translated_fingerprint(&[&vs.0.out.spirv, &gs, ps_code, &[BARY_GS_VERSION, batch as u32]]),
+                None => crate::gpu::pcache::translated_fingerprint(&[&vs.0.out.spirv, &gs, ps_code]),
             }
         };
         let _crumb = crate::gpu::pcache::Crumb::set(
             || format!("graphics pipeline g{hkey:016x}: vs {:#x} (translation {:016x}), ps {}, rect-list gs {:?}, barycentric gs {}", vs.1, vs.0.key, ps.map_or("none".to_string(), |p| format!("{:#x} (translation {:016x})", p.1, p.0.key)), key.rect_gs, bary_gs_of(key, vs, ps).is_some()),
             || {
-                let mut v = vec![("vs", vs.0.out.spirv.clone())];
+                // (The modules as the driver gets them: `module_code`'s declaration included.)
+                let mut v = vec![("vs", super::module_code(&vs.0.out.spirv).into_owned())];
                 if let Some(p) = ps {
-                    v.push(("ps", p.0.out.spirv.clone()));
+                    v.push(("ps", super::module_code(&p.0.out.spirv).into_owned()));
                 }
                 v
             },

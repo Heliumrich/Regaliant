@@ -239,6 +239,12 @@ pub fn open_path(p: &std::path::Path) {
     unsafe { windows_sys::Win32::UI::Shell::ShellExecuteW(std::ptr::null_mut(), op.as_ptr(), f.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL) };
 }
 
+/// Opens Explorer at the folder holding `item`, with `item` selected.
+pub fn select_path(item: &std::path::Path) {
+    let (op, exe, args) = (wide("open"), wide("explorer.exe"), wide(&format!("/select,\"{}\"", item.display())));
+    unsafe { windows_sys::Win32::UI::Shell::ShellExecuteW(std::ptr::null_mut(), op.as_ptr(), exe.as_ptr(), args.as_ptr(), std::ptr::null(), SW_SHOWNORMAL) };
+}
+
 /// Opens a web address in the default browser.
 pub fn open_url(u: &str) {
     let (op, f) = (wide("open"), wide(u));

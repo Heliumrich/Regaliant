@@ -184,6 +184,33 @@ fn modes_checked_on(vendor: u32, device: u32) -> bool {
     vendor == 0x10de && device < 0x2b80
 }
 
+/// Translated shaders declare maximal reconvergence (`exec::module_code`); set when the device is
+/// made.
+static MAX_RECONV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether every translated shader declares maximal reconvergence (`MaximallyReconvergesKHR`,
+/// VK_KHR_shader_maximal_reconvergence; `exec::module_code` adds it to each module). The
+/// translation assumes that a subgroup's invocations come back together at each structured merge
+/// (cross-lane reads after a lane-guarded region, the dispatcher's rounds: RENDERER.md "Wave
+/// semantics"), which Vulkan promises only to a shader declaring it; NVIDIA's compiler did so on
+/// the RTX 40 series without it. On an RTX 5090 and an RTX 5080 (driver 621.24) players saw the
+/// tunnel at the game's start black with what looked like exploding geometry, in 0.1.1 too, with
+/// every compute program in the portable translation (issue #4, 2026-11-24): on the designs the
+/// subgroup modes were not checked on (`subgroup_modes_checked`) shaders declare it since then.
+/// `DS_MAX_RECONV=1` / `0` forces it on or off where the device offers it.
+pub fn max_reconvergence() -> bool {
+    MAX_RECONV.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `DS_MAX_RECONV`: Some(on) when set to 1 or 0.
+fn max_reconv_forced() -> Option<bool> {
+    match std::env::var("DS_MAX_RECONV").ok().as_deref() {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    }
+}
+
 thread_local! {
     /// What this thread is creating (`creating`), for the validation
     /// layer's messages.
@@ -598,6 +625,41 @@ fn init_inner() -> Result<(), String> {
         if barycentric {
             dexts.push(ash::khr::fragment_shader_barycentric::NAME.as_ptr());
         }
+        // Maximal reconvergence (`max_reconvergence`): on the designs the subgroup modes were not
+        // checked on, or as `DS_MAX_RECONV` says, where the device offers it (with the subgroup
+        // uniform control flow extension it requires). Not enabled elsewhere: the device the
+        // checked designs' stored pipelines were made on stays as it was.
+        let mr_wanted = max_reconv_forced().unwrap_or(!checked);
+        let mr_offered = {
+            let exts = instance.enumerate_device_extension_properties(pdev).unwrap_or_default();
+            let has = |n: &CStr| exts.iter().any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == n);
+            if has(ash::khr::shader_maximal_reconvergence::NAME) && has(ash::khr::shader_subgroup_uniform_control_flow::NAME) {
+                let mut mr = vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR::default();
+                let mut ucf = vk::PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR::default();
+                let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut mr).push_next(&mut ucf);
+                instance.get_physical_device_features2(pdev, &mut f2);
+                mr.shader_maximal_reconvergence != 0 && ucf.shader_subgroup_uniform_control_flow != 0
+            } else {
+                false
+            }
+        };
+        let max_reconv = mr_wanted && mr_offered;
+        if max_reconv {
+            dexts.push(ash::khr::shader_subgroup_uniform_control_flow::NAME.as_ptr());
+            dexts.push(ash::khr::shader_maximal_reconvergence::NAME.as_ptr());
+        }
+        MAX_RECONV.store(max_reconv, std::sync::atomic::Ordering::Relaxed);
+        crate::info!(
+            "Vulkan: maximal reconvergence {} (offered {mr_offered}, wanted {mr_wanted}: {}; DS_MAX_RECONV=1 or 0 overrides)",
+            if max_reconv { "on: every translated shader declares it" } else { "off" },
+            match max_reconv_forced() {
+                Some(_) => "DS_MAX_RECONV",
+                None if checked => "a design the translation was checked on",
+                None => "a design the translation was not checked on",
+            }
+        );
+        let mut mr_f = vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR::default().shader_maximal_reconvergence(true);
+        let mut ucf_f = vk::PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR::default().shader_subgroup_uniform_control_flow(true);
         // Subgroups: the translation's cross-lane code (ballots, lane reads, wave halves) is
         // written for subgroups of 32 lanes, NVIDIA's only size. Where the device's default
         // differs (AMD 64, Intel 8 to 32), the stages it lets a pipeline give a size get 32
@@ -799,6 +861,9 @@ fn init_inner() -> Result<(), String> {
         }
         if barycentric {
             dci = dci.push_next(&mut bary);
+        }
+        if max_reconv {
+            dci = dci.push_next(&mut mr_f).push_next(&mut ucf_f);
         }
         if has_fault {
             dci = dci.push_next(&mut fault_f);

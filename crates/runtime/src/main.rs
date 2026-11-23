@@ -324,7 +324,8 @@ fn parse_args() -> Config {
         None => (PathBuf::new(), PathBuf::new(), dsconfig::zar::Source::Dir(PathBuf::new()), String::new(), Some(format!("The game folder is not set. Start {} and choose it.", dsconfig::paths::LAUNCHER_EXE))),
     };
     let game_unset = chosen.is_none();
-    let run_dir = paths.logs().join(utc_stamp());
+    // (The launcher's quick checks log apart from the game's sessions: `Paths::check_logs`.)
+    let run_dir = if pb_check.is_some() || translation_fingerprint { paths.check_logs() } else { paths.logs() }.join(utc_stamp());
     Config {
         code,
         app,
@@ -367,7 +368,9 @@ fn parse_args() -> Config {
 fn prune_runs(runs: &Path, keep: usize) {
     let keep = std::env::var("DS_KEEP_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(keep);
     let Ok(rd) = std::fs::read_dir(runs) else { return };
-    let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir() && !p.join("KEEP").exists()).collect();
+    // (Run folders are named by their time; the quick checks' `checks` folder is not one.)
+    let dated = |p: &Path| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(|c: char| c.is_ascii_digit()));
+    let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir() && dated(p) && !p.join("KEEP").exists()).collect();
     dirs.sort();
     if dirs.len() <= keep {
         return;

@@ -155,6 +155,17 @@ impl Paths {
         }
     }
 
+    /// The run folders of the launcher's quick checks (the pipeline store's probe at its start,
+    /// the translation check): a `checks` folder in the logs, so that the newest folder there is
+    /// the newest session's (a player who reopened the launcher to fetch the logs sent the
+    /// probe's half-second log instead, 2026-11-24). In a checkout: the runs, as before.
+    pub fn check_logs(&self) -> PathBuf {
+        match self.layout {
+            Layout::Dev => self.logs(),
+            _ => self.logs().join("checks"),
+        }
+    }
+
     /// How many run folders are kept (a development run's KEEP mark keeps one apart).
     pub fn logs_kept(&self) -> usize {
         match self.layout {

@@ -691,6 +691,7 @@ pub fn enabled() -> bool {
         match super::vk::init() {
             Ok(()) => {
                 crate::info!("gpu: executing the GPU work on Vulkan");
+                super::reconv::check();
                 super::resident::init();
                 super::fe2::init();
                 super::resident::section_test_maybe();
@@ -4003,20 +4004,25 @@ fn keep_pipe(map: &Mutex<Option<HashMap<u64, PipeEntry>>>, key: u64, pipe: Pipe)
 /// to this session, so the driver's shader cache serves nothing it compiled
 /// in an earlier one.
 pub(super) fn module_code(spirv: &[u32]) -> std::borrow::Cow<'_, [u32]> {
-    // (`DS_SPV_DUMP=<dir>`: every module written there before the driver
-    // compiles it, by its content's hash: a module that crashes the
-    // driver's compiler is among the last written.)
+    let code = match super::vk::max_reconvergence().then(|| declare_max_reconvergence(spirv)).flatten() {
+        Some(v) => std::borrow::Cow::Owned(v),
+        None => std::borrow::Cow::Borrowed(spirv),
+    };
+    // (`DS_SPV_DUMP=<dir>`: every module written there as the driver gets
+    // it (before the nonce), by its content's hash: a module that crashes
+    // the driver's compiler is among the last written.)
     static DUMP: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     if let Some(dir) = DUMP.get_or_init(|| std::env::var_os("DS_SPV_DUMP").map(|d| {
         let p = std::path::PathBuf::from(d);
         let _ = std::fs::create_dir_all(&p);
         p
     })) {
+        let bytes = unsafe { std::slice::from_raw_parts(code.as_ptr() as *const u8, code.len() * 4) };
         let mut h = super::fx::FxHasher::default();
-        std::hash::Hasher::write(&mut h, unsafe { std::slice::from_raw_parts(spirv.as_ptr() as *const u8, spirv.len() * 4) });
+        std::hash::Hasher::write(&mut h, bytes);
         let path = dir.join(format!("{:016x}.spv", std::hash::Hasher::finish(&h)));
         if !path.exists() {
-            let _ = std::fs::write(&path, unsafe { std::slice::from_raw_parts(spirv.as_ptr() as *const u8, spirv.len() * 4) });
+            let _ = std::fs::write(&path, bytes);
         }
     }
     static NONCE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
@@ -4035,13 +4041,90 @@ pub(super) fn module_code(spirv: &[u32]) -> std::borrow::Cow<'_, [u32]> {
         })
     });
     match nonce {
-        Some(n) if spirv.len() > 2 => {
-            let mut v = spirv.to_vec();
+        Some(n) if code.len() > 2 => {
+            let mut v = code.into_owned();
             v[2] = n;
             std::borrow::Cow::Owned(v)
         }
-        _ => std::borrow::Cow::Borrowed(spirv),
+        _ => code,
     }
+}
+
+/// The SPIR-V extension and execution mode of maximal reconvergence (`vk::max_reconvergence`).
+const MAX_RECONV_EXT: &str = "SPV_KHR_maximal_reconvergence";
+const EXEC_MODE_MAXIMALLY_RECONVERGES: u32 = 6023;
+
+/// `spirv` with every entry point declaring `MaximallyReconvergesKHR` (and the extension), for
+/// `vk::max_reconvergence`; None when it is not a module this can read or already declares it.
+pub(super) fn declare_max_reconvergence(spirv: &[u32]) -> Option<Vec<u32>> {
+    const OP_EXTENSION: u32 = 10;
+    const OP_MEMORY_MODEL: u32 = 14;
+    const OP_ENTRY_POINT: u32 = 15;
+    const OP_EXECUTION_MODE: u32 = 16;
+    const OP_CAPABILITY: u32 = 17;
+    const OP_EXECUTION_MODE_ID: u32 = 331;
+    if spirv.len() < 5 || spirv[0] != 0x0723_0203 {
+        return None;
+    }
+    // (Where the extension goes: after the capabilities and extensions; the modes: after the
+    // entry points and the modes already declared.)
+    let (mut ext_at, mut mode_at) = (None, None);
+    let mut entries = Vec::new();
+    let mut i = 5;
+    while i < spirv.len() {
+        let (wc, op) = ((spirv[i] >> 16) as usize, spirv[i] & 0xffff);
+        if wc == 0 || i + wc > spirv.len() {
+            return None;
+        }
+        match op {
+            OP_CAPABILITY => ext_at = Some(i + wc),
+            OP_EXTENSION => {
+                let s: Vec<u8> = spirv[i + 1..i + wc].iter().flat_map(|w| w.to_le_bytes()).take_while(|&b| b != 0).collect();
+                if s == MAX_RECONV_EXT.as_bytes() {
+                    return None;
+                }
+                ext_at = Some(i + wc);
+            }
+            OP_MEMORY_MODEL => mode_at = Some(i + wc),
+            OP_ENTRY_POINT => {
+                if wc < 3 {
+                    return None;
+                }
+                entries.push(spirv[i + 2]);
+                mode_at = Some(i + wc);
+            }
+            OP_EXECUTION_MODE | OP_EXECUTION_MODE_ID => {
+                if wc >= 3 && spirv[i + 2] == EXEC_MODE_MAXIMALLY_RECONVERGES {
+                    return None;
+                }
+                mode_at = Some(i + wc);
+            }
+            // (The debug, annotation and type sections follow: nothing more to find.)
+            _ if mode_at.is_some() => break,
+            _ => {}
+        }
+        i += wc;
+    }
+    let (ext_at, mode_at) = (ext_at?, mode_at?);
+    if entries.is_empty() || ext_at > mode_at {
+        return None;
+    }
+    let mut name: Vec<u8> = MAX_RECONV_EXT.as_bytes().to_vec();
+    name.push(0);
+    while name.len() % 4 != 0 {
+        name.push(0);
+    }
+    let words: Vec<u32> = name.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let mut out = Vec::with_capacity(spirv.len() + 1 + words.len() + 3 * entries.len());
+    out.extend_from_slice(&spirv[..ext_at]);
+    out.push(((1 + words.len() as u32) << 16) | OP_EXTENSION);
+    out.extend_from_slice(&words);
+    out.extend_from_slice(&spirv[ext_at..mode_at]);
+    for f in entries {
+        out.extend_from_slice(&[(3 << 16) | OP_EXECUTION_MODE, f, EXEC_MODE_MAXIMALLY_RECONVERGES]);
+    }
+    out.extend_from_slice(&spirv[mode_at..]);
+    Some(out)
 }
 
 /// Modules carry the session nonce whatever `DS_SPIRV_NONCE` says
@@ -4157,9 +4240,10 @@ fn compute_pipeline(out: &rdna::translate::Output, push_mode: bool, cache_key: O
                 }
                 c.device.create_compute_pipelines(via.cache, &[ci], None).map(|v| v[0]).map_err(|(_, e)| format!("compute pipeline: {e}"))
             };
-            let _crumb = super::pcache::Crumb::set(|| format!("compute pipeline c{:016x}", cache_key.unwrap_or(0)), || vec![("cs", out.spirv.clone())]);
+            // (The module as the driver gets it: `module_code`'s declaration included.)
+            let _crumb = super::pcache::Crumb::set(|| format!("compute pipeline c{:016x}", cache_key.unwrap_or(0)), || vec![("cs", module_code(&out.spirv).into_owned())]);
             let pipeline = match cache_key {
-                Some(k) => super::pcache::create_with('c', k, super::pcache::fingerprint(&[&out.spirv]), make),
+                Some(k) => super::pcache::create_with('c', k, super::pcache::translated_fingerprint(&[&out.spirv]), make),
                 None => make(super::pcache::Via { cache: vk::PipelineCache::null(), capture: false, binaries: None }),
             };
             c.device.destroy_shader_module(module, None);

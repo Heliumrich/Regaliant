@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- On RTX 50-series graphics cards (and AMD and Intel ones) the game's shaders now tell the driver
+  to keep each group of shader threads together after they take different paths. The game's
+  translated shaders rely on it, and RTX 40-series cards do it on their own. On an RTX 5090 and an
+  RTX 5080 the tunnel at the game's start showed black shapes and stretched geometry, in 0.1.1
+  too. This is the likely cause, not yet confirmed on such a card. On these cards the launcher
+  prepares the shaders again once.
+- **Open logs** in the launcher now selects the newest session's folder, the one to send with a
+  bug report. The launcher's own quick checks keep their logs in a `checks` folder.
+
 ## 0.1.1
 
 - The game can be one .zar archive instead of its folder, read in place: about two thirds of the

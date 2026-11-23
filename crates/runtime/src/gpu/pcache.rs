@@ -1051,6 +1051,18 @@ pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result
     r
 }
 
+/// The code fingerprint of a pipeline made from translations: `fingerprint` of its parts, and
+/// whether its modules declare maximal reconvergence (`exec::module_code`, `vk::max_reconvergence`:
+/// binaries made without the declaration are not taken for modules with it, nor the other way).
+pub fn translated_fingerprint(parts: &[&[u32]]) -> u64 {
+    let h = fingerprint(parts);
+    if super::vk::max_reconvergence() {
+        fingerprint(&[&[h as u32, (h >> 32) as u32], &[0x4d52_4331]])
+    } else {
+        h
+    }
+}
+
 /// A pipeline's code fingerprint (`create_with`): its stages' SPIR-V words
 /// and any other words that shape it.
 pub fn fingerprint(parts: &[&[u32]]) -> u64 {

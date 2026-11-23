@@ -189,6 +189,16 @@ pub fn play(app: &mut App) {
     start_game(app);
 }
 
+/// Open logs: Explorer at the logs folder with the newest session's folder selected (the
+/// player's or a shader preparation step's; run folders are named by their time, the launcher's
+/// quick checks log in `checks`), else the folder.
+fn open_logs(app: &App) {
+    match newest_log(&app.paths) {
+        Some(p) => ui::select_path(&p),
+        None => ui::open_path(&app.paths.logs()),
+    }
+}
+
 /// Starts the game (the launcher minimized while it runs; it comes back when the game exits).
 pub fn start_game(app: &mut App) {
     if app.running.is_some() {
@@ -236,9 +246,11 @@ pub fn start_game(app: &mut App) {
     }
 }
 
-/// The newest run folder in the logs (a session's log).
+/// The newest run folder in the logs (a session's log): folders named by their time (the
+/// launcher's quick checks log in `checks`, `Paths::check_logs`).
 fn newest_log(paths: &Paths) -> Option<PathBuf> {
-    let mut v: Vec<PathBuf> = std::fs::read_dir(paths.logs()).ok()?.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+    let dated = |p: &PathBuf| p.is_dir() && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(|c: char| c.is_ascii_digit()));
+    let mut v: Vec<PathBuf> = std::fs::read_dir(paths.logs()).ok()?.flatten().map(|e| e.path()).filter(dated).collect();
     v.sort();
     v.pop()
 }
@@ -349,7 +361,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             with_app(|app| match id {
                 ID_PLAY => play(app),
                 ID_RESET => reset_settings(app),
-                ID_LOGS => ui::open_path(&app.paths.logs()),
+                ID_LOGS => open_logs(app),
                 ID_DISCORD => ui::open_url(DISCORD),
                 100..=199 => game::command(app, id, code),
                 200..=299 => shaders::command(app, id, code),
