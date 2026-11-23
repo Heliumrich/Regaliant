@@ -278,17 +278,22 @@ static WATCHING: AtomicBool = AtomicBool::new(false);
 static WANT: Mutex<Out> = Mutex::new(Out { left: 0, right: 0, rgb: DEFAULT_RGB });
 /// Controllers ever connected (the log's numbering).
 static COUNT: AtomicU64 = AtomicU64::new(0);
+/// The game's end (`motors_off`): the motors stay off, whatever a writer had pending.
+static STOPPED: AtomicBool = AtomicBool::new(false);
+/// One output report at a time on any controller, so that `motors_off`'s is the last.
+static WRITING: Mutex<()> = Mutex::new(());
 
 fn read_reports(d: Arc<Device>) {
     let mut buf = vec![0u8; d.in_len.max(64)];
     unsafe {
         let ev = CreateEventW(std::ptr::null(), 1, 0, std::ptr::null());
+        // (Without an event nothing is read: the device ends as an unplugged one, its writer
+        // told to stop below.)
         if ev.is_null() {
-            d.alive.store(false, Relaxed);
-            return;
+            crate::warn!("controller: {} ({}): no event for its reads (error {})", d.name, link(&d), GetLastError());
         }
         let mut have = false;
-        loop {
+        while !ev.is_null() {
             let mut ov: OVERLAPPED = std::mem::zeroed();
             ov.hEvent = ev;
             ResetEvent(ev);
@@ -311,7 +316,9 @@ fn read_reports(d: Arc<Device>) {
             s.0 = p;
             s.2 = true;
         }
-        CloseHandle(ev);
+        if !ev.is_null() {
+            CloseHandle(ev);
+        }
     }
     d.alive.store(false, Relaxed);
     let mut o = d.out.lock();
@@ -337,24 +344,36 @@ fn write_reports(d: Arc<Device>) {
             g.1 = false;
             g.0
         };
-        let mut reports = Vec::new();
-        match d.model {
-            Model::DualShock4 => reports.push(dualshock4_output(d.bluetooth, &o, d.out_len)),
-            _ => {
-                if first {
-                    reports.push(dualsense_output(d.bluetooth, seq, &o, d.v2, true, d.out_len));
-                    seq = (seq + 1) & 15;
-                }
-                reports.push(dualsense_output(d.bluetooth, seq, &o, d.v2, false, d.out_len));
-                seq = (seq + 1) & 15;
-            }
-        }
+        // (The DualSense's first report sets its light bar up.)
+        let kinds: &[bool] = match d.model {
+            Model::DualShock4 => &[false],
+            _ if first => &[true, false],
+            _ => &[false],
+        };
         first = false;
-        for r in reports {
-            let mut done = 0u32;
-            if unsafe { WriteFile(w.0, r.as_ptr(), r.len() as u32, &mut done, std::ptr::null_mut()) } == 0 {
-                crate::warn!("controller: {} ({}): an output report was refused (error {})", d.name, link(&d), unsafe { GetLastError() });
-                return;
+        for &setup in kinds {
+            {
+                // (Under the write lock, the motors off once the game has ended: `motors_off`'s
+                // report stays the last that sets them.)
+                let _w = WRITING.lock();
+                let mut o = o;
+                if STOPPED.load(Relaxed) {
+                    o.left = 0;
+                    o.right = 0;
+                }
+                let r = match d.model {
+                    Model::DualShock4 => dualshock4_output(d.bluetooth, &o, d.out_len),
+                    _ => {
+                        let r = dualsense_output(d.bluetooth, seq, &o, d.v2, setup, d.out_len);
+                        seq = (seq + 1) & 15;
+                        r
+                    }
+                };
+                let mut done = 0u32;
+                if unsafe { WriteFile(w.0, r.as_ptr(), r.len() as u32, &mut done, std::ptr::null_mut()) } == 0 {
+                    crate::warn!("controller: {} ({}): an output report was refused (error {})", d.name, link(&d), unsafe { GetLastError() });
+                    return;
+                }
             }
             std::thread::sleep(Duration::from_millis(8));
         }
@@ -572,6 +591,10 @@ fn publish(f: impl Fn(&mut Out)) {
     let want = {
         let mut w = WANT.lock();
         f(&mut w);
+        if STOPPED.load(Relaxed) {
+            w.left = 0;
+            w.right = 0;
+        }
         *w
     };
     for d in DEVS.lock().iter() {
@@ -600,6 +623,7 @@ pub fn set_lightbar(rgb: Option<[u8; 3]>) {
 /// The motors stopped at once, written from this thread (the game's end: a controller keeps its
 /// last vibration otherwise).
 pub fn motors_off() {
+    STOPPED.store(true, Relaxed);
     let want = {
         let mut w = WANT.lock();
         w.left = 0;
@@ -613,6 +637,7 @@ pub fn motors_off() {
             _ => dualsense_output(d.bluetooth, 0, &want, d.v2, false, d.out_len),
         };
         let mut done = 0u32;
+        let _w = WRITING.lock();
         unsafe { WriteFile(w.0, r.as_ptr(), r.len() as u32, &mut done, std::ptr::null_mut()) };
     }
 }

@@ -13,7 +13,7 @@
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
 pub struct Trophy {
@@ -58,8 +58,7 @@ struct State {
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
-fn archive(path: &Path) -> Option<HashMap<String, Vec<u8>>> {
-    let d = std::fs::read(path).ok()?;
+fn archive(d: &[u8]) -> Option<HashMap<String, Vec<u8>>> {
     let n = u32::from_be_bytes(d.get(0x10..0x14)?.try_into().ok()?) as usize;
     let mut out = HashMap::new();
     for j in 0..n.min(4096) {
@@ -82,11 +81,11 @@ fn num(v: &serde_json::Value) -> Option<i64> {
     v.as_i64().or_else(|| v.as_str()?.parse().ok())
 }
 
-/// Reads the definitions from the game tree (`app`) and the unlocks kept so far; `lang` the
-/// trophy text's language (e.g. "en-GB"; en-US when the set has none).
-pub fn init(app: &Path, keep: PathBuf, lang: &str) {
+/// Reads the definitions from the game's files (its folder or archive) and the unlocks kept so
+/// far; `lang` the trophy text's language (e.g. "en-GB"; en-US when the set has none).
+pub fn init(src: &dsconfig::zar::Source, keep: PathBuf, lang: &str) {
     let built = (|| -> Result<State, String> {
-        let t = archive(&app.join("sce_sys/trophy2/trophy00.ucp")).ok_or("no trophy set")?;
+        let t = src.read("sce_sys/trophy2/trophy00.ucp").ok().and_then(|d| archive(&d)).ok_or("no trophy set")?;
         let conf = json(&t, "tropconf.json").ok_or("no tropconf.json")?;
         let meta = json(&t, &format!("tropmeta_{lang}.json")).or_else(|| json(&t, "tropmeta_en-US.json")).ok_or("no trophy text")?;
         let mut text = HashMap::new();
@@ -101,7 +100,7 @@ pub fn init(app: &Path, keep: PathBuf, lang: &str) {
             let (name, detail) = text.get(&id).cloned().unwrap_or_default();
             trophies.push(Trophy { id, name, detail, grade: tr["grade"].as_str().and_then(|g| g.chars().next()).unwrap_or('B'), hidden: tr["hidden"].as_bool().unwrap_or(false), cond });
         }
-        let u = archive(&app.join("sce_sys/uds/uds00.ucp")).ok_or("no UDS definitions")?;
+        let u = src.read("sce_sys/uds/uds00.ucp").ok().and_then(|d| archive(&d)).ok_or("no UDS definitions")?;
         let stats = json(&u, "stats_definition.json").ok_or("no stats_definition.json")?;
         let ex = json(&u, "stats_extraction.json").ok_or("no stats_extraction.json")?;
         let mut aggregation = HashMap::new();

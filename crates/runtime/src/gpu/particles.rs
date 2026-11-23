@@ -20,6 +20,16 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+/// The game's shader folders (paths in its files, `dsconfig::zar::Source`): the particles'
+/// bundles and the engine's own programs.
+pub const PARTICLE_SHADERS: &str = "particles/!cookedparticleshaders/version01/_ps5";
+pub const ENGINE_SHADERS: &str = "coredata/enginesupport/shaders/_ps5";
+
+/// Whether a file name or path has the extension (as `Path::extension` reads it).
+pub fn has_ext(name: &str, ext: &str) -> bool {
+    std::path::Path::new(name).extension().is_some_and(|x| x == ext)
+}
+
 static HASHES: RwLock<Option<HashSet<u64>>> = RwLock::new(None);
 /// The engine's programs by code hash: their directory.
 static ENGINE: RwLock<Option<HashMap<u64, Arc<str>>>> = RwLock::new(None);
@@ -29,27 +39,25 @@ static ENGINE_ASYNC: RwLock<Option<HashSet<u64>>> = RwLock::new(None);
 /// programs whose last instruction ends before their code size].
 static STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
-/// Reads the bundles under `app` (the PPSA01341-app0 folder) on a
+/// Reads the bundles in the game's files (its folder or archive) on a
 /// background thread; until it is done no program counts as a particle one.
-pub fn start(app: std::path::PathBuf) {
-    let _ = crate::thread::spawn_host("particle-scan", 1 << 20, Box::new(move || scan(&app)));
+pub fn start(src: dsconfig::zar::Source) {
+    let _ = crate::thread::spawn_host("particle-scan", 1 << 20, Box::new(move || scan(&src)));
 }
 
-fn scan(app: &std::path::Path) {
+fn scan(src: &dsconfig::zar::Source) {
     crate::log::set_thread_name("particle-scan");
     let t0 = std::time::Instant::now();
-    let dir = app.join("particles").join("!cookedparticleshaders").join("version01").join("_ps5");
-    let Ok(rd) = std::fs::read_dir(&dir) else {
-        crate::warn!("particles: no shader bundles at {}", dir.display());
+    let Ok(rd) = src.list(PARTICLE_SHADERS) else {
+        crate::warn!("particles: no shader bundles at {PARTICLE_SHADERS} in {}", src.display());
         return;
     };
     let mut set = HashSet::new();
-    for e in rd.flatten() {
-        let p = e.path();
-        if p.extension().is_none_or(|x| x != "csdr") {
+    for e in rd {
+        if !has_ext(&e.name, "csdr") {
             continue;
         }
-        let Ok(b) = std::fs::read(&p) else { continue };
+        let Ok(b) = src.read(&format!("{PARTICLE_SHADERS}/{}", e.name)) else { continue };
         STATS[0].fetch_add(1, Ordering::Relaxed);
         if !programs(&b, &mut set) {
             STATS[2].fetch_add(1, Ordering::Relaxed);
@@ -59,28 +67,27 @@ fn scan(app: &std::path::Path) {
     STATS[3].store(t0.elapsed().as_millis() as u64, Ordering::Relaxed);
     crate::info!("particles: {} programs in {} shader bundles ({} not understood; {} with code past their last instruction) read in {} ms", set.len(), STATS[0].load(Ordering::Relaxed), STATS[2].load(Ordering::Relaxed), STATS[4].load(Ordering::Relaxed), t0.elapsed().as_millis());
     *HASHES.write() = Some(set);
-    scan_engine(app);
+    scan_engine(src);
 }
 
 /// The engine's shader files: each program's code hash and its directory.
-fn scan_engine(app: &std::path::Path) {
+fn scan_engine(src: &dsconfig::zar::Source) {
     let t0 = std::time::Instant::now();
-    let root = app.join("coredata").join("enginesupport").join("shaders").join("_ps5");
     let dirs: Vec<String> = std::env::var("DS_ASYNC_ENGINE").unwrap_or_else(|_| "particle-lightmap-update".into()).split(',').map(|d| d.trim().to_string()).filter(|d| !d.is_empty()).collect();
     let mut map: HashMap<u64, Arc<str>> = HashMap::new();
     let mut slow = HashSet::new();
     let (mut files, mut odd) = (0u64, 0u64);
-    let mut stack: Vec<(std::path::PathBuf, Option<Arc<str>>)> = vec![(root.clone(), None)];
+    let mut stack: Vec<(String, Option<Arc<str>>)> = vec![(ENGINE_SHADERS.to_string(), None)];
     while let Some((d, top)) = stack.pop() {
-        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                let name = top.clone().unwrap_or_else(|| Arc::from(e.file_name().to_string_lossy().as_ref()));
+        for e in src.list(&d).unwrap_or_default() {
+            let p = format!("{d}/{}", e.name);
+            if e.dir {
+                let name = top.clone().unwrap_or_else(|| Arc::from(e.name.as_str()));
                 stack.push((p, Some(name)));
-            } else if p.extension().is_some_and(|x| x == "csdr") {
+            } else if has_ext(&e.name, "csdr") {
                 let Some(dir) = top.clone() else { continue };
                 files += 1;
-                match std::fs::read(&p).ok().and_then(|b| bundle_programs(&b)) {
+                match src.read(&p).ok().and_then(|b| bundle_programs(&b)) {
                     Some(v) => {
                         for prog in v {
                             if dirs.iter().any(|x| **x == *dir) {

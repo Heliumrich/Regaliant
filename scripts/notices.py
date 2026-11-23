@@ -6,7 +6,8 @@ regaliant.exe and regaliant-launcher.exe (this project's own code: LICENSE).
 The crates are the ones linked into the two programs for the Windows target (`cargo metadata`
 with Cargo.lock: normal dependencies, without proc-macros and build-time crates), each with the
 license file it ships; where a crate offers a choice, MIT is used. Then the vendored C code
-(LibAtrac9, minimp3, the mimalloc allocator libmimalloc-sys builds), Mesa addrlib's notice for
+(LibAtrac9, minimp3, the mimalloc allocator libmimalloc-sys builds, the zstd library zstd-sys
+builds), Mesa addrlib's notice for
 the surface layout tables, the MIT notice of the earlier native port much of the runtime derives
 from, and the Rust standard library's notices (the toolchain's COPYRIGHT-library.html), each
 distinct notice text once. The Microsoft C runtime linked statically needs no notice.
@@ -24,7 +25,7 @@ OUT = ROOT / 'THIRD_PARTY_NOTICES.txt'
 TARGET = 'x86_64-pc-windows-msvc'
 PROGRAMS = ('dsport', 'launcher')
 # Where a crate offers several licenses, the first of these it offers is used.
-PREFERENCE = ('MIT', 'ISC', 'Zlib', '0BSD', 'Apache-2.0')
+PREFERENCE = ('MIT', 'ISC', 'Zlib', '0BSD', 'Apache-2.0', 'BSD-3-Clause')
 EXT = r'(\.(md|txt))?'
 LICENSE_FILES = {
     'MIT': [rf'licen[cs]e[-_.]?mit{EXT}', rf'mit[-_.]licen[cs]e{EXT}'],
@@ -32,6 +33,13 @@ LICENSE_FILES = {
     'Zlib': [rf'licen[cs]e[-_.]?zlib{EXT}'],
     '0BSD': [rf'licen[cs]e[-_.]?0bsd{EXT}'],
     'Apache-2.0': [rf'licen[cs]e[-_.]?apache(-2\.0)?{EXT}'],
+    'BSD-3-Clause': [rf'licen[cs]e[-_.]?bsd[-_.]?3[-_.]?clause{EXT}'],
+}
+# Crates whose license expression joins licenses that all apply: the expression decided on and
+# the crate's files that carry them, all included (a new expression fails, to be decided again).
+BY_HAND = {
+    # (Its own code BSD-3-Clause; the zstd sources' legacy decoders BSD-2-Clause.)
+    'zstd-sys': ('BSD-3-Clause AND BSD-2-Clause', ['LICENSE', 'LICENSE.BSD-2-Clause']),
 }
 # Accepted as well when the crate has a single license.
 SINGLE_FILES = [rf'licen[cs]e{EXT}', rf'copying{EXT}']
@@ -108,6 +116,12 @@ def license_text(p):
     name = f"{p['name']} {p['version']}"
     if not expr:
         fail(f'{name}: no license field')
+    if p['name'] in BY_HAND:
+        decided, files = BY_HAND[p['name']]
+        if expr != decided:
+            fail(f"{name}: '{expr}' is not the expression decided on ('{decided}')")
+        d = Path(p['manifest_path']).parent
+        return expr, '\n'.join(read(d / f) for f in files)
     if ' AND ' in expr or ' WITH ' in expr:
         fail(f"{name}: '{expr}' needs a decision by hand")
     offered = [o.strip(' ()') for o in re.split(r'\s+OR\s+|/', expr)]
@@ -153,6 +167,17 @@ def mimalloc_notice(meta):
     lic = next((f for f in [d / 'v2' / 'LICENSE', d / 'LICENSE'] if f.is_file()), None)
     if lic is None:
         fail(f'no mimalloc LICENSE under {d}')
+    return read(lic)
+
+
+def zstd_notice(meta):
+    """The zstd C library zstd-sys builds into both programs (its own BSD notice)."""
+    p = next((p for p in meta['packages'] if p['name'] == 'zstd-sys'), None)
+    if p is None:
+        fail('zstd-sys not in the dependency graph')
+    lic = Path(p['manifest_path']).parent / 'zstd' / 'LICENSE'
+    if not lic.is_file():
+        fail(f'no zstd LICENSE at {lic}')
     return read(lic)
 
 
@@ -239,6 +264,7 @@ def main():
     sections = [
         ('Rust crates', crates_section(linked_crates(meta))),
         ('mimalloc (built by libmimalloc-sys): the memory allocator', mimalloc_notice(meta)),
+        ('zstd (built by zstd-sys): the game read from and written to a .zar archive', zstd_notice(meta)),
         ('LibAtrac9 (third_party/libatrac9): ATRAC9 decoding', read(ROOT / 'third_party/libatrac9/LICENSE')),
         ('minimp3 (third_party/minimp3): MP3 decoding (CC0, no notice required)', read(ROOT / 'third_party/minimp3/LICENSE')),
         ('Mesa addrlib: the gfx10 surface layout tables and logic (crates/runtime/src/gpu/swizzle_tables.rs, tiling.rs)',

@@ -110,6 +110,11 @@ fn prot_from_flags(flags: u32) -> u32 {
 /// Loads (maps and copies) a module without relocating it.
 pub fn load(path: &Path, is_main: bool) -> Result<Arc<LoadedModule>, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    load_bytes(bytes, path, is_main)
+}
+
+/// `load` of a module's bytes read already (from the game's archive); `path` names it.
+pub fn load_bytes(bytes: Vec<u8>, path: &Path, is_main: bool) -> Result<Arc<LoadedModule>, String> {
     let m = Module::parse(bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     let dynamic = m.dynamic().map_err(|e| format!("{}: {e}", path.display()))?;
     let image_size = m.image_span(PAGE);

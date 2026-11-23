@@ -24,7 +24,6 @@ use parking_lot::{Condvar, Mutex};
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::os::windows::fs::FileExt;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -188,7 +187,8 @@ fn valid_range(dest: u64, size: u64) -> bool {
 
 struct AprFile {
     path: String,
-    host: PathBuf,
+    /// Its host file, or its node in the game's archive.
+    at: crate::hle::kernel::fs::Found,
     size: u64,
     handle: Mutex<Option<Arc<File>>>,
     /// Content the port serves from memory (`crate::pcsettings`: title files it extends).
@@ -215,7 +215,7 @@ fn resolve_path(guest: &str) -> Result<(u32, u64), i32> {
     }
     // Filesystem queries run without the lock (cached listings for the
     // read-only game tree).
-    let Some((host, md)) = crate::hle::kernel::fs::guest_meta(guest) else {
+    let Some((at, md)) = crate::hle::kernel::fs::guest_meta(guest) else {
         return Err(ENOENT);
     };
     if md.is_dir {
@@ -231,7 +231,7 @@ fn resolve_path(guest: &str) -> Result<(u32, u64), i32> {
     if let Some(d) = &mem {
         crate::info!("apr: '{guest}' served from the port's extended copy ({} bytes)", d.len());
     }
-    t.files.push(Arc::new(AprFile { path: guest.to_string(), host, size: md.size, handle: Mutex::new(None), mem }));
+    t.files.push(Arc::new(AprFile { path: guest.to_string(), at, size: md.size, handle: Mutex::new(None), mem }));
     let id = t.files.len() as u32;
     t.by_path.insert(guest.to_string(), id);
     Ok((id, md.size))
@@ -246,8 +246,9 @@ fn open_handle(f: &AprFile) -> Result<Arc<File>, i32> {
     if let Some(x) = h.as_ref() {
         return Ok(x.clone());
     }
-    let file = Arc::new(File::open(&f.host).map_err(|e| {
-        crate::warn!("apr: open {} ({}) failed: {e}", f.path, f.host.display());
+    let crate::hle::kernel::fs::Found::Host(host) = &f.at else { return Err(EIO) };
+    let file = Arc::new(File::open(host).map_err(|e| {
+        crate::warn!("apr: open {} ({}) failed: {e}", f.path, host.display());
         EIO
     })?);
     *h = Some(file.clone());
@@ -421,6 +422,19 @@ fn read_into(file_id: u32, dest: u64, size: u64, offset: u64) -> Result<(), i32>
             Ok(())
         })
         .map_err(|_| EIO)?;
+        STATS[1].fetch_add(1, Ordering::Relaxed);
+        STATS[2].fetch_add(size, Ordering::Relaxed);
+        return Ok(());
+    }
+    if let crate::hle::kernel::fs::Found::Zar(a, node) = &f.at {
+        if crate::hle::iostat::note("apr", &f.path, crate::hle::iostat::What::Read, size) {
+            crate::info!("apr: read {} [{offset:#x}+{size:#x}] -> {dest:#x} (archive)", f.path);
+        }
+        let buf = unsafe { std::slice::from_raw_parts_mut(dest as *mut u8, size as usize) };
+        match crate::hle::kernel::fs::read_archive_into(&f.path, a, *node, buf, offset) {
+            Ok(n) if n as u64 == size => {}
+            _ => return Err(EIO),
+        }
         STATS[1].fetch_add(1, Ordering::Relaxed);
         STATS[2].fetch_add(size, Ordering::Relaxed);
         return Ok(());
@@ -943,8 +957,14 @@ sysv! {
     }
     fn sceKernelAprGetFileStat(id: u32, st: *mut crate::hle::kernel::fs::Stat) -> i32 {
         let Some(f) = file(id) else { return crate::hle::kernel::posix_ret(sce(EBADF)) };
-        match std::fs::metadata(&f.host) {
-            Ok(md) if !st.is_null() => { std::ptr::write_unaligned(st, crate::hle::kernel::fs::fill_stat(&md)); 0 }
+        // (The file as the game tree has it: the host file's metadata, or the archive's entry as
+        // the folder's would be.)
+        let stat = match &f.at {
+            crate::hle::kernel::fs::Found::Host(host) => std::fs::metadata(host).ok().map(|md| crate::hle::kernel::fs::fill_stat(&md)),
+            crate::hle::kernel::fs::Found::Zar(a, n) => Some(crate::hle::kernel::fs::archive_stat(a, *n)),
+        };
+        match stat {
+            Some(s) if !st.is_null() => { std::ptr::write_unaligned(st, s); 0 }
             _ => crate::hle::kernel::posix_ret(sce(EIO)),
         }
     }

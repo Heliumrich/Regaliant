@@ -515,8 +515,7 @@ fn texture_of(entity: &str) -> &'static str {
 /// while the setting is on), the template of the variants' conditions: its category and payload.
 fn hide_template() -> Result<(u32, super::value::Payload), String> {
     use super::value::{Payload, h};
-    let host = crate::hle::kernel::fs::host_path_existing("/app0/ui/scripts/_cmn/uihud.cgpr").ok_or("no HUD data")?;
-    let d = std::fs::read(host).map_err(|_| "HUD data unreadable")?;
+    let d = crate::hle::kernel::fs::read_file("/app0/ui/scripts/_cmn/uihud.cgpr").map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { "no HUD data" } else { "HUD data unreadable" })?;
     let f = cgpr::parse(&d).ok_or("HUD data of another layout")?;
     let sub = f.roots.iter().find(|r| r.name.starts_with(b"ConversationSubtitle")).ok_or("no subtitles")?;
     let idx = sub
@@ -692,8 +691,7 @@ pub fn texture(guest: &str) -> Result<Vec<u8>, String> {
     let id = guest.strip_prefix(DIR).and_then(|n| n.strip_suffix(".ctxr")).ok_or("not a glyph")?;
     let art = set().arts.get(id).ok_or("no such glyph")?.clone();
     let template = {
-        let host = crate::hle::kernel::fs::host_path_existing(&format!("{DIR}{TEMPLATE}")).ok_or("no template glyph")?;
-        std::fs::read(host).map_err(|_| "template unreadable")?
+        crate::hle::kernel::fs::read_file(&format!("{DIR}{TEMPLATE}")).map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { "no template glyph" } else { "template unreadable" })?
     };
     if glyphs::decode(&template).is_none() {
         return Err("the template glyph has another layout".into());

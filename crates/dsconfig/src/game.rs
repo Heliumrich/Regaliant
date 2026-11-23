@@ -1,7 +1,9 @@
 //! The game folder's checks: Demon's Souls (PS5, PPSA01341) at version 01.007.000, with its
 //! executable and its two libraries decrypted, and its data folders. The runtime checks the
-//! same at start and the launcher when a folder is chosen; both show `Problem`'s text.
+//! same at start and the launcher when a folder is chosen; both show `Problem`'s text. The game
+//! can also be a `.zar` archive of that folder (`zar`, since 2026-11-23), read in place.
 
+use crate::zar::Source;
 use std::path::{Path, PathBuf};
 
 /// The release the port was made and tested with (Europe).
@@ -28,16 +30,30 @@ const DATA_DIRS: [&str; 8] = ["cp11demonssouls", "levels", "sound", "text", "tex
 pub struct Game {
     /// The title id (`TITLE_ID`, or another region's release).
     pub id: String,
-    /// The application folder (data and `sce_sys`), mounted read-only.
+    /// The application folder (data and `sce_sys`), mounted read-only; an archive's own file.
     pub app: PathBuf,
-    /// The folder holding the decrypted `eboot.bin` and `sce_module`.
+    /// The folder holding the decrypted `eboot.bin` and `sce_module`; an archive's own file.
     pub code: PathBuf,
+    /// The game's files: the application folder, or the archive.
+    pub source: Source,
+    /// The decrypted executable's folder in `source` ("" or "decrypted").
+    pub code_dir: String,
     pub version: String,
+}
+
+impl std::fmt::Debug for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Source({})", self.display())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Problem {
     NotFound,
+    /// An archive without the game's folder in its root or one folder down.
+    NotFoundInArchive,
+    /// An archive that could not be opened (its reason).
+    Archive(String),
     OtherGame(String),
     Version(String),
     Param(String),
@@ -52,6 +68,8 @@ impl std::fmt::Display for Problem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Problem::NotFound => write!(f, "No Demon's Souls game files were found in this folder. Choose the folder that holds eboot.bin and sce_sys."),
+            Problem::NotFoundInArchive => write!(f, "No Demon's Souls game files were found in this .zar archive. It must hold the folder with eboot.bin and sce_sys."),
+            Problem::Archive(e) => write!(f, "This .zar archive could not be read ({e})."),
             Problem::OtherGame(id) => write!(f, "This folder holds another game ({id}). This port runs the PS5 game Demon's Souls (PPSA01341)."),
             Problem::Version(v) => write!(f, "This is version {v} of the game. This port needs version {VERSION}."),
             Problem::Param(e) => write!(f, "The game's sce_sys\\param.json could not be read ({e})."),
@@ -82,18 +100,23 @@ pub fn locate(dir: &Path) -> Option<PathBuf> {
     subs.into_iter().find_map(|s| [s.clone(), s.join(APP_DIR)].into_iter().find(|d| has_param(d)))
 }
 
-/// Whether `path` starts as an ELF file (decrypted); None when it cannot be read.
-fn is_elf(path: &Path) -> Option<bool> {
-    use std::io::Read;
+/// Whether `rel` in the game's files starts as an ELF file (decrypted); None when it cannot be
+/// read.
+fn is_elf(src: &Source, rel: &str) -> Option<bool> {
+    let f = src.open_file(rel).ok()?;
     let mut b = [0u8; 4];
-    let mut f = std::fs::File::open(path).ok()?;
-    f.read_exact(&mut b).ok()?;
-    Some(b == *b"\x7fELF")
+    (f.read_at(0, &mut b).ok()? == 4).then_some(b == *b"\x7fELF")
 }
 
 /// The title's id and content version from `sce_sys/param.json`.
 pub fn param(app: &Path) -> Result<(String, String), Problem> {
-    let t = std::fs::read_to_string(app.join("sce_sys").join("param.json")).map_err(|e| Problem::Param(e.to_string()))?;
+    param_from(&Source::Dir(app.to_path_buf()))
+}
+
+/// `param` from the game's files.
+pub fn param_from(src: &Source) -> Result<(String, String), Problem> {
+    let t = src.read("sce_sys/param.json").map_err(|e| Problem::Param(e.to_string()))?;
+    let t = String::from_utf8(t).map_err(|e| Problem::Param(e.to_string()))?;
     let v: serde_json::Value = serde_json::from_str(&t).map_err(|e| Problem::Param(e.to_string()))?;
     let get = |k: &str| v.get(k).and_then(|x| x.as_str()).map(|s| s.trim().to_string());
     let id = get("titleId").ok_or_else(|| Problem::Param("no titleId".into()))?;
@@ -101,10 +124,18 @@ pub fn param(app: &Path) -> Result<(String, String), Problem> {
     Ok((id, ver))
 }
 
-/// Checks the game folder at or under `dir`.
+/// Checks the game folder at or under `dir`, or the archive `dir` (`.zar`).
 pub fn check(dir: &Path) -> Result<Game, Problem> {
-    let app = locate(dir).ok_or(Problem::NotFound)?;
-    let (id, version) = param(&app)?;
+    let source = if crate::zar::is_archive_path(dir) {
+        let s = Source::open(dir).map_err(|e| Problem::Archive(e.to_string()))?;
+        if !s.is_file("sce_sys/param.json") {
+            return Err(Problem::NotFoundInArchive);
+        }
+        s
+    } else {
+        Source::Dir(locate(dir).ok_or(Problem::NotFound)?)
+    };
+    let (id, version) = param_from(&source)?;
     if !is_demons_souls(&id) {
         return Err(Problem::OtherGame(id));
     }
@@ -113,31 +144,52 @@ pub fn check(dir: &Path) -> Result<Game, Problem> {
     }
     // The decrypted executable: in `decrypted\` (as dumps keep it beside the encrypted one) or
     // the application folder's own.
-    let code = if is_elf(&app.join("decrypted").join("eboot.bin")) == Some(true) {
-        app.join("decrypted")
+    let code_dir = if is_elf(&source, "decrypted/eboot.bin") == Some(true) {
+        "decrypted"
     } else {
-        match is_elf(&app.join("eboot.bin")) {
-            Some(true) => app.clone(),
+        match is_elf(&source, "eboot.bin") {
+            Some(true) => "",
             Some(false) => return Err(Problem::Encrypted),
             None => return Err(Problem::NoExecutable),
         }
     };
+    let under = |rel: &str| if code_dir.is_empty() { rel.to_string() } else { format!("{code_dir}/{rel}") };
     for m in MODULES {
-        match is_elf(&code.join("sce_module").join(m)) {
+        match is_elf(&source, &under(&format!("sce_module/{m}"))) {
             Some(true) => {}
             Some(false) => return Err(Problem::EncryptedModule(m.into())),
             None => return Err(Problem::NoModule(m.into())),
         }
     }
-    if let Some(d) = DATA_DIRS.iter().find(|d| !app.join(d).is_dir()) {
+    if let Some(d) = DATA_DIRS.iter().find(|d| !source.is_dir(d)) {
         return Err(Problem::MissingData(d.to_string()));
     }
-    Ok(Game { id, app, code, version })
+    let (app, code) = match &source {
+        Source::Dir(a) => (a.clone(), if code_dir.is_empty() { a.clone() } else { a.join(code_dir) }),
+        Source::Zar { archive, .. } => (archive.path().to_path_buf(), archive.path().to_path_buf()),
+    };
+    Ok(Game { id, app, code, source, code_dir: code_dir.to_string(), version })
 }
 
 /// Whether the executable is the one the port was tested with (its SHA-256).
 pub fn tested_executable(g: &Game) -> std::io::Result<bool> {
-    Ok(crate::sha::file_sha256(&g.code.join("eboot.bin"))? == TESTED_EBOOT)
+    if let Source::Dir(_) = &g.source {
+        return Ok(crate::sha::file_sha256(&g.code.join("eboot.bin"))? == TESTED_EBOOT);
+    }
+    let rel = if g.code_dir.is_empty() { "eboot.bin".to_string() } else { format!("{}/eboot.bin", g.code_dir) };
+    let f = g.source.open_file(&rel)?;
+    let mut sha = crate::sha::Sha256::new()?;
+    let mut buf = vec![0u8; 8 << 20];
+    let mut off = 0u64;
+    loop {
+        let n = f.read_at(off, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        sha.update(&buf[..n])?;
+        off += n as u64;
+    }
+    Ok(crate::sha::hex(&sha.finish()?) == TESTED_EBOOT)
 }
 
 #[cfg(test)]
@@ -192,5 +244,31 @@ mod tests {
         std::fs::remove_dir_all(&tmp).unwrap();
         assert_eq!(check(&tmp).unwrap_err(), Problem::NotFound);
         assert!(!Problem::Encrypted.to_string().contains(';'));
+    }
+
+    #[test]
+    fn archives() {
+        let tmp = std::env::temp_dir().join(format!("dsconfig-game-zar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let dump = tmp.join("dump");
+        let app = fake(&dump, VERSION, true);
+        let zar = tmp.join("game.zar");
+        crate::zar::write_folder(&dump, &zar, 3, 2, &|_, _| true).unwrap();
+        let g = check(&zar).unwrap();
+        assert_eq!(g.code_dir, "decrypted");
+        assert!(g.source.is_archive() && g.app == zar);
+        assert!(!tested_executable(&g).unwrap());
+        // The folder's own check: as before, the source its folder.
+        let f = check(&dump).unwrap();
+        assert_eq!((f.app.clone(), f.code.clone(), f.code_dir.as_str()), (app.clone(), app.join("decrypted"), "decrypted"));
+        // Without the game: not found in it; not an archive: refused.
+        std::fs::remove_dir_all(app.join("sce_sys")).unwrap();
+        let other = tmp.join("other.zar");
+        crate::zar::write_folder(&dump, &other, 3, 2, &|_, _| true).unwrap();
+        assert_eq!(check(&other).unwrap_err(), Problem::NotFoundInArchive);
+        std::fs::write(tmp.join("junk.zar"), b"not an archive at all, just text, long enough for a footer........................................................................................................").unwrap();
+        assert!(matches!(check(&tmp.join("junk.zar")), Err(Problem::Archive(_))));
+        assert!(!Problem::NotFoundInArchive.to_string().contains(';'));
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 }

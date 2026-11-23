@@ -712,8 +712,7 @@ pub fn generated(guest: &str) -> Option<Arc<Vec<u8>>> {
         if prompts::serves(guest) {
             return prompts::texture(guest);
         }
-        let host = crate::hle::kernel::fs::host_path_existing(guest).ok_or("not in the game tree")?;
-        let orig = std::fs::read(&host).map_err(|_| "unreadable")?;
+        let orig = crate::hle::kernel::fs::read_file(guest).map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { "not in the game tree" } else { "unreadable" })?;
         if guest == START_MENU {
             start_menu(&orig)
         } else if guest == HUD {

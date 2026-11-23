@@ -5,6 +5,7 @@ pub mod display;
 pub mod game;
 pub mod paths;
 pub mod sha;
+pub mod zar;
 
 /// The port's version (the workspace's).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

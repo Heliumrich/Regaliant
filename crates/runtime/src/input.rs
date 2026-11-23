@@ -410,8 +410,10 @@ struct Xi {
     first: [u32; 4],
     active: [bool; 4],
     retry: [Option<Instant>; 4],
+    /// When an empty slot may be asked again (one at a time, 250 ms apart).
+    probe: Option<Instant>,
 }
-static XI: Mutex<Xi> = Mutex::new(Xi { on: [false; 4], first: [0; 4], active: [false; 4], retry: [None; 4] });
+static XI: Mutex<Xi> = Mutex::new(Xi { on: [false; 4], first: [0; 4], active: [false; 4], retry: [None; 4], probe: None });
 /// The XInput controllers connected at the last poll (bit i: user index i): the vibration goes
 /// to each.
 static XI_ON: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -465,6 +467,11 @@ pub fn xinput_state() -> Option<XINPUT_STATE> {
         if !x.on[i] && x.retry[i].is_some_and(|t| now < t) {
             continue;
         }
+        // (Asking for a controller that is not there can take long, and this runs on the game's
+        // thread: the empty slots one at a time, 250 ms apart, each at most once a second.)
+        if !x.on[i] && x.retry[i].is_some() && x.probe.is_some_and(|t| now < t) {
+            continue;
+        }
         let mut s: XINPUT_STATE = unsafe { std::mem::zeroed() };
         let on = unsafe { XInputGetState(i as u32, &mut s) } == 0;
         if on {
@@ -486,8 +493,8 @@ pub fn xinput_state() -> Option<XINPUT_STATE> {
             if x.on[i] {
                 crate::info!("controller: XInput controller {i} disconnected");
             }
-            // (Asking for a controller that is not there can take long: once a second.)
             x.retry[i] = Some(now + Duration::from_secs(1));
+            x.probe = Some(now + Duration::from_millis(250));
         }
         x.on[i] = on;
     }

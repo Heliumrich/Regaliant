@@ -17,6 +17,7 @@ Zlib, 0BSD, CC0).
 | miniz_oxide / adler2 | zlib for screenshots and the launcher's pictures | MIT OR Zlib OR Apache-2.0 / 0BSD OR MIT OR Apache-2.0 |
 | serde_json | reading the game's `param.json` | MIT OR Apache-2.0 |
 | mimalloc / libmimalloc-sys | the memory allocator (libmimalloc-sys builds Microsoft's mimalloc C sources bundled in it) | MIT |
+| zstd / zstd-safe / zstd-sys | the game read from a `.zar` archive and the launcher's Compress (zstd-sys builds Meta's zstd C sources bundled in it) | BSD-3-Clause (zstd-sys: BSD-3-Clause AND BSD-2-Clause; the zstd library: BSD-3-Clause) |
 | cc (build dependency) | compiles the vendored C sources below and mimalloc | MIT OR Apache-2.0 |
 
 Their dependencies are MIT and/or Apache-2.0, except libloading (ISC, used by ash to load

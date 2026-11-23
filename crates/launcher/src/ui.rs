@@ -198,6 +198,40 @@ pub fn pick_folder(parent: HWND, title: &str) -> Option<PathBuf> {
     }
 }
 
+/// A file picker (the shell's file dialog) for `kind` files matching `spec` (e.g. "*.zar"); with
+/// `save`, a save dialog starting in that folder with that file name.
+pub fn pick_file(parent: HWND, title: &str, kind: &str, spec: &str, save: Option<(&std::path::Path, &str)>) -> Option<PathBuf> {
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
+    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+    use windows::Win32::UI::Shell::{FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT, FileOpenDialog, FileSaveDialog, IFileDialog, IFileOpenDialog, IFileSaveDialog, IShellItem, SHCreateItemFromParsingName, SIGDN_FILESYSPATH};
+    use windows::core::{Interface, PCWSTR};
+    unsafe {
+        let d: IFileDialog = match save {
+            Some(_) => CoCreateInstance::<_, IFileSaveDialog>(&FileSaveDialog, None, CLSCTX_INPROC_SERVER).ok()?.cast().ok()?,
+            None => CoCreateInstance::<_, IFileOpenDialog>(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?.cast().ok()?,
+        };
+        let opts = d.GetOptions().ok()?;
+        d.SetOptions(opts | FOS_FORCEFILESYSTEM | if save.is_some() { FOS_OVERWRITEPROMPT } else { FOS_FILEMUSTEXIST }).ok()?;
+        let (t, k, s, ext) = (wide(title), wide(kind), wide(spec), wide(spec.trim_start_matches("*.")));
+        let _ = d.SetTitle(PCWSTR(t.as_ptr()));
+        let _ = d.SetFileTypes(&[COMDLG_FILTERSPEC { pszName: PCWSTR(k.as_ptr()), pszSpec: PCWSTR(s.as_ptr()) }]);
+        let _ = d.SetDefaultExtension(PCWSTR(ext.as_ptr()));
+        if let Some((folder, name)) = save {
+            let (f, n) = (wide(&folder.display().to_string()), wide(name));
+            if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(f.as_ptr()), None) {
+                let _ = d.SetFolder(&item);
+            }
+            let _ = d.SetFileName(PCWSTR(n.as_ptr()));
+        }
+        d.Show(Some(windows::Win32::Foundation::HWND(parent as _))).ok()?;
+        let item = d.GetResult().ok()?;
+        let p = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let s = p.to_string().ok();
+        CoTaskMemFree(Some(p.0 as *const _));
+        s.map(PathBuf::from)
+    }
+}
+
 /// Opens a folder (made first when missing) with Explorer.
 pub fn open_path(p: &std::path::Path) {
     let _ = std::fs::create_dir_all(p);

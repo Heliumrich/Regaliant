@@ -18,10 +18,11 @@ Bug reports: https://github.com/SulphurS16/Regaliant/issues
 
 What you need
 -------------
-- Your own copy of Demon's Souls for PS5 (PPSA01341) at version 01.007.000, as a folder. The
-  folder holds sce_sys, the game's data folders and eboot.bin. The executable and its two
-  libraries must be decrypted: a decrypted eboot.bin (in the folder or in its "decrypted"
-  folder) and decrypted libc.prx and libSceNpCppWebApi.prx in sce_module.
+- Your own copy of Demon's Souls for PS5 (PPSA01341) at version 01.007.000, as a folder or as
+  a .zar archive of that folder. The folder holds sce_sys, the game's data folders and
+  eboot.bin. The executable and its two libraries must be decrypted: a decrypted eboot.bin (in
+  the folder or in its "decrypted" folder) and decrypted libc.prx and libSceNpCppWebApi.prx in
+  sce_module.
 - Windows 10 or 11, 64-bit.
 - A graphics card and driver with Vulkan 1.3.
 - A processor with AVX2 (Intel from 2013 on, AMD Ryzen).
@@ -36,7 +37,8 @@ Getting started
 1. Unpack this zip into a folder, for example C:\Games\Regaliant.
 2. Start regaliant-launcher.exe. If Windows says "Windows protected your PC", click
    "More info", then "Run anyway". The programs are not code-signed.
-3. On the Game page, choose the game folder. The launcher checks it and says what is missing.
+3. On the Game page, choose the game folder (Folder...) or a .zar archive of it
+   (.zar file...). The launcher checks it and says what is missing.
 4. Click Play. The first time, the launcher prepares the game's shaders before the game
    starts. This takes about an hour once on a fast PC, longer on others (the Shaders page
    says how long). You can turn it off on the Shaders page.
@@ -47,7 +49,9 @@ Controls
 Controllers: Xbox and other XInput controllers, and PlayStation controllers (DualSense,
 DualSense Edge, DUALSHOCK 4) over USB or Bluetooth, without Steam Input. Connect them at any
 time. All connected controllers play as one. The prompts show the controller's own buttons.
-Vibration works on both, and a PlayStation controller's light bar follows the game.
+Vibration works on both, and a PlayStation controller's light bar follows the game. If you
+remapped buttons in Steam Input or DS4Windows, turn it off for this game: the game also reads
+the controller itself, so the original buttons press too.
 
 Keyboard and mouse (defaults, Dark Souls III-style):
   W A S D            move                      Left Alt         walk
@@ -112,7 +116,8 @@ the screen for the same number of refreshes, so motion stays even:
 
 The launcher
 ------------
-- Game: the game folder and its check, what your PC brings, and safe mode for the next start.
+- Game: the game folder or its .zar archive and its check, Compress to .zar (see "Saving disk
+  space"), what your PC brings, and safe mode for the next start.
 - Display: window mode, monitor, fullscreen resolution and refresh rate, render scale and
   frame rate limit for the next start. The game's PC tab changes the same settings.
   Safe mode starts the game in a window with the default settings and without an upscaler. Use

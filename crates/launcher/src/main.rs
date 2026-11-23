@@ -135,7 +135,9 @@ impl App {
     }
 
     pub fn update_play(&self) {
-        unsafe { ui::enable(self.play, self.game.ok && self.running.is_none()) };
+        // (Not while the game folder is being compressed: the game would read it meanwhile.)
+        unsafe { ui::enable(self.play, self.game.ok && self.running.is_none() && !game::compressing(self)) };
+        game::update(self);
         saves::update(self);
         display::update(self);
     }
@@ -158,7 +160,7 @@ impl App {
 
 /// Play: the shaders first when they are not prepared (unless turned off), then the game.
 pub fn play(app: &mut App) {
-    if app.running.is_some() || !app.game.ok {
+    if app.running.is_some() || !app.game.ok || game::compressing(app) {
         return;
     }
     if shaders::running(app) {
@@ -316,6 +318,14 @@ fn reset_settings(app: &mut App) {
 
 /// Closing while the shaders are prepared: they stop after their current ones.
 fn close(app: &mut App) -> bool {
+    if game::compressing(app) {
+        let t = "The game is still being compressed. Stop and close?\n\nThe unfinished archive is removed.";
+        if unsafe { ui::message(app.hwnd, t, TITLE, MB_ICONQUESTION | MB_YESNO) } == IDYES {
+            // (The launcher closes once the compressing thread has removed it.)
+            game::stop_then_close(app);
+        }
+        return false;
+    }
     if shaders::running(app) && !shaders::stopping(app) {
         let t = "The shaders are still being prepared. Stop and close?\n\nThe next preparation goes on where this one stops.";
         if unsafe { ui::message(app.hwnd, t, TITLE, MB_ICONQUESTION | MB_YESNO) } != IDYES {
@@ -365,6 +375,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_TIMER if wp == shaders::TIMER => with_app(shaders::tick).is_some(),
         WM_TIMER if wp == shaders::CHECK_TIMER => with_app(shaders::check_tick).is_some(),
+        WM_TIMER if wp == game::TIMER => with_app(game::tick).is_some(),
         WM_GAME_EXIT => {
             handle_exit(hwnd, wp);
             true

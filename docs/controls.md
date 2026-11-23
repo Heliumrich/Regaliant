@@ -2,7 +2,7 @@
 
 [Back to the main page](../README.md)
 
-Xbox and other XInput controllers work like the PS5 pad, with their own button prompts. PlayStation controllers (DualSense, DualSense Edge and DUALSHOCK 4) work directly over USB or Bluetooth, without Steam Input, with the game's own button prompts, vibration and light bar. Connect controllers at any time. All connected controllers play as one pad, so Steam Input can stay on too.
+Xbox and other XInput controllers work like the PS5 pad, with their own button prompts. PlayStation controllers (DualSense, DualSense Edge and DUALSHOCK 4) work directly over USB or Bluetooth, without Steam Input, with the game's own button prompts, vibration and light bar. Connect controllers at any time. All connected controllers play as one pad, so Steam Input can stay on with its default layout. If you remapped buttons in Steam Input or DS4Windows, turn it off for this game: the game also reads the controller itself, so the original buttons press too.
 
 ## Keyboard and mouse
 

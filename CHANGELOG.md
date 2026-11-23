@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- The game can be one .zar archive instead of its folder, read in place: about two thirds of the
+  folder's size (54 GB instead of 82 GB for the tested copy). On the launcher's Game page,
+  "Compress to .zar..." makes one from the game folder and then offers to play from it, and
+  ".zar file..." chooses an existing one. The game folder is left as it is.
 - PlayStation controllers work directly, without Steam Input: DualSense, DualSense Edge and
   DUALSHOCK 4, over USB or Bluetooth, also when connected while the game runs. While you use one,
   the game shows its own PlayStation buttons. Vibration and the light bar work on them.

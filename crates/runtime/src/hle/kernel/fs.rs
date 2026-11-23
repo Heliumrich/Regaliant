@@ -2,12 +2,15 @@
 //!
 //! `/app0` layers the update tree over the base tree and is read-only. Writable
 //! mounts live under the project's local-data runtime directory. Paths are
-//! normalized component by component and can never escape a mount root.
+//! normalized component by component and can never escape a mount root. The
+//! game can also be a `.zar` archive (`mount_game`): its files are read from it
+//! in place, decompressed into the title's buffers (`Kind::Zar`).
 
 use super::errno::*;
 use super::{posix_ret, sce};
 use crate::hle::{Registry, cstr};
 use crate::{reg, sysv};
+use dsconfig::zar::{Archive, Source};
 use parking_lot::{Mutex, RwLock};
 use std::fs::{File, OpenOptions};
 use std::os::windows::fs::FileExt;
@@ -23,20 +26,37 @@ pub const O_TRUNC: i32 = 0x400;
 pub const O_EXCL: i32 = 0x800;
 pub const O_DIRECTORY: i32 = 0x20000;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Mount {
     pub prefix: String,
     pub layers: Vec<PathBuf>,
+    /// The game's archive and its folder in it ("" for its root): read-only, no host layers.
+    pub zar: Option<(Arc<Archive>, String)>,
     pub writable: bool,
 }
 
 static MOUNTS: RwLock<Vec<Mount>> = RwLock::new(Vec::new());
 
 pub fn mount(prefix: &str, layers: Vec<PathBuf>, writable: bool) {
-    let mut m = MOUNTS.write();
-    m.retain(|x| x.prefix != prefix);
     crate::info!("mount {prefix} -> {:?} writable={writable}", layers);
-    m.push(Mount { prefix: prefix.to_string(), layers, writable });
+    add_mount(Mount { prefix: prefix.to_string(), layers, zar: None, writable });
+}
+
+/// Mounts the game's files read-only: its folder, or its archive.
+pub fn mount_game(prefix: &str, src: &Source) {
+    match src {
+        Source::Dir(p) => mount(prefix, vec![p.clone()], false),
+        Source::Zar { archive, base } => {
+            crate::info!("mount {prefix} -> the archive {} (its folder '{base}') writable=false", archive.path().display());
+            add_mount(Mount { prefix: prefix.to_string(), layers: Vec::new(), zar: Some((archive.clone(), base.clone())), writable: false });
+        }
+    }
+}
+
+fn add_mount(mount: Mount) {
+    let mut m = MOUNTS.write();
+    m.retain(|x| x.prefix != mount.prefix);
+    m.push(mount);
     m.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
 }
 
@@ -66,6 +86,8 @@ fn normalize(path: &str) -> Option<Vec<String>> {
 pub struct Resolved {
     pub candidates: Vec<PathBuf>,
     pub writable: bool,
+    /// On the game's archive: the archive and the path in it (`candidates` is empty).
+    pub zar: Option<(Arc<Archive>, String)>,
 }
 
 pub fn resolve(guest: &str) -> Option<Resolved> {
@@ -75,20 +97,15 @@ pub fn resolve(guest: &str) -> Option<Resolved> {
     for m in mounts.iter() {
         let pre = normalize(&m.prefix)?;
         if comps.len() >= pre.len() && comps[..pre.len()] == pre[..] {
+            if let Some((a, base)) = &m.zar {
+                let rel = crate::game::join(base, &comps[pre.len()..].join("/"));
+                return Some(Resolved { candidates: Vec::new(), writable: false, zar: Some((a.clone(), rel)) });
+            }
             let rel: PathBuf = comps[pre.len()..].iter().collect();
-            return Some(Resolved { candidates: m.layers.iter().map(|l| l.join(&rel)).collect(), writable: m.writable });
+            return Some(Resolved { candidates: m.layers.iter().map(|l| l.join(&rel)).collect(), writable: m.writable, zar: None });
         }
     }
     None
-}
-
-/// Host path for reading (first existing layer).
-pub fn host_path_existing(guest: &str) -> Option<PathBuf> {
-    let r = resolve(guest)?;
-    if !r.writable {
-        return r.candidates.into_iter().find(|p| ro_meta(p).is_some());
-    }
-    r.candidates.into_iter().find(|p| p.exists())
 }
 
 /// Metadata of a path on a read-only mount.
@@ -141,30 +158,68 @@ pub fn ro_meta(host: &Path) -> Option<CachedMeta> {
     }
 }
 
-/// Host path and metadata of a guest path (first existing layer).
-pub fn guest_meta(guest: &str) -> Option<(PathBuf, CachedMeta)> {
-    let r = resolve(guest)?;
+/// Where a guest path's file is: a host path, or a node of the game's archive.
+#[derive(Clone)]
+pub enum Found {
+    Host(PathBuf),
+    Zar(Arc<Archive>, u32),
+}
+
+fn time_pair(t: Option<std::time::SystemTime>) -> [i64; 2] {
+    t.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| [d.as_secs() as i64, d.subsec_nanos() as i64]).unwrap_or([0, 0])
+}
+
+/// An archive node's metadata (the archive file's write time as its own).
+fn zar_meta(a: &Archive, n: u32) -> CachedMeta {
+    CachedMeta { is_dir: a.is_dir(n), size: a.file_size(n), mtime: time_pair(a.modified()) }
+}
+
+/// The resolved path's file (first existing layer) as the game tree has it, the port's extended
+/// copies aside (`guest_meta`).
+fn locate_in(r: &Resolved) -> Option<(Found, CachedMeta)> {
+    if let Some((a, p)) = &r.zar {
+        let n = a.lookup(p)?;
+        return Some((Found::Zar(a.clone(), n), zar_meta(a, n)));
+    }
     if !r.writable {
-        let first = r.candidates.first().cloned();
-        let found = r.candidates.into_iter().find_map(|p| ro_meta(&p).map(|m| (p, m)));
-        match (&found, crate::pcsettings::generated(guest)) {
-            // A title file the port extends: its extended size.
-            (Some((p, m)), Some(d)) => return Some((p.clone(), CachedMeta { size: d.len() as u64, ..*m })),
-            // A file the port adds (served from memory; its host path is never opened).
-            (None, Some(d)) => return Some((first?, CachedMeta { is_dir: false, size: d.len() as u64, mtime: [0, 0] })),
-            _ => {}
-        }
+        return r.candidates.iter().find_map(|p| ro_meta(p).map(|m| (Found::Host(p.clone()), m)));
+    }
+    let p = r.candidates.iter().find(|p| p.exists())?;
+    let md = std::fs::metadata(p).ok()?;
+    Some((Found::Host(p.clone()), CachedMeta { is_dir: md.is_dir(), size: md.len(), mtime: time_pair(md.modified().ok()) }))
+}
+
+/// Whether a guest path exists (the game tree's own files).
+pub fn exists(guest: &str) -> bool {
+    resolve(guest).is_some_and(|r| locate_in(&r).is_some())
+}
+
+/// A game file's bytes as the game tree has them (its folder or its archive; the port's
+/// extended copies aside).
+pub fn read_file(guest: &str) -> std::io::Result<Vec<u8>> {
+    let not_found = || std::io::Error::new(std::io::ErrorKind::NotFound, format!("{guest}: not found"));
+    let r = resolve(guest).ok_or_else(not_found)?;
+    match locate_in(&r) {
+        Some((Found::Host(p), m)) if !m.is_dir => std::fs::read(p),
+        Some((Found::Zar(a, n), m)) if !m.is_dir => a.read_all(n),
+        _ => Err(not_found()),
+    }
+}
+
+/// Where a guest path's file is and its metadata (first existing layer).
+pub fn guest_meta(guest: &str) -> Option<(Found, CachedMeta)> {
+    let r = resolve(guest)?;
+    let found = locate_in(&r);
+    if r.writable {
         return found;
     }
-    let p = r.candidates.into_iter().find(|p| p.exists())?;
-    let md = std::fs::metadata(&p).ok()?;
-    let mtime = md
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| [d.as_secs() as i64, d.subsec_nanos() as i64])
-        .unwrap_or([0, 0]);
-    Some((p, CachedMeta { is_dir: md.is_dir(), size: md.len(), mtime }))
+    match (found, crate::pcsettings::generated(guest)) {
+        // A title file the port extends: its extended size.
+        (Some((p, m)), Some(d)) => Some((p, CachedMeta { size: d.len() as u64, ..m })),
+        // A file the port adds (served from memory; its host path is never opened).
+        (None, Some(d)) => Some((Found::Host(r.candidates.first().cloned().unwrap_or_default()), CachedMeta { is_dir: false, size: d.len() as u64, mtime: [0, 0] })),
+        (found, _) => found,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -174,6 +229,8 @@ pub enum Kind {
     File { file: File, writable: bool },
     /// Content the port serves from memory (`crate::pcsettings`: title files it extends).
     Mem(Arc<Vec<u8>>),
+    /// A file of the game's archive (read-only).
+    Zar { archive: Arc<Archive>, node: u32 },
     Dir { entries: Vec<(String, bool)> },
     Console(i32),
 }
@@ -306,11 +363,14 @@ pub fn vfs_open(path: &str, flags: i32, _mode: u32) -> i32 {
             return alloc_fd(Fd { kind: Kind::Mem(d), pos: Mutex::new(0), path: path.to_string() });
         }
     }
-    let existing = r.candidates.iter().find(|p| p.exists()).cloned();
     if wants_write && !r.writable {
         crate::warn!("open '{path}' for writing on read-only mount");
         return sce(EROFS);
     }
+    if let Some((a, p)) = &r.zar {
+        return open_in_archive(path, flags, a, p);
+    }
+    let existing = r.candidates.iter().find(|p| p.exists()).cloned();
     if let Some(p) = &existing {
         if p.is_dir() {
             if flags & O_ACCMODE != 0 {
@@ -359,6 +419,55 @@ pub fn vfs_open(path: &str, flags: i32, _mode: u32) -> i32 {
             sce(io_errno(&e))
         }
     }
+}
+
+/// `vfs_open` in the game's archive (`p` the path in it; never for writing).
+fn open_in_archive(path: &str, flags: i32, a: &Arc<Archive>, p: &str) -> i32 {
+    let Some(n) = a.lookup(p) else {
+        if crate::hle::iostat::note("kernel", path, crate::hle::iostat::What::Fail, 0) {
+            crate::info!("open '{path}': not found");
+        } else {
+            crate::debug!("open '{path}': not found");
+        }
+        return sce(ENOENT);
+    };
+    if a.is_dir(n) {
+        if flags & O_ACCMODE != 0 {
+            return sce(EISDIR);
+        }
+        // (In the order `list_dir` gives a folder's: by name.)
+        let mut names: Vec<(String, bool)> = a.list(n).into_iter().map(|e| (e.name, e.dir)).collect();
+        names.sort();
+        let mut entries = vec![(".".to_string(), true), ("..".to_string(), true)];
+        entries.extend(names);
+        crate::debug!("opendir '{path}' ({} entries, archive)", entries.len());
+        return alloc_fd(Fd { kind: Kind::Dir { entries }, pos: Mutex::new(0), path: path.to_string() });
+    }
+    if flags & O_CREAT != 0 && flags & O_EXCL != 0 {
+        return sce(EEXIST);
+    }
+    let fd = alloc_fd(Fd { kind: Kind::Zar { archive: a.clone(), node: n }, pos: Mutex::new(0), path: path.to_string() });
+    if crate::hle::iostat::note("kernel", path, crate::hle::iostat::What::Open, 0) {
+        crate::info!("open '{path}' flags={flags:#x} -> fd {fd} (archive)");
+    } else {
+        crate::debug!("open '{path}' flags={flags:#x} -> fd {fd} (archive)");
+    }
+    fd
+}
+
+/// Reads an archive file into guest memory (`buf`), as the kernel would a host file: the
+/// decompression writes the title's pages, made writable first (`track::host_write`).
+pub fn read_archive_into(path: &str, a: &Archive, node: u32, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
+    let base = buf.as_ptr() as u64;
+    let len = buf.len() as u64;
+    let _w = crate::gpu::track::host_write(base, len);
+    crate::gpu::exec::trace_writes(|| format!("archive read of '{path}' [{off:#x}]"), base, len);
+    let what = || format!("read of '{path}' [{off:#x}] into {base:#x} (archive)");
+    let r = crate::mem::kernel_io(&what, base, len, true, || a.read_at(node, off, &mut *buf));
+    if let Err(e) = &r {
+        crate::warn!("read of '{path}' [{off:#x}+{len:#x}] from the archive failed: {e}");
+    }
+    r
 }
 
 pub fn vfs_close(fd: i32) -> i32 {
@@ -450,6 +559,16 @@ pub fn pread_fd(fd: i32, buf: &mut [u8], off: u64) -> Result<usize, i32> {
             })
             .map_err(|e| io_errno(&e))
         }
+        Kind::Zar { archive, node } => {
+            let t0 = std::time::Instant::now();
+            let want = buf.len();
+            let done = read_archive_into(&f.path, archive, *node, buf, off).map_err(|e| io_errno(&e))?;
+            if crate::hle::iostat::note("kernel", &f.path, crate::hle::iostat::What::Read, done as u64) {
+                crate::info!("read '{}' [{off:#x}+{want:#x}] -> {done:#x} bytes (archive)", f.path);
+            }
+            crate::gpu::hitch::note_since(crate::gpu::hitch::Kind::File, t0, || format!("read '{}' {} KiB (archive)", f.path, done >> 10));
+            Ok(done)
+        }
         Kind::Dir { .. } => Err(EISDIR),
         Kind::Console(_) => Ok(0),
     }
@@ -458,7 +577,7 @@ pub fn pread_fd(fd: i32, buf: &mut [u8], off: u64) -> Result<usize, i32> {
 pub fn vfs_read(fd: i32, buf: &mut [u8]) -> Result<usize, i32> {
     let f = get_fd(fd).ok_or(EBADF)?;
     match &f.kind {
-        Kind::File { .. } | Kind::Mem(_) => {
+        Kind::File { .. } | Kind::Mem(_) | Kind::Zar { .. } => {
             let mut pos = f.pos.lock();
             let n = pread_fd(fd, buf, *pos)?;
             *pos += n as u64;
@@ -493,7 +612,7 @@ pub fn pwrite_fd(fd: i32, data: &[u8], off: Option<u64>) -> Result<usize, i32> {
             crate::gpu::hitch::note_since(crate::gpu::hitch::Kind::File, t0, || format!("write '{}' {} KiB", f.path, done >> 10));
             Ok(done)
         }
-        Kind::Mem(_) => Err(EBADF),
+        Kind::Mem(_) | Kind::Zar { .. } => Err(EBADF),
         Kind::Dir { .. } => Err(EISDIR),
         Kind::Console(c) => {
             console_write(*c, data);
@@ -507,6 +626,7 @@ pub fn vfs_lseek(fd: i32, off: i64, whence: i32) -> i64 {
     let size = match &f.kind {
         Kind::File { file, .. } => file.metadata().map(|m| m.len()).unwrap_or(0),
         Kind::Mem(d) => d.len() as u64,
+        Kind::Zar { archive, node } => archive.file_size(*node),
         Kind::Dir { entries } => entries.len() as u64,
         Kind::Console(_) => return sce(ESPIPE) as i64,
     };
@@ -577,6 +697,11 @@ pub fn fill_stat(md: &std::fs::Metadata) -> Stat {
     st
 }
 
+/// An archive file's stat as the folder's file would give it (the port's extended copies aside).
+pub fn archive_stat(a: &Archive, n: u32) -> Stat {
+    stat_from_meta(&zar_meta(a, n))
+}
+
 fn stat_from_meta(m: &CachedMeta) -> Stat {
     let mut st = Stat { atime: m.mtime, mtime: m.mtime, ctime: m.mtime, birthtime: m.mtime, blksize: 0x10000, ..Default::default() };
     if m.is_dir {
@@ -613,6 +738,7 @@ pub fn fstat_fd(fd: i32, out: *mut Stat) -> i32 {
             Err(e) => return sce(io_errno(&e)),
         },
         Kind::Mem(d) => Stat { mode: S_IFREG | 0o777, nlink: 1, blksize: 0x10000, size: d.len() as i64, blocks: (d.len() as i64 + 511) / 512, ..Default::default() },
+        Kind::Zar { archive, node } => stat_from_meta(&zar_meta(archive, *node)),
         Kind::Dir { .. } => Stat { mode: S_IFDIR | 0o777, nlink: 2, blksize: 0x10000, size: 0x10000, ..Default::default() },
         Kind::Console(_) => Stat { mode: 0o020000 | 0o666, ..Default::default() },
     };
@@ -770,7 +896,7 @@ sysv! {
     fn sceKernelTruncate(path: *const u8, len: i64) -> i32 { truncate(cstr(path), len as u64) }
     fn sceKernelFsync(fd: i32) -> i32 { if get_fd(fd).is_some() { 0 } else { sce(EBADF) } }
     fn sceKernelCheckReachability(path: *const u8) -> i32 {
-        if host_path_existing(cstr(path)).is_some() { 0 } else { sce(ENOENT) }
+        if exists(cstr(path)) { 0 } else { sce(ENOENT) }
     }
 
     // POSIX

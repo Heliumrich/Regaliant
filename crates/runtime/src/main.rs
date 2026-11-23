@@ -32,6 +32,7 @@ mod pcsettings;
 mod jobidle;
 mod camhook;
 mod gamestep;
+mod game;
 mod dispmode;
 mod display;
 mod displayclock;
@@ -65,6 +66,10 @@ pub struct Config {
     pub app: PathBuf,
     /// Directory holding the decrypted executable and `sce_module/`.
     pub code: PathBuf,
+    /// The game's files: the application folder, or its `.zar` archive (`game`).
+    pub source: dsconfig::zar::Source,
+    /// The decrypted executable's folder in `source` ("" or "decrypted").
+    pub code_dir: String,
     pub run_dir: PathBuf,
     pub seconds: Option<u64>,
     /// Development control channel (see `poll_control`).
@@ -307,20 +312,24 @@ fn parse_args() -> Config {
     }
     // The game: `--app`, else the folder chosen in the launcher (or the checkout's own copy),
     // checked as the launcher checks it (`dsconfig::game`).
-    let chosen = app.or_else(|| paths.chosen_game());
-    let (app, code, game_problem) = match chosen.as_deref().map(dsconfig::game::check) {
-        Some(Ok(g)) => (g.app, g.code, None),
+    // (`DS_GAME=<folder or .zar>`: another copy for a development run, the archive A/Bs' arm.)
+    let chosen = app.or_else(|| std::env::var_os("DS_GAME").filter(|v| !v.is_empty()).map(PathBuf::from)).or_else(|| paths.chosen_game());
+    let (app, code, source, code_dir, game_problem) = match chosen.as_deref().map(dsconfig::game::check) {
+        Some(Ok(g)) => (g.app, g.code, g.source, g.code_dir, None),
         Some(Err(e)) => {
             let dir = chosen.clone().unwrap_or_default();
-            (dir.clone(), dir.join("decrypted"), Some(format!("{e}\n\nThe game folder: {}\nStart {} to choose another.", dir.display(), dsconfig::paths::LAUNCHER_EXE)))
+            let what = if dsconfig::zar::is_archive_path(&dir) { "The game archive" } else { "The game folder" };
+            (dir.clone(), dir.join("decrypted"), dsconfig::zar::Source::Dir(dir.clone()), "decrypted".to_string(), Some(format!("{e}\n\n{what}: {}\nStart {} to choose another.", dir.display(), dsconfig::paths::LAUNCHER_EXE)))
         }
-        None => (PathBuf::new(), PathBuf::new(), Some(format!("The game folder is not set. Start {} and choose it.", dsconfig::paths::LAUNCHER_EXE))),
+        None => (PathBuf::new(), PathBuf::new(), dsconfig::zar::Source::Dir(PathBuf::new()), String::new(), Some(format!("The game folder is not set. Start {} and choose it.", dsconfig::paths::LAUNCHER_EXE))),
     };
     let game_unset = chosen.is_none();
     let run_dir = paths.logs().join(utc_stamp());
     Config {
         code,
         app,
+        source,
+        code_dir,
         run_dir,
         paths,
         game_problem,
@@ -2242,7 +2251,12 @@ This happens when other software takes that range. Restart the PC and try again.
         let _ = std::fs::write(cfg.paths.running_marker(), format!("pid {}\nlog {}\n", std::process::id(), cfg.run_dir.display()));
     }
     // (Its driver reads the log from here on; the title reads the tour's automation at its boot.)
-    prepplay::start(&cfg.app);
+    // (`DS_ZAR_THREADS=<n>`: threads that decompress one large read of a `.zar` game.)
+    if let Some(n) = std::env::var("DS_ZAR_THREADS").ok().and_then(|v| v.parse().ok()) {
+        dsconfig::zar::set_threads(n);
+    }
+    game::set(cfg.source.clone());
+    prepplay::start();
     exception::install();
     heapsites::start();
     hosted::init();
@@ -2291,7 +2305,7 @@ This happens when other software takes that range. Restart the PC and try again.
         // (Through its cache beside the store: the bundles read only after an install, an
         // update or another card or driver.)
         let fp_dir = cfg.cache.clone().unwrap_or_else(|| cfg.paths.shaders());
-        let code = match gpu::compbench::translation_fingerprint_cached(&cfg.app, Some(&fp_dir), &build_id()) {
+        let code = match gpu::compbench::translation_fingerprint_cached(game::source(), Some(&fp_dir), &build_id()) {
             Ok(fp) => {
                 // (The card and driver this program uses, as the prepared marker names them: the
                 // launcher's records follow the game's own device, the review of 2026-11-20.)
@@ -2311,7 +2325,7 @@ This happens when other software takes that range. Restart the PC and try again.
         log::flush();
         std::process::exit(code);
     }
-    gpu::particles::start(cfg.app.clone());
+    gpu::particles::start(game::source().clone());
     gpu::capture::init_from_env();
     gpu::start_profiler();
     guestprof::start();
@@ -2362,9 +2376,12 @@ This happens when other software takes that range. Restart the PC and try again.
     for d in ["temp0", "download0", "data", "devlog"] {
         hle::kernel::fs::ensure_dir(&rt.join(d));
     }
-    info!("application root {} (read-only), code {}", cfg.app.display(), cfg.code.display());
-    hle::kernel::fs::mount("/app0", vec![cfg.app.clone()], false);
-    hle::kernel::fs::mount("/hostapp", vec![cfg.app.clone()], false);
+    match game::source() {
+        dsconfig::zar::Source::Zar { .. } => info!("application root: the archive {} (read-only, read in place), code in its folder '{}'", game::source().display(), cfg.code_dir),
+        _ => info!("application root {} (read-only), code {}", cfg.app.display(), cfg.code.display()),
+    }
+    hle::kernel::fs::mount_game("/app0", game::source());
+    hle::kernel::fs::mount_game("/hostapp", game::source());
     hle::kernel::fs::mount("/temp0", vec![rt.join("temp0")], true);
     hle::kernel::fs::mount("/temp", vec![rt.join("temp0")], true);
     hle::kernel::fs::mount("/download0", vec![rt.join("download0")], true);
@@ -2376,7 +2393,7 @@ This happens when other software takes that range. Restart the PC and try again.
     input::init(&cfg.paths.controls_file());
     // `DS_ACHIEVEMENTS_FILE`: another file (test runs: theirs, apart from a player's).
     let achievements_file = std::env::var_os("DS_ACHIEVEMENTS_FILE").map(PathBuf::from).unwrap_or_else(|| cfg.paths.achievements_file());
-    achievements::init(&cfg.app, achievements_file, "en-GB");
+    achievements::init(game::source(), achievements_file, "en-GB");
     // Monitors and the PC tab's display choices (before its menu lists are made).
     // Safe mode: the display choices and PC settings at their defaults for this session (a
     // scratch file for the display's, the player's files left as they are).
@@ -2420,7 +2437,7 @@ This happens when other software takes that range. Restart the PC and try again.
         gpu::fe2::specs_as_hosted();
     }
     if let Some(a) = &cfg.compile_bench {
-        let code = gpu::compbench::run(a, &cfg.app);
+        let code = gpu::compbench::run(a, game::source());
         gpu::pcache::clear_crash_suspects();
         log::flush();
         std::process::exit(code);
@@ -2428,7 +2445,7 @@ This happens when other software takes that range. Restart the PC and try again.
     if let Some(n) = cfg.precompile_all {
         // (Every compile of the compute step is ahead of use: the crash list's background rule.)
         gpu::pcache::background_process();
-        let code = gpu::compbench::precompile_all(&cfg.app, n, cfg.progress.as_deref(), Some(&cache_root.join("prepared.txt")));
+        let code = gpu::compbench::precompile_all(game::source(), n, cfg.progress.as_deref(), Some(&cache_root.join("prepared.txt")));
         prepplay::write_health(cfg.progress.as_deref(), &prepplay::health_line("compute", code));
         gpu::pcache::clear_crash_suspects();
         log::flush();
@@ -2460,18 +2477,28 @@ This happens when other software takes that range. Restart the PC and try again.
 
     // Modules: the decrypted executable and the title's own libraries.
     let t0 = Instant::now();
-    let eboot = loader::load(&cfg.code.join("eboot.bin"), true).unwrap_or_else(|e| {
+    // (From the folder as before, or read out of the game's archive.)
+    let load_module = |rel: &str, is_main: bool| -> Result<Arc<loader::LoadedModule>, String> {
+        match game::source() {
+            dsconfig::zar::Source::Dir(_) => loader::load(&rel.split('/').fold(cfg.code.clone(), |p, c| p.join(c)), is_main),
+            src => {
+                let full = game::join(&cfg.code_dir, rel);
+                let bytes = src.read(&full).map_err(|e| format!("{full} in {}: {e}", src.display()))?;
+                loader::load_bytes(bytes, &src.path().join(full.replace('/', "\\")), is_main)
+            }
+        }
+    };
+    let eboot = load_module("eboot.bin", true).unwrap_or_else(|e| {
         error!("loading eboot failed: {e}");
         fatal_exit(EXIT_START, "load failure");
     });
     let mut libs: Vec<Arc<loader::LoadedModule>> = Vec::new();
     for name in ["libc.prx", "libSceNpCppWebApi.prx"] {
-        let p = cfg.code.join("sce_module").join(name);
-        if !p.exists() {
-            error!("{name} not found in {}", p.display());
+        if !game::source().is_file(&game::join(&cfg.code_dir, &format!("sce_module/{name}"))) {
+            error!("{name} not found in {}", game::source().display());
             fatal_exit(EXIT_START, "missing title module");
         }
-        match loader::load(&p, false) {
+        match load_module(&format!("sce_module/{name}"), false) {
             Ok(m) => libs.push(m),
             Err(e) => {
                 error!("loading {name} failed: {e}");

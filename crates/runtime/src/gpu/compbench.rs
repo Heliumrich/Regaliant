@@ -44,7 +44,7 @@ fn top_fields(d: &str) -> Vec<String> {
     out
 }
 
-fn guess_report(app: &std::path::Path) -> i32 {
+fn guess_report(src: &dsconfig::zar::Source) -> i32 {
     use rdna::translate::ResSpec;
     use std::collections::HashMap;
     // (Specs depend on the device's features.)
@@ -54,18 +54,17 @@ fn guess_report(app: &std::path::Path) -> i32 {
     }
     // The engine's programs by code hash: their directory.
     let mut engine: HashMap<u64, String> = HashMap::new();
-    let root = app.join("coredata").join("enginesupport").join("shaders").join("_ps5");
-    let mut stack: Vec<(std::path::PathBuf, Option<String>)> = vec![(root, None)];
+    let mut stack: Vec<(String, Option<String>)> = vec![(super::particles::ENGINE_SHADERS.to_string(), None)];
     let mut files = 0;
     while let Some((d, top)) = stack.pop() {
-        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                let name = top.clone().unwrap_or_else(|| e.file_name().to_string_lossy().into_owned());
+        for e in src.list(&d).unwrap_or_default() {
+            let p = format!("{d}/{}", e.name);
+            if e.dir {
+                let name = top.clone().unwrap_or_else(|| e.name.clone());
                 stack.push((p, Some(name)));
-            } else if p.extension().is_some_and(|x| x == "csdr") {
+            } else if super::particles::has_ext(&e.name, "csdr") {
                 files += 1;
-                if let Some(v) = std::fs::read(&p).ok().and_then(|b| super::particles::bundle_programs(&b)) {
+                if let Some(v) = src.read(&p).ok().and_then(|b| super::particles::bundle_programs(&b)) {
                     let dir = top.clone().unwrap_or_default();
                     engine.extend(v.iter().filter(|x| x.stage == 0).map(|x| (x.hash, dir.clone())));
                 }
@@ -75,9 +74,9 @@ fn guess_report(app: &std::path::Path) -> i32 {
     // The particle bundles' programs (compiled at their first dispatch: a
     // guess at level load would have them ready).
     let mut particle: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    let pdir = app.join("particles").join("!cookedparticleshaders").join("version01").join("_ps5");
-    for e in std::fs::read_dir(&pdir).into_iter().flatten().flatten() {
-        if let Some(v) = std::fs::read(e.path()).ok().and_then(|b| super::particles::bundle_programs(&b)) {
+    let pdir = super::particles::PARTICLE_SHADERS;
+    for e in src.list(pdir).unwrap_or_default() {
+        if let Some(v) = src.read(&format!("{pdir}/{}", e.name)).ok().and_then(|b| super::particles::bundle_programs(&b)) {
             particle.extend(v.iter().map(|x| x.hash));
         }
     }
@@ -277,7 +276,7 @@ fn guess_report(app: &std::path::Path) -> i32 {
     }
     crate::info!("guess report: {engine_learned} of the learned programs are the engine's; other differences: {other_why:?}");
     {
-        let progs = bundle_compute(app);
+        let progs = bundle_compute(src);
         let engine_variants: usize = progs.iter().map(|p| p.2.len() - 1).sum();
         crate::info!("guess report: the preparation would make {} compute pipelines' specs ({} of them variants of the guess)", progs.iter().map(|p| p.2.len()).sum::<usize>(), engine_variants);
     }
@@ -346,9 +345,9 @@ fn object_regs(o: &[u8]) -> Option<(u32, [u32; 3])> {
 
 /// The compute programs of the game's shader files (`DS_CB_BUNDLES`), each
 /// with the spec guessed from its shader object, once per code hash.
-fn bundle_compute(app: &std::path::Path) -> Vec<(u64, std::sync::Arc<Vec<u32>>, Vec<rdna::translate::Spec>)> {
+fn bundle_compute(src: &dsconfig::zar::Source) -> Vec<(u64, std::sync::Arc<Vec<u32>>, Vec<rdna::translate::Spec>)> {
     let sample: u64 = std::env::var("DS_CB_SAMPLE").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(1);
-    bundle_compute_sampled(app, sample)
+    bundle_compute_sampled(src, sample)
 }
 
 /// The programs a preparation's fingerprint translates: one in this many by code hash (~65 of
@@ -375,10 +374,10 @@ pub(crate) const PREPARATION_RULES: u32 = 9;
 /// SPIR-V hashed. A port update that changes translations changes it; the prepared pipelines
 /// then no longer match (the store takes a binary only for the SPIR-V it was made from), so
 /// the launcher asks for another preparation (`prepared.txt`'s `translation`).
-pub fn translation_fingerprint(app: &std::path::Path) -> Result<String, String> {
+pub fn translation_fingerprint(src: &dsconfig::zar::Source) -> Result<String, String> {
     // (Specs depend on the device's features.)
     super::vk::init().map_err(|e| format!("Vulkan: {e}"))?;
-    let progs = bundle_compute_sampled(app, FINGERPRINT_SAMPLE);
+    let progs = bundle_compute_sampled(src, FINGERPRINT_SAMPLE);
     if progs.is_empty() {
         return Err("no compute programs found in the game's shader files".into());
     }
@@ -405,22 +404,23 @@ pub fn translation_fingerprint(app: &std::path::Path) -> Result<String, String> 
 /// The game's shader bundle files the compute programs come from, in the order they are read:
 /// the particles' bundles, then the engine's tree before the materials' (a stack), so that a
 /// program in both is the engine's and gets its image variants.
-fn shader_bundle_files(app: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut files: Vec<std::path::PathBuf> = Vec::new();
-    let pdir = app.join("particles").join("!cookedparticleshaders").join("version01").join("_ps5");
-    files.extend(std::fs::read_dir(&pdir).into_iter().flatten().flatten().map(|e| e.path()));
+fn shader_bundle_files(src: &dsconfig::zar::Source) -> Vec<(String, dsconfig::zar::DirEntry)> {
+    let mut files: Vec<(String, dsconfig::zar::DirEntry)> = Vec::new();
+    let pdir = super::particles::PARTICLE_SHADERS;
+    files.extend(src.list(pdir).unwrap_or_default().into_iter().map(|e| (format!("{pdir}/{}", e.name), e)));
     // The engine's shaders, and the materials' bundles (their compute programs: 58% of a prepared
     // first session's remaining misses, 2026-11-13; a material's `_trinity` bundle repeats its
     // other one's programs, left out).
-    let materials = app.join("materials").join("!cookedshaders");
-    let mut stack = vec![materials.clone(), app.join("coredata").join("enginesupport").join("shaders").join("_ps5")];
+    let materials = "materials/!cookedshaders";
+    let mut stack = vec![materials.to_string(), super::particles::ENGINE_SHADERS.to_string()];
     while let Some(d) = stack.pop() {
-        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
-            let p = e.path();
-            if p.is_dir() {
+        let in_materials = d == materials || d.starts_with(&format!("{materials}/"));
+        for e in src.list(&d).unwrap_or_default() {
+            let p = format!("{d}/{}", e.name);
+            if e.dir {
                 stack.push(p);
-            } else if !(p.starts_with(&materials) && p.file_stem().is_some_and(|s| s.to_string_lossy().ends_with("_trinity"))) {
-                files.push(p);
+            } else if !(in_materials && std::path::Path::new(&e.name).file_stem().is_some_and(|s| s.to_string_lossy().ends_with("_trinity"))) {
+                files.push((p, e));
             }
         }
     }
@@ -433,7 +433,7 @@ fn shader_bundle_files(app: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// (12,860 files, 265 MiB) to sample one program in 509, which a slow drive, a virus scanner or a
 /// cold file cache can stretch past the check's 60 s watch, leaving the store untrusted at every
 /// launcher start (the review of 2026-11-21 night); listing the files takes a fraction of that.
-pub fn translation_fingerprint_cached(app: &std::path::Path, dir: Option<&std::path::Path>, build: &str) -> Result<String, String> {
+pub fn translation_fingerprint_cached(src: &dsconfig::zar::Source, dir: Option<&std::path::Path>, build: &str) -> Result<String, String> {
     super::vk::init().map_err(|e| format!("Vulkan: {e}"))?;
     let c = super::vk::ctx();
     let driver = unsafe { c.instance.get_physical_device_properties(c.pdev) }.driver_version;
@@ -443,11 +443,11 @@ pub fn translation_fingerprint_cached(app: &std::path::Path, dir: Option<&std::p
             h = (h ^ x as u64).wrapping_mul(0x100_0000_01b3);
         }
     };
-    for f in shader_bundle_files(app).iter().filter(|p| p.extension().is_some_and(|x| x == "csdr")) {
-        let md = std::fs::metadata(f).ok();
-        mix(f.strip_prefix(app).unwrap_or(f).to_string_lossy().as_bytes());
-        mix(&md.as_ref().map_or(0, |m| m.len()).to_le_bytes());
-        let t = md.and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+    // (The game's files: in an archive every file has the archive's write time.)
+    for (f, e) in shader_bundle_files(src).iter().filter(|(p, _)| super::particles::has_ext(p, "csdr")) {
+        mix(f.as_bytes());
+        mix(&e.size.to_le_bytes());
+        let t = e.modified.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
         mix(&t.to_le_bytes());
     }
     let key = format!("{build} {} {driver} r{PREPARATION_RULES} {h:016x}", c.device_name);
@@ -462,7 +462,7 @@ pub fn translation_fingerprint_cached(app: &std::path::Path, dir: Option<&std::p
         }
     }
     FP_MISSES.store(0, std::sync::atomic::Ordering::Relaxed);
-    let fp = translation_fingerprint(app)?;
+    let fp = translation_fingerprint(src)?;
     // (Kept only when whole: a shader file that could not be read, or a sampled program that did
     // not translate, makes a fingerprint the markers' own (made afresh) would not match, and a
     // cached one would say "the game was updated" after every preparation; the review of
@@ -481,20 +481,20 @@ pub fn translation_fingerprint_cached(app: &std::path::Path, dir: Option<&std::p
 static FP_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `bundle_compute`, one program in `sample` by code hash.
-fn bundle_compute_sampled(app: &std::path::Path, sample: u64) -> Vec<(u64, std::sync::Arc<Vec<u32>>, Vec<rdna::translate::Spec>)> {
-    let files = shader_bundle_files(app);
+fn bundle_compute_sampled(src: &dsconfig::zar::Source, sample: u64) -> Vec<(u64, std::sync::Arc<Vec<u32>>, Vec<rdna::translate::Spec>)> {
+    let files = shader_bundle_files(src);
     let mut seen = std::collections::HashSet::new();
     let (mut programs, mut no_object) = (0u64, 0u64);
     let mut out = Vec::new();
-    let engine_dir = app.join("coredata");
+    let engine_dir = "coredata/";
     let mut variants = 0u64;
     let mut d3_variants = 0u64;
-    for f in files.iter().filter(|p| p.extension().is_some_and(|x| x == "csdr")) {
-        let Some(v) = std::fs::read(f).ok().and_then(|b| super::particles::bundle_programs(&b)) else {
+    for (f, _) in files.iter().filter(|(p, _)| super::particles::has_ext(p, "csdr")) {
+        let Some(v) = src.read(f).ok().and_then(|b| super::particles::bundle_programs(&b)) else {
             FP_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             continue;
         };
-        let engine = f.starts_with(&engine_dir);
+        let engine = f.starts_with(engine_dir);
         for p in v.into_iter().filter(|p| p.stage == 0) {
             if !seen.insert(p.hash) || p.hash % sample != 0 {
                 continue;
@@ -562,14 +562,14 @@ fn spec_hash(s: &rdna::translate::Spec) -> u64 {
 /// second in `progress` (the launcher's: `<programs done> <programs>` and `<code words done>
 /// <code words>` lines); when all are done, `marker` records it (the launcher's "prepared": the
 /// date, the counts, the device and its driver, for which the pipelines hold).
-pub fn precompile_all(app: &std::path::Path, threads: usize, progress: Option<&std::path::Path>, marker: Option<&std::path::Path>) -> i32 {
+pub fn precompile_all(src: &dsconfig::zar::Source, threads: usize, progress: Option<&std::path::Path>, marker: Option<&std::path::Path>) -> i32 {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
     if let Err(e) = super::vk::init() {
         crate::error!("precompile all: Vulkan: {e}");
         return 2;
     }
     let t_all = Instant::now();
-    let (progs, recipes, total_words) = work_list(app, threads);
+    let (progs, recipes, total_words) = work_list(src, threads);
     let all = progs.len() + recipes.len();
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
@@ -786,20 +786,20 @@ pub fn precompile_all(app: &std::path::Path, threads: usize, progress: Option<&s
         let _ = std::fs::write(p, format!("{} {}\n{} {}\n", all, all, total_words, total_words));
     }
     if let Some(m) = marker {
-        write_marker(app, m, all, all, failed.load(Relaxed), t_all.elapsed().as_secs_f64());
+        write_marker(src, m, all, all, failed.load(Relaxed), t_all.elapsed().as_secs_f64());
     }
     0
 }
 
 /// The prepared shaders' marker (`prepared.txt`, the launcher's "prepared": the date, the
 /// counts, the device and its driver, the translation, for which the pipelines hold).
-pub fn write_marker(app: &std::path::Path, m: &std::path::Path, done: usize, all: usize, failed: usize, seconds: f64) {
+pub fn write_marker(src: &dsconfig::zar::Source, m: &std::path::Path, done: usize, all: usize, failed: usize, seconds: f64) {
     let c = super::vk::ctx();
     let props = unsafe { c.instance.get_physical_device_properties(c.pdev) };
     let uuid: String = props.pipeline_cache_uuid.iter().map(|b| format!("{b:02x}")).collect();
     // (What the pipelines were translated as: another build that translates differently
     // makes them stale, `translation_fingerprint`.)
-    let translation = translation_fingerprint(app).unwrap_or_else(|e| {
+    let translation = translation_fingerprint(src).unwrap_or_else(|e| {
         crate::warn!("precompile all: no translation fingerprint ({e})");
         String::new()
     });
@@ -886,7 +886,7 @@ pub static BACKGROUND: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::a
 static BACKGROUND_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Starts the background compute preparation (once the device exists).
-pub fn background(app: std::path::PathBuf, threads: usize) {
+pub fn background(src: dsconfig::zar::Source, threads: usize) {
     use std::sync::atomic::Ordering::Relaxed;
     let r = std::thread::Builder::new().name("gpu-prep-list".into()).spawn(move || {
         crate::log::set_thread_name("gpu-prep-list");
@@ -894,7 +894,7 @@ pub fn background(app: std::path::PathBuf, threads: usize) {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         let t0 = Instant::now();
-        let (progs, recipes, total_words) = work_list(&app, threads);
+        let (progs, recipes, total_words) = work_list(&src, threads);
         let all = progs.len() + recipes.len();
         BACKGROUND[0].store(all as u64, Relaxed);
         BACKGROUND[3].store(total_words as u64, Relaxed);
@@ -1010,7 +1010,7 @@ pub fn background_stop() {
 
 /// The precompile's work list: every compute program's variants (guessed, and the engine's image
 /// variants), then the player's own learned specs and graphics recipes; with the code words.
-fn work_list(app: &std::path::Path, threads: usize) -> (Vec<Prog>, Vec<(usize, usize)>, usize) {
+fn work_list(src: &dsconfig::zar::Source, threads: usize) -> (Vec<Prog>, Vec<(usize, usize)>, usize) {
     // Each program's variants as its dispatches prepare them: with LOD statistics in rotation
     // (`shaders::cs_lod_rotation`) a dispatch is prepared without them first (every first use),
     // and a measuring one (one in `tune lod_cs`, binding counted textures: programs that sample
@@ -1020,7 +1020,7 @@ fn work_list(app: &std::path::Path, threads: usize) -> (Vec<Prog>, Vec<(usize, u
     let mut second = Vec::new();
     // The engine's image variants: [pipelines, code words].
     let mut variants = [0usize; 2];
-    for (h, code, specs) in bundle_compute(app) {
+    for (h, code, specs) in bundle_compute(src) {
         let n = code.len();
         // (The guess and, for the engine's programs, its image-dimension variants.)
         for (k, spec) in specs.into_iter().enumerate() {
@@ -1180,16 +1180,16 @@ fn memtest(n: usize) -> i32 {
 /// SOPK immediates. How many pipelines would serve them if constants were
 /// read at run time, by count and by instructions (compile time follows
 /// program size), and the largest groups.
-fn shapes_report(app: &std::path::Path) -> i32 {
+fn shapes_report(src: &dsconfig::zar::Source) -> i32 {
     use std::collections::HashMap;
-    let mut files: Vec<(std::path::PathBuf, bool)> = Vec::new();
-    let pdir = app.join("particles").join("!cookedparticleshaders").join("version01").join("_ps5");
-    files.extend(std::fs::read_dir(&pdir).into_iter().flatten().flatten().map(|e| (e.path(), true)));
-    let mut stack = vec![app.join("coredata").join("enginesupport").join("shaders").join("_ps5")];
+    let mut files: Vec<(String, bool)> = Vec::new();
+    let pdir = super::particles::PARTICLE_SHADERS;
+    files.extend(src.list(pdir).unwrap_or_default().into_iter().map(|e| (format!("{pdir}/{}", e.name), true)));
+    let mut stack = vec![super::particles::ENGINE_SHADERS.to_string()];
     while let Some(d) = stack.pop() {
-        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
-            let p = e.path();
-            if p.is_dir() {
+        for e in src.list(&d).unwrap_or_default() {
+            let p = format!("{d}/{}", e.name);
+            if e.dir {
                 stack.push(p);
             } else {
                 files.push((p, false));
@@ -1206,8 +1206,8 @@ fn shapes_report(app: &std::path::Path) -> i32 {
     let mut tot = [(0u64, 0u64); 2];
     let mut shapes: [[HashMap<u64, (u64, u64)>; 2]; 2] = Default::default();
     let mut lits = [0u64; 2];
-    for (f, particle) in files.iter().filter(|(p, _)| p.extension().is_some_and(|x| x == "csdr")) {
-        let Some(v) = std::fs::read(f).ok().and_then(|b| super::particles::bundle_programs(&b)) else { continue };
+    for (f, particle) in files.iter().filter(|(p, _)| super::particles::has_ext(p, "csdr")) {
+        let Some(v) = src.read(f).ok().and_then(|b| super::particles::bundle_programs(&b)) else { continue };
         for p in v.into_iter().filter(|p| p.stage == 0) {
             if !seen.insert(p.hash) {
                 continue;
@@ -1304,12 +1304,12 @@ fn shapes_report(app: &std::path::Path) -> i32 {
     0
 }
 
-pub fn run(args: &[String], app: &std::path::Path) -> i32 {
+pub fn run(args: &[String], src: &dsconfig::zar::Source) -> i32 {
     if std::env::var("DS_CB_GUESS").ok().as_deref() == Some("1") {
-        return guess_report(app);
+        return guess_report(src);
     }
     if std::env::var("DS_CB_SHAPES").ok().as_deref() == Some("1") {
-        return shapes_report(app);
+        return shapes_report(src);
     }
     if let Some(n) = std::env::var("DS_CB_MEMTEST").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0) {
         return memtest(n);
@@ -1348,7 +1348,7 @@ pub fn run(args: &[String], app: &std::path::Path) -> i32 {
     // each with the spec guessed from its shader object: what compiling
     // them all ahead would take (DS_CB_SAMPLE=<n>: every n-th by code
     // hash).
-    let source = if std::env::var("DS_CB_BUNDLES").ok().as_deref() == Some("1") { bundle_compute(app) } else { super::precompile::learned_compute() };
+    let source = if std::env::var("DS_CB_BUNDLES").ok().as_deref() == Some("1") { bundle_compute(src) } else { super::precompile::learned_compute() };
     // DS_CB_MAX_INSTS=<n>: programs of at most n instructions.
     let max_insts = std::env::var("DS_CB_MAX_INSTS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(usize::MAX);
     let mut progs: Vec<(u64, std::sync::Arc<Vec<u32>>, Vec<rdna::translate::Spec>, usize)> = source

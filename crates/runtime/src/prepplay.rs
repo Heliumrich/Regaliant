@@ -283,7 +283,7 @@ static LEVELS_CUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 
 /// The store marked prepared (`compbench::write_marker`, with `levels_cut` when levels were
 /// left), once the device exists (none: nothing written, the launcher marks it).
-fn mark_prepared(app: &Path, store: &Path, seconds: f64) {
+fn mark_prepared(store: &Path, seconds: f64) {
     if crate::gpu::vk::try_ctx().is_none() {
         crate::warn!("prepare-play: no graphics device: the store is not marked here");
         return;
@@ -291,7 +291,7 @@ fn mark_prepared(app: &Path, store: &Path, seconds: f64) {
     crate::gpu::compbench::background_stop();
     let b = &crate::gpu::compbench::BACKGROUND;
     let marker = store.join("prepared.txt");
-    crate::gpu::compbench::write_marker(app, &marker, b[1].load(Relaxed) as usize, b[0].load(Relaxed) as usize, b[2].load(Relaxed) as usize, seconds);
+    crate::gpu::compbench::write_marker(crate::game::source(), &marker, b[1].load(Relaxed) as usize, b[0].load(Relaxed) as usize, b[2].load(Relaxed) as usize, seconds);
     if LEVELS_CUT.load(Relaxed) {
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&marker) {
@@ -456,7 +456,7 @@ fn copy_synced(from: &Path, to: &Path) -> std::io::Result<u64> {
 
 /// Starts the stage (`main`, once the log is open; before the title starts: the tour's
 /// automation is read at its boot): its driver thread plays it and ends the session.
-pub fn start(app: &Path) {
+pub fn start() {
     let Some(s) = SETUP.get() else { return };
     prepare_files(s);
     crate::log::tap_on();
@@ -468,7 +468,7 @@ pub fn start(app: &Path) {
     // A part of the levels begun after the preparation's time is up: the store is marked
     // prepared as it is (once the device exists), and the session ends.
     if s.stage == Stage::Tour && past_deadline() {
-        let (app, store) = (app.to_path_buf(), s.store.clone());
+        let store = s.store.clone();
         let _ = std::thread::Builder::new().name("prepare-play".into()).spawn(move || {
             crate::log::set_thread_name("prepare-play");
             let t = Instant::now();
@@ -477,7 +477,7 @@ pub fn start(app: &Path) {
             }
             crate::info!("prepare-play: the preparation's time was up before this part of the levels: the store is marked prepared");
             LEVELS_CUT.store(true, Relaxed);
-            mark_prepared(&app, &store, 0.0);
+            mark_prepared(&store, 0.0);
             end(0);
         });
         return;
@@ -490,7 +490,7 @@ pub fn start(app: &Path) {
             let _ = std::fs::remove_file(&args);
             NEWGAME_STEPS
         }
-        Stage::Tour => match tour_script(app) {
+        Stage::Tour => match tour_script(crate::game::source()) {
             Ok((text, views)) => {
                 // (No '-' in the name: `automate_loadfile=#/prepare-tour.txt` failed to execute,
                 // its usage printed, 2026-11-19.)
@@ -518,10 +518,10 @@ pub fn start(app: &Path) {
         if s.stage == Stage::NewGame && std::env::var("DS_PREPARE_NG_FULL").ok().as_deref() != Some("0") {
             crate::gpu::compbench::full_from_start();
         }
-        crate::gpu::compbench::background(app.to_path_buf(), s.threads);
+        crate::gpu::compbench::background(crate::game::source().clone(), s.threads);
         BACKGROUND_ON.store(true, Relaxed);
     }
-    let (stage, progress, store, app) = (s.stage, s.progress.clone(), s.store.clone(), app.to_path_buf());
+    let (stage, progress, store) = (s.stage, s.progress.clone(), s.store.clone());
     watch_hangs();
     let spawned = std::thread::Builder::new().name("prepare-play".into()).spawn(move || {
         crate::log::set_thread_name("prepare-play");
@@ -544,7 +544,7 @@ pub fn start(app: &Path) {
                     if p.compute_tail().is_err() {
                         crate::info!("prepare-play: stopped during the compute tail (the levels were played)");
                     }
-                    mark_prepared(&app, &store, p.t0.elapsed().as_secs_f64());
+                    mark_prepared(&store, p.t0.elapsed().as_secs_f64());
                 }
                 p.done();
                 crate::info!("prepare-play: stage {} played to its end in {:.0} s", stage.name(), p.t0.elapsed().as_secs_f64());
@@ -566,7 +566,7 @@ pub fn start(app: &Path) {
                 p.drain(60);
                 let last = SETUP.get().and_then(|s| s.chunk).is_none_or(|(i, n)| i == n) || past_deadline();
                 if stage == Stage::Tour && last {
-                    mark_prepared(&app, &store, p.t0.elapsed().as_secs_f64());
+                    mark_prepared(&store, p.t0.elapsed().as_secs_f64());
                 }
                 EXIT_FAILED
             }
@@ -1403,18 +1403,18 @@ fn pois(text: &str) -> Vec<Poi> {
 /// and `tools/areas.py` write the development tours) and its number of steps, from the title's
 /// own files: the screenshot positions of `misc/automation/demonssoulsscreenshots.txt` and the
 /// points of interest of `misc/dspointsofinterest.txt`.
-fn tour_script(app: &Path) -> Result<(String, u32), String> {
-    let misc = app.join("misc");
-    let src = misc.join("automation").join("demonssoulsscreenshots.txt");
-    let shots = std::fs::read_to_string(&src).map_err(|e| format!("{}: {e}", src.display()))?;
-    let poi_file = misc.join("dspointsofinterest.txt");
-    let poi = std::fs::read_to_string(&poi_file).unwrap_or_else(|e| {
-        crate::warn!("prepare-play: {}: {e} (the camera views only)", poi_file.display());
+fn tour_script(game: &dsconfig::zar::Source) -> Result<(String, u32), String> {
+    let text = |rel: &str| game.read(rel).and_then(|b| String::from_utf8(b).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)));
+    let src = "misc/automation/demonssoulsscreenshots.txt";
+    let shots = text(src).map_err(|e| format!("{src}: {e}"))?;
+    let poi_file = "misc/dspointsofinterest.txt";
+    let poi = text(poi_file).unwrap_or_else(|e| {
+        crate::warn!("prepare-play: {poi_file}: {e} (the camera views only)");
         String::new()
     });
     let mut o = LevelOpts::from_env();
     o.chunk = SETUP.get().and_then(|s| s.chunk);
-    levels_lines(&shots, &poi, &o).ok_or_else(|| format!("no positions in {}", src.display()))
+    levels_lines(&shots, &poi, &o).ok_or_else(|| format!("no positions in {src}"))
 }
 
 /// The levels stage's script (None: no positions). Each level is loaded once and, in this

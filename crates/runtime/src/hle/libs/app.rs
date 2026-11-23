@@ -17,11 +17,10 @@ pub fn param_sfo() -> &'static HashMap<String, SfoValue> {
     static SFO: OnceLock<HashMap<String, SfoValue>> = OnceLock::new();
     SFO.get_or_init(|| {
         let mut m = HashMap::new();
-        let Some(p) = crate::hle::kernel::fs::host_path_existing("/app0/sce_sys/param.sfo") else {
+        let Ok(b) = crate::hle::kernel::fs::read_file("/app0/sce_sys/param.sfo") else {
             crate::warn!("param.sfo not found");
             return m;
         };
-        let Ok(b) = std::fs::read(&p) else { return m };
         let rd32 = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
         let rd16 = |o: usize| u16::from_le_bytes(b[o..o + 2].try_into().unwrap());
         if b.len() < 20 || rd32(0) != 0x4653_5000 {
@@ -65,11 +64,11 @@ fn sfo_int(key: &str) -> Option<u32> {
 pub fn param_json() -> &'static serde_json::Value {
     static J: OnceLock<serde_json::Value> = OnceLock::new();
     J.get_or_init(|| {
-        let Some(p) = crate::hle::kernel::fs::host_path_existing("/app0/sce_sys/param.json") else {
+        let Ok(b) = crate::hle::kernel::fs::read_file("/app0/sce_sys/param.json") else {
             crate::warn!("param.json not found");
             return serde_json::Value::Null;
         };
-        match std::fs::read(&p).map_err(|e| e.to_string()).and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string())) {
+        match serde_json::from_slice(&b).map_err(|e| e.to_string()) {
             Ok(v) => v,
             Err(e) => {
                 crate::warn!("param.json unreadable: {e}");
@@ -102,8 +101,9 @@ const PG_BAD_LOCUS: i32 = 0x80B2_0010u32 as i32;
 /// tree, so all report as local. Returns the defined chunk ids, sorted.
 fn playgo_chunks() -> &'static [u16] {
     PLAYGO_CHUNKS.get_or_init(|| {
-        let mut ids: Vec<u16> = crate::hle::kernel::fs::host_path_existing("/app0/playgo-chunkdefs.xml")
-            .and_then(|p| std::fs::read_to_string(p).ok())
+        let mut ids: Vec<u16> = crate::hle::kernel::fs::read_file("/app0/playgo-chunkdefs.xml")
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok())
             .map(|x| {
                 x.split("<chunk id=\"").skip(1).filter_map(|t| t.split('"').next()?.parse::<u16>().ok()).collect()
             })
