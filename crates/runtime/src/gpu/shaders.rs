@@ -2273,14 +2273,25 @@ const SG_WAVE_PROGRAMS: &[(u64, &str)] = &[
     (0x7f89_1d6a_4856_4598, "GI reinsert cs 0x10089f4d00"),
 ];
 
-/// `DS_PLAIN_MODES=1` (diagnosis): no program is translated per lane, without lockstep, as
-/// subgroup waves or with per-subgroup appends (the lists above and `append_program`): every
-/// compute program runs in the mode the translator picks from its code alone. An A/B of what
-/// those modes give against the plain translation (their programs then compile at their first
-/// dispatch: the stored specs are keyed with the modes).
+/// Whether every compute program runs in the mode the translator picks from its code alone, the
+/// portable one: none translated per lane, without lockstep, as subgroup waves or with
+/// per-subgroup appends (the lists above and `append_program`). Those modes rely on how a subgroup
+/// treats lanes that are off (reads of them, votes) and on its lanes coming back together, which
+/// Vulkan leaves to the driver; they were checked on NVIDIA's RTX 40 series only. On an RTX 5090
+/// and an RTX 5080 players saw the tunnel at the game's start drawn black, the deferred lighting
+/// and the froxel fog (both in these modes) the likely part (issue #4, 2026-11-23): on a design
+/// they were not checked on (`vk::subgroup_modes_checked`: the RTX 50 series, AMD, Intel) the
+/// portable mode is the default since then. `DS_PLAIN_MODES=1` / `0` forces it on or off (an
+/// A/B: the stored specs are keyed with the modes, so their programs then compile at their first
+/// dispatch).
 fn plain_modes() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("DS_PLAIN_MODES").ok().as_deref() == Some("1"))
+    static FORCED: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let forced = *FORCED.get_or_init(|| match std::env::var("DS_PLAIN_MODES").ok().as_deref() {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    });
+    forced.unwrap_or_else(|| !super::vk::subgroup_modes_checked())
 }
 
 /// Program hashes found in SG_WAVE_PROGRAMS.

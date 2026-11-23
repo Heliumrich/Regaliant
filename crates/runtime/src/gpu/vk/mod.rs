@@ -169,6 +169,21 @@ pub struct CopyQueue {
 
 static CTX: OnceLock<Ctx> = OnceLock::new();
 
+/// The chosen device is one the translation's subgroup modes were checked on
+/// (`shaders::plain_modes`); set when the device is chosen.
+static SUBGROUP_MODES_CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether the chosen device is a design the translation's subgroup modes were checked on: NVIDIA's
+/// before Blackwell (PCI device ids below 0x2B80: the RTX 40 series and older; the RTX 50 series
+/// starts at 0x2B80). Their tests ran on an RTX 4090 and an RTX 4070 SUPER.
+pub fn subgroup_modes_checked() -> bool {
+    SUBGROUP_MODES_CHECKED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn modes_checked_on(vendor: u32, device: u32) -> bool {
+    vendor == 0x10de && device < 0x2b80
+}
+
 thread_local! {
     /// What this thread is creating (`creating`), for the validation
     /// layer's messages.
@@ -368,6 +383,15 @@ fn init_inner() -> Result<(), String> {
         crate::info!("Vulkan devices: {} (taken: the last discrete one with a graphics and compute queue, else the first)", seen.join(", "));
         let (pdev, qf, props) = chosen.ok_or("no Vulkan device with graphics+compute")?;
         let device_name = CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy().into_owned();
+        // (The design decides the translation's subgroup modes: `shaders::plain_modes`.)
+        let checked = modes_checked_on(props.vendor_id, props.device_id);
+        SUBGROUP_MODES_CHECKED.store(checked, std::sync::atomic::Ordering::Relaxed);
+        crate::info!(
+            "Vulkan device ids: PCI {:04x}:{:04x}; the translation's subgroup modes {} (DS_PLAIN_MODES=1 or 0 overrides)",
+            props.vendor_id,
+            props.device_id,
+            if checked { "on: a design they were checked on" } else { "off: not checked on this design, every compute program in the portable translation" }
+        );
         // (The driver's version and pipeline cache id: players' logs are compared by them.)
         let driver_desc = {
             let v = props.driver_version;

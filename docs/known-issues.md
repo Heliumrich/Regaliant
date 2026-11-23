@@ -13,6 +13,7 @@
 - In character creation the character fills only part of the screen when Render Scale is set to a percentage. Visual Mode shows it whole.
 - HDR has not been seen on an HDR screen yet.
 - AMD and Intel graphics cards have not been tested.
+- RTX 50-series cards drew the tunnel at the game's start black in 0.1.0. Version 0.1.1 runs their shaders in a portable form, which should fix it, but it has not been tried on such a card yet.
 - On graphics cards with 12 GB or less the game can run short of graphics memory in busy places. It then keeps some textures in system memory, and the frame rate there can drop.
 - On cards with 4 or 5 GB the game keeps its large images in system memory from the start. It runs, but slowly. Cards with less than 4 GB have not been tested.
 - PCs with 16 GB of memory have not been tested on a real PC. A simulation of one played the tested levels. 32 GB is recommended.

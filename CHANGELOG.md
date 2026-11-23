@@ -11,8 +11,13 @@
   the game shows its own PlayStation buttons. Vibration and the light bar work on them.
 - All connected controllers play together as one pad. Before, only the first Xbox controller was
   read.
-- Fullscreen fills the whole screen when Windows display scaling is above 100%. Before, the picture
-  could cover only the top-left part of the screen, as on a 4K screen at 175%.
+- The picture fills the window and the screen in every display mode when Windows display scaling is
+  above 100%. Before, it could cover only the top-left part, as on a 4K screen at 175% or a 1440p
+  screen at 200%.
+- On RTX 50-series graphics cards (and AMD and Intel ones) every compute shader now runs in its
+  portable form. The faster forms some shaders used were only checked on RTX 40-series cards, and
+  on an RTX 5090 and an RTX 5080 the tunnel at the game's start was drawn black. This is the likely
+  cause, not yet confirmed on such a card.
 
 ## 0.1.0
 

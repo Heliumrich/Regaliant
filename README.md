@@ -32,6 +32,7 @@ This is an early version.
 - 5.1 and 7.1 sound, and headphone output of the game's 3D sound, also through Windows Sonic or Dolby Atmos for Headphones.
 - Trophies as achievements with a pop-up and a list.
 - A launcher that checks your game files, sets the display before the game starts, prepares the shaders ahead (the game plays itself in the background, hidden and silent, once: about an hour on a fast PC, longer on others), backs up and restores saves, and offers a safe mode.
+- The game can also be one .zar archive, about two thirds of the folder's size and read in place. The launcher makes one from your game folder ([what you trade](docs/install.md#save-disk-space-with-a-zar-archive)).
 
 ## Performance
 
@@ -44,7 +45,7 @@ Shader preparation happens once. The first time you press Play, the game plays i
 - In a window on a 144 or 165 Hz screen the game shows an even 48 or 55 fps. Borderless or fullscreen with G-SYNC or FreeSync, or a 120 Hz screen, gives 60 ([more](docs/settings.md#frame-rate-and-refresh-rate)).
 - Shaders the preparation did not meet (rare effects, spells) still compile on first sight, and a level's first arrival can pause briefly.
 - A full playthrough has not been tested.
-- AMD and Intel graphics cards, HDR screens and 16 GB of memory have not been tested.
+- AMD and Intel graphics cards, RTX 50-series cards, HDR screens and 16 GB of memory have not been tested.
 - Online features are not available. The game plays offline.
 
 See [all known issues](docs/known-issues.md). Found a bug? Here is [how to report a bug](docs/report-a-bug.md).
