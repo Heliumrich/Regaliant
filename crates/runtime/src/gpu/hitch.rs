@@ -486,10 +486,10 @@ pub fn flip(n: u64, us: u64) {
     // of them is (background compiles at a level load crowd out what the
     // command processors met).
     let background = |e: &Event| e.thread.starts_with("gpu-compile") || e.thread.starts_with("gpu-async") || e.thread.starts_with("gpu-precompile");
-    let top = shown_top();
-    let mut shown: Vec<&(u64, &Event)> = over.iter().take(top).collect();
+    let n_shown = shown_top();
+    let mut shown: Vec<&(u64, &Event)> = over.iter().take(n_shown).collect();
     if shown.iter().all(|x| background(x.1)) {
-        shown.extend(over.iter().skip(top).find(|x| !background(x.1)));
+        shown.extend(over.iter().skip(n_shown).find(|x| !background(x.1)));
     }
     let longest: Vec<String> = shown.iter().map(|(o, e)| format!("{} {:.0} ms on {} ({})", NAMES[e.kind as usize], *o as f64 / 1e3, e.thread, e.what)).collect();
     crate::info!(
