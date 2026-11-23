@@ -6839,6 +6839,7 @@ pub fn c4_drop_sync(base: u64, len: u64) {
     let lo = (base & !(PAGE - 1)).max(MIRROR_BASE);
     let hi = base.saturating_add(len).next_multiple_of(PAGE).min(MIRROR_END);
     let _lock = crate::hosted::arm_lock();
+    let t1 = std::time::Instant::now();
     let mut pages = Vec::new();
     let mut p = lo;
     while p < hi {
@@ -6868,6 +6869,7 @@ pub fn c4_drop_sync(base: u64, len: u64) {
         let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
         c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
     });
+    super::hitch::note_since(super::hitch::Kind::Mirror, t1, || format!("C4: {} held pages dropped before a decommit at {base:#x}: the GPU's clear of their marks waited for, the arm lock held", pages.len()));
     if let Err(e) = r {
         crate::error!("fe2: C4: clearing the marks of {} held pages before a decommit failed: {e}", pages.len());
     }
