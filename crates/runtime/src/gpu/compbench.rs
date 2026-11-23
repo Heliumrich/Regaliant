@@ -1072,7 +1072,11 @@ fn work_list(src: &dsconfig::zar::Source, threads: usize) -> (Vec<Prog>, Vec<(us
     let exact_n = {
         let have: std::collections::HashSet<(u64, u64)> = progs.iter().map(|p| (p.0, spec_hash(&p.2))).collect();
         let mut extra: Vec<(u64, std::sync::Arc<Vec<u32>>, rdna::translate::Spec, usize)> = Vec::new();
-        for (h, code, spec) in super::precompile::exact_work() {
+        for (h, code, mut spec) in super::precompile::exact_work() {
+            // (Its translation modes as this device takes them now: a key spec kept under other
+            // modes, as 0.1.0's on a card that now runs the portable translation, would make a
+            // pipeline no dispatch looks up.)
+            super::shaders::apply_modes(&mut spec, h);
             if !have.contains(&(h, spec_hash(&spec))) {
                 let n = code.len();
                 extra.push((h, code, spec, n));

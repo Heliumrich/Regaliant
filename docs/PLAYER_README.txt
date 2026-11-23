@@ -139,6 +139,27 @@ The launcher
 - Open logs opens the folder with each session's log.
 
 
+Saving disk space
+-----------------
+The launcher can pack the game folder into one .zar archive, which the game reads in place.
+With the tested copy the archive takes 54 GB instead of the folder's 82 GB.
+
+1. On the Game page, with the game folder chosen, click "Compress to .zar..." and choose where
+   to save the archive. That drive needs about two thirds of the folder's size free.
+2. Wait. On the tested PC it took about 3 to 4 minutes. You can stop it, and closing the
+   launcher stops it too. An unfinished archive is removed.
+3. When it is done, the launcher offers to play from the archive. Prepared shaders, settings
+   and saves carry over.
+4. Once the game runs from the archive, delete the game folder yourself to free its space. Keep
+   it if you want to switch back with "Folder...".
+
+What you trade, measured on the tested PC (both copies on the same NVMe drive): the game starts
+about 2 seconds sooner from the archive, and a level's first load in a session is the same or
+faster (up to 3 seconds on one level). Reloading a level whose data Windows still holds in
+memory takes about 0.3 seconds longer (8.3 instead of 8.0). Frame rate and stutter while
+playing are the same. Slower drives and processors were not measured.
+
+
 Settings, saves and logs
 ------------------------
 - Settings, key bindings and saves: %APPDATA%\Regaliant.

@@ -20,6 +20,30 @@ See [System requirements](requirements.md) for what was tested.
 4. On **Game**, choose the game folder with **Folder...**, or a .zar archive of it with **.zar file...**. The launcher checks it and says what is missing.
 5. Click **Play**. The first time, the launcher prepares the game's shaders before the game starts: the game plays a new game and its levels by itself in the background, hidden and silent, to learn them. This takes about an hour once on a fast PC and longer on others, and the launcher says how long. It can be stopped and continued later, and turned off on the **Shaders** page. On battery, Play starts the game without preparing: plug in the PC, then press **Play** or **Prepare now**.
 
+## Save disk space with a .zar archive
+
+The launcher can pack the game folder into one .zar archive, which the game reads in place. With the tested copy the archive takes 54 GB instead of the folder's 82 GB.
+
+1. On **Game**, with the game folder chosen, click **Compress to .zar...** and choose where to save the archive. That drive needs about two thirds of the folder's size free.
+2. Wait. On the tested PC it took about 3 to 4 minutes. You can stop it, and closing the launcher stops it too. An unfinished archive is removed.
+3. When it is done, the launcher offers to play from the archive. Prepared shaders, settings and saves carry over.
+4. Once the game runs from the archive, delete the game folder yourself to free its space. Keep it if you want to switch back with **Folder...**.
+
+An archive made by another tool should work too if it holds the game folder (the one with eboot.bin and sce_sys) at its top or one folder down. Choose it with **.zar file...**.
+
+**What you trade.** Measured on the tested PC (Ryzen 9 5900X, RTX 4090, both copies on the same NVMe drive):
+
+| | Game folder | .zar archive |
+| --- | --- | --- |
+| Disk space | 82 GB | 54 GB |
+| Starting the game | | about 2 s faster |
+| A level's first load in a session | | the same or faster: up to 3 s on one level, 0.5 s on average |
+| Reloading a level whose data is still in memory | 8.0 s | 8.3 s |
+| Frame rate while playing | 47.6 fps | 47.7 fps |
+| Stutter | the same | the same |
+
+The processor decompresses the archive while the game reads it. From the drive it still loads at least as fast, because there is a third less to read and one file instead of thousands. When Windows still holds the data in memory, decompressing makes a reload about 0.3 s slower. Slower drives and processors were not measured.
+
 ## Update
 
 Unzip the new release over the old one or into a new folder, and start its 'regaliant-launcher.exe'. Settings, key bindings and saves are in '%APPDATA%\Regaliant', which every version uses. Prepared shaders in '%LOCALAPPDATA%\Regaliant' carry on too.

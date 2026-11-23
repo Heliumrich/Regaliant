@@ -2173,14 +2173,7 @@ fn cs_spec(addr: u64, rsrc2: u32, local: [u32; 3], wave64: bool, code_hash: u64)
         pt_linear: false,
         outlier: None,
     };
-    if super::tune::per_lane() != 0 && per_lane_program(code_hash) && !plain_modes() {
-        let votes = lane_votes_program(code_hash);
-        spec.per_lane = super::tune::per_lane() == 1 || !votes;
-        spec.lane_votes = spec.per_lane && votes;
-    }
-    spec.lockstep_off = no_lockstep_program(code_hash) && !plain_modes();
-    spec.sg_waves = sg_wave_program(code_hash) && !plain_modes();
-    spec.sg_appends = append_program(code_hash) && !plain_modes();
+    apply_modes(&mut spec, code_hash);
     // LOD statistics in rotation (`tune lod_cs` >= 2): a dispatch measures
     // only when prepared within `with_lod_stats` (`lodstats::rotate`);
     // batched dispatches keep them (their textures are not all known to the
@@ -2272,6 +2265,23 @@ const SG_WAVE_PROGRAMS: &[(u64, &str)] = &[
     // read from lane 0, v_mbcnt ranks), per-lane atomic ands.
     (0x7f89_1d6a_4856_4598, "GI reinsert cs 0x10089f4d00"),
 ];
+
+/// A compute program's translation modes as this device takes them (`plain_modes`): per lane
+/// (with its lane votes), without lockstep, as subgroup waves, with per-subgroup appends. Also for
+/// the specs earlier sessions kept (`precompile::exact_work`): a preparation on a device whose modes
+/// changed then makes the variants its dispatches look up (the review of 2026-11-23 night).
+pub(crate) fn apply_modes(spec: &mut rdna::translate::Spec, code_hash: u64) {
+    spec.per_lane = false;
+    spec.lane_votes = false;
+    if super::tune::per_lane() != 0 && per_lane_program(code_hash) && !plain_modes() {
+        let votes = lane_votes_program(code_hash);
+        spec.per_lane = super::tune::per_lane() == 1 || !votes;
+        spec.lane_votes = spec.per_lane && votes;
+    }
+    spec.lockstep_off = no_lockstep_program(code_hash) && !plain_modes();
+    spec.sg_waves = sg_wave_program(code_hash) && !plain_modes();
+    spec.sg_appends = append_program(code_hash) && !plain_modes();
+}
 
 /// Whether every compute program runs in the mode the translator picks from its code alone, the
 /// portable one: none translated per lane, without lockstep, as subgroup waves or with
@@ -4395,14 +4405,7 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         pt_linear: false,
         outlier: None,
     };
-    if super::tune::per_lane() != 0 && per_lane_program(code_hash) && !plain_modes() {
-        let votes = lane_votes_program(code_hash);
-        spec.per_lane = super::tune::per_lane() == 1 || !votes;
-        spec.lane_votes = spec.per_lane && votes;
-    }
-    spec.lockstep_off = no_lockstep_program(code_hash) && !plain_modes();
-    spec.sg_waves = sg_wave_program(code_hash) && !plain_modes();
-    spec.sg_appends = append_program(code_hash) && !plain_modes();
+    apply_modes(&mut spec, code_hash);
     spec
 }
 /// R2 (`tune r2`): what `prepare` looks up per plan (its analysis, the

@@ -194,6 +194,12 @@ pub fn start_game(app: &mut App) {
     if app.running.is_some() {
         return;
     }
+    // (Not while the game folder is being compressed: also when a preparation that ends now
+    // would start the game.)
+    if game::compressing(app) {
+        app.set_status("The game folder is being compressed. Press Play when it is done.");
+        return;
+    }
     let exe = dsconfig::paths::game_exe_in(&app.paths.exe_dir);
     if !exe.is_file() {
         unsafe { ui::message(app.hwnd, &format!("{} was not found next to the launcher.", dsconfig::paths::GAME_EXE), TITLE, MB_ICONERROR) };

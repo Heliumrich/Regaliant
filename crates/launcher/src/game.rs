@@ -191,13 +191,13 @@ pub fn check(app: &mut App, dir: &Path, keep: bool) {
     unsafe { ui::redraw(app.hwnd) };
 }
 
-/// The Compress button: usable for a checked folder while the game is not running; "Stop"
-/// while compressing.
+/// The Compress button: usable for a checked folder while neither the game runs nor the shaders
+/// are being prepared; "Stop" while compressing.
 pub fn update(app: &App) {
     let busy = app.game.job.is_some();
     unsafe {
         ui::set_text(h(app.game.compress), if busy { "Stop compressing" } else { "Compress to .zar..." });
-        ui::enable(h(app.game.compress), busy || (app.game.ok && app.game.folder.is_some() && app.running.is_none()));
+        ui::enable(h(app.game.compress), busy || (app.game.ok && app.game.folder.is_some() && app.running.is_none() && !crate::shaders::running(app)));
     }
 }
 
