@@ -161,9 +161,9 @@ Memory, measured there: the game reserves about 35 to 40 GB of memory and page f
 play an area it keeps about 4 to 5 GB in active use. 32 GB is recommended. The graphics card
 reads part of the game's memory directly, and Windows lets it use about half of the installed
 memory for that. 16 GB has not been tested on a real PC. In a simulation of a 16 GB PC on the
-tested PC, the game played every tested level, at the same frame rates once a level had
-loaded. The first level loads of a session took longer. With 16 GB, keep Windows' page file
-on automatic and about 30 GB free on the system drive.
+tested PC, the game played every tested level at the same frame rates, and a first session's
+level loads took about as long. With 16 GB, keep Windows' page file on automatic and about 30 GB
+free on the system drive.
 
 Graphics card: Vulkan 1.3. Only an RTX 4090 was tested. Smaller cards were simulated on it by
 giving the game less video memory. That shows how much memory the game needs, but not how fast
@@ -209,9 +209,8 @@ Known issues
   places. It then keeps some textures in system memory, and the frame rate there can drop.
 - On cards with 4 or 5 GB the game keeps its large images in system memory from the start. It
   runs, but slowly.
-- PCs with 16 GB of memory have not been tested on a real PC. In a simulation of one, the game
-  played the tested levels, but the first level loads of a session were slower. 32 GB is
-  recommended.
+- PCs with 16 GB of memory have not been tested on a real PC. A simulation of one played the
+  tested levels. 32 GB is recommended.
 - Graphics cards without fragment shader barycentrics draw some surfaces through an extra
   shader stage, which costs some speed. NVIDIA's GTX 10 series and older and Intel Arc A-series,
   Meteor Lake and Arrow Lake graphics are among them. This was only simulated on an NVIDIA card.

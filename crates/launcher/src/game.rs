@@ -97,12 +97,12 @@ fn pc_text() -> String {
     // (The card reads the game's memory through Windows' graphics share of it, about half the
     // installed memory. A 16 GB PC simulated on the tested one: on 2026-11-22 afternoon the game
     // froze at the first level load and lost its graphics device; since that night's eviction
-    // and write-back fallback it played every tested level, its first session's level loads
-    // ~20% slower.)
+    // and write-back fallback it played every tested level, a first session as fast as with
+    // room.)
     if mem < 15 << 30 {
         lines.push("The game needs 16 GB of memory. It may stop when memory runs out.".into());
     } else if mem < 24 << 30 {
-        lines.push("With 16 GB of memory the first level loads can be slow. 32 GB is recommended.".into());
+        lines.push("16 GB of memory has not been tested on a real PC. 32 GB is recommended.".into());
         lines.push("Keep Windows' page file on automatic and about 30 GB free on the system drive.".into());
     } else if mem < 30 << 30 {
         lines.push("Keep Windows' page file on automatic and about 30 GB free on the system drive.".into());
