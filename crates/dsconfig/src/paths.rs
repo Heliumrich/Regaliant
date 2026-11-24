@@ -103,6 +103,12 @@ impl Paths {
         Paths::for_exe(&std::env::current_exe().unwrap_or_default())
     }
 
+    /// A player's diagnostic switches (`DS_NAME=value` lines the game sets in its environment at
+    /// its start; not read in a checkout, whose runs set their own).
+    pub fn diagnostics_file(&self) -> Option<PathBuf> {
+        (self.layout != Layout::Dev).then(|| self.user.join("diagnostics.txt"))
+    }
+
     /// The PC settings (the game's PC tab), `audio-device.txt` beside it.
     pub fn settings_file(&self) -> PathBuf {
         self.user.join("pcsettings.txt")

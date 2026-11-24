@@ -2143,7 +2143,32 @@ fn read_proc_param(m: &loader::LoadedModule) -> (u64, String, i32) {
     (stack, name, prio)
 }
 
+/// A player's diagnostic switches: the `DS_NAME=value` lines of `diagnostics.txt` in the settings
+/// folder (`Paths::diagnostics_file`; `#` comments and other lines ignored), set in this
+/// process's environment before anything reads them; the hosted game and the shader
+/// preparation's sessions inherit them. A way to try a switch on a player's PC without a new
+/// build (issue #4, 2026-11-24: RTX 50-series cards, which no PC here has). Returns what it set.
+fn apply_diagnostics() -> Vec<String> {
+    let Some(path) = dsconfig::paths::Paths::current().diagnostics_file() else { return Vec::new() };
+    let Ok(text) = std::fs::read_to_string(&path) else { return Vec::new() };
+    let mut set = Vec::new();
+    for line in text.lines().map(str::trim).filter(|l| !l.starts_with('#')) {
+        let Some((k, v)) = line.split_once('=') else { continue };
+        let (k, v) = (k.trim(), v.trim());
+        let name_ok = k.len() > 3 && k.starts_with("DS_") && k.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
+        if !name_ok || v.len() > 1024 || v.contains('\0') {
+            continue;
+        }
+        // (At the start of `main`, before any thread of ours: nothing reads the environment
+        // concurrently.)
+        unsafe { std::env::set_var(k, v) };
+        set.push(format!("{k}={v}"));
+    }
+    set
+}
+
 fn main() {
+    let diagnostics = apply_diagnostics();
     // Per-monitor DPI awareness for the whole process, before any window, monitor or surface is
     // asked about (a player's report, 2026-11-23: at 175% Windows scaling the picture covered the
     // top-left 2194x1234 of a 3840x2160 fullscreen. Only the window's thread was aware; the
@@ -2211,6 +2236,9 @@ This happens when other software takes that range. Restart the PC and try again.
     }
     RUN_DIR.set(cfg.run_dir.clone()).ok();
     log::set_thread_name("host");
+    if !diagnostics.is_empty() {
+        crate::warn!("diagnostics.txt in the settings folder set {}: {}", diagnostics.len(), diagnostics.join(", "));
+    }
     // Panics (host threads abort the process) are logged with the thread
     // that panicked: the run log is what post-mortems read.
     // A panic ends the game as a crash does (the player told, the display mode back).
