@@ -43,7 +43,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "dsconfig"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde_json",
  "windows-sys",
@@ -52,7 +52,7 @@ dependencies = [
 
 [[package]]
 name = "dsport"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ash",
  "cc",
@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "launcher"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ash",
  "dsconfig",
