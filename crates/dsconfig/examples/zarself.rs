@@ -3,7 +3,9 @@
 //! `eboot.bin` and its two libraries (the dump's top-level files, SELF containers) into a scratch
 //! folder with one small file in each data folder the check wants, packs it into a `.zar` beside
 //! it, then runs the game check and the tested-version hash on the archive. Reads the game
-//! folder only; the scratch folder and archive are deleted at the end.
+//! folder only; everything it makes is in a new `zarself-<process id>` folder under the given
+//! one, removed at the end (nothing else there is touched; a folder that is, holds or lies in
+//! the game folder is refused).
 //!     cargo run --release -p dsconfig --example zarself -- <PPSA01341-app0 folder> <scratch folder>
 use dsconfig::game;
 use std::path::PathBuf;
@@ -11,9 +13,19 @@ use std::path::PathBuf;
 fn main() {
     let mut args = std::env::args().skip(1);
     let app = PathBuf::from(args.next().expect("usage: zarself <PPSA01341-app0 folder> <scratch folder>"));
-    let scratch = PathBuf::from(args.next().expect("usage: zarself <PPSA01341-app0 folder> <scratch folder>"));
+    let parent = PathBuf::from(args.next().expect("usage: zarself <PPSA01341-app0 folder> <scratch folder>"));
+    std::fs::create_dir_all(&parent).unwrap();
+    let (a, p) = (std::fs::canonicalize(&app).unwrap(), std::fs::canonicalize(&parent).unwrap());
+    if a.starts_with(&p) || p.starts_with(&a) {
+        eprintln!("refused: the scratch folder {} is, holds or lies in the game folder {}", p.display(), a.display());
+        std::process::exit(2);
+    }
+    let scratch = p.join(format!("zarself-{}", std::process::id()));
+    if scratch.exists() {
+        eprintln!("refused: {} exists already", scratch.display());
+        std::process::exit(2);
+    }
     let dir = scratch.join("PPSA01341-app0");
-    let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(dir.join("sce_sys")).unwrap();
     std::fs::create_dir_all(dir.join("sce_module")).unwrap();
     std::fs::copy(app.join("sce_sys").join("param.json"), dir.join("sce_sys").join("param.json")).unwrap();

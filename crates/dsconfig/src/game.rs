@@ -185,22 +185,26 @@ pub fn check(dir: &Path) -> Result<Game, Problem> {
     }
     // The decrypted executable: in `decrypted\` (as dumps keep it beside the encrypted one) or
     // the application folder's own.
-    let code_dir = if exe_state(&source, "decrypted/eboot.bin") == Exe::Usable {
+    let decrypted = exe_state(&source, "decrypted/eboot.bin");
+    let code_dir = if decrypted == Exe::Usable {
         "decrypted"
     } else {
-        match exe_state(&source, "eboot.bin") {
-            Exe::Usable => "",
-            Exe::Encrypted => return Err(Problem::Encrypted),
-            Exe::Unusable(why) => return Err(Problem::Unusable("eboot.bin".into(), why)),
-            Exe::Missing => return Err(Problem::NoExecutable),
+        match (decrypted, exe_state(&source, "eboot.bin")) {
+            (_, Exe::Usable) => "",
+            // (Neither usable: the decrypted copy's reason first, as the one the player meant.)
+            (Exe::Unusable(why), _) => return Err(Problem::Unusable("decrypted\\eboot.bin".into(), why)),
+            (_, Exe::Unusable(why)) => return Err(Problem::Unusable("eboot.bin".into(), why)),
+            (Exe::Encrypted, _) | (_, Exe::Encrypted) => return Err(Problem::Encrypted),
+            _ => return Err(Problem::NoExecutable),
         }
     };
     let under = |rel: &str| if code_dir.is_empty() { rel.to_string() } else { format!("{code_dir}/{rel}") };
     for m in MODULES {
-        match exe_state(&source, &under(&format!("sce_module/{m}"))) {
+        let rel = under(&format!("sce_module/{m}"));
+        match exe_state(&source, &rel) {
             Exe::Usable => {}
             Exe::Encrypted => return Err(Problem::EncryptedModule(m.into())),
-            Exe::Unusable(why) => return Err(Problem::Unusable(format!("sce_module\\{m}"), why)),
+            Exe::Unusable(why) => return Err(Problem::Unusable(rel.replace('/', "\\"), why)),
             Exe::Missing => return Err(Problem::NoModule(m.into())),
         }
     }
@@ -279,12 +283,21 @@ mod tests {
             assert_eq!(g.app, app);
             assert_eq!(g.code, app.join("decrypted"));
         }
-        std::fs::remove_file(app.join("decrypted").join("sce_module").join("libc.prx")).unwrap();
+        // (A library in the decrypted folder cut short: named with that folder.)
+        let s = crate::self_file::tests::sample().1;
+        let libc = app.join("decrypted").join("sce_module").join("libc.prx");
+        std::fs::write(&libc, &s[..s.len() - 0x40]).unwrap();
+        assert!(matches!(check(&dump).unwrap_err(), Problem::Unusable(f, why) if f == "decrypted\\sce_module\\libc.prx" && why.contains("past its end")));
+        std::fs::remove_file(&libc).unwrap();
         assert_eq!(check(&dump).unwrap_err(), Problem::NoModule("libc.prx".into()));
+        // (The decrypted copy cut short beside an encrypted one: the decrypted copy's reason.)
+        std::fs::write(app.join("decrypted").join("eboot.bin"), &s[..s.len() - 0x40]).unwrap();
+        let e = check(&dump).unwrap_err();
+        assert!(matches!(&e, Problem::Unusable(f, why) if f == "decrypted\\eboot.bin" && why.contains("past its end")), "{e:?}");
+        assert!(!e.to_string().contains(';'), "{e}");
         std::fs::remove_dir_all(app.join("decrypted")).unwrap();
         assert_eq!(check(&dump).unwrap_err(), Problem::Encrypted);
         // (A container cut short by a copy says why; an empty file is a missing one.)
-        let s = crate::self_file::tests::sample().1;
         std::fs::write(app.join("eboot.bin"), &s[..s.len() - 0x40]).unwrap();
         assert!(matches!(check(&dump).unwrap_err(), Problem::Unusable(f, why) if f == "eboot.bin" && why.contains("past its end")));
         std::fs::write(app.join("eboot.bin"), b"").unwrap();

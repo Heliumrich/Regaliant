@@ -25,6 +25,9 @@ const PT_SCE_VERSION: u32 = 0x6fff_ff01;
 const DATA_ENTRY: u64 = 1 << 11;
 /// Properties bit 3: the entry's data is compressed.
 const COMPRESSED: u64 = 1 << 3;
+/// Properties bit 1: the entry's data is encrypted (a retail container's; the game's decrypted
+/// containers have it clear). Read only where the data itself cannot tell: a compressed entry.
+const ENCRYPTED_ENTRY: u64 = 1 << 1;
 
 /// Whether `head` (a file's first bytes) starts a SELF container.
 pub fn is_self(head: &[u8]) -> bool {
@@ -121,7 +124,11 @@ pub fn to_elf(s: &[u8]) -> Result<Vec<u8>, String> {
         let (Some(off), Some(stored), Some(plain)) = (off, stored, plain) else { return Err(bad("short entry table")) };
         let (off, stored) = (usize::try_from(off).map_err(|_| bad("entry offset"))?, usize::try_from(stored).map_err(|_| bad("entry size"))?);
         if props & COMPRESSED != 0 || stored as u64 != plain {
-            return Err(bad("compressed segments (not supported: convert it to an ELF)"));
+            // (A retail container may compress its encrypted segments: that one is encrypted.)
+            if props & ENCRYPTED_ENTRY != 0 {
+                return Err(ENCRYPTED.into());
+            }
+            return Err(bad("its segments are compressed"));
         }
         let p = *ph.get(seg).ok_or_else(|| bad("an entry for a program header it lacks"))?;
         if stored != p.size {
@@ -132,7 +139,7 @@ pub fn to_elf(s: &[u8]) -> Result<Vec<u8>, String> {
             return Err(bad("a segment over its headers"));
         }
         let end = off.checked_add(stored).ok_or_else(|| bad("an entry past its end"))?;
-        let data = s.get(off..end).ok_or_else(|| bad("an entry past its end (the file may be cut short)"))?;
+        let data = s.get(off..end).ok_or_else(|| bad("an entry past its end, the file may be cut short"))?;
         out[p.off..p.off + p.size].copy_from_slice(data);
         covered[seg] = true;
         filled.push((p.off, p.off + p.size));
@@ -386,5 +393,54 @@ pub(crate) mod tests {
             *b = b.wrapping_mul(31).wrapping_add(i as u8 ^ 0x5c) | 0x80;
         }
         assert_eq!(decrypted_elf(&enc).unwrap_err(), ENCRYPTED);
+    }
+
+    /// The sample's entry `i` (0-3: digest and data of segment 0, then of segment 1): its
+    /// properties word's offset in the container.
+    fn entry_at(i: usize) -> usize {
+        0x20 + i * ENTRY
+    }
+
+    fn set_u64(s: &mut [u8], at: usize, v: u64) {
+        s[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    }
+
+    fn get_u64(s: &[u8], at: usize) -> u64 {
+        u64::from_le_bytes(s[at..at + 8].try_into().unwrap())
+    }
+
+    #[test]
+    fn layouts_the_loader_could_not_use() {
+        let (_, s) = sample();
+        // A segment placed over the headers (program header 0's offset moved to 0x40).
+        let mut c = s.clone();
+        let ph0 = entry_at(4) + 0x40;
+        set_u64(&mut c, ph0 + 8, 0x40);
+        assert!(to_elf(&c).unwrap_err().contains("over its headers"));
+        // The code from its entry, the dynamic table's segment without one.
+        let mut c = s.clone();
+        let props = get_u64(&c, entry_at(3)) & !DATA_ENTRY;
+        set_u64(&mut c, entry_at(3), props);
+        assert!(to_elf(&c).unwrap_err().contains("no data entry"));
+        // An entry whose end overflows: refused, not a panic.
+        let mut c = s.clone();
+        set_u64(&mut c, entry_at(1) + 8, u64::MAX - 0x10);
+        assert!(to_elf(&c).unwrap_err().contains("past its end"));
+    }
+
+    #[test]
+    fn compressed_entries() {
+        let (_, s) = sample();
+        // Compressed and flagged encrypted (a retail container): encrypted.
+        let mut c = s.clone();
+        let props = get_u64(&c, entry_at(1)) | COMPRESSED | ENCRYPTED_ENTRY;
+        set_u64(&mut c, entry_at(1), props);
+        assert_eq!(to_elf(&c).unwrap_err(), ENCRYPTED);
+        // Compressed only: not readable here, and said so.
+        let mut c = s.clone();
+        let props = get_u64(&c, entry_at(1)) | COMPRESSED;
+        set_u64(&mut c, entry_at(1), props);
+        let e = to_elf(&c).unwrap_err();
+        assert!(e.contains("compressed") && !e.contains(';'), "{e}");
     }
 }
