@@ -69,7 +69,7 @@ fn reason(code: i32) -> String {
         5 => "the graphics card stopped responding",
         7 => "Windows ran out of memory",
         8 => "this PC's processor lacks instructions the game needs",
-        10 => "the game could not reserve the memory it needs",
+        10 => "the game could not reserve the memory it needs, as another program holds part of it (Open logs shows which)",
         11 => "no graphics card the game can use was found",
         13 => "it could not go on",
         STAGE_HUNG => "it stopped responding",

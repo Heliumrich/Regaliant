@@ -394,6 +394,11 @@ static FSR_DEVICE_OK: AtomicBool = AtomicBool::new(false);
 /// device (before vkCreateDevice).
 pub fn device_needs(instance: &ash::Instance, pdev: vk::PhysicalDevice) -> DeviceNeeds {
     let mut n = DeviceNeeds::default();
+    // (An upscaler that asks for a device extension the driver does not offer is left out: the
+    // device with it failed to be made, VK_ERROR_EXTENSION_NOT_PRESENT, and the game could not
+    // start at all (a player's RTX 3060 Ti, 2026-11-24 night).)
+    let offered = unsafe { instance.enumerate_device_extension_properties(pdev) }.unwrap_or_default();
+    let has = |e: &CStr| offered.iter().any(|p| unsafe { CStr::from_ptr(p.extension_name.as_ptr()) } == e);
     for (k, needs, ok) in [
         (Kind::Xess, xess_device_needs(instance, pdev), &XESS_DEVICE_OK),
         (Kind::Dlss, dlss_device_needs(instance, pdev), &DLSS_DEVICE_OK),
@@ -401,6 +406,11 @@ pub fn device_needs(instance: &ash::Instance, pdev: vk::PhysicalDevice) -> Devic
     ] {
         let Some(d) = needs else { continue };
         if failed_flag(k).load(Relaxed) {
+            continue;
+        }
+        let missing: Vec<String> = d.extensions.iter().filter(|e| !has(e.as_c_str())).map(|e| e.to_string_lossy().into_owned()).collect();
+        if !missing.is_empty() {
+            fail(k, format!("it needs the device extension(s) {} that this graphics driver does not offer (the game starts without it)", missing.join(", ")));
             continue;
         }
         for e in d.extensions {

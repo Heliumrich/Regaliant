@@ -996,6 +996,12 @@ pub fn reserve_guest_range_early() {
         return;
     }
     let size = (GUEST_END - GUEST_BASE) as usize;
+    // (`DS_SIM_OCCUPIED=1`, a test: 64 KiB of the range taken first, as another program's
+    // module or memory took part of it on a player's PC (issue #15): the start then ends with
+    // status 10, naming the region.)
+    if env_is("DS_SIM_OCCUPIED", "1") {
+        unsafe { VirtualAlloc((GUEST_BASE + 0x1000_0000) as _, 0x1_0000, MEM_RESERVE, PAGE_NOACCESS) };
+    }
     // Section-backed guest memory (no write watching: views have none).
     if env_is("DS_SECTIONS", "1") && crate::sections::reserve(GUEST_BASE, size as u64, DMEM_SIZE, ANON_SIZE).is_ok() {
         RESERVED_EARLY.store(true, std::sync::atomic::Ordering::Release);
@@ -1863,9 +1869,21 @@ fn take_written_query(lo: u64, hi: u64, out: &mut Vec<u64>, who: usize) -> Optio
 /// before anything else allocates widely.
 pub fn reserve_guest_range() -> Result<(), String> {
     reserve_guest_range_early();
+    // (Something taking part of the range while the process starts may let go of it soon, e.g.
+    // a module another program puts into every process, in its own setup: tried again for up to
+    // a second before giving up (issue #15, 2026-11-25: a player's every shader preparation
+    // ended here, status 10).)
+    for _ in 0..10 {
+        if RESERVED_EARLY.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        reserve_guest_range_early();
+    }
     if !RESERVED_EARLY.load(std::sync::atomic::Ordering::Acquire) {
         let err = last_error();
-        // Find what occupies the range for a useful diagnostic.
+        // Find what occupies the range for a useful diagnostic: each region's kind and, for a
+        // module or a mapped file, its file (it names the program that put it there).
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         let mut addr = GUEST_BASE;
         let mut busy = Vec::new();
@@ -1874,12 +1892,24 @@ pub fn reserve_guest_range() -> Result<(), String> {
             if n == 0 {
                 break;
             }
-            if info.State != MEM_FREE {
-                busy.push(format!("{:#x}+{:#x}", info.BaseAddress as u64, info.RegionSize));
+            if info.State != MEM_FREE && busy.len() < 16 {
+                let kind = match info.Type {
+                    MEM_IMAGE => "a module",
+                    MEM_MAPPED => "a mapped file",
+                    _ => "private memory",
+                };
+                let mut name = [0u16; 512];
+                let len = if info.Type == MEM_IMAGE || info.Type == MEM_MAPPED {
+                    unsafe { windows_sys::Win32::System::ProcessStatus::K32GetMappedFileNameW(windows_sys::Win32::System::Threading::GetCurrentProcess(), info.BaseAddress, name.as_mut_ptr(), name.len() as u32) as usize }
+                } else {
+                    0
+                };
+                let file = if len > 0 { format!(" {}", crate::log::redact(&String::from_utf16_lossy(&name[..len.min(name.len())]))) } else { String::new() };
+                busy.push(format!("{:#x}+{:#x} {kind}{file}", info.BaseAddress as u64, info.RegionSize));
             }
             addr = info.BaseAddress as u64 + info.RegionSize as u64;
         }
-        return Err(format!("reserving guest range failed (error {err}); occupied: {busy:?}"));
+        return Err(format!("reserving guest range failed (error {err}); occupied: {}", busy.join("; ")));
     }
     Ok(())
 }

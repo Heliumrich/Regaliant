@@ -193,6 +193,20 @@ unsafe impl std::alloc::GlobalAlloc for GuardedAlloc {
 #[global_allocator]
 static ALLOCATOR: GuardedAlloc = GuardedAlloc;
 
+/// A failure before the log exists, written to `early-failure-<time>.txt` in the logs folder
+/// (personal paths left out, as in the log); the sentence naming that file for the player's
+/// message, or nothing when it could not be written.
+fn early_failure_note(what: &str) -> String {
+    let dir = paths().logs();
+    let file = dir.join(format!("early-failure-{}.txt", utc_stamp()));
+    let text = format!("{}\n", log::redact(what));
+    if std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&file, text).is_ok() {
+        format!("\n\nThe details are in {} (the launcher's Open logs shows its folder).", log::redact(&file.display().to_string()))
+    } else {
+        String::new()
+    }
+}
+
 pub(crate) fn utc_stamp() -> String {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
     let days = secs.div_euclid(86400);
@@ -2312,9 +2326,12 @@ fn main() {
     // (Before the log exists: the player is told, and the launcher shows the code.)
     if let Err(e) = mem::reserve_guest_range() {
         eprintln!("{e}");
+        // (Before the log exists, the reason also goes to a file in the logs folder, which the
+        // launcher's Open logs shows: a hidden step's player saw only "status 10", issue #15.)
+        let note = early_failure_note(&e);
         player_error(&format!("The game could not reserve the memory range its program needs ({e}).
 
-This happens when other software takes that range. Restart the PC and try again."));
+This happens when other software takes that range. Restart the PC and try again.{note}"));
         std::process::exit(EXIT_EARLY as i32);
     }
     let slot = match tls::init_slot() {

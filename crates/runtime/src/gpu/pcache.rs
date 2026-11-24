@@ -1110,6 +1110,12 @@ pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result
             if std::env::var("DS_SIM_COMPILER_CRASH_MODE").ok().as_deref() == Some("abort") {
                 std::process::abort();
             }
+            // (`DS_SIM_COMPILER_CRASH_MODE=breakpoint`: a breakpoint inside another module, as
+            // NVIDIA's 621.40 compiler stops on one (status 0x80000003); no handler takes it.)
+            if std::env::var("DS_SIM_COMPILER_CRASH_MODE").ok().as_deref() == Some("breakpoint") {
+                // SAFETY: a deliberate breakpoint exception, as the driver's own.
+                unsafe { windows_sys::Win32::System::Diagnostics::Debug::DebugBreak() };
+            }
             SIM_CRASHING.with(|c| c.set(true));
             // SAFETY: none; a deliberate access violation, as the driver's own crash.
             unsafe { std::ptr::write_volatile(std::ptr::without_provenance_mut::<u64>(8), 0) };

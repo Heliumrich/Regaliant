@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- The shader preparation no longer gives up when the graphics driver stops while compiling a
+  shader (seen with NVIDIA's driver 621.40 as "crashed (status 0x80000003)"). That shader is
+  left out and the step runs again. The log names the shader.
+- The game now starts when DLSS, XeSS or FSR asks for something the graphics driver does not
+  offer. Before, the game stopped with "vkCreateDevice: Extension specified does not exist".
+  That upscaler is left out, and the log says which extension was missing.
+- When another program holds part of the memory the game needs ("status 10"), the game tries
+  again for a moment. If it still cannot start, a file in the logs folder names what holds the
+  memory (the launcher's Open logs shows it).
+
 ## 0.1.5
 
 - Fixed the game not starting at all for players who put their own DLSS file
