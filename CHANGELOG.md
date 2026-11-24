@@ -17,6 +17,12 @@
   them. Before, such a save was not found. The PS5's own backups beside them are left out.
 - Fixed a rare hang after slow first shader compiles: a part of the graphics work that fell
   behind could wait forever for a frame that had already passed, and the game stopped.
+- On RTX 50-series graphics cards (and AMD and Intel ones) the game's shaders now tell the driver
+  to keep the special values NaN and infinity. The game gives the unused slots of some draws such
+  values so that the graphics card drops them, and the port moves them out of view; without this,
+  a driver may treat the check as never true and draw them as dark streaks across the view. This
+  is the likely cause of the black picture on RTX 50-series cards, not yet confirmed on such a
+  card. On these cards the launcher prepares the shaders again once.
 
 ## 0.1.2
 

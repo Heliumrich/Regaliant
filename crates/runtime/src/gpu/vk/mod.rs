@@ -202,6 +202,32 @@ pub fn max_reconvergence() -> bool {
     MAX_RECONV.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Translated shaders declare SignedZeroInfNanPreserve (`exec::module_code`); set when the device
+/// is made, with the widths the device allows (bit 0: 16, bit 1: 32, bit 2: 64).
+static NAN_PRESERVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Whether every translated shader declares `SignedZeroInfNanPreserve` (SPV_KHR_float_controls).
+/// Without it Vulkan lets a compiler assume that no value is a NaN or an infinity and ignore the
+/// sign of zero, so it may fold an `OpIsNan` or `OpIsInf` to false. The translation relies on
+/// them where the console's hardware does: a vertex whose position has a NaN or infinite
+/// component is moved outside the clip volume so that its primitive is dropped, as the console's
+/// clipper drops it (the title's instancing gives unused instance slots NaN positions;
+/// `translate::mem`'s position export), and v_cmp_class tests classes. On the RTX 40 series the
+/// tests held without the declaration; before that guard the RTX 4090 drew those primitives as
+/// streaks across the tutorial's opening tunnel, and on the RTX 50 series (driver 621.24 and
+/// 621.35) players see that tunnel black with "vertex explosions" (issues #4 and #6, 2026-11-24):
+/// on the designs the translation was not checked on (`subgroup_modes_checked`) shaders declare it
+/// since then, for the widths the device allows (the RTX 4090 and 5090 report all three).
+/// `DS_NAN_PRESERVE=1` / `0` forces it on or off where the device allows it.
+pub fn nan_preserve() -> bool {
+    NAN_PRESERVE.load(std::sync::atomic::Ordering::Relaxed) & 2 != 0
+}
+
+/// The widths `nan_preserve` declares (bit 0: 16, bit 1: 32, bit 2: 64).
+pub fn nan_preserve_widths() -> u32 {
+    NAN_PRESERVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// `DS_MAX_RECONV`: Some(on) when set to 1 or 0.
 fn max_reconv_forced() -> Option<bool> {
     match std::env::var("DS_MAX_RECONV").ok().as_deref() {
@@ -694,6 +720,52 @@ fn init_inner() -> Result<(), String> {
             (p11.subgroup_size, stages, note)
         };
         crate::info!("{sg_note}");
+        // (What the driver lets a module declare about denormals, signed zeros, infinities, NaNs and
+        // rounding: translated modules declare none of it, so the driver's defaults decide; players'
+        // logs say what their design offers.)
+        {
+            let mut p12 = vk::PhysicalDeviceVulkan12Properties::default();
+            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut p12);
+            instance.get_physical_device_properties2(pdev, &mut p2);
+            let b = |x: vk::Bool32| u32::from(x != 0);
+            let widths = b(p12.shader_signed_zero_inf_nan_preserve_float16) | b(p12.shader_signed_zero_inf_nan_preserve_float32) << 1 | b(p12.shader_signed_zero_inf_nan_preserve_float64) << 2;
+            let forced = match std::env::var("DS_NAN_PRESERVE").ok().as_deref() {
+                Some("1") => Some(true),
+                Some("0") => Some(false),
+                _ => None,
+            };
+            let on = forced.unwrap_or(!checked) && widths & 2 != 0;
+            NAN_PRESERVE.store(if on { widths } else { 0 }, std::sync::atomic::Ordering::Relaxed);
+            crate::info!(
+                "Vulkan: NaN, infinity and signed-zero preservation {} ({}; DS_NAN_PRESERVE=1 or 0 overrides)",
+                if on { "declared by every translated shader" } else { "not declared" },
+                match forced {
+                    Some(_) => "DS_NAN_PRESERVE",
+                    None if checked => "a design the translation was checked on",
+                    None => "a design the translation was not checked on",
+                }
+            );
+            crate::info!(
+                "Vulkan float controls: denormal modes {:?}, rounding modes {:?}; f16/f32/f64: signed zero, inf and NaN preserve {}{}{}, denormal preserve {}{}{}, flush to zero {}{}{}, RTE {}{}{}, RTZ {}{}{}",
+                p12.denorm_behavior_independence,
+                p12.rounding_mode_independence,
+                b(p12.shader_signed_zero_inf_nan_preserve_float16),
+                b(p12.shader_signed_zero_inf_nan_preserve_float32),
+                b(p12.shader_signed_zero_inf_nan_preserve_float64),
+                b(p12.shader_denorm_preserve_float16),
+                b(p12.shader_denorm_preserve_float32),
+                b(p12.shader_denorm_preserve_float64),
+                b(p12.shader_denorm_flush_to_zero_float16),
+                b(p12.shader_denorm_flush_to_zero_float32),
+                b(p12.shader_denorm_flush_to_zero_float64),
+                b(p12.shader_rounding_mode_rte_float16),
+                b(p12.shader_rounding_mode_rte_float32),
+                b(p12.shader_rounding_mode_rte_float64),
+                b(p12.shader_rounding_mode_rtz_float16),
+                b(p12.shader_rounding_mode_rtz_float32),
+                b(p12.shader_rounding_mode_rtz_float64),
+            );
+        }
         if subgroup_size != 32 {
             let left = (vk::ShaderStageFlags::COMPUTE | vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::GEOMETRY | vk::ShaderStageFlags::FRAGMENT) & !subgroup32;
             if !left.is_empty() {

@@ -4014,10 +4014,15 @@ fn keep_pipe(map: &Mutex<Option<HashMap<u64, PipeEntry>>>, key: u64, pipe: Pipe)
 /// to this session, so the driver's shader cache serves nothing it compiled
 /// in an earlier one.
 pub(super) fn module_code(spirv: &[u32]) -> std::borrow::Cow<'_, [u32]> {
-    let code = match super::vk::max_reconvergence().then(|| declare_max_reconvergence(spirv)).flatten() {
+    let mut code = match super::vk::max_reconvergence().then(|| declare_max_reconvergence(spirv)).flatten() {
         Some(v) => std::borrow::Cow::Owned(v),
         None => std::borrow::Cow::Borrowed(spirv),
     };
+    if super::vk::nan_preserve() {
+        if let Some(v) = declare_float_modes(&code, NAN_PRESERVE_MODES, super::vk::nan_preserve_widths()) {
+            code = std::borrow::Cow::Owned(v);
+        }
+    }
     // (`DS_SPV_DUMP=<dir>`: every module written there as the driver gets
     // it (before the nonce), by its content's hash: a module that crashes
     // the driver's compiler is among the last written.)
@@ -4132,6 +4137,127 @@ pub(super) fn declare_max_reconvergence(spirv: &[u32]) -> Option<Vec<u32>> {
     out.extend_from_slice(&spirv[ext_at..mode_at]);
     for f in entries {
         out.extend_from_slice(&[(3 << 16) | OP_EXECUTION_MODE, f, EXEC_MODE_MAXIMALLY_RECONVERGES]);
+    }
+    out.extend_from_slice(&spirv[mode_at..]);
+    Some(out)
+}
+
+/// `SignedZeroInfNanPreserve` for 16-, 32- and 64-bit floats (`vk::nan_preserve`).
+const NAN_PRESERVE_MODES: &[(u32, u32)] = &[
+    (rspirv::spirv::ExecutionMode::SignedZeroInfNanPreserve as u32, 16),
+    (rspirv::spirv::ExecutionMode::SignedZeroInfNanPreserve as u32, 32),
+    (rspirv::spirv::ExecutionMode::SignedZeroInfNanPreserve as u32, 64),
+];
+
+/// The module with the float-controls modes declared for each entry point (the capabilities, the
+/// extension and the execution modes), or None when it does not parse as expected. `widths` (bit 0:
+/// 16, bit 1: 32, bit 2: 64) are the widths the device lets a module declare; a 16- or 64-bit mode
+/// is also left out of a module without that float type.
+pub(super) fn declare_float_modes(spirv: &[u32], modes: &[(u32, u32)], widths: u32) -> Option<Vec<u32>> {
+    use rspirv::spirv::{Capability as C, ExecutionMode as M};
+    const OP_EXTENSION: u32 = 10;
+    const OP_MEMORY_MODEL: u32 = 14;
+    const OP_ENTRY_POINT: u32 = 15;
+    const OP_EXECUTION_MODE: u32 = 16;
+    const OP_CAPABILITY: u32 = 17;
+    const OP_EXECUTION_MODE_ID: u32 = 331;
+    const EXT: &str = "SPV_KHR_float_controls";
+    if spirv.len() < 5 || spirv[0] != 0x0723_0203 {
+        return None;
+    }
+    let (mut cap_at, mut ext_at, mut mode_at) = (None, None, None);
+    let mut caps = Vec::new();
+    let mut has_ext = false;
+    let mut entries = Vec::new();
+    let mut i = 5;
+    while i < spirv.len() {
+        let (wc, op) = ((spirv[i] >> 16) as usize, spirv[i] & 0xffff);
+        if wc == 0 || i + wc > spirv.len() {
+            return None;
+        }
+        match op {
+            OP_CAPABILITY => {
+                caps.push(spirv[i + 1]);
+                cap_at = Some(i + wc);
+                ext_at = Some(i + wc);
+            }
+            OP_EXTENSION => {
+                let s: Vec<u8> = spirv[i + 1..i + wc].iter().flat_map(|w| w.to_le_bytes()).take_while(|&b| b != 0).collect();
+                has_ext |= s == EXT.as_bytes();
+                ext_at = Some(i + wc);
+            }
+            OP_MEMORY_MODEL => mode_at = Some(i + wc),
+            OP_ENTRY_POINT => {
+                if wc < 3 {
+                    return None;
+                }
+                entries.push(spirv[i + 2]);
+                mode_at = Some(i + wc);
+            }
+            OP_EXECUTION_MODE | OP_EXECUTION_MODE_ID => mode_at = Some(i + wc),
+            _ if mode_at.is_some() => break,
+            _ => {}
+        }
+        i += wc;
+    }
+    let (cap_at, ext_at, mode_at) = (cap_at?, ext_at?, mode_at?);
+    if entries.is_empty() || !(cap_at <= ext_at && ext_at <= mode_at) {
+        return None;
+    }
+    let width_bit = |w: u32| match w {
+        16 => 1,
+        32 => 2,
+        _ => 4,
+    };
+    let typed = |w: u32| match w {
+        16 => caps.contains(&(C::Float16 as u32)),
+        64 => caps.contains(&(C::Float64 as u32)),
+        _ => true,
+    };
+    let modes: Vec<(u32, u32)> = modes.iter().copied().filter(|&(_, w)| widths & width_bit(w) != 0 && typed(w)).collect();
+    if modes.is_empty() {
+        return None;
+    }
+    let modes = &modes[..];
+    let cap_of = |m: u32| -> u32 {
+        match m {
+            x if x == M::DenormPreserve as u32 => C::DenormPreserve as u32,
+            x if x == M::DenormFlushToZero as u32 => C::DenormFlushToZero as u32,
+            x if x == M::SignedZeroInfNanPreserve as u32 => C::SignedZeroInfNanPreserve as u32,
+            x if x == M::RoundingModeRTE as u32 => C::RoundingModeRTE as u32,
+            _ => C::RoundingModeRTZ as u32,
+        }
+    };
+    let mut new_caps: Vec<u32> = Vec::new();
+    for &(m, _) in modes {
+        let c = cap_of(m);
+        if !caps.contains(&c) && !new_caps.contains(&c) {
+            new_caps.push(c);
+        }
+    }
+    let version = ((spirv[1] >> 16) & 0xff, (spirv[1] >> 8) & 0xff);
+    let need_ext = !has_ext && version < (1, 4);
+    let mut out = Vec::with_capacity(spirv.len() + 2 * new_caps.len() + 8 + 4 * modes.len() * entries.len());
+    out.extend_from_slice(&spirv[..cap_at]);
+    for c in &new_caps {
+        out.extend_from_slice(&[(2 << 16) | OP_CAPABILITY, *c]);
+    }
+    out.extend_from_slice(&spirv[cap_at..ext_at]);
+    if need_ext {
+        let mut name: Vec<u8> = EXT.as_bytes().to_vec();
+        name.push(0);
+        while name.len() % 4 != 0 {
+            name.push(0);
+        }
+        let words: Vec<u32> = name.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        out.push(((1 + words.len() as u32) << 16) | OP_EXTENSION);
+        out.extend_from_slice(&words);
+    }
+    out.extend_from_slice(&spirv[ext_at..mode_at]);
+    for &f in &entries {
+        for &(m, w) in modes {
+            out.extend_from_slice(&[(4 << 16) | OP_EXECUTION_MODE, f, m, w]);
+        }
     }
     out.extend_from_slice(&spirv[mode_at..]);
     Some(out)
@@ -7830,6 +7956,74 @@ impl RangeLog {
     fn stats_text(&self) -> String {
         let v: Vec<u64> = self.stats.iter().map(|c| c.load(Ordering::Relaxed)).collect();
         format!("{} lookups ({} with nothing unfinished, {} with no bucket overlapping, {} under the lock, {} of them finding a batch)", v[0], v[1], v[2], v[3], v[4])
+    }
+}
+
+#[cfg(test)]
+mod float_modes_tests {
+    use rspirv::binary::Assemble;
+    use rspirv::dr::Builder;
+    use rspirv::spirv;
+
+    /// (opcode, operands) of each instruction after the header.
+    fn insts(w: &[u32]) -> Vec<(u32, Vec<u32>)> {
+        let mut out = Vec::new();
+        let mut i = 5;
+        while i < w.len() {
+            let wc = (w[i] >> 16) as usize;
+            out.push((w[i] & 0xffff, w[i + 1..i + wc].to_vec()));
+            i += wc.max(1);
+        }
+        out
+    }
+
+    /// A compute module with 32-bit floats only (SPIR-V 1.3): its declared form gains the
+    /// capability, the extension and one execution mode, the 16- and 64-bit ones left out, and
+    /// passes spirv-val where the local Vulkan SDK copy has it; a device allowing no 32-bit
+    /// declaration leaves it as it was.
+    #[test]
+    fn nan_preserve_declared_for_the_module_widths() {
+        let mut b = Builder::new();
+        b.set_version(1, 3);
+        b.capability(spirv::Capability::Shader);
+        b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
+        let void = b.type_void();
+        let f32t = b.type_float(32, None);
+        let fnt = b.type_function(void, []);
+        let one = b.constant_bit32(f32t, 1.0f32.to_bits());
+        let f = b.begin_function(void, None, spirv::FunctionControl::NONE, fnt).unwrap();
+        b.begin_block(None).unwrap();
+        let _ = b.f_add(f32t, None, one, one).unwrap();
+        b.ret().unwrap();
+        b.end_function().unwrap();
+        b.entry_point(spirv::ExecutionModel::GLCompute, f, "main", []);
+        b.execution_mode(f, spirv::ExecutionMode::LocalSize, [1, 1, 1]);
+        let code = b.module().assemble();
+        let out = super::declare_float_modes(&code, super::NAN_PRESERVE_MODES, 7).expect("declared");
+        let list = insts(&out);
+        let cap = spirv::Capability::SignedZeroInfNanPreserve as u32;
+        assert_eq!(list.iter().filter(|(op, o)| *op == 17 && o[0] == cap).count(), 1);
+        let ext: Vec<u32> = {
+            let mut s = b"SPV_KHR_float_controls".to_vec();
+            s.push(0);
+            while s.len() % 4 != 0 {
+                s.push(0);
+            }
+            s.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+        };
+        assert_eq!(list.iter().filter(|(op, o)| *op == 10 && *o == ext).count(), 1);
+        let mode = spirv::ExecutionMode::SignedZeroInfNanPreserve as u32;
+        let widths: Vec<u32> = list.iter().filter(|(op, o)| *op == 16 && o.len() == 3 && o[1] == mode).map(|(_, o)| o[2]).collect();
+        assert_eq!(widths, vec![32]);
+        assert!(super::declare_float_modes(&code, super::NAN_PRESERVE_MODES, 1).is_none());
+        let val = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../local-data/research/vulkan-sdk/1.4.363.0/Bin/spirv-val.exe");
+        if val.is_file() {
+            let p = std::env::temp_dir().join(format!("nan-preserve-{}.spv", std::process::id()));
+            std::fs::write(&p, out.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+            let r = std::process::Command::new(&val).args(["--target-env", "vulkan1.3"]).arg(&p).output().unwrap();
+            let _ = std::fs::remove_file(&p);
+            assert!(r.status.success(), "spirv-val: {}", String::from_utf8_lossy(&r.stderr));
+        }
     }
 }
 
