@@ -1257,6 +1257,70 @@ unsafe extern "C" fn sl_log(ty: u32, msg: *const c_char) {
     }
 }
 
+/// Streamline's files, and the port's version, as a line (`streamline-crashed.txt` holds the line
+/// of the files a start died loading: they are tried again once it differs).
+fn streamline_files_line(dir: &Path) -> String {
+    let mut v = vec![format!("Regaliant {}", env!("CARGO_PKG_VERSION"))];
+    for f in ["nvngx_dlss.dll", "sl.interposer.dll", "sl.common.dll", "sl.dlss.dll"] {
+        let m = std::fs::metadata(dir.join(f)).ok();
+        let t = m.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+        v.push(format!("{f} {} {t}", m.map_or(0, |m| m.len())));
+    }
+    v.join("; ")
+}
+
+/// Whether process `pid` still runs.
+fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return false;
+        }
+        let mut code = 0u32;
+        let alive = GetExitCodeProcess(h, &mut code) != 0 && code == 259;
+        CloseHandle(h);
+        alive
+    }
+}
+
+/// Starts that died while Streamline loaded (2026-11-24 night: a player's every start, the shader
+/// preparation's compute step too, ended with an access violation right after XeSS's query, where
+/// Streamline loads, with their own nvngx_dlss.dll in the upscalers folder; the launcher said the
+/// preparation "crashed (status 0xc0000005)"). Each process leaves `streamline-loading-<pid>.txt`
+/// in the cache folder while it loads Streamline. A marker of a process that no longer runs (or
+/// one older than five minutes: the load takes seconds) means that start died in the load: its
+/// files' line goes to `streamline-crashed.txt`, and starts leave DLSS out while the files and
+/// the port's version are the same. Returns why DLSS is left out, if it is.
+fn streamline_crashed_before(dir: &Path) -> Option<String> {
+    let cache = crate::paths().cache.clone();
+    let crashed = cache.join("streamline-crashed.txt");
+    if let Ok(rd) = std::fs::read_dir(&cache) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(pid) = name.strip_prefix("streamline-loading-").and_then(|s| s.strip_suffix(".txt")).and_then(|s| s.parse::<u32>().ok()) else { continue };
+            let old = e.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|a| a.as_secs() > 300);
+            if pid != std::process::id() && (old || !process_alive(pid)) {
+                let line = std::fs::read_to_string(e.path()).unwrap_or_default();
+                crate::warn!("upscaler: an earlier start ended while it loaded Streamline (DLSS): {}", e.path().display());
+                let _ = std::fs::write(&crashed, line.trim());
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    let was = std::fs::read_to_string(&crashed).ok()?;
+    if was.trim() == streamline_files_line(dir) {
+        Some(format!(
+            "an earlier start ended while it loaded Streamline with these files, so DLSS is left out (it is tried again when they or Regaliant's version change, or after deleting {})",
+            crashed.display()
+        ))
+    } else {
+        let _ = std::fs::remove_file(&crashed);
+        None
+    }
+}
+
 fn load_sl() -> Result<SlLib, LoadError> {
     let dir = std::env::var_os("DS_SL_DIR").map(PathBuf::from).unwrap_or_else(lib_dir);
     // DLSS itself: the player's own nvngx_dlss.dll (from a game with DLSS or
@@ -1266,7 +1330,108 @@ fn load_sl() -> Result<SlLib, LoadError> {
     if !ngx.is_file() {
         return Err(LoadError::Missing);
     }
+    // (Without NVIDIA's driver Streamline has nothing to run on: its library nvapi64.dll is in
+    // the system folder with every NVIDIA driver.)
+    let mut sys = [0u16; 260];
+    let n = unsafe { windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW(sys.as_mut_ptr(), sys.len() as u32) } as usize;
+    if n > 0 && n < sys.len() && !PathBuf::from(String::from_utf16_lossy(&sys[..n])).join("nvapi64.dll").is_file() {
+        return Err("no NVIDIA graphics driver here (nvapi64.dll is not in the system folder): DLSS needs an NVIDIA RTX card".to_string().into());
+    }
     check_signature(&ngx, "NVIDIA Corporation")?;
+    if let Some(why) = streamline_crashed_before(&dir) {
+        return Err(why.into());
+    }
+    let cache = crate::paths().cache.clone();
+    let _ = std::fs::create_dir_all(&cache);
+    let line = streamline_files_line(&dir);
+    // A start loads Streamline itself only once a separate process has loaded these files
+    // (`probe_streamline`; `streamline-ok.txt` holds their line): the player's DLSS runtime that
+    // ended every start ended only that process, and the game starts without DLSS.
+    let ok = cache.join("streamline-ok.txt");
+    if std::fs::read_to_string(&ok).ok().as_deref().map(str::trim) != Some(line.as_str()) {
+        let t0 = std::time::Instant::now();
+        match run_probe(&dir) {
+            Ok(code) => {
+                crate::info!("upscaler: Streamline's separate check loaded these files in {:.2} s (exit {code})", t0.elapsed().as_secs_f32());
+                let _ = std::fs::write(&ok, &line);
+            }
+            Err(why) => {
+                let crashed = cache.join("streamline-crashed.txt");
+                let _ = std::fs::write(&crashed, &line);
+                return Err(format!(
+                    "Streamline's separate check of these files {why}, so DLSS is left out (it is tried again when they or Regaliant's version change, or after deleting {})",
+                    crashed.display()
+                )
+                .into());
+            }
+        }
+    }
+    // (Removed whatever the load's outcome; left behind only if the process dies in it.)
+    let marker = cache.join(format!("streamline-loading-{}.txt", std::process::id()));
+    let _ = std::fs::write(&marker, &line);
+    // (Diagnosis: `DS_SL_CRASH_TEST=2` ends the process here, as a crash in the load would; `1`
+    // ends the separate check instead.)
+    if std::env::var_os("DS_SL_CRASH_TEST").is_some_and(|v| v == "2") {
+        crate::warn!("upscaler: DS_SL_CRASH_TEST: ending the process while Streamline loads");
+        std::process::abort();
+    }
+    let r = load_sl_from(&dir);
+    let _ = std::fs::remove_file(&marker);
+    r
+}
+
+/// Exit codes of `dsport --probe-streamline`: loaded, or refused without a fault.
+const PROBE_LOADED: u32 = 0;
+const PROBE_REFUSED: u32 = 3;
+
+/// Runs `dsport --probe-streamline <dir>` and waits up to 30 s: its exit code when it loaded
+/// Streamline or refused it without a fault, else what happened.
+fn run_probe(dir: &Path) -> Result<u32, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let exe = std::env::current_exe().map_err(|e| format!("could not start ({e})"))?;
+    let mut child = std::process::Command::new(exe)
+        .arg("--probe-streamline")
+        .arg(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map_err(|e| format!("could not start ({e})"))?;
+    let t0 = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let code = status.code().map_or(u32::MAX, |c| c as u32);
+                return if code == PROBE_LOADED || code == PROBE_REFUSED { Ok(code) } else { Err(format!("ended with code {code:#x}")) };
+            }
+            Ok(None) if t0.elapsed() < std::time::Duration::from_secs(30) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Ok(None) => {
+                let _ = child.kill();
+                return Err("did not end within 30 s".to_string());
+            }
+            Err(e) => return Err(format!("could not be waited for ({e})")),
+        }
+    }
+}
+
+/// `dsport --probe-streamline <dir>` (`main`, before anything else of a start): loads Streamline
+/// from `dir` as a start does (its library, slInit with DLSS, DLSS's requirements) and ends at
+/// once (no library's exit code runs): `PROBE_LOADED`, or `PROBE_REFUSED` when it refused without
+/// a fault. A fault in it ends only this process (`load_sl`).
+pub fn probe_streamline(dir: &Path) -> ! {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+    if std::env::var_os("DS_SL_CRASH_TEST").is_some_and(|v| v == "1") {
+        std::process::abort();
+    }
+    let code = if load_sl_from(dir).is_ok() { PROBE_LOADED } else { PROBE_REFUSED };
+    unsafe { TerminateProcess(GetCurrentProcess(), code) };
+    std::process::exit(code as i32)
+}
+
+fn load_sl_from(dir: &Path) -> Result<SlLib, LoadError> {
+    let dir = dir.to_path_buf();
     let path = dir.join("sl.interposer.dll");
     let h = load_lib(&path, "NVIDIA Corporation")?;
     let f = |name: &CStr| export(h, &path, name);

@@ -2258,6 +2258,18 @@ pub(crate) unsafe fn set_unless_given(k: &str, v: &str) {
 }
 
 fn main() {
+    // `--probe-streamline <dir>`: a start's separate check that Streamline loads (`gpu::upscale::
+    // probe_streamline`), before anything else: no log, no window, no error popups.
+    {
+        let mut args = std::env::args().skip(1);
+        if args.next().as_deref() == Some("--probe-streamline") {
+            unsafe {
+                use windows_sys::Win32::System::Diagnostics::Debug::{SetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SEM_NOOPENFILEERRORBOX};
+                SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+            }
+            gpu::upscale::probe_streamline(std::path::Path::new(&args.next().unwrap_or_default()));
+        }
+    }
     // Per-monitor DPI awareness for the whole process, before any window, monitor or surface is
     // asked about (a player's report, 2026-11-23: at 175% Windows scaling the picture covered the
     // top-left 2194x1234 of a 3840x2160 fullscreen. Only the window's thread was aware; the
