@@ -45,7 +45,8 @@ Shader preparation happens once. The first time you press Play, the game plays i
 - In a window on a 144 or 165 Hz screen the game shows an even 48 or 55 fps. Borderless or fullscreen with G-SYNC or FreeSync, or a 120 Hz screen, gives 60 ([more](docs/settings.md#frame-rate-and-refresh-rate)).
 - Shaders the preparation did not meet (rare effects, spells) still compile on first sight, and a level's first arrival can pause briefly.
 - A full playthrough has not been tested.
-- AMD and Intel graphics cards, RTX 50-series cards, HDR screens and 16 GB of memory have not been tested.
+- On RTX 50-series graphics cards the picture is mostly black in play ([issue #6](https://github.com/SulphurS16/Regaliant/issues/6)). The cause is being looked into.
+- AMD and Intel graphics cards, HDR screens and 16 GB of memory have not been tested.
 - Online features are not available. The game plays offline.
 
 See [all known issues](docs/known-issues.md). Found a bug? Here is [how to report a bug](docs/report-a-bug.md).
