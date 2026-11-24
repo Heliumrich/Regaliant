@@ -10,9 +10,6 @@
 - Fixed a timing fault on the graphics card in the texture streaming's statistics: resetting them
   could overtake reading them, and the game then kept textures at low detail. Vulkan's
   synchronization checks found it. It was not seen to cause problems on the tested cards.
-- When the graphics driver stops taking the game's frames but the game itself goes on, the game
-  now sets up its output again at once. Before, the picture could stay frozen for many seconds,
-  as it did for a player in exclusive fullscreen with HDR.
 
 ## 0.1.2
 

@@ -830,10 +830,6 @@ pub fn present(src: Source) -> bool {
                 window::RESIZED.store(true, std::sync::atomic::Ordering::SeqCst);
                 return false;
             }
-            Err(vk::Result::ERROR_DEVICE_LOST) if !crate::gpu::exec::DEVICE_LOST.load(std::sync::atomic::Ordering::Relaxed) => {
-                present_lost("acquire");
-                return false;
-            }
             Err(e) => {
                 crate::error!("acquire: {e}");
                 return false;
@@ -1031,44 +1027,13 @@ pub fn present(src: Source) -> bool {
                 s.send((PW_GEN.load(std::sync::atomic::Ordering::Relaxed), p.swapchain.as_raw(), p.present_id, std::time::Instant::now())).ok();
             }
         }
-        // (`DS_SIM_PRESENT_LOST=<flip>`, a test: the presents from that one on, 30 of them, report
-        // the device lost after presenting, as the player's driver did.)
-        let presented = match sim_present_lost() {
-            Some(n) if presented.is_ok() && (n..n + 30).contains(&(p.frame as u64)) => Err(vk::Result::ERROR_DEVICE_LOST),
-            _ => presented,
-        };
         match presented {
             Ok(false) => {}
             Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => window::RESIZED.store(true, std::sync::atomic::Ordering::SeqCst),
-            Err(vk::Result::ERROR_DEVICE_LOST) if !crate::gpu::exec::DEVICE_LOST.load(std::sync::atomic::Ordering::Relaxed) => present_lost("present"),
             Err(e) => crate::error!("present: {e}"),
         }
     }
     true
-}
-
-/// Presents (or acquires) that reported the device lost while the GPU work went on.
-static PRESENT_LOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// A present or acquire reported the device lost, but the executor's own work has not met it:
-/// the driver gave up on this swapchain, not the device (issue #1, 2026-11-24: a player's RTX
-/// 4090 on driver 621.14, in exclusive fullscreen with HDR, got this at every present for 24 s
-/// while its GPU work went on completing, and showed frames again only once a window change made
-/// a new swapchain). A new swapchain is made at the next frame; were the device really lost, the
-/// executor stops at its next submission and the new swapchain fails quietly.
-fn present_lost(what: &str) {
-    let n = PRESENT_LOST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if n < 8 || n.is_power_of_two() {
-        crate::warn!("{what}: the device reported lost while its work goes on ({} time(s)): the swapchain made again", n + 1);
-    }
-    window::RESIZED.store(true, std::sync::atomic::Ordering::SeqCst);
-}
-
-/// `DS_SIM_PRESENT_LOST=<flip>` (a test): the presents from that flip on (30 of them) report the
-/// device lost after presenting (`present_lost`'s recovery, without a driver that does it).
-fn sim_present_lost() -> Option<u64> {
-    static N: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("DS_SIM_PRESENT_LOST").ok().and_then(|v| v.trim().parse().ok()))
 }
 
 /// Where a `sw`x`sh` frame goes in a `dw`x`dh` window (x, y, width, height):
