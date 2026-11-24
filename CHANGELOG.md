@@ -10,6 +10,8 @@
   prepares the shaders again once.
 - **Open logs** in the launcher now selects the newest session's folder, the one to send with a
   bug report. The launcher's own quick checks keep their logs in a `checks` folder.
+- The log names the programs that hold much of the graphics card's memory. When other programs
+  hold a lot of it, the game keeps fewer textures and can stutter.
 
 ## 0.1.1
 

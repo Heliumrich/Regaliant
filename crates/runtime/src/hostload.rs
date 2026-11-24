@@ -125,26 +125,53 @@ fn pid_of(instance: &str) -> Option<u32> {
     instance.strip_prefix("pid_")?.split('_').next()?.parse().ok()
 }
 
-/// A process's executable name without its extension (`pid <n>` when it
-/// cannot be opened).
+/// A process's executable name without its extension (from a process snapshot when it cannot be
+/// opened, `pid <n>` when neither names it).
 fn name_of(pid: u32) -> String {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
+    let strip = |file: &str| file.strip_suffix(".exe").or_else(|| file.strip_suffix(".EXE")).unwrap_or(file).to_string();
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if h.is_null() {
-            return format!("pid {pid}");
+            return snapshot_name(pid).map(|n| strip(&n)).unwrap_or_else(|| format!("pid {pid}"));
         }
         let mut buf = [0u16; 520];
         let mut len = buf.len() as u32;
         let ok = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len) != 0;
         CloseHandle(h);
         if !ok {
-            return format!("pid {pid}");
+            return snapshot_name(pid).map(|n| strip(&n)).unwrap_or_else(|| format!("pid {pid}"));
         }
         let path = String::from_utf16_lossy(&buf[..len as usize]);
-        let file = path.rsplit(['\\', '/']).next().unwrap_or(&path);
-        file.strip_suffix(".exe").or_else(|| file.strip_suffix(".EXE")).unwrap_or(file).to_string()
+        strip(path.rsplit(['\\', '/']).next().unwrap_or(&path))
+    }
+}
+
+/// A process's executable file name from a process snapshot: protected processes (dwm.exe among
+/// them, 4.3 GB of dedicated video memory here on 2026-11-24) cannot be opened for their image name.
+fn snapshot_name(pid: u32) -> Option<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut e: PROCESSENTRY32W = std::mem::zeroed();
+        e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut found = None;
+        let mut ok = Process32FirstW(snap, &mut e) != 0;
+        while ok {
+            if e.th32ProcessID == pid {
+                let n = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+                found = Some(String::from_utf16_lossy(&e.szExeFile[..n]));
+                break;
+            }
+            ok = Process32NextW(snap, &mut e) != 0;
+        }
+        CloseHandle(snap);
+        found
     }
 }
 
@@ -205,14 +232,43 @@ fn sampler() {
             }
         }
         if let Some(c) = vram {
+            let mut vram_by: HashMap<u32, f64> = HashMap::new();
             for (inst, v) in unsafe { values(c, PDH_FMT_DOUBLE) } {
                 match pid_of(&inst) {
                     Some(pid) if pid == me => vram_ours += v,
-                    Some(_) => vram_other += v,
+                    Some(pid) => {
+                        vram_other += v;
+                        *vram_by.entry(pid).or_default() += v;
+                    }
                     None => {}
                 }
             }
             OTHERS_VRAM.store(vram_other as u64, std::sync::atomic::Ordering::Relaxed);
+            // (Each time others' dedicated memory passes another 4 GiB: who holds it. A player's
+            // 12 GB card had others at 11.7 GB, so the image cache kept to half its budget,
+            // without the log naming them: issue #5, 2026-11-24.)
+            // (`DS_HOST_VRAM_REPORT_MIB=<n>`: that step instead, for a test.)
+            static STEP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let step = *STEP.get_or_init(|| std::env::var("DS_HOST_VRAM_REPORT_MIB").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&m| m > 0).map_or(4 << 30, |m| m << 20));
+            static NEXT_VRAM_REPORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let other = vram_other as u64;
+            if other >= NEXT_VRAM_REPORT.load(std::sync::atomic::Ordering::Relaxed).max(step) {
+                NEXT_VRAM_REPORT.store((other / step + 1) * step, std::sync::atomic::Ordering::Relaxed);
+                let mut by_name: HashMap<String, f64> = HashMap::new();
+                for (pid, v) in vram_by {
+                    let name = names.entry(pid).or_insert_with(|| name_of(pid)).clone();
+                    *by_name.entry(name).or_default() += v;
+                }
+                let mut top: Vec<(String, f64)> = by_name.into_iter().collect();
+                top.sort_by(|a, b| b.1.total_cmp(&a.1));
+                let list: Vec<String> = top.iter().take(5).map(|(n, v)| format!("{n} {:.1} GB", v / (1u64 << 30) as f64)).collect();
+                crate::info!(
+                    "host load: other processes' dedicated video memory {:.1} GB as Windows counts it (ours {:.1} GB); the most: {}",
+                    other as f64 / (1u64 << 30) as f64,
+                    vram_ours / (1u64 << 30) as f64,
+                    list.join(", ")
+                );
+            }
         }
         if let Some(c) = cpu {
             // PDH_FMT_NOCAP100: a process's share over 100% of one CPU.
