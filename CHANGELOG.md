@@ -1,15 +1,5 @@
 # Changelog
 
-## 0.1.4 (not released yet)
-
-- Import PS5 Saves also takes save folders named 'sdimg_SAVEDATA...', as PS5 save tools name
-  them. Before, such a save was not found. The PS5's own backups beside them are left out.
-- Fixed a rare hang after slow first shader compiles: a part of the graphics work that fell
-  behind could wait forever for a frame that had already passed, and the game stopped.
-- Your own pre-order and Digital Deluxe add-on packages count: put them in a folder named
-  'Add-ons' in '%APPDATA%\Regaliant', and the game finds them as owned when it starts. Before,
-  it was told that no add-ons were installed.
-
 ## 0.1.3
 
 - Game folders whose executable and libraries are decrypted but still in their SELF containers
@@ -20,6 +10,13 @@
 - Fixed a timing fault on the graphics card in the texture streaming's statistics: resetting them
   could overtake reading them, and the game then kept textures at low detail. Vulkan's
   synchronization checks found it. It was not seen to cause problems on the tested cards.
+- Your own pre-order and Digital Deluxe add-on packages count: put them in a folder named
+  'Add-ons' in '%APPDATA%\Regaliant', and the game finds them as owned when it starts. Before,
+  it was told that no add-ons were installed.
+- Import PS5 Saves also takes save folders named 'sdimg_SAVEDATA...', as PS5 save tools name
+  them. Before, such a save was not found. The PS5's own backups beside them are left out.
+- Fixed a rare hang after slow first shader compiles: a part of the graphics work that fell
+  behind could wait forever for a frame that had already passed, and the game stopped.
 
 ## 0.1.2
 
