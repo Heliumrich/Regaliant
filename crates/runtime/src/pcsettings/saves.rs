@@ -47,7 +47,17 @@ pub fn folder(option: u32, port: &Path) -> PathBuf {
     }
 }
 
-/// Save directories (`SAVEDATA*` with a `USR-DATA` file) at most four levels under `dir`.
+/// The game's name for a save directory: `SAVEDATA...` as it is, and `sdimg_SAVEDATA...` (the
+/// PS5 keeps each save as an image named so, and decrypting tools keep the name: a player's
+/// import found nothing, 2026-11-24) without the prefix. The PS5's own backups beside them
+/// (`sdimg_sce_bu_SAVEDATA...`) and anything else: None.
+fn save_name(folder: &str) -> Option<&str> {
+    let name = folder.strip_prefix("sdimg_").unwrap_or(folder);
+    name.starts_with("SAVEDATA").then_some(name)
+}
+
+/// Save directories (`SAVEDATA*` or `sdimg_SAVEDATA*` with a `USR-DATA` file) at most four levels
+/// under `dir`.
 fn save_dirs(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {
@@ -56,9 +66,9 @@ fn save_dirs(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
             continue;
         }
         let name = e.file_name().to_string_lossy().to_string();
-        if name.starts_with("SAVEDATA") && p.join("USR-DATA").is_file() {
+        if save_name(&name).is_some() && p.join("USR-DATA").is_file() {
             out.push(p);
-        } else if depth > 0 && !name.starts_with('.') {
+        } else if depth > 0 && !name.starts_with('.') && !name.starts_with("sdimg_sce_bu_") {
             save_dirs(&p, depth - 1, out);
         }
     }
@@ -120,14 +130,24 @@ pub fn import(from: &Path, saves: &Path, title: &str) -> usize {
     let mut found = Vec::new();
     save_dirs(from, 4, &mut found);
     if found.is_empty() {
-        crate::warn!("saves: PS5 import: no save directory (SAVEDATA... with USR-DATA) in {}", from.display());
+        crate::warn!("saves: PS5 import: no save directory (SAVEDATA... or sdimg_SAVEDATA... with USR-DATA) in {}", from.display());
         return 0;
     }
+    // (A name found twice, as SAVEDATA... and sdimg_SAVEDATA... or in two folders: the first one,
+    // in name order.)
+    found.sort();
+    let mut names = std::collections::HashSet::new();
     let stamp = crate::utc_stamp();
     let base = saves.join(user()).join(title);
     let mut done = 0;
     for src in &found {
-        let name = src.file_name().unwrap_or_default();
+        let folder = src.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let Some(name) = save_name(&folder).map(std::ffi::OsString::from) else { continue };
+        if !names.insert(name.clone()) {
+            crate::warn!("saves: PS5 import: {} left out: {} was imported already", src.display(), name.to_string_lossy());
+            continue;
+        }
+        let name = name.as_os_str();
         let dst = base.join(name);
         if dst.is_dir() {
             let keep = saves.parent().unwrap_or(saves).join("save-backups").join(user()).join(title).join(name).join(format!("{stamp}-before-import"));
@@ -206,6 +226,34 @@ mod tests {
         assert_eq!(k.len(), 1);
         assert_eq!(std::fs::read_to_string(k[0].path().join("USR-DATA")).unwrap(), "pc");
         assert!(!from.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn import_takes_sdimg_folders_without_the_ps5_backups() {
+        // A decrypted save as a player's tool left it (2026-11-24): sdimg_ folders, and the PS5's
+        // backups beside them.
+        let base = std::env::temp_dir().join(format!("dsport-ps5import-sdimg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let from = base.join(IMPORT_DIR);
+        for (dir, data) in [
+            ("sdimg_SAVEDATA0PlayerProfile0", "player0"),
+            ("sdimg_SAVEDATA0OptionsProfile0", "options0"),
+            ("sdimg_sce_bu_SAVEDATA0PlayerProfile0", "backup"),
+        ] {
+            let d = from.join("PPSA01341").join(dir);
+            std::fs::create_dir_all(d.join("sce_sys")).unwrap();
+            std::fs::write(d.join("USR-DATA"), data).unwrap();
+            std::fs::write(d.join("sce_sys").join("param.sfo"), "meta").unwrap();
+        }
+        let saves = base.join("saves");
+        assert_eq!(import(&from, &saves, "PPSA01341"), 2);
+        let got = saves.join(user()).join("PPSA01341");
+        assert_eq!(std::fs::read_to_string(got.join("SAVEDATA0PlayerProfile0").join("USR-DATA")).unwrap(), "player0");
+        assert_eq!(std::fs::read_to_string(got.join("SAVEDATA0OptionsProfile0").join("USR-DATA")).unwrap(), "options0");
+        assert!(!got.join("sdimg_SAVEDATA0PlayerProfile0").exists());
+        assert!(!got.join("sdimg_sce_bu_SAVEDATA0PlayerProfile0").exists());
+        assert_eq!(save_name("sdimg_sce_bu_SAVEDATA0PlayerProfile0"), None);
         let _ = std::fs::remove_dir_all(&base);
     }
 

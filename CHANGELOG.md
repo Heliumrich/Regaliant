@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.4 (not released yet)
+
+- Import PS5 Saves also takes save folders named 'sdimg_SAVEDATA...', as PS5 save tools name
+  them. Before, such a save was not found. The PS5's own backups beside them are left out.
+- Fixed a rare hang after slow first shader compiles: a part of the graphics work that fell
+  behind could wait forever for a frame that had already passed, and the game stopped.
+
 ## 0.1.3
 
 - Game folders whose executable and libraries are decrypted but still in their SELF containers
