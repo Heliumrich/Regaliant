@@ -17303,6 +17303,11 @@ impl Exec {
         unsafe {
             d.cmd_copy_buffer(cmd, fx.lodstats, fx.lod_readback, &[vk::BufferCopy { src_offset: 0, dst_offset: slot as u64 * bytes, size: bytes }]);
             if reset {
+                // (The copy reads the counters before the fills start them again: without this
+                // execution dependency a fill may overtake the copy and the title reads "nothing
+                // sampled" for every bank; the validation layer's synchronization check reported
+                // it every frame, 2026-11-24.)
+                d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[]);
                 let m = super::lodstats::MIN_BYTES;
                 d.cmd_fill_buffer(cmd, fx.lodstats, 0, m, 15);
                 d.cmd_fill_buffer(cmd, fx.lodstats, m, bytes - m, 0);

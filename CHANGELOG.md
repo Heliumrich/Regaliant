@@ -5,6 +5,9 @@
 - Game folders whose executable and libraries are decrypted but still in their SELF containers
   (as some dumps keep them) now work as they are. Before, the launcher called them encrypted and
   they had to be converted to ELF files first.
+- Fixed a timing fault on the graphics card in the texture streaming's statistics: resetting them
+  could overtake reading them, and the game then kept textures at low detail. Vulkan's
+  synchronization checks found it. It was not seen to cause problems on the tested cards.
 
 ## 0.1.2
 
