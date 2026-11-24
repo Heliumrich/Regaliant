@@ -40,6 +40,11 @@ struct Merge {
     retired: Vec<Retired>,
 }
 
+/// Flips after an image is put aside before the batch sequence its work came before is taken:
+/// far more than a batch takes to be handed over (`FRAMES` is also stored by the display's
+/// thread, and a flip need not hand the open batch over: the review of 2026-11-24 night).
+const RETIRE_FLIPS: u64 = 120;
+
 /// Images made and freed (the status line).
 pub static IMAGES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
@@ -139,7 +144,7 @@ pub fn target(w: u32, h: u32) -> Result<super::upscale::Tex, String> {
     let done = super::exec::completed_seq();
     let mut keep = Vec::with_capacity(m.retired.len());
     for mut r in m.retired.drain(..) {
-        if r.seq.is_none() && frame >= r.frame + 2 {
+        if r.seq.is_none() && frame >= r.frame + RETIRE_FLIPS {
             r.seq = Some(super::exec::next_seq());
         }
         if r.seq.is_some_and(|s| done >= s) && (r.img.w, r.img.h) != (w, h) {

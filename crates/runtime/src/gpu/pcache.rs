@@ -650,13 +650,15 @@ impl Drop for Crumb {
     }
 }
 
-/// The compiles in flight, kept on disk (`inflight-<pid>.bin` in the store, 2026-11-24 night): a
-/// slot per compiling thread holds the pipeline it has the driver compile (`Crumb`), cleared when
-/// that compile ends; a clean shutdown removes the file (`clear_crash_suspects`). A session that
-/// ended otherwise, by an exit inside the driver no fault handler sees (a player's sessions on
-/// NVIDIA's 621.40 ended in their background compiles with nothing in their logs) or from
-/// outside, leaves it, and the next start lists those compiles as suspects
-/// (`confirm_left_suspects`): the same compile cannot end every session.
+/// The compiles in flight, kept on disk (`inflight/inflight-<pid>.bin` in the store, 2026-11-24
+/// night): a slot per compiling thread holds the pipeline it has the driver compile (`Crumb`),
+/// cleared when that compile ends; a clean shutdown removes the file (`clear_crash_suspects`). A
+/// session that ended otherwise, by an exit inside the driver no fault handler sees (a player's
+/// sessions on NVIDIA's 621.40 ended in their background compiles with nothing in their logs), a
+/// hang report (a compile that does not return) or from outside, leaves it, and the next start
+/// lists those compiles as suspects (`confirm_left_suspects`): the same compile cannot end every
+/// session. The launcher removes the files of the steps it ends when it closes (its
+/// `end_for_close`): those ends are the player's.
 struct Inflight {
     file: std::fs::File,
     next: std::sync::atomic::AtomicU32,
@@ -667,14 +669,19 @@ static INFLIGHT: OnceLock<Option<Inflight>> = OnceLock::new();
 /// (a byte), seven bytes of padding, the key (little-endian).
 const INFLIGHT_HEADER: u64 = 128;
 const INFLIGHT_SLOT: u64 = 16;
-const INFLIGHT_SLOTS: u32 = 64;
+const INFLIGHT_SLOTS: u32 = 256;
 
 thread_local! {
     static INFLIGHT_SLOT_OF: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
+/// The files' folder (apart from the store's thousands of pipeline files: a start lists it).
+fn inflight_dir() -> Option<PathBuf> {
+    DIR.get().map(|d| d.join("inflight"))
+}
+
 fn inflight_file(pid: u32) -> Option<PathBuf> {
-    DIR.get().map(|d| d.join(format!("inflight-{pid}.bin")))
+    inflight_dir().map(|d| d.join(format!("inflight-{pid}.bin")))
 }
 
 fn inflight() -> Option<&'static Inflight> {
@@ -685,6 +692,7 @@ fn inflight() -> Option<&'static Inflight> {
                 return None;
             }
             let (_, id) = IDENTITY.get()?;
+            std::fs::create_dir_all(inflight_dir()?).ok()?;
             let f = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(inflight_file(std::process::id())?).ok()?;
             let mut header = [0u8; INFLIGHT_HEADER as usize];
             let n = id.len().min(header.len());
@@ -718,15 +726,19 @@ fn inflight_mark(what: Option<(char, u64)>) {
     let _ = f.file.seek_write(&b, INFLIGHT_HEADER + slot as u64 * INFLIGHT_SLOT);
 }
 
-/// The compiles a dead session's `inflight-<pid>.bin` holds: its cache id and the pipelines.
+/// The compiles a dead session's `inflight-<pid>.bin` holds: its cache id and the pipelines, each
+/// once (two threads can compile one pipeline at once: one session's evidence counts once).
 fn inflight_left(path: &Path) -> Option<(String, Vec<(char, u64)>)> {
     let b = std::fs::read(path).ok()?;
     let header = b.get(..INFLIGHT_HEADER as usize)?;
     let id = String::from_utf8_lossy(&header[..header.iter().position(|&c| c == 0).unwrap_or(header.len())]).into_owned();
-    let mut v = Vec::new();
+    let mut v: Vec<(char, u64)> = Vec::new();
     for s in b[INFLIGHT_HEADER as usize..].chunks_exact(INFLIGHT_SLOT as usize) {
         if let (k @ (b'g' | b'c'), Ok(key)) = (s[0], <[u8; 8]>::try_from(&s[8..16])) {
-            v.push((k as char, u64::from_le_bytes(key)));
+            let e = (k as char, u64::from_le_bytes(key));
+            if !v.contains(&e) {
+                v.push(e);
+            }
         }
     }
     Some((id, v))
@@ -978,6 +990,17 @@ pub fn clear_crash_suspects() {
     {
         let _ = std::fs::remove_file(p);
     }
+    clear_first_chance_suspects();
+}
+
+/// A session found hung (`crate::hung`): its first-chance suspects go as at a clean end, its
+/// compiles in flight stay for the next start (a compile that does not return is what the
+/// compute step's and the self-play's watches end a session for: the review of 2026-11-24 night).
+pub fn clear_crash_suspects_keep_inflight() {
+    clear_first_chance_suspects();
+}
+
+fn clear_first_chance_suspects() {
     let Some(path) = suspect_file() else { return };
     let Ok(t) = std::fs::read_to_string(&path) else { return };
     let mine = format!("pid={} ", std::process::id());
@@ -1015,16 +1038,22 @@ fn confirm_left_suspects() {
         }
         let _ = if kept.is_empty() { std::fs::remove_file(&path) } else { std::fs::write(&path, kept) };
     }
-    // Compiles in flight when a session ended without a clean exit (`Inflight`).
-    let Some(dir) = DIR.get() else { return };
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    // Compiles in flight when a session ended without a clean exit (`Inflight`): each dead
+    // session's file claimed by renaming it first (several processes start at once: the evidence
+    // counts once).
+    let Some(dir) = inflight_dir() else { return };
+    let Ok(rd) = std::fs::read_dir(&dir) else { return };
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         let Some(pid) = name.strip_prefix("inflight-").and_then(|s| s.strip_suffix(".bin")).and_then(|s| s.parse::<u32>().ok()) else { continue };
         if pid == std::process::id() || process_alive(pid) {
             continue;
         }
-        if let Some((cid, pipelines)) = inflight_left(&e.path()) {
+        let claimed = dir.join(format!("inflight-{pid}.claimed-{}", std::process::id()));
+        if std::fs::rename(e.path(), &claimed).is_err() {
+            continue;
+        }
+        if let Some((cid, pipelines)) = inflight_left(&claimed) {
             for (kind, key) in pipelines {
                 let k = format!("{kind}{key:016x}");
                 if !noted.contains(&(pid, k.clone())) {
@@ -1033,7 +1062,7 @@ fn confirm_left_suspects() {
                 }
             }
         }
-        let _ = std::fs::remove_file(e.path());
+        let _ = std::fs::remove_file(&claimed);
     }
 }
 

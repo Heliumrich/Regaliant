@@ -1257,14 +1257,24 @@ unsafe extern "C" fn sl_log(ty: u32, msg: *const c_char) {
     }
 }
 
-/// Streamline's files, and the port's version, as a line (`streamline-crashed.txt` holds the line
-/// of the files a start died loading: they are tried again once it differs).
+/// The system folder (nvapi64.dll, NVIDIA's driver library, is there with every NVIDIA driver).
+fn system_dir() -> Option<PathBuf> {
+    let mut sys = [0u16; 260];
+    let n = unsafe { windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW(sys.as_mut_ptr(), sys.len() as u32) } as usize;
+    (n > 0 && n < sys.len()).then(|| PathBuf::from(String::from_utf16_lossy(&sys[..n])))
+}
+
+/// Streamline's files, NVIDIA's driver library and the port's version, as a line
+/// (`streamline-ok.txt` and `streamline-crashed.txt` hold the line they were written for: a check
+/// is made again once it differs, a driver update included).
 fn streamline_files_line(dir: &Path) -> String {
     let mut v = vec![format!("Regaliant {}", env!("CARGO_PKG_VERSION"))];
-    for f in ["nvngx_dlss.dll", "sl.interposer.dll", "sl.common.dll", "sl.dlss.dll"] {
-        let m = std::fs::metadata(dir.join(f)).ok();
+    let files = ["nvngx_dlss.dll", "sl.interposer.dll", "sl.common.dll", "sl.dlss.dll"].map(|f| dir.join(f));
+    for p in files.iter().cloned().chain(system_dir().map(|s| s.join("nvapi64.dll"))) {
+        let m = std::fs::metadata(&p).ok();
         let t = m.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
-        v.push(format!("{f} {} {t}", m.map_or(0, |m| m.len())));
+        let name = p.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
+        v.push(format!("{name} {} {t}", m.map_or(0, |m| m.len())));
     }
     v.join("; ")
 }
@@ -1285,14 +1295,42 @@ fn process_alive(pid: u32) -> bool {
     }
 }
 
+/// Streamline loads that ended a process, or checks that did not end (`note_streamline_death`),
+/// in a row for the same files: at `STREAMLINE_DEATHS` DLSS is left out. One alone is no proof: a
+/// launcher check or preparation step is ended from outside when the launcher closes or a check
+/// takes too long, and such an end in the load must not switch DLSS off (the review of 2026-11-24
+/// night); it only makes the separate check run again.
+const STREAMLINE_DEATHS: u32 = 2;
+
+/// One more death in Streamline's load for the files of `line` (`streamline-deaths.txt`: the
+/// count and the line), the separate check made to run again; at `STREAMLINE_DEATHS` the files'
+/// line goes to `streamline-crashed.txt`.
+fn note_streamline_death(cache: &Path, line: &str, what: &str) {
+    let deaths = cache.join("streamline-deaths.txt");
+    let n = std::fs::read_to_string(&deaths)
+        .ok()
+        .and_then(|t| t.split_once(' ').filter(|(_, l)| l.trim() == line.trim()).and_then(|(n, _)| n.parse::<u32>().ok()))
+        .unwrap_or(0)
+        + 1;
+    let _ = std::fs::remove_file(cache.join("streamline-ok.txt"));
+    if n >= STREAMLINE_DEATHS {
+        crate::warn!("upscaler: {what} ({n} in a row with these files): DLSS is left out");
+        let _ = std::fs::write(cache.join("streamline-crashed.txt"), line.trim());
+        let _ = std::fs::remove_file(&deaths);
+    } else {
+        crate::warn!("upscaler: {what}: Streamline's separate check runs again before DLSS is loaded");
+        let _ = std::fs::write(&deaths, format!("{n} {}", line.trim()));
+    }
+}
+
 /// Starts that died while Streamline loaded (2026-11-24 night: a player's every start, the shader
 /// preparation's compute step too, ended with an access violation right after XeSS's query, where
 /// Streamline loads, with their own nvngx_dlss.dll in the upscalers folder; the launcher said the
 /// preparation "crashed (status 0xc0000005)"). Each process leaves `streamline-loading-<pid>.txt`
 /// in the cache folder while it loads Streamline. A marker of a process that no longer runs (or
-/// one older than five minutes: the load takes seconds) means that start died in the load: its
-/// files' line goes to `streamline-crashed.txt`, and starts leave DLSS out while the files and
-/// the port's version are the same. Returns why DLSS is left out, if it is.
+/// one older than five minutes: the load takes seconds) is claimed by renaming it (a death counts
+/// once, however many processes start together) and counted (`note_streamline_death`). Returns
+/// why DLSS is left out, if it is (`streamline-crashed.txt` written for these files).
 fn streamline_crashed_before(dir: &Path) -> Option<String> {
     let cache = crate::paths().cache.clone();
     let crashed = cache.join("streamline-crashed.txt");
@@ -1301,18 +1339,22 @@ fn streamline_crashed_before(dir: &Path) -> Option<String> {
             let name = e.file_name().to_string_lossy().into_owned();
             let Some(pid) = name.strip_prefix("streamline-loading-").and_then(|s| s.strip_suffix(".txt")).and_then(|s| s.parse::<u32>().ok()) else { continue };
             let old = e.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|a| a.as_secs() > 300);
-            if pid != std::process::id() && (old || !process_alive(pid)) {
-                let line = std::fs::read_to_string(e.path()).unwrap_or_default();
-                crate::warn!("upscaler: an earlier start ended while it loaded Streamline (DLSS): {}", e.path().display());
-                let _ = std::fs::write(&crashed, line.trim());
-                let _ = std::fs::remove_file(e.path());
+            if pid == std::process::id() || !(old || !process_alive(pid)) {
+                continue;
             }
+            let claimed = cache.join(format!("streamline-loading-{pid}.claimed-{}", std::process::id()));
+            if std::fs::rename(e.path(), &claimed).is_err() {
+                continue;
+            }
+            let line = std::fs::read_to_string(&claimed).unwrap_or_default();
+            let _ = std::fs::remove_file(&claimed);
+            note_streamline_death(&cache, &line, &format!("an earlier start (process {pid}) ended while it loaded Streamline (DLSS)"));
         }
     }
     let was = std::fs::read_to_string(&crashed).ok()?;
     if was.trim() == streamline_files_line(dir) {
         Some(format!(
-            "an earlier start ended while it loaded Streamline with these files, so DLSS is left out (it is tried again when they or Regaliant's version change, or after deleting {})",
+            "Streamline's load ended starts or its separate check with these files, so DLSS is left out (it is tried again when they, the graphics driver or Regaliant's version change, or after deleting {})",
             crashed.display()
         ))
     } else {
@@ -1332,9 +1374,7 @@ fn load_sl() -> Result<SlLib, LoadError> {
     }
     // (Without NVIDIA's driver Streamline has nothing to run on: its library nvapi64.dll is in
     // the system folder with every NVIDIA driver.)
-    let mut sys = [0u16; 260];
-    let n = unsafe { windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW(sys.as_mut_ptr(), sys.len() as u32) } as usize;
-    if n > 0 && n < sys.len() && !PathBuf::from(String::from_utf16_lossy(&sys[..n])).join("nvapi64.dll").is_file() {
+    if system_dir().is_some_and(|s| !s.join("nvapi64.dll").is_file()) {
         return Err("no NVIDIA graphics driver here (nvapi64.dll is not in the system folder): DLSS needs an NVIDIA RTX card".to_string().into());
     }
     check_signature(&ngx, "NVIDIA Corporation")?;
@@ -1351,18 +1391,23 @@ fn load_sl() -> Result<SlLib, LoadError> {
     if std::fs::read_to_string(&ok).ok().as_deref().map(str::trim) != Some(line.as_str()) {
         let t0 = std::time::Instant::now();
         match run_probe(&dir) {
-            Ok(code) => {
+            ProbeEnd::Ended(code) => {
                 crate::info!("upscaler: Streamline's separate check loaded these files in {:.2} s (exit {code})", t0.elapsed().as_secs_f32());
                 let _ = std::fs::write(&ok, &line);
             }
-            Err(why) => {
+            // (A fault's NTSTATUS: the load itself crashed, not an end from outside.)
+            ProbeEnd::Faulted(code) => {
                 let crashed = cache.join("streamline-crashed.txt");
                 let _ = std::fs::write(&crashed, &line);
                 return Err(format!(
-                    "Streamline's separate check of these files {why}, so DLSS is left out (it is tried again when they or Regaliant's version change, or after deleting {})",
+                    "Streamline's separate check of these files crashed (code {code:#x}), so DLSS is left out (it is tried again when they, the graphics driver or Regaliant's version change, or after deleting {})",
                     crashed.display()
                 )
                 .into());
+            }
+            ProbeEnd::Other(why) => {
+                note_streamline_death(&cache, &line, &format!("Streamline's separate check {why}"));
+                return Err(format!("Streamline's separate check {why}: DLSS is left out for this start").into());
             }
         }
     }
@@ -1377,41 +1422,70 @@ fn load_sl() -> Result<SlLib, LoadError> {
     }
     let r = load_sl_from(&dir);
     let _ = std::fs::remove_file(&marker);
+    // (Loaded: the deaths in a row end here.)
+    if r.is_ok() {
+        let _ = std::fs::remove_file(cache.join("streamline-deaths.txt"));
+    }
     r
 }
 
-/// Exit codes of `dsport --probe-streamline`: loaded, or refused without a fault.
+/// Exit codes of `dsport --probe-streamline`: loaded, refused without a fault, out of time (its
+/// own limit, `PROBE_SECS`).
 const PROBE_LOADED: u32 = 0;
 const PROBE_REFUSED: u32 = 3;
+const PROBE_TIMED_OUT: u32 = 4;
+const PROBE_SECS: u64 = 30;
 
-/// Runs `dsport --probe-streamline <dir>` and waits up to 30 s: its exit code when it loaded
-/// Streamline or refused it without a fault, else what happened.
-fn run_probe(dir: &Path) -> Result<u32, String> {
+/// How the separate check ended.
+enum ProbeEnd {
+    /// Loaded, or refused without a fault (`PROBE_LOADED`, `PROBE_REFUSED`).
+    Ended(u32),
+    /// A fault's code (an NTSTATUS error, 0xC0000000 and up: an access violation, a fail-fast).
+    Faulted(u32),
+    /// Out of time, ended from outside, not started or not waited for.
+    Other(String),
+}
+
+/// Runs `dsport --probe-streamline <dir>` at normal priority (a launcher check's lower one is not
+/// inherited) and waits up to `PROBE_SECS` and a little more (it ends itself at `PROBE_SECS`).
+fn run_probe(dir: &Path) -> ProbeEnd {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let exe = std::env::current_exe().map_err(|e| format!("could not start ({e})"))?;
-    let mut child = std::process::Command::new(exe)
+    const NORMAL_PRIORITY_CLASS: u32 = 0x0000_0020;
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => return ProbeEnd::Other(format!("could not start ({e})")),
+    };
+    let mut child = match std::process::Command::new(exe)
         .arg("--probe-streamline")
         .arg(dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
+        .creation_flags(CREATE_NO_WINDOW | NORMAL_PRIORITY_CLASS)
         .spawn()
-        .map_err(|e| format!("could not start ({e})"))?;
+    {
+        Ok(c) => c,
+        Err(e) => return ProbeEnd::Other(format!("could not start ({e})")),
+    };
     let t0 = std::time::Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 let code = status.code().map_or(u32::MAX, |c| c as u32);
-                return if code == PROBE_LOADED || code == PROBE_REFUSED { Ok(code) } else { Err(format!("ended with code {code:#x}")) };
+                return match code {
+                    PROBE_LOADED | PROBE_REFUSED => ProbeEnd::Ended(code),
+                    PROBE_TIMED_OUT => ProbeEnd::Other(format!("did not end within {PROBE_SECS} s")),
+                    c if c >= 0xC000_0000 && c != u32::MAX => ProbeEnd::Faulted(c),
+                    c => ProbeEnd::Other(format!("was ended from outside (code {c:#x})")),
+                };
             }
-            Ok(None) if t0.elapsed() < std::time::Duration::from_secs(30) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Ok(None) if t0.elapsed() < std::time::Duration::from_secs(PROBE_SECS + 5) => std::thread::sleep(std::time::Duration::from_millis(20)),
             Ok(None) => {
                 let _ = child.kill();
-                return Err("did not end within 30 s".to_string());
+                return ProbeEnd::Other(format!("did not end within {PROBE_SECS} s"));
             }
-            Err(e) => return Err(format!("could not be waited for ({e})")),
+            Err(e) => return ProbeEnd::Other(format!("could not be waited for ({e})")),
         }
     }
 }
@@ -1419,9 +1493,14 @@ fn run_probe(dir: &Path) -> Result<u32, String> {
 /// `dsport --probe-streamline <dir>` (`main`, before anything else of a start): loads Streamline
 /// from `dir` as a start does (its library, slInit with DLSS, DLSS's requirements) and ends at
 /// once (no library's exit code runs): `PROBE_LOADED`, or `PROBE_REFUSED` when it refused without
-/// a fault. A fault in it ends only this process (`load_sl`).
+/// a fault; at `PROBE_SECS` it ends itself (`PROBE_TIMED_OUT`), so a load that hangs does not
+/// outlive the start that waits for it. A fault in it ends only this process (`load_sl`).
 pub fn probe_streamline(dir: &Path) -> ! {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(PROBE_SECS));
+        unsafe { TerminateProcess(GetCurrentProcess(), PROBE_TIMED_OUT) };
+    });
     if std::env::var_os("DS_SL_CRASH_TEST").is_some_and(|v| v == "1") {
         std::process::abort();
     }

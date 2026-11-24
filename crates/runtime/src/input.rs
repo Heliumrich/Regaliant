@@ -1181,10 +1181,11 @@ pub fn motion_tick() {
 /// Whether `src` is held: in the window or by the control channel (a sided
 /// modifier held there also holds the common one).
 fn held(src: Src) -> bool {
-    use crate::gpu::vk::window::{MOUSE_BUTTONS, key_down};
+    use crate::gpu::vk::window::{MOUSE_BUTTONS, MOUSE_SWALLOW, key_down};
     let window = match src {
         Src::Key(k) => key_down(k),
-        Src::Mouse(m) => MOUSE_BUTTONS.load(Relaxed) & (1 << m) != 0,
+        // (A click the save list took is not the game's until released.)
+        Src::Mouse(m) => MOUSE_BUTTONS.load(Relaxed) & !MOUSE_SWALLOW.load(Relaxed) & (1 << m) != 0,
         Src::WheelUp | Src::WheelDown => false,
     };
     if window {

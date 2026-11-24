@@ -652,6 +652,21 @@ struct SaveList {
     top: usize,
     /// A held direction (-1 up, 1 down) and when it repeats.
     repeat: Option<(i32, std::time::Instant)>,
+    /// When it opened (`list_click`: the second click of a double-click on Load Game is no choice).
+    opened: std::time::Instant,
+}
+
+/// When the game's window last became active (`note_activation`): the click that brings the
+/// window back is no choice in the list either.
+static ACTIVATED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+/// Clicks this soon after the list opens or the window becomes active are not taken.
+const LIST_CLICK_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+/// The wheel's turn short of a notch (touchpads scroll in small steps), carried to the next.
+static WHEEL_REST: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// The game's window became active (`gpu::vk::window`'s WM_ACTIVATE).
+pub fn note_activation() {
+    *ACTIVATED.lock() = Some(std::time::Instant::now());
 }
 
 static LIST: Mutex<Option<SaveList>> = Mutex::new(None);
@@ -746,6 +761,9 @@ fn list_finish(g: &mut Option<SaveList>, chosen: Option<usize>) {
     }
     d.holds = false;
     LIST_EDITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // (The wheel turned over the list is not the game's: its menus would scroll by it.)
+    WHEEL_REST.store(0, std::sync::atomic::Ordering::Relaxed);
+    crate::gpu::vk::window::MOUSE_WHEEL.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The pad's buttons held (bit i: `input::PAD_BUTTONS[i]`) and its left stick (XInput's range,
@@ -823,20 +841,30 @@ pub fn list_key_down(vk: u8, repeat: bool) -> bool {
     true
 }
 
-/// The mouse over the list: a left click loads the selected save, a right click goes back.
+/// The mouse over the list: a left click loads the selected save, a right click goes back; not
+/// a click that came just as the list opened or the window became active (`LIST_CLICK_GRACE`).
 pub fn list_click(left: bool) {
+    let recent = |t: Option<std::time::Instant>| t.is_some_and(|t| t.elapsed() < LIST_CLICK_GRACE);
     let mut g = LIST.lock();
     let Some(l) = g.as_ref() else { return };
+    if recent(Some(l.opened)) || recent(*ACTIVATED.lock()) {
+        return;
+    }
     let sel = l.sel;
     list_finish(&mut g, left.then_some(sel));
 }
 
-/// The mouse wheel over the list: `notches` up (positive) or down.
-pub fn list_wheel(notches: i32) {
-    if let Some(l) = LIST.lock().as_mut()
-        && notches != 0
-    {
-        list_move(l, -notches.signum());
+/// The mouse wheel over the list: `delta` in WM_MOUSEWHEEL's units (120 a notch, up positive),
+/// the rest short of a notch carried.
+pub fn list_wheel(delta: i32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if let Some(l) = LIST.lock().as_mut() {
+        let total = WHEEL_REST.load(Relaxed) + delta;
+        let notches = total / 120;
+        WHEEL_REST.store(total - notches * 120, Relaxed);
+        if notches != 0 {
+            list_move(l, -notches.signum() * notches.abs().min(LIST_ROWS as i32));
+        }
     }
 }
 
@@ -959,12 +987,14 @@ sysv! {
                         ListItem { title: text(|p| &p.title), sub: text(|p| &p.sub_title), detail: text(|p| &p.detail), mtime: p.as_ref().map_or(0, |p| p.mtime), dir }
                     })
                     .collect();
-                let named_p = *(items.add(48) as *const u64) as *const u8;
-                let named = if named_p.is_null() { String::new() } else { cstr(named_p).to_string() };
                 let focus = *(items.add(40) as *const u32);
+                // (The named focus's name only when the focus is by name: the field is not
+                // meant to be read otherwise.)
+                let named_p = *(items.add(48) as *const u64) as *const u8;
+                let named = if focus != FOCUS_DIRNAME || named_p.is_null() || !crate::gpu::cp::guest_readable(named_p as u64, 32) { String::new() } else { cstr(named_p).to_string() };
                 let sel = list_focus(&entries, focus, &named);
                 desc.push_str(&format!(" list of {} (focus {focus})", entries.len()));
-                list = Some(SaveList { items: entries, sel, top: (sel + 1).saturating_sub(LIST_ROWS), repeat: None });
+                list = Some(SaveList { items: entries, sel, top: (sel + 1).saturating_sub(LIST_ROWS), repeat: None, opened: std::time::Instant::now() });
                 root = Some(r);
             }
         }
@@ -1000,10 +1030,18 @@ sysv! {
         0
     }
     fn sceSaveDataDialogClose(param: *const u8) -> i32 {
-        if LIST.lock().take().is_some() {
+        // (A list the title closes itself ends as one the player went back from: no save chosen.)
+        let closed_list = LIST.lock().take().is_some();
+        if closed_list {
             crate::info!("save-data dialog: the title closed the save list");
+            LIST_EDITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let mut d = DIALOG.lock();
+        if closed_list {
+            d.dir_name.clear();
+            (d.result, d.button) = (RESULT_CANCELED, BUTTON_NO);
+            d.holds = false;
+        }
         if d.status == DLG_RUNNING { d.status = DLG_FINISHED; }
         0
     }
@@ -1130,7 +1168,7 @@ mod tests {
         assert_eq!(list_focus(&items, FOCUS_OLDEST, ""), 4);
         assert_eq!(list_focus(&items, FOCUS_DIRNAME, "SAVEDATA0PlayerProfile3"), 3);
         assert_eq!(list_focus(&items, FOCUS_DIRNAME, "missing"), 0);
-        let mut l = SaveList { items, sel: 0, top: 0, repeat: None };
+        let mut l = SaveList { items, sel: 0, top: 0, repeat: None, opened: std::time::Instant::now() };
         list_move(&mut l, -1);
         assert_eq!((l.sel, l.top), (7, 2));
         list_move(&mut l, 1);

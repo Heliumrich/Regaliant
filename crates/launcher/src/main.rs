@@ -350,6 +350,7 @@ fn close(app: &mut App) -> bool {
             return false;
         }
         shaders::stop(app);
+        shaders::end_for_close(app);
     }
     true
 }

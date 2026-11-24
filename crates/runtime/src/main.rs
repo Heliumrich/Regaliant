@@ -2118,7 +2118,8 @@ pub fn hung(why: &str, code: i32) -> ! {
     // (A self-play stage's health line too, its counters as they stood.)
     prepplay::health_if_playing(code);
     session_ended();
-    gpu::pcache::clear_crash_suspects();
+    // (Its compiles in flight stay on record: a compile that does not return is a reason to end.)
+    gpu::pcache::clear_crash_suspects_keep_inflight();
     crate::log::flush();
     unsafe {
         windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), code as u32);

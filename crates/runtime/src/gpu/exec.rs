@@ -12197,6 +12197,10 @@ pub struct Exec {
     /// The metadata the held run's fast-cleared images were bound with, and the images, found
     /// at the chunk's first use (`claim_meta`: once a chunk, not a draw).
     held_run_metas: Option<Vec<(u64, super::images::ImageKey)>>,
+    /// Clears this held executor took over from another image on the same metadata
+    /// (`claim_meta`): the metadata's target now and that target's clear words, which its
+    /// resolve uses (the cache's `meta_of` still names the other image until the chunk commits).
+    held_claimed: HashMap<u64, (super::images::ImageKey, [u32; 2])>,
     held_base: usize,
     pub(crate) stopped: bool,
     /// Why (statistics), and the reason a caller gives a flush that follows.
@@ -13954,6 +13958,7 @@ impl Exec {
                 held_run_writes: None,
                 held_run_keys: None,
                 held_run_metas: None,
+                held_claimed: HashMap::new(),
                 held_base: 0,
                 stopped: false,
                 stop_why: "",
@@ -17065,7 +17070,22 @@ impl Exec {
             for x in &mine {
                 self.held_clears.remove(&x.0);
             }
-            let clears = super::images::with(|im| mine.iter().filter_map(|&(k, m, v, kept, layers)| im.fast_clear_of(k, m, v, kept, layers)).collect::<Vec<_>>());
+            // (A clear taken over from another image (`claim_meta`) with its new target's words.)
+            let claimed = &self.held_claimed;
+            let clears = super::images::with(|im| {
+                mine.iter()
+                    .filter_map(|&(k, m, v, kept, layers)| {
+                        im.fast_clear_of(k, m, v, kept, layers).map(|mut c| {
+                            if let Some(&(ck, words)) = claimed.get(&m)
+                                && ck == k
+                            {
+                                c.clear = words;
+                            }
+                            c
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            });
             note_clear_resolve(self.rendering.is_some());
             self.end_rendering();
             self.record_fast_clears(clears, false);
@@ -17107,6 +17127,7 @@ impl Exec {
                     if let Some(e) = self.held_clears.remove(&o) {
                         super::images::merge_pending(&mut self.held_clears, key, e);
                         super::images::META_CLAIMS[1].fetch_add(1, Ordering::Relaxed);
+                        self.held_claimed.insert(meta, (key, clear));
                     }
                 }
             }
@@ -19611,6 +19632,7 @@ impl Exec {
         self.held_run_writes = Some(writes);
         self.held_run_keys = Some(keys);
         self.held_run_metas = None;
+        self.held_claimed.clear();
     }
 
     /// The held chunk's end (its batch closed): its record; the executor records as a
@@ -19637,6 +19659,7 @@ impl Exec {
         self.held_run_writes = None;
         self.held_run_keys = None;
         self.held_run_metas = None;
+        self.held_claimed.clear();
         self.held_promises.clear();
         self.held_kinds.clear();
         self.cp_written.clear();
