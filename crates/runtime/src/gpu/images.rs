@@ -203,6 +203,20 @@ mod clear_tests {
     }
 
     #[test]
+    fn others_room_only_when_it_fits() {
+        const GIB: u64 = 1 << 30;
+        // (This RTX 4090: others ~6 GB beside ours ~11 of 24: the room as before.)
+        assert_eq!(others_room(6 * GIB, 11 * GIB, 24 * GIB), Some(18 * GIB));
+        // (Issue #5's 12 GB card: others counted at 11.7 and 38 GB beside ours ~5.8: not taken.)
+        assert_eq!(others_room(11 * GIB + 700 * (1 << 20), 5 * GIB + 800 * (1 << 20), 12 * GIB), None);
+        assert_eq!(others_room(38 * GIB, 5 * GIB, 12 * GIB), None);
+        // (Exactly full still counts; one byte more does not.)
+        assert_eq!(others_room(4 * GIB, 8 * GIB, 12 * GIB), Some(8 * GIB));
+        assert_eq!(others_room(4 * GIB + 1, 8 * GIB, 12 * GIB), None);
+        assert_eq!(others_room(u64::MAX, 1, 12 * GIB), None);
+    }
+
+    #[test]
     fn uniform_words() {
         assert_eq!(uniform_word(&[0x4040_4040; 16]), Some(0x4040_4040));
         assert_eq!(uniform_word(&[0; 16]), Some(0));
@@ -1411,6 +1425,18 @@ pub fn over_budget_line(used: u64, budget: u64) -> String {
     )
 }
 
+/// The heap's room beside other processes' dedicated video memory, as the image cache's limit
+/// takes it (`maybe_evict`), or None when Windows' count of it does not fit on the card beside
+/// ours: then it cannot all be resident (WDDM counts allocations it has paged out to system
+/// memory too), and yielding to it only evicts the scene's own textures. A player's 12 GB card
+/// counted others at 11.7 GB and, in a later session, 38 GB (issue #5, 2026-11-24): the cache
+/// stayed at its floor, half the budget, evicting and uploading all session, and the pressure
+/// it signalled split the shader preparation 10 times. Counts that fit (this RTX 4090: others
+/// ~6 GB beside ours ~11 of 24) give the room as before.
+fn others_room(others: u64, ours: u64, heap: u64) -> Option<u64> {
+    (others.saturating_add(ours) <= heap).then(|| heap - others)
+}
+
 /// When this process uses more video memory than `tune vram_high` percent of
 /// the device-local budget, evicts the least recently used images until
 /// about `vram_low` percent (completion thread, at most every
@@ -1457,10 +1483,23 @@ pub fn maybe_evict() {
     let margin = super::tune::vram_others() << 20;
     if margin != 0 {
         if let Some(others) = crate::hostload::others_vram() {
-            let room = ctx().device_heap_size().saturating_sub(others);
-            let floor = budget / 100 * OTHERS_FLOOR_PCT;
-            high = high.min(room.saturating_sub(margin).max(floor));
-            low = low.min(room.saturating_sub(margin + (1 << 30)).max(floor.saturating_sub(1 << 30)));
+            let heap = ctx().device_heap_size();
+            if let Some(room) = others_room(others, raw_used, heap) {
+                let floor = budget / 100 * OTHERS_FLOOR_PCT;
+                high = high.min(room.saturating_sub(margin).max(floor));
+                low = low.min(room.saturating_sub(margin + (1 << 30)).max(floor.saturating_sub(1 << 30)));
+            } else {
+                // (Once a session: what was not taken.)
+                static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !NOTED.swap(true, Relaxed) {
+                    crate::info!(
+                        "images: other processes' video memory as Windows counts it ({} MiB) does not fit on the card ({} MiB) beside ours ({} MiB): not all of it is resident, so the image cache keeps to its budget instead (issue #5)",
+                        others >> 20,
+                        heap >> 20,
+                        raw_used >> 20
+                    );
+                }
+            }
         }
     }
     OVER_HIGH.store(budget > 0 && used > high, Relaxed);

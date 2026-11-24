@@ -10,8 +10,10 @@
   on such a card. On these cards the launcher prepares the shaders again once.
 - **Open logs** in the launcher now selects the newest session's folder, the one to send with a
   bug report. The launcher's own quick checks keep their logs in a `checks` folder.
-- The log names the programs that hold much of the graphics card's memory. When other programs
-  hold a lot of it, the game keeps fewer textures and can stutter.
+- When Windows reports more video memory in use by other programs than the graphics card has (a
+  12 GB card reported 38 GB), the game no longer shrinks its texture memory to half the card
+  because of it. That caused stutter, and restarts of the shader preparation, on such PCs. The
+  log also names the programs that hold the most video memory.
 
 ## 0.1.1
 

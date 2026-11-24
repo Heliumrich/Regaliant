@@ -38,6 +38,12 @@ static OTHERS_VRAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// Other processes' dedicated video memory at the last sample (once a
 /// second), bytes; None while the sampler is off or has not sampled yet.
 pub fn others_vram() -> Option<u64> {
+    // (`DS_SIM_OTHERS_MIB=<n>`: that count instead, a test of the image cache's limit under a
+    // count like issue #5's 38 GB on a 12 GB card.)
+    static SIM: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    if let Some(s) = *SIM.get_or_init(|| std::env::var("DS_SIM_OTHERS_MIB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map(|m| m << 20)) {
+        return Some(s);
+    }
     let v = OTHERS_VRAM.load(std::sync::atomic::Ordering::Relaxed);
     (v != u64::MAX).then_some(v)
 }
