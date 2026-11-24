@@ -255,11 +255,13 @@ fn sampler() {
             // without the log naming them: issue #5, 2026-11-24.)
             // (`DS_HOST_VRAM_REPORT_MIB=<n>`: that step instead, for a test.)
             static STEP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-            let step = *STEP.get_or_init(|| std::env::var("DS_HOST_VRAM_REPORT_MIB").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&m| m > 0).map_or(4 << 30, |m| m << 20));
+            let step = *STEP.get_or_init(|| {
+                std::env::var("DS_HOST_VRAM_REPORT_MIB").ok().and_then(|v| v.trim().parse::<u64>().ok()).and_then(|m| m.checked_mul(1 << 20)).filter(|&s| s > 0).unwrap_or(4 << 30)
+            });
             static NEXT_VRAM_REPORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let other = vram_other as u64;
             if other >= NEXT_VRAM_REPORT.load(std::sync::atomic::Ordering::Relaxed).max(step) {
-                NEXT_VRAM_REPORT.store((other / step + 1) * step, std::sync::atomic::Ordering::Relaxed);
+                NEXT_VRAM_REPORT.store((other / step).saturating_add(1).saturating_mul(step), std::sync::atomic::Ordering::Relaxed);
                 let mut by_name: HashMap<String, f64> = HashMap::new();
                 for (pid, v) in vram_by {
                     let name = names.entry(pid).or_insert_with(|| name_of(pid)).clone();

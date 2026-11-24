@@ -304,10 +304,8 @@ fn parse_args() -> Config {
         // The GPU front end's cautious fallbacks (no arming of GPU-written pages, no held
         // pages) and no upscaler library loaded: set before any thread starts or reads them.
         for (k, v) in [("DS_FE2_ARM_GPU", "0"), ("DS_C4", "0"), ("DS_UPSCALER", "off")] {
-            if std::env::var_os(k).is_none() {
-                // SAFETY: still the only thread (parse_args runs before any is started).
-                unsafe { std::env::set_var(k, v) };
-            }
+            // SAFETY: still the only thread (parse_args runs before any is started).
+            unsafe { set_unless_given(k, v) };
         }
     }
     // The game: `--app`, else the folder chosen in the launcher (or the checkout's own copy),
@@ -2150,25 +2148,78 @@ fn read_proc_param(m: &loader::LoadedModule) -> (u64, String, i32) {
 /// build (issue #4, 2026-11-24: RTX 50-series cards, which no PC here has). Returns what it set.
 fn apply_diagnostics() -> Vec<String> {
     let Some(path) = dsconfig::paths::Paths::current().diagnostics_file() else { return Vec::new() };
-    let Ok(text) = std::fs::read_to_string(&path) else { return Vec::new() };
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => return vec![format!("not read ({e})")],
+    };
+    // (Notepad writes UTF-8, PowerShell 5.1's `>` UTF-16 with a byte-order mark, Out-File
+    // UTF-8 with one: all are taken.)
+    let text = if bytes.starts_with(&[0xFF, 0xFE]) {
+        String::from_utf16_lossy(&bytes[2..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<u16>>())
+    } else {
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    // (The hosted game process: the names its host set from this file, `DS_DIAGNOSTICS_SET`, are
+    // the file's, not the environment's own.)
+    let inherited: Vec<String> = std::env::var("DS_DIAGNOSTICS_SET").map(|v| v.split(';').filter(|s| !s.is_empty()).map(String::from).collect()).unwrap_or_default();
+    let mut notes = Vec::new();
     let mut set = Vec::new();
-    for line in text.lines().map(str::trim).filter(|l| !l.starts_with('#')) {
-        let Some((k, v)) = line.split_once('=') else { continue };
+    for line in text.lines().map(|l| l.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}')).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        let Some((k, v)) = line.split_once('=') else {
+            notes.push(format!("'{line}' left (no =)"));
+            continue;
+        };
         let (k, v) = (k.trim(), v.trim());
         let name_ok = k.len() > 3 && k.starts_with("DS_") && k.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
         if !name_ok || v.len() > 1024 || v.contains('\0') {
+            notes.push(format!("'{k}' left (not a DS_ name)"));
             continue;
         }
-        // (At the start of `main`, before any thread of ours: nothing reads the environment
-        // concurrently.)
+        // (The host marks its game process with DS_HOSTED: from the file it would run the game
+        // unhosted. DS_DIAGNOSTICS_SET is this function's own.)
+        if k == "DS_HOSTED" || k == "DS_DIAGNOSTICS_SET" {
+            notes.push(format!("'{k}' left (the port's own)"));
+            continue;
+        }
+        // (What the environment already holds wins: the launcher's settings, a developer's.)
+        if std::env::var_os(k).is_some() {
+            if inherited.iter().any(|n| n == k) {
+                set.push((k.to_string(), std::env::var(k).unwrap_or_default()));
+            } else {
+                notes.push(format!("{k} left (already set to {:?})", std::env::var(k).unwrap_or_default()));
+            }
+            continue;
+        }
+        // SAFETY: at the start of `main`, before any thread of ours: nothing reads the environment
+        // concurrently.
         unsafe { std::env::set_var(k, v) };
-        set.push(format!("{k}={v}"));
+        set.push((k.to_string(), v.to_string()));
     }
-    set
+    let mut out: Vec<String> = set.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    out.extend(notes);
+    let names: Vec<String> = set.into_iter().map(|(k, _)| k).collect();
+    // SAFETY: as above. (The hosted game inherits the list with the values.)
+    unsafe { std::env::set_var("DS_DIAGNOSTICS_SET", names.join(";")) };
+    DIAGNOSTICS_SET.set(names).ok();
+    out
+}
+
+/// The names `apply_diagnostics` set: safe mode's and the shader preparation's own settings
+/// replace them (`set_unless_given`).
+static DIAGNOSTICS_SET: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Sets `k` to `v` unless the environment gave it a value of its own: a value from the
+/// player's diagnostics.txt does not count (safe mode's and the self-play's settings win over
+/// it). SAFETY: only before any thread of ours starts.
+pub(crate) unsafe fn set_unless_given(k: &str, v: &str) {
+    let from_file = DIAGNOSTICS_SET.get().is_some_and(|s| s.iter().any(|n| n == k));
+    if std::env::var_os(k).is_none() || from_file {
+        unsafe { std::env::set_var(k, v) };
+    }
 }
 
 fn main() {
-    let diagnostics = apply_diagnostics();
     // Per-monitor DPI awareness for the whole process, before any window, monitor or surface is
     // asked about (a player's report, 2026-11-23: at 175% Windows scaling the picture covered the
     // top-left 2194x1234 of a 3840x2160 fullscreen. Only the window's thread was aware; the
@@ -2197,6 +2248,9 @@ fn main() {
             }
         }
     }
+    // The player's diagnostic switches, before anything reads one (the host's choice included;
+    // the hosted game inherits them).
+    let diagnostics = apply_diagnostics();
     // Under front end 2 (the default) and with `--host` this process only
     // hosts dsport (its debugger; `hosted::wants_host`).
     if hosted::wants_host() {
@@ -2237,7 +2291,7 @@ This happens when other software takes that range. Restart the PC and try again.
     RUN_DIR.set(cfg.run_dir.clone()).ok();
     log::set_thread_name("host");
     if !diagnostics.is_empty() {
-        crate::warn!("diagnostics.txt in the settings folder set {}: {}", diagnostics.len(), diagnostics.join(", "));
+        crate::warn!("diagnostics.txt in the settings folder: {}", diagnostics.join(", "));
     }
     // Panics (host threads abort the process) are logged with the thread
     // that panicked: the run log is what post-mortems read.

@@ -320,9 +320,7 @@ pub fn setup(stage: Stage, cfg: &mut crate::Config) {
     }
     // SAFETY: still the only thread (`main` calls this right after `parse_args`).
     unsafe {
-        if std::env::var_os("DS_TEXT_HOOK").is_none() {
-            std::env::set_var("DS_TEXT_HOOK", TEXT_HOOK);
-        }
+        crate::set_unless_given("DS_TEXT_HOOK", TEXT_HOOK);
         std::env::set_var("DS_IME_TEXT", NAME);
     }
     crate::audio::SILENT.store(true, Relaxed);
@@ -337,19 +335,18 @@ pub fn setup(stage: Stage, cfg: &mut crate::Config) {
         // (No hidden present either, `present::Hidden`: presents to a window never shown blocked
         // in the driver three times on 2026-11-20 and took every other driver call with them;
         // the GPU's clock may run lower, the self-play a little slower.)
+        // (`set_unless_given`: a player's diagnostics.txt does not override them.)
         for (k, v) in [("DS_FRAME_CAP", "0"), ("DS_UNCAPPED", "0"), ("DS_HEADLESS_PRESENT", "0")] {
-            if std::env::var_os(k).is_none() {
-                std::env::set_var(k, v);
-            }
+            crate::set_unless_given(k, v);
         }
-        if stage == Stage::NewGame && std::env::var_os("DS_FLIP_GRID").is_none() {
-            std::env::set_var("DS_FLIP_GRID", "0");
+        if stage == Stage::NewGame {
+            crate::set_unless_given("DS_FLIP_GRID", "0");
         }
         // (The tour moves on and seldom comes back: the mirror gives a place's pages back after
         // 1,200 flips without a placement (10 s at its 120 a second) rather than 3,600, so a 12 GB
         // card's budget holds; the other PC's ran 2 GB over it, 2026-11-21.)
-        if stage == Stage::Tour && std::env::var_os("DS_MIRROR_COLD").is_none() {
-            std::env::set_var("DS_MIRROR_COLD", "1200");
+        if stage == Stage::Tour {
+            crate::set_unless_given("DS_MIRROR_COLD", "1200");
         }
     }
     // The levels at the self-play's game speed (`level_speed`; the new game's screens at their own).

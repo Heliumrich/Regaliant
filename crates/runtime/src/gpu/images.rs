@@ -217,6 +217,27 @@ mod clear_tests {
     }
 
     #[test]
+    fn others_taken_holds_against_our_overshoot() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        let (margin, heap24, heap12) = (512 * MIB, 24 * GIB + 142 * MIB, 12 * GIB + 115 * MIB);
+        // (2026-11-02's case: others 7.8 GB really resident, ours past their limit at 20 GB:
+        // still taken, the room kept.)
+        let floor24 = 11 * GIB + 700 * MIB;
+        assert_eq!(others_taken(7 * GIB + 800 * MIB, 20 * GIB, heap24, margin, floor24), Some(heap24 - 7 * GIB - 800 * MIB));
+        // (This PC tonight: others 6.1 GB beside ours 11: taken as before.)
+        assert!(others_taken(6 * GIB + 100 * MIB, 11 * GIB, heap24, margin, floor24).is_some());
+        // (dwm's leak, others counted at 22 GB: not taken; the floor's eviction cost hitches.)
+        assert_eq!(others_taken(22 * GIB, 11 * GIB, heap24, margin, floor24), None);
+        // (Issue #5's 12 GB card: 11.7 and 38 GB counted beside ours 5.8: not taken.)
+        let floor12 = 5 * GIB + 600 * MIB;
+        assert_eq!(others_taken(11 * GIB + 700 * MIB, 5 * GIB + 800 * MIB, heap12, margin, floor12), None);
+        assert_eq!(others_taken(38 * GIB, 5 * GIB + 800 * MIB, heap12, margin, floor12), None);
+        // (A small real count on that card: taken.)
+        assert!(others_taken(GIB, 6 * GIB, heap12, margin, floor12).is_some());
+    }
+
+    #[test]
     fn uniform_words() {
         assert_eq!(uniform_word(&[0x4040_4040; 16]), Some(0x4040_4040));
         assert_eq!(uniform_word(&[0; 16]), Some(0));
@@ -1437,6 +1458,17 @@ fn others_room(others: u64, ours: u64, heap: u64) -> Option<u64> {
     (others.saturating_add(ours) <= heap).then(|| heap - others)
 }
 
+/// `others_room` as `maybe_evict` asks it: ours counted at most at the limit the count itself
+/// sets (the heap less others and `margin`, never under `floor`), so that our own use passing
+/// that limit (a load's overshoot within a check, idle slabs) cannot switch the limit off; a
+/// count that leaves less than `floor` beside it is not taken (the review of 2026-11-24: with
+/// ours counted whole, others really resident at 7.8 GB on the RTX 4090 would have lost their
+/// room for good once ours passed 15.8 GB).
+fn others_taken(others: u64, used: u64, heap: u64, margin: u64, floor: u64) -> Option<u64> {
+    let mark = heap.saturating_sub(others).saturating_sub(margin).max(floor);
+    others_room(others, used.min(mark), heap)
+}
+
 /// When this process uses more video memory than `tune vram_high` percent of
 /// the device-local budget, evicts the least recently used images until
 /// about `vram_low` percent (completion thread, at most every
@@ -1483,22 +1515,28 @@ pub fn maybe_evict() {
     let margin = super::tune::vram_others() << 20;
     if margin != 0 {
         if let Some(others) = crate::hostload::others_vram() {
-            let heap = ctx().device_heap_size();
-            if let Some(room) = others_room(others, raw_used, heap) {
-                let floor = budget / 100 * OTHERS_FLOOR_PCT;
+            // (The card as the choices made by its size see it: `DS_SIM_VRAM_MIB`'s smaller one.)
+            let heap = super::vk::card_size();
+            let floor = budget / 100 * OTHERS_FLOOR_PCT;
+            let taken = others_taken(others, used, heap, margin, floor);
+            // (Each change of whether the count is taken, at most every 10 s.)
+            static LAST: [std::sync::atomic::AtomicU64; 2] = [std::sync::atomic::AtomicU64::new(2), std::sync::atomic::AtomicU64::new(0)];
+            let state = taken.is_some() as u64;
+            if LAST[0].load(Relaxed) != state && ms >= LAST[1].load(Relaxed) + 10_000 {
+                LAST[0].store(state, Relaxed);
+                LAST[1].store(ms, Relaxed);
+                crate::info!(
+                    "images: other processes' video memory as Windows counts it, {} MiB, {} (the card {} MiB, ours {} MiB, {} with idle slabs; issue #5)",
+                    others >> 20,
+                    if taken.is_some() { "taken: the image cache leaves it room" } else { "not taken: it does not fit on the card beside ours, so not all of it is resident; the image cache keeps to its budget" },
+                    heap >> 20,
+                    used >> 20,
+                    raw_used >> 20
+                );
+            }
+            if let Some(room) = taken {
                 high = high.min(room.saturating_sub(margin).max(floor));
                 low = low.min(room.saturating_sub(margin + (1 << 30)).max(floor.saturating_sub(1 << 30)));
-            } else {
-                // (Once a session: what was not taken.)
-                static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                if !NOTED.swap(true, Relaxed) {
-                    crate::info!(
-                        "images: other processes' video memory as Windows counts it ({} MiB) does not fit on the card ({} MiB) beside ours ({} MiB): not all of it is resident, so the image cache keeps to its budget instead (issue #5)",
-                        others >> 20,
-                        heap >> 20,
-                        raw_used >> 20
-                    );
-                }
             }
         }
     }
