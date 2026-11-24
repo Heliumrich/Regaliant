@@ -22,6 +22,20 @@ pub struct Content {
     pub hint: String,
     /// The controller's keyboard, when it shows.
     pub keys: Option<Keys>,
+    /// A list to choose from instead of the field (the save list: `hle::libs::savedata`).
+    pub list: Option<List>,
+}
+
+/// A list the box shows instead of its field: the rows in view (a heading, a note at its right
+/// such as a date, and a line under it), the selected one among them, whether more rows lie above
+/// or below, and where the selection stands ("2 / 6").
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct List {
+    pub rows: Vec<(String, String, String)>,
+    pub selected: usize,
+    pub above: bool,
+    pub below: bool,
+    pub position: String,
 }
 
 /// The controller's keyboard: rows of keys (label, width in columns of ten, shown as engaged
@@ -57,6 +71,18 @@ fn design_height(keys: usize) -> f32 {
     }
 }
 
+/// A list's rows start below the title; a row's pitch and height; the position line under them.
+const LIST_TOP: f32 = 76.0;
+const LIST_PITCH: f32 = 74.0;
+const LIST_ROW_H: f32 = 66.0;
+const LIST_POS: f32 = 30.0;
+
+/// The box's height in design units with a list of `rows` rows in view: the title, the rows,
+/// the position line and two hint lines.
+fn list_height(rows: usize) -> f32 {
+    LIST_TOP + rows.max(1) as f32 * LIST_PITCH + LIST_POS + 2.0 * HINT_LINE + 14.0
+}
+
 /// The box's size at a frame `frame_h` pixels high (designed at 1080 lines) with `keys` rows of
 /// the controller's keyboard (0: none).
 pub fn size(frame_h: u32, keys: usize) -> (u32, u32) {
@@ -64,12 +90,22 @@ pub fn size(frame_h: u32, keys: usize) -> (u32, u32) {
     ((820.0 * s).round() as u32, (design_height(keys) * s).round() as u32)
 }
 
+/// The box's size for `c` (a list's, a keyboard's or the field's alone).
+pub fn size_for(frame_h: u32, c: &Content) -> (u32, u32) {
+    match &c.list {
+        Some(l) => {
+            let s = (frame_h as f32 / 1080.0).max(0.5);
+            ((820.0 * s).round() as u32, (list_height(l.rows.len()) * s).round() as u32)
+        }
+        None => size(frame_h, c.keys.as_ref().map_or(0, |k| k.rows.len())),
+    }
+}
+
 /// The box as top-down BGRA pixels (alpha 255) for a frame `frame_h` pixels high.
 pub fn render(c: &Content, frame_h: u32) -> (Vec<u8>, u32, u32) {
     let s = (frame_h as f32 / 1080.0).max(0.5);
     let px = |v: f32| (v * s).round() as i32;
-    let rows = c.keys.as_ref().map_or(0, |k| k.rows.len());
-    let (w, h) = size(frame_h, rows);
+    let (w, h) = size_for(frame_h, c);
     let mut out = vec![0u8; (w * h * 4) as usize];
     unsafe {
         let dc = CreateCompatibleDC(std::ptr::null_mut());
@@ -129,62 +165,101 @@ pub fn render(c: &Content, frame_h: u32) -> (Vec<u8>, u32, u32) {
         };
         let single = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
         draw(&c.title, title_font, rgb(226, 216, 194), RECT { left: px(24.0), top: px(14.0), right: wi - px(24.0), bottom: px(60.0) }, single | DT_CENTER | DT_END_ELLIPSIS);
-        // The field.
-        let field = RECT { left: px(40.0), top: px(70.0), right: wi - px(40.0), bottom: px(128.0) };
-        fill(field, rgb(4, 4, 5));
-        frame(field, rgb(96, 88, 72), 1);
-        let count = format!("{} / {}", c.text.encode_utf16().count(), c.max_len);
-        let count_r = RECT { left: field.right - px(110.0), top: field.top, right: field.right - px(14.0), bottom: field.bottom };
-        draw(&count, hint_font, rgb(118, 112, 100), count_r, single | DT_RIGHT);
-        let text_r = RECT { left: field.left + px(16.0), top: field.top, right: count_r.left - px(8.0), bottom: field.bottom };
-        if c.text.is_empty() {
-            draw(&c.placeholder, text_font, rgb(110, 104, 94), text_r, single | DT_LEFT | DT_END_ELLIPSIS);
-        } else {
-            draw(&c.text, text_font, rgb(250, 248, 244), text_r, single | DT_LEFT | DT_END_ELLIPSIS);
-        }
-        if c.caret {
-            // After the text (its width as drawn in the text font).
-            let old = SelectObject(dc, text_font as _);
-            let t: Vec<u16> = c.text.encode_utf16().collect();
-            let mut sz = SIZE { cx: 0, cy: 0 };
-            if !t.is_empty() {
-                GetTextExtentPoint32W(dc, t.as_ptr(), t.len() as i32, &mut sz);
-            }
-            SelectObject(dc, old);
-            let x = (text_r.left + sz.cx + px(2.0)).min(text_r.right);
-            fill(RECT { left: x, top: field.top + px(12.0), right: x + px(2.0).max(1), bottom: field.bottom - px(12.0) }, rgb(236, 226, 200));
-        }
-        if let Some(k) = &c.keys {
-            // Ten columns across the field's width; a key spans its columns less a gap.
-            let pitch = (field.right - field.left) as f32 / 10.0;
-            for (r, row) in k.rows.iter().enumerate() {
-                let top = px(KEYS_TOP + r as f32 * ROW_PITCH);
-                let mut col = 0u32;
-                for (i, (label, width, on)) in row.iter().enumerate() {
-                    let left = field.left + (col as f32 * pitch).round() as i32 + px(3.0);
-                    let right = field.left + ((col + *width as u32) as f32 * pitch).round() as i32 - px(3.0);
-                    col += *width as u32;
-                    let rect = RECT { left, top, right, bottom: top + px(KEY_H) };
-                    let selected = k.selected == (r, i);
-                    let (back, edge, ink) = if selected {
-                        (rgb(150, 134, 104), rgb(236, 226, 200), rgb(12, 11, 10))
-                    } else if *on {
-                        (rgb(48, 43, 35), rgb(150, 134, 104), rgb(236, 206, 140))
-                    } else {
-                        (rgb(24, 23, 26), rgb(66, 61, 52), rgb(226, 216, 194))
-                    };
-                    fill(rect, back);
-                    frame(rect, edge, if selected { px(2.0) } else { 1 });
-                    draw(label, key_font, ink, rect, single | DT_CENTER);
+        if let Some(l) = &c.list {
+            // The rows: the selected one bronze with dark ink, the others dark with a thin edge;
+            // a heading and a line under it each.
+            let line_font = font(21.0, "Segoe UI");
+            for (i, (head, note, line)) in l.rows.iter().enumerate() {
+                let top = px(LIST_TOP + i as f32 * LIST_PITCH);
+                let rect = RECT { left: px(40.0), top, right: wi - px(40.0), bottom: top + px(LIST_ROW_H) };
+                let selected = i == l.selected;
+                let (back, edge, ink, sub) = if selected {
+                    (rgb(150, 134, 104), rgb(236, 226, 200), rgb(12, 11, 10), rgb(40, 36, 30))
+                } else {
+                    (rgb(24, 23, 26), rgb(66, 61, 52), rgb(226, 216, 194), rgb(150, 144, 132))
+                };
+                fill(rect, back);
+                frame(rect, edge, if selected { px(2.0) } else { 1 });
+                let inner = |t: f32, b: f32| RECT { left: rect.left + px(16.0), top: top + px(t), right: rect.right - px(16.0), bottom: top + px(b) };
+                // (The note at the right of the heading, the heading cut short before it.)
+                let mut head_r = inner(4.0, 36.0);
+                if !note.is_empty() {
+                    draw(note, line_font, sub, head_r, single | DT_RIGHT);
+                    head_r.right -= px(190.0);
                 }
+                draw(head, key_font, ink, head_r, single | DT_LEFT | DT_END_ELLIPSIS);
+                draw(line, line_font, sub, inner(36.0, 62.0), single | DT_LEFT | DT_END_ELLIPSIS);
             }
-            let hint_top = px(KEYS_TOP + k.rows.len() as f32 * ROW_PITCH + 12.0);
+            // More rows above or below, and where the selection stands.
+            let pos_top = px(LIST_TOP + l.rows.len().max(1) as f32 * LIST_PITCH);
+            let pos_r = RECT { left: px(40.0), top: pos_top, right: wi - px(40.0), bottom: pos_top + px(LIST_POS) };
+            let marks = format!("{}{}", if l.above { "\u{25B2} " } else { "" }, if l.below { "\u{25BC}" } else { "" });
+            draw(&marks, hint_font, rgb(168, 160, 146), pos_r, single | DT_LEFT);
+            draw(&l.position, hint_font, rgb(168, 160, 146), pos_r, single | DT_RIGHT);
+            let hint_top = pos_top + px(LIST_POS);
             for (i, line) in c.hint.lines().take(2).enumerate() {
                 let top = hint_top + px(i as f32 * HINT_LINE);
                 draw(line, hint_font, rgb(168, 160, 146), RECT { left: px(24.0), top, right: wi - px(24.0), bottom: top + px(HINT_LINE) }, single | DT_CENTER | DT_END_ELLIPSIS);
             }
+            DeleteObject(line_font as _);
         } else {
-            draw(&c.hint, hint_font, rgb(168, 160, 146), RECT { left: px(24.0), top: px(140.0), right: wi - px(24.0), bottom: hi - px(12.0) }, single | DT_CENTER | DT_END_ELLIPSIS);
+            // The field.
+            let field = RECT { left: px(40.0), top: px(70.0), right: wi - px(40.0), bottom: px(128.0) };
+            fill(field, rgb(4, 4, 5));
+            frame(field, rgb(96, 88, 72), 1);
+            let count = format!("{} / {}", c.text.encode_utf16().count(), c.max_len);
+            let count_r = RECT { left: field.right - px(110.0), top: field.top, right: field.right - px(14.0), bottom: field.bottom };
+            draw(&count, hint_font, rgb(118, 112, 100), count_r, single | DT_RIGHT);
+            let text_r = RECT { left: field.left + px(16.0), top: field.top, right: count_r.left - px(8.0), bottom: field.bottom };
+            if c.text.is_empty() {
+                draw(&c.placeholder, text_font, rgb(110, 104, 94), text_r, single | DT_LEFT | DT_END_ELLIPSIS);
+            } else {
+                draw(&c.text, text_font, rgb(250, 248, 244), text_r, single | DT_LEFT | DT_END_ELLIPSIS);
+            }
+            if c.caret {
+                // After the text (its width as drawn in the text font).
+                let old = SelectObject(dc, text_font as _);
+                let t: Vec<u16> = c.text.encode_utf16().collect();
+                let mut sz = SIZE { cx: 0, cy: 0 };
+                if !t.is_empty() {
+                    GetTextExtentPoint32W(dc, t.as_ptr(), t.len() as i32, &mut sz);
+                }
+                SelectObject(dc, old);
+                let x = (text_r.left + sz.cx + px(2.0)).min(text_r.right);
+                fill(RECT { left: x, top: field.top + px(12.0), right: x + px(2.0).max(1), bottom: field.bottom - px(12.0) }, rgb(236, 226, 200));
+            }
+            if let Some(k) = &c.keys {
+                // Ten columns across the field's width; a key spans its columns less a gap.
+                let pitch = (field.right - field.left) as f32 / 10.0;
+                for (r, row) in k.rows.iter().enumerate() {
+                    let top = px(KEYS_TOP + r as f32 * ROW_PITCH);
+                    let mut col = 0u32;
+                    for (i, (label, width, on)) in row.iter().enumerate() {
+                        let left = field.left + (col as f32 * pitch).round() as i32 + px(3.0);
+                        let right = field.left + ((col + *width as u32) as f32 * pitch).round() as i32 - px(3.0);
+                        col += *width as u32;
+                        let rect = RECT { left, top, right, bottom: top + px(KEY_H) };
+                        let selected = k.selected == (r, i);
+                        let (back, edge, ink) = if selected {
+                            (rgb(150, 134, 104), rgb(236, 226, 200), rgb(12, 11, 10))
+                        } else if *on {
+                            (rgb(48, 43, 35), rgb(150, 134, 104), rgb(236, 206, 140))
+                        } else {
+                            (rgb(24, 23, 26), rgb(66, 61, 52), rgb(226, 216, 194))
+                        };
+                        fill(rect, back);
+                        frame(rect, edge, if selected { px(2.0) } else { 1 });
+                        draw(label, key_font, ink, rect, single | DT_CENTER);
+                    }
+                }
+                let hint_top = px(KEYS_TOP + k.rows.len() as f32 * ROW_PITCH + 12.0);
+                for (i, line) in c.hint.lines().take(2).enumerate() {
+                    let top = hint_top + px(i as f32 * HINT_LINE);
+                    draw(line, hint_font, rgb(168, 160, 146), RECT { left: px(24.0), top, right: wi - px(24.0), bottom: top + px(HINT_LINE) }, single | DT_CENTER | DT_END_ELLIPSIS);
+                }
+            } else {
+                draw(&c.hint, hint_font, rgb(168, 160, 146), RECT { left: px(24.0), top: px(140.0), right: wi - px(24.0), bottom: hi - px(12.0) }, single | DT_CENTER | DT_END_ELLIPSIS);
+            }
         }
         GdiFlush();
         let src = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize);

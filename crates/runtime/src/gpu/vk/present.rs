@@ -207,10 +207,11 @@ unsafe fn draw_text_box(p: &mut Presenter, cmd: vk::CommandBuffer, slot: usize, 
     // A size whose image or staging buffers could not be made, and when: tried again after 2 s,
     // not every frame.
     static FAILED: Mutex<Option<((u32, u32), std::time::Instant)>> = Mutex::new(None);
-    let Some((generation, content)) = crate::hle::libs::ime_dialog::overlay() else { return };
+    // (The text entry's box, or the save list's: `hle::libs::savedata`.)
+    let Some((generation, content)) = crate::hle::libs::ime_dialog::overlay().or_else(crate::hle::libs::savedata::overlay) else { return };
     let c = ctx();
     let (rx, ry, rw, rh) = picture;
-    let (w, h) = crate::textbox::size(rh, content.keys.as_ref().map_or(0, |k| k.rows.len()));
+    let (w, h) = crate::textbox::size_for(rh, &content);
     if w > rw || h > rh || FAILED.lock().is_some_and(|(s, at)| s == (w, h) && at.elapsed() < std::time::Duration::from_secs(2)) {
         return;
     }

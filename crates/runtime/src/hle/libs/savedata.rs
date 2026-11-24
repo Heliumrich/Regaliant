@@ -604,14 +604,288 @@ struct Dialog {
     button: i32,
     user_data: u64,
     dir_name: String,
+    /// The saves' folder of a list (the chosen save's parameters are read from it).
+    root: Option<PathBuf>,
 }
 
 static DIALOG: Mutex<Dialog> =
-    Mutex::new(Dialog { status: DLG_NONE, polled: false, holds: false, mode: 0, result: 0, button: 0, user_data: 0, dir_name: String::new() });
+    Mutex::new(Dialog { status: DLG_NONE, polled: false, holds: false, mode: 0, result: 0, button: 0, user_data: 0, dir_name: String::new(), root: None });
 
 /// Whether the save-data dialog is on screen (common dialog in use).
 pub fn dialog_running() -> bool {
     DIALOG.lock().status == DLG_RUNNING
+}
+
+// ---------------------------------------------------------------------------
+// The save list (the dialog's list mode). The title's Load Game asks the system to show its
+// saves and returns the one the player picks; until 2026-11-24 the first was taken without
+// asking, so a player's other characters could not be loaded (issue #13). The port draws the
+// list over the game (`crate::textbox`, as the text entry's box) and takes the pad and the keys
+// while it is open: up and down choose, A (Cross) or Enter loads, B (Circle) or Escape goes
+// back. A list of one is taken without asking, as before.
+
+const MODE_LIST: i32 = 1;
+const DISP_LOAD: i32 = 2;
+/// SceSaveDataDialogFocusPos: the list's end, the newest and oldest save, a named one.
+const FOCUS_LIST_TAIL: u32 = 1;
+const FOCUS_DATA_TAIL: u32 = 3;
+const FOCUS_LATEST: u32 = 4;
+const FOCUS_OLDEST: u32 = 5;
+const FOCUS_DIRNAME: u32 = 6;
+/// Rows the list shows at once.
+const LIST_ROWS: usize = 6;
+const LIST_REPEAT_FIRST: std::time::Duration = std::time::Duration::from_millis(400);
+const LIST_REPEAT_NEXT: std::time::Duration = std::time::Duration::from_millis(120);
+
+struct ListItem {
+    dir: String,
+    title: String,
+    sub: String,
+    detail: String,
+    mtime: i64,
+}
+
+struct SaveList {
+    items: Vec<ListItem>,
+    sel: usize,
+    /// The first row in view.
+    top: usize,
+    /// A held direction (-1 up, 1 down) and when it repeats.
+    repeat: Option<(i32, std::time::Instant)>,
+}
+
+static LIST: Mutex<Option<SaveList>> = Mutex::new(None);
+/// Changes to the list's view (the box is drawn again when they change).
+static LIST_EDITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A save's parameters (`sce_sys/param.bin`).
+fn read_param(dir: &Path) -> Option<SaveParam> {
+    let b = std::fs::read(dir.join("sce_sys").join("param.bin")).ok()?;
+    if b.len() != std::mem::size_of::<SaveParam>() {
+        return None;
+    }
+    let mut p: SaveParam = unsafe { std::mem::zeroed() };
+    unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), &mut p as *mut _ as *mut u8, b.len()) };
+    Some(p)
+}
+
+/// A NUL-terminated UTF-8 field as text.
+fn field_text(b: &[u8]) -> String {
+    let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+    String::from_utf8_lossy(&b[..end]).trim().to_string()
+}
+
+/// A save's time (seconds since 1970, UTC) as the local date and time.
+fn local_time(unix: i64) -> String {
+    use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+    if unix <= 0 {
+        return String::new();
+    }
+    let t = (unix as u64 + 11_644_473_600) * 10_000_000;
+    let ft = FILETIME { dwLowDateTime: t as u32, dwHighDateTime: (t >> 32) as u32 };
+    let (mut utc, mut local): (SYSTEMTIME, SYSTEMTIME) = unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
+    if unsafe { FileTimeToSystemTime(&ft, &mut utc) == 0 || SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc, &mut local) == 0 } {
+        return String::new();
+    }
+    format!("{:04}-{:02}-{:02} {:02}:{:02}", local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute)
+}
+
+/// The list's first selection: the title's focus (`FOCUS_*`; `named` its directory name for a
+/// named one), else the first save.
+fn list_focus(items: &[ListItem], focus: u32, named: &str) -> usize {
+    let last = items.len().saturating_sub(1);
+    match focus {
+        FOCUS_LIST_TAIL | FOCUS_DATA_TAIL => last,
+        FOCUS_LATEST => items.iter().enumerate().max_by_key(|(_, it)| it.mtime).map_or(0, |(i, _)| i),
+        FOCUS_OLDEST => items.iter().enumerate().min_by_key(|(_, it)| it.mtime).map_or(0, |(i, _)| i),
+        FOCUS_DIRNAME => items.iter().position(|it| it.dir == named).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Whether the save list is open (the pad and the keys are its alone).
+pub fn list_active() -> bool {
+    LIST.lock().is_some()
+}
+
+/// Moves the selection by `by` rows (wrapping at the ends) and keeps it in view.
+fn list_move(l: &mut SaveList, by: i32) {
+    let n = l.items.len();
+    if n == 0 {
+        return;
+    }
+    l.sel = (l.sel as i64 + by as i64).rem_euclid(n as i64) as usize;
+    if l.sel < l.top {
+        l.top = l.sel;
+    }
+    if l.sel >= l.top + LIST_ROWS {
+        l.top = l.sel + 1 - LIST_ROWS;
+    }
+    LIST_EDITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Ends the list with the save at `chosen` loaded, or with none (the player went back).
+fn list_finish(g: &mut Option<SaveList>, chosen: Option<usize>) {
+    let Some(l) = g.take() else { return };
+    let mut d = DIALOG.lock();
+    match chosen.and_then(|i| l.items.get(i).map(|it| (i, it))) {
+        Some((i, it)) => {
+            crate::info!("save-data dialog: the player chose '{}' ({} of {})", it.dir, i + 1, l.items.len());
+            d.dir_name = it.dir.clone();
+            (d.result, d.button) = (RESULT_OK, BUTTON_OK_YES);
+        }
+        None => {
+            crate::info!("save-data dialog: the player went back from the list of {}", l.items.len());
+            d.dir_name.clear();
+            (d.result, d.button) = (RESULT_CANCELED, BUTTON_NO);
+        }
+    }
+    if d.status == DLG_RUNNING {
+        d.status = DLG_FINISHED;
+    }
+    d.holds = false;
+    LIST_EDITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The pad's buttons held (bit i: `input::PAD_BUTTONS[i]`) and its left stick (XInput's range,
+/// y up), each poll: true while the list is open. The button that ends it is kept from the game
+/// until it is released.
+pub fn list_pad_input(phys: u32, lx: i16, ly: i16) -> bool {
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+    static LAST: AtomicU32 = AtomicU32::new(0);
+    const A: u32 = 1 << 0;
+    const B: u32 = 1 << 1;
+    const UP: u32 = 1 << 12;
+    const DOWN: u32 = 1 << 13;
+    const HALF: i16 = 16384;
+    let _ = lx;
+    let mut held = phys;
+    if ly > HALF {
+        held |= UP;
+    }
+    if ly < -HALF {
+        held |= DOWN;
+    }
+    // (Every poll, so that a button held when the list opens is no press.)
+    let was = LAST.swap(held, Relaxed);
+    let mut g = LIST.lock();
+    let Some(l) = g.as_mut() else { return false };
+    let pressed = held & !was;
+    if pressed & A != 0 {
+        let sel = l.sel;
+        list_finish(&mut g, Some(sel));
+        crate::input::swallow_pad(A);
+        return true;
+    }
+    if pressed & B != 0 {
+        list_finish(&mut g, None);
+        crate::input::swallow_pad(B);
+        return true;
+    }
+    let dir = if held & UP != 0 {
+        -1
+    } else if held & DOWN != 0 {
+        1
+    } else {
+        0
+    };
+    let now = std::time::Instant::now();
+    if dir == 0 {
+        l.repeat = None;
+    } else if pressed & (UP | DOWN) != 0 || l.repeat.is_none_or(|(d, _)| d != dir) {
+        list_move(l, dir);
+        l.repeat = Some((dir, now + LIST_REPEAT_FIRST));
+    } else if l.repeat.is_some_and(|(_, next)| now >= next) {
+        list_move(l, dir);
+        l.repeat = Some((dir, now + LIST_REPEAT_NEXT));
+    }
+    true
+}
+
+/// A key pressed while the list is open (true: the list's): Up and Down (W, S) choose, Page Up
+/// and Page Down move a view, Enter (Space, E) loads, Escape (Backspace) goes back.
+pub fn list_key_down(vk: u8, repeat: bool) -> bool {
+    let mut g = LIST.lock();
+    let Some(l) = g.as_mut() else { return false };
+    match vk {
+        0x26 | 0x57 => list_move(l, -1),
+        0x28 | 0x53 => list_move(l, 1),
+        0x21 => list_move(l, -(LIST_ROWS as i32).min(l.sel as i32).max(1)),
+        0x22 => list_move(l, (LIST_ROWS as i32).min((l.items.len() - 1 - l.sel) as i32).max(1)),
+        0x0D | 0x20 | 0x45 if !repeat => {
+            let sel = l.sel;
+            list_finish(&mut g, Some(sel));
+        }
+        0x1B | 0x08 if !repeat => list_finish(&mut g, None),
+        _ => {}
+    }
+    true
+}
+
+/// The mouse over the list: a left click loads the selected save, a right click goes back.
+pub fn list_click(left: bool) {
+    let mut g = LIST.lock();
+    let Some(l) = g.as_ref() else { return };
+    let sel = l.sel;
+    list_finish(&mut g, left.then_some(sel));
+}
+
+/// The mouse wheel over the list: `notches` up (positive) or down.
+pub fn list_wheel(notches: i32) {
+    if let Some(l) = LIST.lock().as_mut()
+        && notches != 0
+    {
+        list_move(l, -notches.signum());
+    }
+}
+
+/// The list's buttons and keys, named as the prompts show them.
+fn list_hint() -> String {
+    let pad = if crate::pcsettings::prompts::shown_set() == 1 { "Up/Down Choose    Cross Load    Circle Back" } else { "Up/Down Choose    (A) Load    (B) Back" };
+    format!("{pad}\nUp/Down or wheel Choose    Enter or left click Load    Esc or right click Back")
+}
+
+/// What the list's box shows now and a generation that changes with it (None: no list).
+pub fn overlay() -> Option<(u64, crate::textbox::Content)> {
+    let g = LIST.lock();
+    let l = g.as_ref()?;
+    let rows = l
+        .items
+        .iter()
+        .skip(l.top)
+        .take(LIST_ROWS)
+        .map(|it| {
+            let head = match (it.title.is_empty(), it.sub.is_empty()) {
+                (false, false) => format!("{}  \u{2014}  {}", it.title, it.sub),
+                (false, true) => it.title.clone(),
+                (true, false) => it.sub.clone(),
+                (true, true) => it.dir.clone(),
+            };
+            let detail = it.detail.lines().map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("  \u{00B7}  ");
+            (head, local_time(it.mtime), detail)
+        })
+        .collect();
+    let content = crate::textbox::Content {
+        title: "Load Game".into(),
+        text: String::new(),
+        placeholder: String::new(),
+        max_len: 0,
+        caret: false,
+        hint: list_hint(),
+        keys: None,
+        list: Some(crate::textbox::List {
+            rows,
+            selected: l.sel - l.top,
+            above: l.top > 0,
+            below: l.top + LIST_ROWS < l.items.len(),
+            position: format!("{} / {}", l.sel + 1, l.items.len()),
+        }),
+    };
+    // (Apart from the text entry's generations; the prompts' set is in it: the hint names its
+    // buttons.)
+    let set = crate::pcsettings::prompts::shown_set() as u64;
+    Some((1 << 63 | LIST_EDITS.load(std::sync::atomic::Ordering::Relaxed) << 2 | set, content))
 }
 
 sysv! {
@@ -622,6 +896,7 @@ sysv! {
         0
     }
     fn sceSaveDataDialogTerminate() -> i32 {
+        LIST.lock().take();
         DIALOG.lock().status = DLG_NONE;
         0
     }
@@ -665,33 +940,69 @@ sysv! {
             }
             has_buttons = false;
         }
+        // SceSaveDataDialogItems: userId @0, titleId* @8, dirName* @16 (32 bytes each),
+        // dirNameNum @24, newItem* @32, focusPos @40, focusPosDirName* @48 (public sources).
         let mut dir_name = String::new();
+        let mut list = None;
+        let mut root = None;
         if !items.is_null() {
             let names = *(items.add(16) as *const u64) as *const u8;
             let n = *(items.add(24) as *const u32);
             if !names.is_null() && n > 0 { dir_name = cstr(names).to_string(); }
+            if mode == MODE_LIST && disp == DISP_LOAD && !names.is_null() && n >= 2 {
+                let r = user_root(*(items as *const i32), *(items.add(8) as *const u64) as *const u8);
+                let entries: Vec<ListItem> = (0..n.min(256) as usize)
+                    .map(|i| {
+                        let dir = cstr(names.add(i * 32)).to_string();
+                        let p = read_param(&r.join(&dir));
+                        let text = |f: fn(&SaveParam) -> &[u8]| p.as_ref().map(|p| field_text(f(p))).unwrap_or_default();
+                        ListItem { title: text(|p| &p.title), sub: text(|p| &p.sub_title), detail: text(|p| &p.detail), mtime: p.as_ref().map_or(0, |p| p.mtime), dir }
+                    })
+                    .collect();
+                let named_p = *(items.add(48) as *const u64) as *const u8;
+                let named = if named_p.is_null() { String::new() } else { cstr(named_p).to_string() };
+                let focus = *(items.add(40) as *const u32);
+                let sel = list_focus(&entries, focus, &named);
+                desc.push_str(&format!(" list of {} (focus {focus})", entries.len()));
+                list = Some(SaveList { items: entries, sel, top: (sel + 1).saturating_sub(LIST_ROWS), repeat: None });
+                root = Some(r);
+            }
         }
         let decline = disp == DISP_DELETE;
-        let outcome = if !has_buttons {
+        let outcome = if list.is_some() {
+            "shown for the player to choose"
+        } else if !has_buttons {
             "shown until closed"
         } else if decline {
             "declined (delete prompts are not confirmed automatically)"
         } else {
             "accepted"
         };
-        let dir_desc = if dir_name.is_empty() { String::new() } else { format!(" dir '{dir_name}'") };
+        let dir_desc = if dir_name.is_empty() || list.is_some() { String::new() } else { format!(" dir '{dir_name}'") };
         crate::info!("save-data dialog: {desc}{dir_desc} -> {outcome}");
-        let mut d = DIALOG.lock();
-        d.status = DLG_RUNNING;
-        d.polled = false;
-        d.holds = !has_buttons;
-        d.mode = mode;
-        d.user_data = user_data;
-        d.dir_name = dir_name;
-        (d.result, d.button) = if decline { (RESULT_CANCELED, BUTTON_NO) } else { (RESULT_OK, BUTTON_OK_YES) };
+        {
+            let mut d = DIALOG.lock();
+            d.status = DLG_RUNNING;
+            d.polled = false;
+            d.holds = !has_buttons || list.is_some();
+            d.mode = mode;
+            d.user_data = user_data;
+            d.dir_name = if list.is_some() { String::new() } else { dir_name };
+            d.root = root;
+            (d.result, d.button) = if decline { (RESULT_CANCELED, BUTTON_NO) } else { (RESULT_OK, BUTTON_OK_YES) };
+        }
+        // (After the dialog is running: the list's end finishes it. `LIST` is taken before
+        // `DIALOG` where both are held.)
+        if list.is_some() {
+            *LIST.lock() = list;
+            LIST_EDITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         0
     }
     fn sceSaveDataDialogClose(param: *const u8) -> i32 {
+        if LIST.lock().take().is_some() {
+            crate::info!("save-data dialog: the title closed the save list");
+        }
         let mut d = DIALOG.lock();
         if d.status == DLG_RUNNING { d.status = DLG_FINISHED; }
         0
@@ -716,6 +1027,11 @@ sysv! {
         *(r.add(8) as *mut i32) = d.button;
         let dn = *(r.add(16) as *const u64) as *mut u8;
         if !dn.is_null() && !d.dir_name.is_empty() { crate::hle::write_cstr(dn, 32, &d.dir_name); }
+        // The chosen save's parameters (a list's).
+        let pp = *(r.add(24) as *const u64) as *mut SaveParam;
+        if let (false, Some(root), false) = (pp.is_null(), d.root.as_ref(), d.dir_name.is_empty()) {
+            if let Some(p) = read_param(&root.join(&d.dir_name)) { std::ptr::write_unaligned(pp, p); }
+        }
         *(r.add(32) as *mut u64) = d.user_data;
         0
     }
@@ -801,5 +1117,29 @@ mod tests {
         assert_eq!(std::fs::read_to_string(backups.join(kept.last().unwrap()).join("USR-DATA")).unwrap(), "before");
         assert!(backups.join(kept.last().unwrap()).join("sce_sys").is_dir());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The save list's first selection and its moves (issue #13: Load Game's characters).
+    #[test]
+    fn save_list_focus_and_moves() {
+        let item = |dir: &str, mtime: i64| ListItem { dir: dir.into(), title: String::new(), sub: String::new(), detail: String::new(), mtime };
+        let items: Vec<ListItem> = (0..8).map(|i| item(&format!("SAVEDATA0PlayerProfile{i}"), [5, 9, 2, 7, 1, 3, 8, 6][i])).collect();
+        assert_eq!(list_focus(&items, 0, ""), 0);
+        assert_eq!(list_focus(&items, FOCUS_LIST_TAIL, ""), 7);
+        assert_eq!(list_focus(&items, FOCUS_LATEST, ""), 1);
+        assert_eq!(list_focus(&items, FOCUS_OLDEST, ""), 4);
+        assert_eq!(list_focus(&items, FOCUS_DIRNAME, "SAVEDATA0PlayerProfile3"), 3);
+        assert_eq!(list_focus(&items, FOCUS_DIRNAME, "missing"), 0);
+        let mut l = SaveList { items, sel: 0, top: 0, repeat: None };
+        list_move(&mut l, -1);
+        assert_eq!((l.sel, l.top), (7, 2));
+        list_move(&mut l, 1);
+        assert_eq!((l.sel, l.top), (0, 0));
+        for _ in 0..6 {
+            list_move(&mut l, 1);
+        }
+        assert_eq!((l.sel, l.top), (6, 1));
+        assert_eq!(field_text(b"Name\0\0junk"), "Name");
+        assert_eq!(field_text(b"  spaced  "), "spaced");
     }
 }

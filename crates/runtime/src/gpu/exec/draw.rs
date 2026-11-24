@@ -2622,6 +2622,8 @@ impl Exec {
                 let col_format = reg(0x28714);
                 let target_mask = reg(0x28238) & reg(0x2823C);
                 let mut colors: [Option<Target>; MAX_RT] = [None; MAX_RT];
+                // Each colour target's metadata and clear words as bound now (`claim_meta`).
+                let mut color_metas: [(u64, [u32; 2]); MAX_RT] = [(0, [0; 2]); MAX_RT];
                 let mut blend = [0u32; MAX_RT];
                 let mut masks = [0u8; MAX_RT];
                 if cb_mode == 1 {
@@ -2658,6 +2660,7 @@ impl Exec {
                             continue;
                         }
                         colors[i as usize] = Some(t);
+                        color_metas[i as usize] = (s.meta, s.clear);
                         blend[i as usize] = reg(0x28780 + 4 * i);
                         masks[i as usize] = m as u8;
                     }
@@ -2862,6 +2865,21 @@ impl Exec {
                     None => self.grow_sampled_depth(&[&vs]),
                 }
                 let hz_t1 = hz_t.map(|_| std::time::Instant::now());
+                // A fast clear pending on a bound target's metadata under another image is this
+                // target's (`Exec::claim_meta`: the title reuses metadata blocks between targets).
+                for (i, c) in colors.iter().enumerate() {
+                    if let Some(t) = c {
+                        self.claim_meta(t.key, color_metas[i].0, color_metas[i].1);
+                    }
+                }
+                if let (Some(t), Some(s)) = (depth.as_ref(), dsurf.as_ref())
+                    && t.key.layers == 1
+                {
+                    self.claim_meta(t.key, s.meta, s.clear);
+                }
+                if self.stopped {
+                    return Err(super::STOPPED.into());
+                }
                 // Fast clears (metadata writes), reloads and block copies of the
                 // attachments and textures.
                 let mut used = std::mem::take(&mut self.keys_scratch);

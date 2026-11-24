@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+- Fixed video memory filling up and the game slowing down the longer it ran with DLSS, XeSS or
+  FSR chosen. In menus that show your character (the equipment menu), the game runs its
+  anti-aliasing on the small preview too, and the upscaler followed it: it switched size every
+  frame or two and kept a new 30 MB image each time, never freed. A 16 GB card filled within
+  minutes. The upscaler now stays on the game's view and frees images it no longer needs.
+- Fixed HUD trails, menus that stayed on screen after closing, and likely some black screens
+  (seen with HDR on at 2160p). After the game rebuilt its images, for example on a display mode
+  change, it could use one block of the graphics card's compression data for two images. The
+  port then cleared the wrong image each frame: the HUD layer kept its old picture, and the
+  scene's lighting was cleared before the HUD was drawn over it.
+- Load Game now shows your characters to choose from, as the PS5 does. Before, it loaded the
+  first one without asking. Choose with up and down or the mouse wheel. Load with Cross, A,
+  Enter or a left click. Go back with Circle, B, Esc or a right click.
+- Add-ons: the game also looks for your add-on packages in an 'Add-ons' folder in
+  '%LOCALAPPDATA%\Regaliant' and next to 'regaliant.exe', besides the one in
+  '%APPDATA%\Regaliant' (AppData\Roaming), and finds them by the content ID inside them,
+  whatever their names. Its log now says what it found where. Their items go to Stockpile
+  Thomas's storage in the Nexus when a character loads (the pre-order's weapon under the
+  weapons tab). The game gives the Digital Deluxe items only to characters created while the
+  add-ons are in place.
+- A controller the port does not see now leaves a line in the log after a minute: which
+  controllers Windows lists and which programs that hide or translate controllers are running.
+
 ## 0.1.4
 
 - Fixed the mostly black picture in play on RTX 50-series graphics cards (black shapes and streaks

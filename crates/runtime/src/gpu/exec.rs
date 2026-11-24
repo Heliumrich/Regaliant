@@ -12194,6 +12194,9 @@ pub struct Exec {
     /// fast clears or overwrites of (a use stops the chunk); its closed batches before the chunk.
     held_run_writes: Option<std::sync::Arc<super::ranges::Ranges>>,
     held_run_keys: Option<std::sync::Arc<HashMap<super::images::ImageKey, u8>>>,
+    /// The metadata the held run's fast-cleared images were bound with, and the images, found
+    /// at the chunk's first use (`claim_meta`: once a chunk, not a draw).
+    held_run_metas: Option<Vec<(u64, super::images::ImageKey)>>,
     held_base: usize,
     pub(crate) stopped: bool,
     /// Why (statistics), and the reason a caller gives a flush that follows.
@@ -13950,6 +13953,7 @@ impl Exec {
                 held_extra: super::ranges::Ranges::new(),
                 held_run_writes: None,
                 held_run_keys: None,
+                held_run_metas: None,
                 held_base: 0,
                 stopped: false,
                 stop_why: "",
@@ -17087,6 +17091,41 @@ impl Exec {
         self.record_fast_clears(clears, check);
     }
 
+    /// A target bound now with metadata `meta` (a draw's colour or depth target): a fast clear
+    /// pending on that metadata under another image is this target's (`Images::claim_meta`). A
+    /// held executor moves its own clears among its images; a clear the work before it noted on
+    /// that metadata (the cache's, or its held run's) is not its to take: it stops, as for the
+    /// current frame's other clears, and the draw is recorded again by the executor after it.
+    pub(crate) fn claim_meta(&mut self, key: super::images::ImageKey, meta: u64, clear: [u32; 2]) {
+        if meta == 0 {
+            return;
+        }
+        if self.held {
+            if !self.held_clears.is_empty() {
+                let others: Vec<super::images::ImageKey> = self.held_clears.iter().filter(|(k, v)| **k != key && v.0 == meta && v.3 == 0).map(|(k, _)| *k).collect();
+                for o in others {
+                    if let Some(e) = self.held_clears.remove(&o) {
+                        super::images::merge_pending(&mut self.held_clears, key, e);
+                        super::images::META_CLAIMS[1].fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            if self.held_run_metas.is_none() {
+                let clears: Vec<super::images::ImageKey> = self.held_run_keys.as_ref().map(|m| m.iter().filter(|&(_, &kind)| kind == 0).map(|(k, _)| *k).collect()).unwrap_or_default();
+                let metas = if clears.is_empty() { Vec::new() } else { super::images::with(|im| clears.iter().filter_map(|k| im.meta_bound(*k).map(|m| (m, *k))).collect()) };
+                self.held_run_metas = Some(metas);
+            }
+            let run_hit = self.held_run_metas.as_ref().is_some_and(|v| v.iter().any(|&(m, k)| m == meta && k != key));
+            if run_hit || (super::images::pending_meta_hit(meta) && super::images::with(|im| im.meta_pending_elsewhere(key, meta))) {
+                self.stop("fast clear (another image's, on this target's metadata)");
+            }
+            return;
+        }
+        if super::images::pending_meta_hit(meta) {
+            super::images::with(|im| im.claim_meta(key, meta, clear));
+        }
+    }
+
     /// Records `clears` (`resolve_fast_clears`): each image cleared to the
     /// value its metadata gives (known, else read now); `check`: known
     /// values compared with the metadata (`DS_GPU_VERIFY`).
@@ -17173,7 +17212,22 @@ impl Exec {
                         FAST_CLEARS_NOT_UNIFORM[1].fetch_add(1, Ordering::Relaxed);
                         v
                     } else {
-                        FAST_CLEARS_NOT_UNIFORM[0].fetch_add(1, Ordering::Relaxed);
+                        // (Said for the first 20 a session: which image, and what its metadata
+                        // held, so a log tells a stale read from other data over the block.)
+                        if FAST_CLEARS_NOT_UNIFORM[0].fetch_add(1, Ordering::Relaxed) < 20 {
+                            let shown: Vec<String> = words.iter().take(n as usize / 4).take(8).map(|w| format!("{w:08x}")).collect();
+                            crate::info!(
+                                "images: fast clear of {:#x} {}x{} {:?} refused: its metadata {:#x} reads {} (not one code; for flip {}, [{}])",
+                                c.key.base,
+                                c.key.width,
+                                c.key.height,
+                                c.key.format,
+                                c.meta,
+                                shown.join(" "),
+                                crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1,
+                                self.name
+                            );
+                        }
                         continue;
                     }
                 }
@@ -19556,6 +19610,7 @@ impl Exec {
         self.held_base = self.closed.len();
         self.held_run_writes = Some(writes);
         self.held_run_keys = Some(keys);
+        self.held_run_metas = None;
     }
 
     /// The held chunk's end (its batch closed): its record; the executor records as a
@@ -19581,6 +19636,7 @@ impl Exec {
         self.past_grow = false;
         self.held_run_writes = None;
         self.held_run_keys = None;
+        self.held_run_metas = None;
         self.held_promises.clear();
         self.held_kinds.clear();
         self.cp_written.clear();
@@ -20908,6 +20964,11 @@ impl Exec {
             ONCE.call_once(|| crate::warn!("upscaler: the TAA's resources are not the four images expected: the title's TAA runs"));
             return false;
         };
+        // (Only the scene's TAA: the title's smaller views, such as a menu's character preview,
+        // keep their own result; `upscale::main_view`.)
+        if !super::upscale::main_view(to.width, to.height, frame) {
+            return false;
+        }
         let r = super::images::with(|im| -> Result<_, String> { Ok((im.upscale_tex(&tc, false, frame)?, im.upscale_tex(&td, false, frame)?, im.upscale_tex(&tv, false, frame)?, im.upscale_tex(&to, true, frame)?)) });
         let (color, depth, velocity, taa_out) = match r {
             Ok(v) => v,
@@ -20949,8 +21010,8 @@ impl Exec {
         if !super::upscale::record(cmd, &inp) {
             return false;
         }
-        let (view, w, h) = (taa_out.view, to.width, to.height);
-        super::vk::defer::external(cmd, Box::new(move |cb| super::upmerge::record(cb, view, w, h, exposure)));
+        let (src, view, w, h) = (inp.output.view, taa_out.view, to.width, to.height);
+        super::vk::defer::external(cmd, Box::new(move |cb| super::upmerge::record(cb, src, view, w, h, exposure)));
         // (The upscaler and the merge bound pipelines and descriptors of their own.)
         self.dyncache = Default::default();
         true
@@ -22900,7 +22961,7 @@ fn clear_pass_line() -> String {
 /// One status line for hang reports.
 pub fn status() -> String {
     format!(
-        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them from a resident shadow, {} of them behind a barrier of their own; {} render passes ended into the next full barrier; draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU, {} title timestamps written by the CPU, left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges ({} before an in-place use), {} skipped; {} draws executed ({} reading their arguments on the GPU, {} repeating the draw before (chains ended by opcode: {}), {} barriers before a dispatch rewrote them), {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait{}; read from memory and not one code throughout: {} refused, {} with the value of the fill an unknown write had replaced; {} of layers alone), {} fill-kernel dispatches recorded as buffer fills ({} of them only clearing the GPU-written images they cover, {} MiB not stored), {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
+        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them from a resident shadow, {} of them behind a barrier of their own; {} render passes ended into the next full barrier; draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU, {} title timestamps written by the CPU, left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges ({} before an in-place use), {} skipped; {} draws executed ({} reading their arguments on the GPU, {} repeating the draw before (chains ended by opcode: {}), {} barriers before a dispatch rewrote them), {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait{}; read from memory and not one code throughout: {} refused, {} with the value of the fill an unknown write had replaced; {} of layers alone; {} taken over by the target bound next with their metadata, {} of them in held work), {} fill-kernel dispatches recorded as buffer fills ({} of them only clearing the GPU-written images they cover, {} MiB not stored), {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
         EXECUTED.load(Ordering::Relaxed),
         GPU_INDIRECT.load(Ordering::Relaxed),
         SHADOW_ARGS.load(Ordering::Relaxed),
@@ -22938,6 +22999,8 @@ pub fn status() -> String {
         FAST_CLEARS_NOT_UNIFORM[0].load(Ordering::Relaxed),
         FAST_CLEARS_NOT_UNIFORM[1].load(Ordering::Relaxed),
         FAST_CLEARS_LAYERED.load(Ordering::Relaxed),
+        super::images::META_CLAIMS[0].load(Ordering::Relaxed) + super::images::META_CLAIMS[1].load(Ordering::Relaxed),
+        super::images::META_CLAIMS[1].load(Ordering::Relaxed),
         FILLS_IN_PLACE.load(Ordering::Relaxed),
         FILL_SKIPS[0].load(Ordering::Relaxed),
         FILL_SKIPS[1].load(Ordering::Relaxed) >> 20,
@@ -22949,6 +23012,7 @@ pub fn status() -> String {
         + &slot_mem_line()
         + &clear_pass_line()
         + &super::images::pressure_line()
+        + &super::upmerge::status_line()
         + &super::vk::gate_line()
         + &super::fe2::unimported_line()
         + &super::vk::system_line()

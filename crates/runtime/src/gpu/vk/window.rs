@@ -570,6 +570,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
+        // The save list (Load Game's characters, `savedata`): the wheel chooses, a left click
+        // loads, a right click goes back.
+        WM_LBUTTONDOWN | WM_RBUTTONDOWN if crate::hle::libs::savedata::list_active() => {
+            crate::input::note_device(crate::input::DEVICE_KBM);
+            crate::hle::libs::savedata::list_click(msg == WM_LBUTTONDOWN);
+            0
+        }
+        WM_MOUSEWHEEL if crate::hle::libs::savedata::list_active() => {
+            crate::input::note_device(crate::input::DEVICE_KBM);
+            crate::hle::libs::savedata::list_wheel(((wp >> 16) & 0xFFFF) as i16 as i32 / 120);
+            0
+        }
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN
             if crate::pcsettings::bindings::mouse_down(
                 Some(match msg {
@@ -631,6 +643,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if crate::hle::libs::ime_dialog::key_down(wp as u8, repeat, ctrl, ((lp >> 16) & 0x1FF) as u16) {
                     crate::input::note_device(crate::input::DEVICE_KBM);
                     if !crate::hle::libs::ime_dialog::active() {
+                        IME_SWALLOW.store(wp as u32, Ordering::Relaxed);
+                    }
+                    return 0;
+                }
+                // The save list (Load Game's characters, `savedata`) likewise.
+                if crate::hle::libs::savedata::list_key_down(wp as u8, repeat) {
+                    crate::input::note_device(crate::input::DEVICE_KBM);
+                    if !crate::hle::libs::savedata::list_active() {
                         IME_SWALLOW.store(wp as u32, Ordering::Relaxed);
                     }
                     return 0;

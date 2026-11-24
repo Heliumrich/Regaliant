@@ -883,9 +883,10 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 // or `watch <slot> off`: hardware watchpoint on every
                 // registered thread (writes: all threads by default; rw:
                 // guest threads by default). Hits are logged (`watch N ...`).
+                // (The address as `debug_addr` reads it: a pointer chain from the executable too.)
                 let slot = parts.next().and_then(|v| v.parse::<usize>().ok()).filter(|&s| s < 4);
                 let arg = parts.next().unwrap_or("");
-                let addr = if arg == "off" { Some(0) } else { u64::from_str_radix(arg.trim_start_matches("0x"), 16).ok() };
+                let addr = if arg == "off" { Some(0) } else { debug_addr(arg).ok() };
                 let (mut rw, mut len, mut guest) = (1u32, 8u32, None::<bool>);
                 for o in parts.by_ref() {
                     match o {
@@ -1227,6 +1228,22 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 gpu::capture::arm_next();
                 Ok(())
             }
+            "peek" => {
+                // Debug: `peek <address> [<hex length up to 0x100>]`: logs the bytes at the
+                // address (`debug_addr`: hex, `eboot+<hex>`, `,<hex>` pointer steps).
+                let spec = parts.next().unwrap_or("");
+                let n = parts.next().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()).unwrap_or(8).clamp(1, 0x100);
+                match debug_addr(spec) {
+                    Ok(a) if gpu::cp::guest_readable(a, n) || mem::os_readable(a, n) => {
+                        let bytes = unsafe { std::slice::from_raw_parts(a as *const u8, n as usize) };
+                        let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                        info!("control: peek {spec} = {a:#x}: {}", hex.join(" "));
+                        Ok(())
+                    }
+                    Ok(a) => Err(format!("{a:#x}+{n:#x} is not readable memory")),
+                    Err(e) => Err(format!("usage: peek <hex address | eboot+<hex>>[,<hex step>...] [<hex length>]: {e}")),
+                }
+            }
             "mem" => {
                 // Debug: `mem <hex address> <hex length>` writes guest memory
                 // to mem-<address>.bin in the run directory.
@@ -1546,6 +1563,27 @@ struct FScan {
 static FSCAN: parking_lot::Mutex<Option<FScan>> = parking_lot::Mutex::new(None);
 /// Candidate pages copied for `fscan floats` (64 MiB) at most.
 const FSCAN_COPY_PAGES: usize = 16384;
+
+/// An address for the debug commands (`peek`, `watch`): hex, or `eboot+<hex>` (the main
+/// executable's load address plus an offset), then `,<hex>` steps that each read the 8 bytes at
+/// the address so far and add the offset: `eboot+330ccb0,720,e8` is a field of an object a field
+/// of the object a global points to points to.
+fn debug_addr(spec: &str) -> Result<u64, String> {
+    let hex = |s: &str| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).map_err(|_| format!("{s}: not hex"));
+    let mut steps = spec.split(',');
+    let first = steps.next().unwrap_or("");
+    let mut a = match first.strip_prefix("eboot+") {
+        Some(o) => pcsettings::convar::base().checked_add(hex(o)?).filter(|_| pcsettings::convar::base() != 0).ok_or("the executable's address is not known yet")?,
+        None => hex(first)?,
+    };
+    for s in steps {
+        if !(gpu::cp::guest_readable(a, 8) || mem::os_readable(a, 8)) {
+            return Err(format!("{a:#x} is not readable"));
+        }
+        a = unsafe { (a as *const u64).read_unaligned() }.wrapping_add(hex(s)?);
+    }
+    Ok(a)
+}
 
 fn page_hash(a: u64) -> u64 {
     let p = a as *const u64;
