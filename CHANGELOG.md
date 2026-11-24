@@ -2,6 +2,17 @@
 
 ## 0.1.5
 
+- Fixed the game not starting at all for players who put their own DLSS file
+  ('nvngx_dlss.dll') in the 'upscalers' folder and whose DLSS version could not be loaded: every
+  start, and the shader preparation, ended with an error at once. DLSS is now first tried in a
+  separate short check; if that check fails, the game starts without DLSS and its log says why.
+  It tries again when the DLSS files or Regaliant change. On PCs without an NVIDIA driver DLSS is
+  not loaded at all.
+- When a graphics driver crashes while it compiles one of the game's shaders, the game now
+  remembers which compiles were running even when the crash leaves no error report, and the
+  next start leaves them out of the background compiles (a compile that crashes again is left
+  out everywhere). Before, such a crash could repeat at every start, as seen with NVIDIA's
+  driver 621.40. The log now names the shaders on that list.
 - Fixed video memory filling up and the game slowing down the longer it ran with DLSS, XeSS or
   FSR chosen. In menus that show your character (the equipment menu), the game runs its
   anti-aliasing on the small preview too, and the upscaler followed it: it switched size every
