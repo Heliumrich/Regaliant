@@ -67,6 +67,54 @@ static UDS_LIVE: parking_lot::Mutex<std::collections::BTreeSet<u64>> = parking_l
 fn cstr_or(p: *const u8) -> String {
     if p.is_null() { String::new() } else { unsafe { crate::hle::cstr(p) }.to_string() }
 }
+/// One entry of the add-on entitlement list (`sceNpEntitlementAccessGetAddcontEntitlementInfoList`):
+/// 28 bytes, the entitlement label a NUL-terminated string at its start. (From the title's own
+/// caller, 2026-11-24: it asks for the count with no list, allocates count x 28 bytes, asks for the
+/// list and compares each entry's label with its own, `DEMONSSOULSGIFT1` and `...2`, the
+/// pre-order gifts; it reads nothing else of an entry.)
+const ADDCONT_ENTRY: usize = 28;
+
+/// The player's own add-on packages: the entitlement labels in the names of the files and folders
+/// under "Add-ons" in the settings folder (the .pkg files or folders unpacked from them, at most
+/// three levels down; `addon_label`), scanned once. Without them the title hears of no add-ons, as
+/// on a console that has none installed.
+fn addon_labels() -> &'static (Vec<String>, std::path::PathBuf) {
+    static L: std::sync::OnceLock<(Vec<String>, std::path::PathBuf)> = std::sync::OnceLock::new();
+    L.get_or_init(|| {
+        let dir = dsconfig::paths::Paths::current().user.join("Add-ons");
+        let mut found = Vec::new();
+        scan_addons(&dir, 3, &mut found);
+        found.sort();
+        found.dedup();
+        if !found.is_empty() {
+            crate::info!("add-ons: {} found in {}: {}", found.len(), dir.display(), found.join(", "));
+        }
+        (found, dir)
+    })
+}
+
+fn scan_addons(dir: &std::path::Path, depth: u32, out: &mut Vec<String>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        if let Some(l) = addon_label(&e.file_name().to_string_lossy()) {
+            out.push(l);
+        }
+        if depth > 0 && e.path().is_dir() {
+            scan_addons(&e.path(), depth - 1, out);
+        }
+    }
+}
+
+/// The entitlement label in a package's content ID as a file or folder name has it: the 16
+/// capital letters and digits after `PPSA0134<digit>_00-` (`EP9000-PPSA01341_00-DEMONSSOULSGIFT1.pkg`
+/// gives `DEMONSSOULSGIFT1`).
+fn addon_label(name: &str) -> Option<String> {
+    let rest = &name[name.find("PPSA0134")? + 8..];
+    let rest = rest.strip_prefix(|c: char| c.is_ascii_digit())?.strip_prefix("_00-")?;
+    let label: String = rest.chars().take(16).collect();
+    (label.len() == 16 && label.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())).then_some(label)
+}
+
 fn next_id() -> i32 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
@@ -170,17 +218,34 @@ sysv! {
         0
     }
 
-    // ---- NP entitlement access (add-on content). The supplied package has no
-    // add-ons installed. Error code and structure sizes per public sources.
+    // ---- NP entitlement access (add-on content): the player's own add-on packages under
+    // "Add-ons" are reported as owned (`addon_labels`), none without them. Error code and the
+    // initialization's structure size per public sources; the list's entries per the title's
+    // own use (`ADDCONT_ENTRY`).
     fn sceNpEntitlementAccessInitialize(init: *const u8, boot: *mut u8) -> i32 {
         if init.is_null() || boot.is_null() { return 0x817D_0002u32 as i32; }
         std::ptr::write_bytes(boot, 0, 32);
-        stub_log("sceNpEntitlementAccessInitialize (no add-on entitlements)", 0);
+        stub_log("sceNpEntitlementAccessInitialize (add-ons: the player's own packages under Add-ons)", 0);
         0
     }
     fn sceNpEntitlementAccessGetAddcontEntitlementInfoList(label: u32, list: *mut u8, num: u32, hit: *mut u32) -> i32 {
         if hit.is_null() || (list.is_null() && num != 0) { return 0x817D_0002u32 as i32; }
-        *hit = 0;
+        let (owned, dir) = addon_labels();
+        // (A count with no list; else the entries that fit.)
+        let n = if list.is_null() { owned.len() } else { owned.len().min(num as usize) };
+        if !list.is_null() {
+            for (i, l) in owned.iter().take(n).enumerate() {
+                let e = list.add(i * ADDCONT_ENTRY);
+                std::ptr::write_bytes(e, 0, ADDCONT_ENTRY);
+                std::ptr::copy_nonoverlapping(l.as_ptr(), e, l.len().min(16));
+            }
+        }
+        *hit = n as u32;
+        static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
+            let what = if owned.is_empty() { format!("none (no package under {})", dir.display()) } else { owned.join(", ") };
+            crate::info!("sceNpEntitlementAccessGetAddcontEntitlementInfoList ({}, {num} asked): {n} add-on(s) reported as owned: {what}", if list.is_null() { "the count" } else { "the list" });
+        }
         0
     }
 
@@ -392,4 +457,23 @@ pub fn register(r: &mut Registry) {
         sceSigninDialogClose, sceSigninDialogTerminate,
     ]);
     reg!(r, "libSceCommonDialog", [sceCommonDialogIsUsed]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::addon_label;
+
+    /// Add-on labels from package names as players have them (2026-11-24: the pre-order GIFT1
+    /// and GIFT2 packages, as a .pkg file or the folders unpacked from it).
+    #[test]
+    fn addon_labels_from_package_names() {
+        assert_eq!(addon_label("EP9000-PPSA01341_00-DEMONSSOULSGIFT1.pkg").as_deref(), Some("DEMONSSOULSGIFT1"));
+        assert_eq!(addon_label("EP9000-PPSA01341_00-DEMONSSOULSGIFT2").as_deref(), Some("DEMONSSOULSGIFT2"));
+        assert_eq!(addon_label("UP9000-PPSA01342_00-DEMONSSOULSGIFT1").as_deref(), Some("DEMONSSOULSGIFT1"));
+        assert_eq!(addon_label("common"), None);
+        assert_eq!(addon_label("playgo-chunk.dat"), None);
+        assert_eq!(addon_label("EP9000-PPSA01341_00-SHORT"), None);
+        assert_eq!(addon_label("EP9000-PPSA01341_00-demonssoulsgift1"), None);
+        assert_eq!(addon_label("EP9000-PPSA01341-DEMONSSOULSGIFT1"), None);
+    }
 }

@@ -6,6 +6,9 @@
   them. Before, such a save was not found. The PS5's own backups beside them are left out.
 - Fixed a rare hang after slow first shader compiles: a part of the graphics work that fell
   behind could wait forever for a frame that had already passed, and the game stopped.
+- Your own pre-order and Digital Deluxe add-on packages count: put them in a folder named
+  'Add-ons' in '%APPDATA%\Regaliant', and the game finds them as owned when it starts. Before,
+  it was told that no add-ons were installed.
 
 ## 0.1.3
 

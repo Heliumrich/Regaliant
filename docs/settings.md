@@ -28,6 +28,7 @@ NVIDIA and DLSS are trademarks of NVIDIA Corporation. Intel and XeSS are tradema
 
 - Settings and saves are in '%APPDATA%\Regaliant'. Before a session first changes a save, the game copies it to 'save-backups' there. The launcher's **Saves** page restores a backup.
 - To play on with a decrypted PS5 save: put its folder (for example 'PPSA01341', holding 'SAVEDATA0PlayerProfile0' and 'SAVEDATA0OptionsProfile0', each with a 'USR-DATA' file; folders named 'sdimg_SAVEDATA...' work too) into a folder named 'PS5 Saves' in '%APPDATA%\Regaliant'. Turn on **Import PS5 Saves** in SETTINGS > PC, then quit and start the game again. The saves it replaces are kept in 'save-backups'.
+- The pre-order and Digital Deluxe add-ons: put your own add-on packages (the files named like 'EP9000-PPSA01341_00-DEMONSSOULSGIFT1.pkg' and '...GIFT2.pkg', or the folders unpacked from them) into a folder named 'Add-ons' in '%APPDATA%\Regaliant'. The game finds them as owned when it starts. Without them it finds none.
 - Logs and prepared shaders are in '%LOCALAPPDATA%\Regaliant'. The launcher's **Open logs** button opens the logs.
 - An empty file named 'portable.txt' next to 'regaliant.exe' keeps everything in a 'user' folder beside it.
 - When the game cannot go on, it says so and names its log folder. Logs leave out your user name, your computer's name and your profile folder.
