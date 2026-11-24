@@ -7464,10 +7464,29 @@ impl Cp {
                 super::xwait::wait_start(&q);
             }
         }
+        // An equality wait whose counter moves past its value while this queue waits passes too
+        // (`counter_passed`, checked again whenever the label's value changes): checked only where
+        // the wait began until 2026-11-24, a queue that reached it one step late, or whose
+        // preparing ahead here (`work`) kept it from polling while the counter went by, waited
+        // forever, and every queue with it (the shader-prep branch's cold new game, 2026-11-23:
+        // compute queue 0x48 waited for 0xa20 with the counter at 0xa84).
+        let counter_seen = std::cell::Cell::new(v0);
+        let counter_moved = std::cell::Cell::new(false);
         let r = self.poll_until_wake(
             at,
             &what,
-            || hit.load(Ordering::SeqCst) || compare(func, read() & mask, reference & mask) || (use_promise && promises_moved() && promised(a, wide, func, mask, reference).is_some()),
+            || {
+                hit.load(Ordering::SeqCst)
+                    || compare(func, read() & mask, reference & mask)
+                    || (use_promise && promises_moved() && promised(a, wide, func, mask, reference).is_some())
+                    || (func & 7 == 3 && {
+                        let v = read();
+                        counter_seen.replace(v) != v && counter_passed(a, wide, func, mask, reference) && {
+                            counter_moved.set(true);
+                            true
+                        }
+                    })
+            },
             &mut work,
             (gpu_label && a % if wide { 8 } else { 4 } == 0).then_some((a, wide)),
         );
@@ -7494,7 +7513,12 @@ impl Cp {
         }
         // Passed on a promise (its batch may have completed meanwhile).
         let mut kind = if latched { b'L' } else { b'E' };
-        if !in_memory && !latched {
+        if !in_memory && !latched && counter_moved.get() {
+            if COUNTER_PASSED.fetch_add(1, Ordering::Relaxed) < 20 {
+                crate::info!("gpu[{}]: WAIT_REG_MEM at {at:#x} for [{a:#x}] == {reference:#x} passed while waiting: the counter is at {:#x}", self.name, read());
+            }
+            kind = b'M';
+        } else if !in_memory && !latched {
             if let (Some((seq, by_cpu, epoch)), Some(e)) = (promised(a, wide, func, mask, reference), self.exec.as_mut()) {
                 e.depend_on(seq, by_cpu);
                 PROMISED.fetch_add(1, Ordering::Relaxed);
@@ -7829,6 +7853,13 @@ mod tests {
         // A counter that was reset is not trusted.
         history(0x1020, &[0x10, 0x11, 0x0, 0x1, 0x2, 0x3]);
         assert!(!counter_passed(0x1020, false, 3, m, 0x11));
+        // A queue that reaches its wait one step late is not passed then, but once the counter
+        // moves on again, which the wait's polling now checks (2026-11-24: acb0x48 waited for
+        // 0xa20 while the counter went on to 0xa84, and every queue stopped).
+        history(0x1028, &[0xa1c, 0xa1e, 0xa20, 0xa22]);
+        assert!(!counter_passed(0x1028, false, 3, m, 0xa20), "one step on: may still be a flag");
+        history(0x1028, &[0xa1c, 0xa1e, 0xa20, 0xa22, 0xa24]);
+        assert!(counter_passed(0x1028, false, 3, m, 0xa20));
     }
 
     #[test]

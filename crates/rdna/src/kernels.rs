@@ -2045,7 +2045,10 @@ fn build_detile() -> Result<Vec<u32>, rspirv::dr::Error> {
         let lo = b.shift_left_logical(u32t, None, lo, k[3])?;
         let v = b.shift_right_logical(u32t, None, wd, lo)?;
         let v = b.bitwise_and(u32t, None, v, emask)?;
+        // (An element past the word's `per` shifts by 0: 2-byte elements 2 and 3 would shift by
+        // 32 and 48, which SPIR-V leaves undefined; their value is 0 either way.)
         let at = b.shift_left_logical(u32t, None, k[j], e3)?;
+        let at = b.select(u32t, None, in_word, at, k[0])?;
         let v = b.shift_left_logical(u32t, None, v, at)?;
         acc = b.bitwise_or(u32t, None, acc, v)?;
     }

@@ -3921,8 +3921,16 @@ fn compute_pipe_with(tr: &super::shaders::Translated, addr: u64, created: &std::
             }
             d.clone().unwrap()
         };
+        let waited = t.elapsed();
         PIPE_FLIGHT_WAITS[0].fetch_add(1, Ordering::Relaxed);
-        PIPE_FLIGHT_WAITS[1].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        PIPE_FLIGHT_WAITS[1].fetch_add(waited.as_nanos() as u64, Ordering::Relaxed);
+        // (A long wait on another thread's compile, named with the waiting thread as a creation of
+        // 200 ms or more is: a queue held back this way falls behind the others unseen in the
+        // hitch lines, as compute queue 0x48 did before the shader-prep branch's hung new game,
+        // 2026-11-24.)
+        if waited >= std::time::Duration::from_millis(500) {
+            crate::info!("gpu: waited {} ms for the compute pipeline of cs {addr:#x}, made on another thread", waited.as_millis());
+        }
         if r.is_ok() {
             PIPE_FLIGHT_WAITS[2].fetch_add(1, Ordering::Relaxed);
             return r;
