@@ -21,8 +21,8 @@
   to keep the special values NaN and infinity. The game gives the unused slots of some draws such
   values so that the graphics card drops them, and the port moves them out of view; without this,
   a driver may treat the check as never true and draw them as dark streaks across the view. This
-  is the likely cause of the black picture on RTX 50-series cards, not yet confirmed on such a
-  card. On these cards the launcher prepares the shaders again once.
+  may be the cause of the black picture on RTX 50-series cards; it is not confirmed on such a card
+  yet. On these cards the launcher prepares the shaders again once.
 
 ## 0.1.2
 
