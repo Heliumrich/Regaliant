@@ -20,7 +20,7 @@ The game runs at the same speed at every frame rate. With the 60 limit each fram
 
 ## DLSS, FSR and XeSS
 
-NVIDIA's 'nvngx_dlss.dll' is under NVIDIA's own license and not included. Copy your own into the 'upscalers' folder beside 'regaliant.exe' (games with DLSS have it in their installation folder). Then DLSS appears in the Anti-Aliasing list. XeSS, FSR and NVIDIA Streamline ship in the 'upscalers' folder with their licenses, and each is loaded only after its maker's digital signature checks out.
+NVIDIA's 'nvngx_dlss.dll' is under NVIDIA's own license and not included. Copy your own into the 'upscalers' folder beside 'regaliant.exe' (games with DLSS have it in their installation folder). Then DLSS appears in the Anti-Aliasing list. XeSS, FSR and NVIDIA Streamline ship in the 'upscalers' folder with their licenses, and each is loaded only after its maker's digital signature checks out. DLSS is first tried in a short separate check: if your 'nvngx_dlss.dll' cannot be loaded, the game starts without DLSS and its log says why. It is tried again when the file changes.
 
 NVIDIA and DLSS are trademarks of NVIDIA Corporation. Intel and XeSS are trademarks of Intel Corporation. AMD and FSR are trademarks of Advanced Micro Devices, Inc.
 
