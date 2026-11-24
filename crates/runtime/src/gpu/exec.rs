@@ -3928,7 +3928,9 @@ fn compute_pipe_with(tr: &super::shaders::Translated, addr: u64, created: &std::
         // 200 ms or more is: a queue held back this way falls behind the others unseen in the
         // hitch lines, as compute queue 0x48 did before the shader-prep branch's hung new game,
         // 2026-11-24.)
-        if waited >= std::time::Duration::from_millis(500) {
+        // (The first 100 of them: a cold first session meets ~70.)
+        static LOGGED: AtomicU64 = AtomicU64::new(0);
+        if waited >= std::time::Duration::from_millis(500) && LOGGED.fetch_add(1, Ordering::Relaxed) < 100 {
             crate::info!("gpu: waited {} ms for the compute pipeline of cs {addr:#x}, made on another thread", waited.as_millis());
         }
         if r.is_ok() {

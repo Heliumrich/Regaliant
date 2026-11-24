@@ -1231,6 +1231,11 @@ static LAST_WRITE: parking_lot::Mutex<Option<std::collections::HashMap<u64, (Str
 /// its command buffer was submitted (`missed_write`).
 static LABEL_WRITES: parking_lot::Mutex<Option<HashMap<u64, std::collections::VecDeque<(Instant, u64)>>>> = parking_lot::Mutex::new(None);
 const LABEL_WRITES_KEEP: usize = 64;
+/// Values added to `LABEL_WRITES`, over all labels: a waiting queue checks `counter_passed` again
+/// when it moves. (The history can lag the label's memory: a GPU-performed write reaches it when
+/// its batch completes, a CP write just after memory; a check made between them, keyed by the
+/// value in memory, came too early and was never made again: the review of 2026-11-24.)
+static LABEL_WRITES_GEN: AtomicU64 = AtomicU64::new(0);
 /// Waits passed on a write made after their submission (diagnostics).
 pub static MISSED: AtomicU64 = AtomicU64::new(0);
 
@@ -1265,6 +1270,14 @@ fn counter_passed(addr: u64, wide: bool, func: u32, mask: u64, reference: u64) -
     let vals: Vec<u64> = h.iter().map(|&(_, v)| val(v)).collect();
     let Some(step) = vals.windows(2).map(|w| w[1].wrapping_sub(w[0])).find(|&d| d != 0) else { return false };
     if !(1..=4).contains(&step) {
+        return false;
+    }
+    // Every recorded write kept the value or added the step, the whole window: a label that
+    // wrapped or was reset in it (a ring of values, a count kept modulo something, a flag) is
+    // no counter, though its writes since the waited value rise by steps (a queue waiting at 2
+    // for a ring's next 1 is not passed at 3; the review of 2026-11-24, once the check ran
+    // while waiting too).
+    if !vals.windows(2).all(|w| w[1] == w[0] || w[1] == w[0].wrapping_add(step)) {
         return false;
     }
     let later = match vals.iter().rposition(|&v| v == r) {
@@ -1369,6 +1382,7 @@ fn note_write(queue: &str, addr: u64, value: u64, at: u64) {
                     h.pop_front();
                 }
                 h.push_back((Instant::now(), value));
+                LABEL_WRITES_GEN.fetch_add(1, Ordering::Release);
             }
         }
     }
@@ -1481,6 +1495,7 @@ pub(super) fn gpu_label_written(queue: &str, addr: u64, value: u64, bytes: u8) {
                     h.pop_front();
                 }
                 h.push_back((Instant::now(), value));
+                LABEL_WRITES_GEN.fetch_add(1, Ordering::Release);
             }
         }
     }
@@ -1672,6 +1687,7 @@ fn label_history(addr: u64, max: usize) -> String {
             b'L' => format!("wait ref {:#x}: satisfied by a CP write it latched (value now {:#x})", e.reference, e.value),
             b'P' => format!("wait ref {:#x}: passed on a promised write (value now {:#x})", e.reference, e.value),
             b'M' => format!("wait ref {:#x}: passed on a write made after its submission (value now {:#x})", e.reference, e.value),
+            b'C' => format!("wait ref {:#x}: passed, its counter moved on past it (value now {:#x})", e.reference, e.value),
             _ => format!("wait ref {:#x}: satisfied (value {:#x})", e.reference, e.value),
         };
         out.push_str(&format!("\n    {:>10.3} ms {} {what} (packet {:#x})", e.us as f64 / 1000.0, e.queue, e.packet));
@@ -2182,7 +2198,7 @@ fn wait_stats_inner() -> String {
 /// memory with a promise for it (of a value that did not satisfy the wait or
 /// made after the wait ended), passed on a promise, latched]; the first 40
 /// are logged in detail (`long_wait`).
-static LONG_WAITS: parking_lot::Mutex<Option<HashMap<(String, String, u64), [u64; 6]>>> = parking_lot::Mutex::new(None);
+static LONG_WAITS: parking_lot::Mutex<Option<HashMap<(String, String, u64), [u64; 7]>>> = parking_lot::Mutex::new(None);
 static LONG_WAITS_LOGGED: AtomicU64 = AtomicU64::new(0);
 
 /// A blocking wait on `a` that lasted `ns` and ended as `kind` (b'E': the
@@ -2201,6 +2217,7 @@ fn long_wait(waiter: &str, a: u64, wide: bool, func: u32, mask: u64, reference: 
     let slot = match (kind, p) {
         (b'P', _) => 4,
         (b'L', _) => 5,
+        (b'C', _) => 6,
         (_, None) => 2,
         _ => 3,
     };
@@ -2234,6 +2251,7 @@ fn long_wait(waiter: &str, a: u64, wide: bool, func: u32, mask: u64, reference: 
             match kind {
                 b'P' => "on a promise",
                 b'L' => "latched",
+                b'C' => "as its counter moved on past it",
                 _ => "in memory",
             },
             if wide { unsafe { rd64(a) } } else { (unsafe { rd32(a) }) as u64 },
@@ -2251,7 +2269,7 @@ pub fn long_waits_line() -> String {
     let parts: Vec<String> = v
         .iter()
         .take(10)
-        .map(|((w, by, a), e)| format!("{w} <- {by} [{a:#x}]: {} waits {:.1} ms (in memory without a promise {}, with one {}, on a promise {}, latched {})", e[0], e[1] as f64 / 1e6, e[2], e[3], e[4], e[5]))
+        .map(|((w, by, a), e)| format!("{w} <- {by} [{a:#x}]: {} waits {:.1} ms (in memory without a promise {}, with one {}, on a promise {}, latched {}, its counter moved on {})", e[0], e[1] as f64 / 1e6, e[2], e[3], e[4], e[5], e[6]))
         .collect();
     format!("    label waits of 1 ms or more: {}\n", parts.join("; "))
 }
@@ -7357,8 +7375,10 @@ impl Cp {
             if COUNTER_PASSED.fetch_add(1, Ordering::Relaxed) < 20 {
                 crate::info!("gpu[{}]: WAIT_REG_MEM at {at:#x} for [{a:#x}] == {reference:#x} passed: the counter is at {v0:#x}", self.name);
             }
-            self.last_wait_kind = b'M';
-            label_event(&self.name, b'M', a, v0, reference, at);
+            // (b'C': passed because its counter moved on; treated as b'M' and b'E' are, named
+            // apart in the wait reports since 2026-11-24.)
+            self.last_wait_kind = b'C';
+            label_event(&self.name, b'C', a, v0, reference, at);
             if let Some(e) = self.exec.as_mut() {
                 e.xq_label(a, wide, v0);
             }
@@ -7465,12 +7485,13 @@ impl Cp {
             }
         }
         // An equality wait whose counter moves past its value while this queue waits passes too
-        // (`counter_passed`, checked again whenever the label's value changes): checked only where
-        // the wait began until 2026-11-24, a queue that reached it one step late, or whose
-        // preparing ahead here (`work`) kept it from polling while the counter went by, waited
-        // forever, and every queue with it (the shader-prep branch's cold new game, 2026-11-23:
-        // compute queue 0x48 waited for 0xa20 with the counter at 0xa84).
-        let counter_seen = std::cell::Cell::new(v0);
+        // (`counter_passed`, checked again whenever the label write history gains a value,
+        // `LABEL_WRITES_GEN`; the first poll checks once, for history added since the check
+        // above): checked only where the wait began until 2026-11-24, a queue that reached it one
+        // step late, or whose preparing ahead here (`work`) kept it from polling while the counter
+        // went by, waited forever, and every queue with it (the shader-prep branch's cold new
+        // game, 2026-11-23: compute queue 0x48 waited for 0xa20 with the counter at 0xa84).
+        let counter_gen = std::cell::Cell::new(u64::MAX);
         let counter_moved = std::cell::Cell::new(false);
         let r = self.poll_until_wake(
             at,
@@ -7480,8 +7501,8 @@ impl Cp {
                     || compare(func, read() & mask, reference & mask)
                     || (use_promise && promises_moved() && promised(a, wide, func, mask, reference).is_some())
                     || (func & 7 == 3 && {
-                        let v = read();
-                        counter_seen.replace(v) != v && counter_passed(a, wide, func, mask, reference) && {
+                        let g = LABEL_WRITES_GEN.load(Ordering::Acquire);
+                        counter_gen.replace(g) != g && counter_passed(a, wide, func, mask, reference) && {
                             counter_moved.set(true);
                             true
                         }
@@ -7513,17 +7534,19 @@ impl Cp {
         }
         // Passed on a promise (its batch may have completed meanwhile).
         let mut kind = if latched { b'L' } else { b'E' };
-        if !in_memory && !latched && counter_moved.get() {
-            if COUNTER_PASSED.fetch_add(1, Ordering::Relaxed) < 20 {
-                crate::info!("gpu[{}]: WAIT_REG_MEM at {at:#x} for [{a:#x}] == {reference:#x} passed while waiting: the counter is at {:#x}", self.name, read());
-            }
-            kind = b'M';
-        } else if !in_memory && !latched {
+        if !in_memory && !latched {
+            // (A promise first, as the poll checks them: its dependency orders this queue after
+            // the write; then the counter.)
             if let (Some((seq, by_cpu, epoch)), Some(e)) = (promised(a, wide, func, mask, reference), self.exec.as_mut()) {
                 e.depend_on(seq, by_cpu);
                 PROMISED.fetch_add(1, Ordering::Relaxed);
                 kind = b'P';
                 self.last_wait_epoch = epoch;
+            } else if counter_moved.get() {
+                if COUNTER_PASSED.fetch_add(1, Ordering::Relaxed) < 20 {
+                    crate::info!("gpu[{}]: WAIT_REG_MEM at {at:#x} for [{a:#x}] == {reference:#x} passed while waiting: the counter is at {:#x}", self.name, read());
+                }
+                kind = b'C';
             }
         }
         self.last_wait_kind = kind;
@@ -7850,9 +7873,15 @@ mod tests {
         // A flag (0 -> 1 -> 0) is not a counter.
         history(0x1018, &[0, 1, 0, 1]);
         assert!(!counter_passed(0x1018, false, 3, m, 0));
-        // A counter that was reset is not trusted.
+        // A counter that was reset is not trusted, while the reset is in the window (for the
+        // values after it too).
         history(0x1020, &[0x10, 0x11, 0x0, 0x1, 0x2, 0x3]);
         assert!(!counter_passed(0x1020, false, 3, m, 0x11));
+        assert!(!counter_passed(0x1020, false, 3, m, 0x1));
+        // A ring (values counted modulo 4) is no counter: a queue waiting at 2 for its next 1 is
+        // not passed at 3 (the review of 2026-11-24).
+        history(0x1030, &[0, 1, 2, 3, 0, 1, 2, 3]);
+        assert!(!counter_passed(0x1030, false, 3, m, 1));
         // A queue that reaches its wait one step late is not passed then, but once the counter
         // moves on again, which the wait's polling now checks (2026-11-24: acb0x48 waited for
         // 0xa20 while the counter went on to 0xa84, and every queue stopped).
