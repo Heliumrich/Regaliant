@@ -2,12 +2,13 @@
 
 ## 0.1.4
 
-- On RTX 50-series graphics cards (and AMD and Intel ones) the game's shaders now tell the driver
-  to keep the special values NaN and infinity. The game gives the unused slots of some draws such
-  values so that the graphics card drops them, and the port moves them out of view; without this,
-  a driver may treat the check as never true and draw them as dark streaks across the view. This
-  may be the cause of the black picture on RTX 50-series cards; it is not confirmed on such a card
-  yet. On these cards the launcher prepares the shaders again once.
+- Fixed the mostly black picture in play on RTX 50-series graphics cards (black shapes and streaks
+  across the view from the first tunnel on). The game gives the unused slots of some draws
+  "not a number" positions so that the graphics card drops them, and the port moves them out of
+  view; the driver for these cards was allowed to skip that check and drew them across the
+  screen. The game's shaders now tell the driver to keep it, on RTX 50-series cards and on AMD and
+  Intel ones. Confirmed on an RTX 5090. On these cards the launcher prepares the shaders again
+  once; RTX 40-series and older cards keep their prepared shaders.
 
 ## 0.1.3
 
