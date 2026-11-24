@@ -81,7 +81,9 @@ const ADDCONT_ENTRY: usize = 28;
 fn addon_labels() -> &'static (Vec<String>, std::path::PathBuf) {
     static L: std::sync::OnceLock<(Vec<String>, std::path::PathBuf)> = std::sync::OnceLock::new();
     L.get_or_init(|| {
-        let dir = dsconfig::paths::Paths::current().user.join("Add-ons");
+        // (The settings folder this run uses, `--root` and portable ones too; the shader
+        // preparation's self-play has its own, without add-ons.)
+        let dir = crate::paths().user.join("Add-ons");
         let mut found = Vec::new();
         scan_addons(&dir, 3, &mut found);
         found.sort();
@@ -99,7 +101,8 @@ fn scan_addons(dir: &std::path::Path, depth: u32, out: &mut Vec<String>) {
         if let Some(l) = addon_label(&e.file_name().to_string_lossy()) {
             out.push(l);
         }
-        if depth > 0 && e.path().is_dir() {
+        // (Not into junctions or links: `file_type` does not follow them.)
+        if depth > 0 && e.file_type().is_ok_and(|t| t.is_dir()) {
             scan_addons(&e.path(), depth - 1, out);
         }
     }
@@ -107,12 +110,19 @@ fn scan_addons(dir: &std::path::Path, depth: u32, out: &mut Vec<String>) {
 
 /// The entitlement label in a package's content ID as a file or folder name has it: the 16
 /// capital letters and digits after `PPSA0134<digit>_00-` (`EP9000-PPSA01341_00-DEMONSSOULSGIFT1.pkg`
-/// gives `DEMONSSOULSGIFT1`).
+/// gives `DEMONSSOULSGIFT1`); or a name that is the label alone (`DEMONSSOULSGIFT1.pkg`, a
+/// package renamed).
 fn addon_label(name: &str) -> Option<String> {
-    let rest = &name[name.find("PPSA0134")? + 8..];
-    let rest = rest.strip_prefix(|c: char| c.is_ascii_digit())?.strip_prefix("_00-")?;
-    let label: String = rest.chars().take(16).collect();
-    (label.len() == 16 && label.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())).then_some(label)
+    let label_at = |s: &str| -> Option<String> {
+        let label: String = s.chars().take(16).collect();
+        (label.len() == 16 && label.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())).then_some(label)
+    };
+    if let Some(i) = name.find("PPSA0134") {
+        let rest = &name[i + 8..];
+        return label_at(rest.strip_prefix(|c: char| c.is_ascii_digit())?.strip_prefix("_00-")?);
+    }
+    let stem = name.split('.').next()?;
+    (stem.len() == 16).then(|| label_at(stem)).flatten()
 }
 
 fn next_id() -> i32 {
@@ -475,5 +485,10 @@ mod tests {
         assert_eq!(addon_label("EP9000-PPSA01341_00-SHORT"), None);
         assert_eq!(addon_label("EP9000-PPSA01341_00-demonssoulsgift1"), None);
         assert_eq!(addon_label("EP9000-PPSA01341-DEMONSSOULSGIFT1"), None);
+        // A package renamed to its label alone.
+        assert_eq!(addon_label("DEMONSSOULSGIFT2.pkg").as_deref(), Some("DEMONSSOULSGIFT2"));
+        assert_eq!(addon_label("DEMONSSOULSGIFT1").as_deref(), Some("DEMONSSOULSGIFT1"));
+        assert_eq!(addon_label("PS5 SAVES BACKUP.pkg"), None);
+        assert_eq!(addon_label("DEMONSSOULSGIFT12.pkg"), None);
     }
 }

@@ -1268,24 +1268,29 @@ fn counter_passed(addr: u64, wide: bool, func: u32, mask: u64, reference: u64) -
     let val = |v: u64| (if wide { v } else { v & 0xFFFF_FFFF }) & mask;
     let r = reference & mask;
     let vals: Vec<u64> = h.iter().map(|&(_, v)| val(v)).collect();
-    let Some(step) = vals.windows(2).map(|w| w[1].wrapping_sub(w[0])).find(|&d| d != 0) else { return false };
+    // (The step of the latest writes.)
+    let Some(step) = vals.windows(2).rev().map(|w| w[1].wrapping_sub(w[0])).find(|&d| d != 0) else { return false };
     if !(1..=4).contains(&step) {
         return false;
     }
-    // Every recorded write kept the value or added the step, the whole window: a label that
-    // wrapped or was reset in it (a ring of values, a count kept modulo something, a flag) is
-    // no counter, though its writes since the waited value rise by steps (a queue waiting at 2
-    // for a ring's next 1 is not passed at 3; the review of 2026-11-24, once the check ran
-    // while waiting too).
-    if !vals.windows(2).all(|w| w[1] == w[0] || w[1] == w[0].wrapping_add(step)) {
+    // The run of writes since the last one that neither kept the value nor added the step (a
+    // reset, a ring's wrap, a flag going back): a counter only when the whole window is one run,
+    // or when the run holds 8 steps or more (a ring of fewer values never does; a counter reset
+    // at a load is trusted again after 8 steps). (The review of 2026-11-24, once the check ran
+    // while waiting too: a ring's queue waiting at 2 for its next 1 must not pass at 3; a whole
+    // window without a break, tried first, kept late waits after a reset blocked for 64 writes.)
+    let ok = |w: &[u64]| w[1] == w[0] || w[1] == w[0].wrapping_add(step);
+    let start = vals.windows(2).rposition(|w| !ok(w)).map_or(0, |i| i + 1);
+    let run = &vals[start..];
+    if start > 0 && run.windows(2).filter(|w| w[1] != w[0]).count() < 8 {
         return false;
     }
-    let later = match vals.iter().rposition(|&v| v == r) {
-        Some(i) => &vals[i..],
-        None if vals.len() >= 3 && vals[0] > r && (vals[0] - r) % step == 0 && vals[0] - r < 64 * step => &vals[..],
+    let later = match run.iter().rposition(|&v| v == r) {
+        Some(i) => &run[i..],
+        None if start == 0 && run.len() >= 3 && run[0] > r && (run[0] - r) % step == 0 && run[0] - r < 64 * step => run,
         None => return false,
     };
-    later.windows(2).all(|w| w[1] == w[0] || w[1] == w[0].wrapping_add(step)) && later.last().is_some_and(|&l| l >= r.wrapping_add(2 * step))
+    later.last().is_some_and(|&l| l >= r.wrapping_add(2 * step))
 }
 
 /// The recorded writes of a waited-on label (wait reports).
@@ -1687,7 +1692,7 @@ fn label_history(addr: u64, max: usize) -> String {
             b'L' => format!("wait ref {:#x}: satisfied by a CP write it latched (value now {:#x})", e.reference, e.value),
             b'P' => format!("wait ref {:#x}: passed on a promised write (value now {:#x})", e.reference, e.value),
             b'M' => format!("wait ref {:#x}: passed on a write made after its submission (value now {:#x})", e.reference, e.value),
-            b'C' => format!("wait ref {:#x}: passed, its counter moved on past it (value now {:#x})", e.reference, e.value),
+            b'K' => format!("wait ref {:#x}: passed, its counter moved on past it (value now {:#x})", e.reference, e.value),
             _ => format!("wait ref {:#x}: satisfied (value {:#x})", e.reference, e.value),
         };
         out.push_str(&format!("\n    {:>10.3} ms {} {what} (packet {:#x})", e.us as f64 / 1000.0, e.queue, e.packet));
@@ -2217,7 +2222,7 @@ fn long_wait(waiter: &str, a: u64, wide: bool, func: u32, mask: u64, reference: 
     let slot = match (kind, p) {
         (b'P', _) => 4,
         (b'L', _) => 5,
-        (b'C', _) => 6,
+        (b'K', _) => 6,
         (_, None) => 2,
         _ => 3,
     };
@@ -2251,7 +2256,7 @@ fn long_wait(waiter: &str, a: u64, wide: bool, func: u32, mask: u64, reference: 
             match kind {
                 b'P' => "on a promise",
                 b'L' => "latched",
-                b'C' => "as its counter moved on past it",
+                b'K' => "as its counter moved on past it",
                 _ => "in memory",
             },
             if wide { unsafe { rd64(a) } } else { (unsafe { rd32(a) }) as u64 },
@@ -7375,10 +7380,10 @@ impl Cp {
             if COUNTER_PASSED.fetch_add(1, Ordering::Relaxed) < 20 {
                 crate::info!("gpu[{}]: WAIT_REG_MEM at {at:#x} for [{a:#x}] == {reference:#x} passed: the counter is at {v0:#x}", self.name);
             }
-            // (b'C': passed because its counter moved on; treated as b'M' and b'E' are, named
+            // (b'K': passed because its counter moved on; treated as b'M' and b'E' are, named
             // apart in the wait reports since 2026-11-24.)
-            self.last_wait_kind = b'C';
-            label_event(&self.name, b'C', a, v0, reference, at);
+            self.last_wait_kind = b'K';
+            label_event(&self.name, b'K', a, v0, reference, at);
             if let Some(e) = self.exec.as_mut() {
                 e.xq_label(a, wide, v0);
             }
@@ -7546,7 +7551,7 @@ impl Cp {
                 if COUNTER_PASSED.fetch_add(1, Ordering::Relaxed) < 20 {
                     crate::info!("gpu[{}]: WAIT_REG_MEM at {at:#x} for [{a:#x}] == {reference:#x} passed while waiting: the counter is at {:#x}", self.name, read());
                 }
-                kind = b'C';
+                kind = b'K';
             }
         }
         self.last_wait_kind = kind;
@@ -7882,6 +7887,10 @@ mod tests {
         // not passed at 3 (the review of 2026-11-24).
         history(0x1030, &[0, 1, 2, 3, 0, 1, 2, 3]);
         assert!(!counter_passed(0x1030, false, 3, m, 1));
+        // A counter reset (at a load, say) is trusted again once it has counted 8 steps.
+        history(0x1038, &[0x10, 0x11, 0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9]);
+        assert!(counter_passed(0x1038, false, 3, m, 0x2));
+        assert!(!counter_passed(0x1038, false, 3, m, 0x11), "before the reset");
         // A queue that reaches its wait one step late is not passed then, but once the counter
         // moves on again, which the wait's polling now checks (2026-11-24: acb0x48 waited for
         // 0xa20 while the counter went on to 0xa84, and every queue stopped).
