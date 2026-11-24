@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.5
 
 - Fixed video memory filling up and the game slowing down the longer it ran with DLSS, XeSS or
   FSR chosen. In menus that show your character (the equipment menu), the game runs its
