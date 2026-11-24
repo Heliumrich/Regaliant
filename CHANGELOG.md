@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.3
 
 - Game folders whose executable and libraries are decrypted but still in their SELF containers
   (as some dumps keep them) now work as they are, and so do .zar archives made from them.
