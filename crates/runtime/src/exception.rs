@@ -1378,6 +1378,25 @@ unsafe fn veh_body(info: *mut EXCEPTION_POINTERS) -> i32 {
                         // (A suspect: the driver's own handlers may still take it. The fatal
                         // report confirms it, `pcache::note_crash_suspect`.)
                         crate::gpu::pcache::note_crash_suspect();
+                        // (Under the port's host the game has a debugger attached, so code that
+                        // breaks only for a debugger breaks here, and the host passes every such
+                        // exception on: the process ended with 0x80000003 where a game without a
+                        // debugger goes on, the review of 2026-11-25. Stepped over, as without a
+                        // debugger; the suspect line stays in case it was fatal after all.)
+                        if code == 0x80000003 && crate::hosted::on() {
+                            let at = rip as *const u8;
+                            let len = match (*at, *at.add(1)) {
+                                (0xCC, _) => 1,
+                                (0xCD, 0x03) => 2,
+                                _ => 0,
+                            };
+                            if len > 0 {
+                                (*(*info).ContextRecord).Rip += len;
+                                crate::warn!("driver debug break at {module} while compiling {what}: stepped over, as a game without a debugger goes on (the port's host is one)");
+                                crate::log::try_flush();
+                                return -1; // EXCEPTION_CONTINUE_EXECUTION
+                            }
+                        }
                     }
                 }
                 return EXCEPTION_CONTINUE_SEARCH;

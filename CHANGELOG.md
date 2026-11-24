@@ -2,12 +2,16 @@
 
 ## Unreleased
 
-- The shader preparation no longer gives up when the graphics driver stops while compiling a
-  shader (seen with NVIDIA's driver 621.40 as "crashed (status 0x80000003)"). That shader is
-  left out and the step runs again. The log names the shader.
-- The game now starts when DLSS, XeSS or FSR asks for something the graphics driver does not
-  offer. Before, the game stopped with "vkCreateDevice: Extension specified does not exist".
-  That upscaler is left out, and the log says which extension was missing.
+- Fixed the shader preparation and the game ending when the graphics driver stops on a debug
+  break while it compiles a shader (seen with NVIDIA's driver 621.40 as "crashed (status
+  0x80000003)", and likely the silent ends of issue #5). The game runs under its own helper,
+  which counts as a debugger, so the driver broke where it would otherwise go on. It now goes
+  on. Should the driver still fail there, the shader is left out, the step runs again, and the
+  log names the shader.
+- On PCs where Vulkan lists the graphics card twice, for example through Windows' OpenCL,
+  OpenGL and Vulkan Compatibility Pack, the game now takes the card's own driver. Before, it
+  could take the other entry and stop with "vkCreateDevice: Extension specified does not
+  exist". The log lists every device with its driver and what it lacks.
 - When another program holds part of the memory the game needs ("status 10"), the game tries
   again for a moment. If it still cannot start, a file in the logs folder names what holds the
   memory (the launcher's Open logs shows it).

@@ -417,24 +417,69 @@ fn init_inner() -> Result<(), String> {
                 .pfn_user_callback(Some(debug_cb));
             let _ = du.create_debug_utils_messenger(&mci, None);
         }
-        // Pick a discrete GPU with a graphics+compute queue.
+        // Pick a device the port can use: Vulkan 1.3, a graphics+compute queue and the extensions
+        // it always enables; a card's own driver before a translation layer's device of the same
+        // card (Microsoft's D3D12 one, installed with Windows' compatibility pack, lists every
+        // card again, without push descriptors), a discrete one before others, the last of
+        // equals. (Until 2026-11-25 the last discrete device was taken whatever it offered: a
+        // player's RTX 3060 Ti failed with "vkCreateDevice: Extension specified does not
+        // exist", likely such a device; the review of that night.) None usable: the old rule,
+        // and its error.
         let pdevs = instance.enumerate_physical_devices().map_err(|e| format!("enumerate devices: {e}"))?;
-        let mut chosen = None;
+        let mut chosen: Option<(vk::PhysicalDevice, u32, vk::PhysicalDeviceProperties)> = None;
+        let mut chosen_rank = i32::MIN;
+        let mut fallback: Option<(vk::PhysicalDevice, u32, vk::PhysicalDeviceProperties)> = None;
         let mut seen = Vec::new();
         for &pd in &pdevs {
             let props = instance.get_physical_device_properties(pd);
-            seen.push(format!("{} ({:?})", CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy(), props.device_type));
+            let name = CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy().into_owned();
+            let mut dp = vk::PhysicalDeviceDriverProperties::default();
+            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut dp);
+            instance.get_physical_device_properties2(pd, &mut p2);
+            let driver = CStr::from_ptr(dp.driver_name.as_ptr()).to_string_lossy().into_owned();
+            let layered = matches!(dp.driver_id, vk::DriverId::MESA_DOZEN | vk::DriverId::MESA_VENUS | vk::DriverId::MOLTENVK);
             let qfs = instance.get_physical_device_queue_family_properties(pd);
-            if let Some(qf) = qfs.iter().position(|q| q.queue_flags.contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)) {
-                let discrete = props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU;
-                if chosen.is_none() || discrete {
-                    chosen = Some((pd, qf as u32, props));
+            let qf = qfs.iter().position(|q| q.queue_flags.contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE));
+            let exts = instance.enumerate_device_extension_properties(pd).unwrap_or_default();
+            let has = |n: &CStr| exts.iter().any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == n);
+            let mut lacks: Vec<String> = Vec::new();
+            if vk::api_version_major(props.api_version) == 1 && vk::api_version_minor(props.api_version) < 3 {
+                lacks.push(format!("Vulkan 1.3 (it offers 1.{})", vk::api_version_minor(props.api_version)));
+            }
+            if qf.is_none() {
+                lacks.push("a graphics and compute queue".into());
+            }
+            for n in [ash::khr::swapchain::NAME, ash::khr::push_descriptor::NAME] {
+                if !has(n) {
+                    lacks.push(n.to_string_lossy().into_owned());
+                }
+            }
+            let discrete = props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU;
+            seen.push(format!(
+                "{name} ({:?}, driver {driver}{}{})",
+                props.device_type,
+                if layered { ", a translation layer" } else { "" },
+                if lacks.is_empty() { String::new() } else { format!("; lacks {}", lacks.join(", ")) }
+            ));
+            if let Some(qf) = qf {
+                if fallback.is_none() || discrete {
+                    fallback = Some((pd, qf as u32, props));
+                }
+                if lacks.is_empty() {
+                    let rank = if layered { 0 } else { 4 } + if discrete { 2 } else { 0 };
+                    if rank >= chosen_rank {
+                        chosen_rank = rank;
+                        chosen = Some((pd, qf as u32, props));
+                    }
                 }
             }
         }
         // (Every card Vulkan lists, for a player's report: a laptop with two graphics chips.)
-        crate::info!("Vulkan devices: {} (taken: the last discrete one with a graphics and compute queue, else the first)", seen.join(", "));
-        let (pdev, qf, props) = chosen.ok_or("no Vulkan device with graphics+compute")?;
+        crate::info!(
+            "Vulkan devices: {} (taken: a usable one, a card's own driver before a translation layer, discrete before others, the last of equals; none usable: the last discrete one, else the first)",
+            seen.join(", ")
+        );
+        let (pdev, qf, props) = chosen.or(fallback).ok_or("no Vulkan device with graphics+compute")?;
         let device_name = CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy().into_owned();
         // (The design decides the translation's subgroup modes: `shaders::plain_modes`.)
         let checked = modes_checked_on(props.vendor_id, props.device_id);

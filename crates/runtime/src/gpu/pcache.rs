@@ -1111,14 +1111,17 @@ pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result
                 std::process::abort();
             }
             // (`DS_SIM_COMPILER_CRASH_MODE=breakpoint`: a breakpoint inside another module, as
-            // NVIDIA's 621.40 compiler stops on one (status 0x80000003); no handler takes it.)
+            // NVIDIA's 621.40 compiler stops on one (status 0x80000003), then the compile goes
+            // on as a debugger-only break does: under the port's host it is stepped over, without
+            // a debugger it ends the process.)
             if std::env::var("DS_SIM_COMPILER_CRASH_MODE").ok().as_deref() == Some("breakpoint") {
                 // SAFETY: a deliberate breakpoint exception, as the driver's own.
                 unsafe { windows_sys::Win32::System::Diagnostics::Debug::DebugBreak() };
+            } else {
+                SIM_CRASHING.with(|c| c.set(true));
+                // SAFETY: none; a deliberate access violation, as the driver's own crash.
+                unsafe { std::ptr::write_volatile(std::ptr::without_provenance_mut::<u64>(8), 0) };
             }
-            SIM_CRASHING.with(|c| c.set(true));
-            // SAFETY: none; a deliberate access violation, as the driver's own crash.
-            unsafe { std::ptr::write_volatile(std::ptr::without_provenance_mut::<u64>(8), 0) };
         }
     }
     let Some(pb) = ctx().pbin.as_ref() else {

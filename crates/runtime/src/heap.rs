@@ -38,7 +38,9 @@ fn mode() -> u8 {
 fn decide() -> u8 {
     if MODE.compare_exchange(UNDECIDED, DECIDING, Ordering::AcqRel, Ordering::Acquire).is_ok() {
         crate::mem::reserve_guest_range_early();
-        let m = if env_is_system() { SYSTEM } else { MIMALLOC };
+        // (Without the guest range the start ends at status 10 (`main`): Windows' heap then, so
+        // mimalloc's segments, hinted into 2-6 TiB, do not appear in the report as the holder.)
+        let m = if env_is_system() || !crate::mem::guest_range_reserved() { SYSTEM } else { MIMALLOC };
         MODE.store(m, Ordering::Release);
         return m;
     }

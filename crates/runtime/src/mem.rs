@@ -995,6 +995,33 @@ pub fn reserve_guest_range_early() {
     if RESERVED_EARLY.load(std::sync::atomic::Ordering::Acquire) {
         return;
     }
+    // (Something taking part of the range while the process starts may let go of it soon, e.g.
+    // a module another program puts into every process, in its own setup: the first call tries
+    // again for up to a second (issue #15, 2026-11-25: a player's every shader preparation ended
+    // at status 10). Here, at the first allocation and before the heap is chosen: a retry after
+    // it would meet the heap's own memory, mimalloc's segments are hinted into 2-6 TiB (the
+    // review of 2026-11-25). Sleeping allocates nothing.)
+    static TRIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let tries = if TRIED.swap(true, std::sync::atomic::Ordering::AcqRel) { 1 } else { 11 };
+    for i in 0..tries {
+        if i > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        reserve_guest_range_once();
+        if RESERVED_EARLY.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+    }
+}
+
+/// Whether the guest range is reserved (`reserve_guest_range_early`): the heap uses Windows'
+/// own when it is not, so a failed start's report names only what really holds the range.
+pub fn guest_range_reserved() -> bool {
+    RESERVED_EARLY.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// One attempt at the whole range (`reserve_guest_range_early`).
+fn reserve_guest_range_once() {
     let size = (GUEST_END - GUEST_BASE) as usize;
     // (`DS_SIM_OCCUPIED=1`, a test: 64 KiB of the range taken first, as another program's
     // module or memory took part of it on a player's PC (issue #15): the start then ends with
@@ -1868,18 +1895,8 @@ fn take_written_query(lo: u64, hi: u64, out: &mut Vec<u64>, who: usize) -> Optio
 /// Reserves the whole guest range (`reserve_guest_range_early`). Must run
 /// before anything else allocates widely.
 pub fn reserve_guest_range() -> Result<(), String> {
+    // (Tried again for up to a second at the first allocation: `reserve_guest_range_early`.)
     reserve_guest_range_early();
-    // (Something taking part of the range while the process starts may let go of it soon, e.g.
-    // a module another program puts into every process, in its own setup: tried again for up to
-    // a second before giving up (issue #15, 2026-11-25: a player's every shader preparation
-    // ended here, status 10).)
-    for _ in 0..10 {
-        if RESERVED_EARLY.load(std::sync::atomic::Ordering::Acquire) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        reserve_guest_range_early();
-    }
     if !RESERVED_EARLY.load(std::sync::atomic::Ordering::Acquire) {
         let err = last_error();
         // Find what occupies the range for a useful diagnostic: each region's kind and, for a
@@ -1904,7 +1921,7 @@ pub fn reserve_guest_range() -> Result<(), String> {
                 } else {
                     0
                 };
-                let file = if len > 0 { format!(" {}", crate::log::redact(&String::from_utf16_lossy(&name[..len.min(name.len())]))) } else { String::new() };
+                let file = if len > 0 { format!(" {}", users_folder_hidden(&crate::log::redact(&String::from_utf16_lossy(&name[..len.min(name.len())])))) } else { String::new() };
                 busy.push(format!("{:#x}+{:#x} {kind}{file}", info.BaseAddress as u64, info.RegionSize));
             }
             addr = info.BaseAddress as u64 + info.RegionSize as u64;
@@ -1912,6 +1929,17 @@ pub fn reserve_guest_range() -> Result<(), String> {
         return Err(format!("reserving guest range failed (error {err}); occupied: {}", busy.join("; ")));
     }
     Ok(())
+}
+
+/// `path` with the folder after `\Users\` shown as `<user>`: a mapped file's name comes as a
+/// device path (`\Device\HarddiskVolumeN\...`), which the log's own rule for the profile folder
+/// does not meet (the review of 2026-11-25).
+fn users_folder_hidden(path: &str) -> String {
+    let low = path.to_ascii_lowercase();
+    let Some(i) = low.find("\\users\\") else { return path.to_string() };
+    let start = i + "\\users\\".len();
+    let end = path[start..].find('\\').map_or(path.len(), |j| start + j);
+    format!("{}<user>{}", &path[..start], &path[end..])
 }
 
 /// Host memory calls for guest mappings in the profile window

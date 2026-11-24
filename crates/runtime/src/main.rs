@@ -193,12 +193,13 @@ unsafe impl std::alloc::GlobalAlloc for GuardedAlloc {
 #[global_allocator]
 static ALLOCATOR: GuardedAlloc = GuardedAlloc;
 
-/// A failure before the log exists, written to `early-failure-<time>.txt` in the logs folder
-/// (personal paths left out, as in the log); the sentence naming that file for the player's
-/// message, or nothing when it could not be written.
+/// A failure before the log exists, written to `early-failure.txt` in a dated folder of its own
+/// in the logs folder, as a session's (so the launcher's Open logs selects it), personal paths
+/// left out as in the log; the sentence naming that file for the player's message, or nothing
+/// when it could not be written.
 fn early_failure_note(what: &str) -> String {
-    let dir = paths().logs();
-    let file = dir.join(format!("early-failure-{}.txt", utc_stamp()));
+    let dir = paths().logs().join(utc_stamp());
+    let file = dir.join("early-failure.txt");
     let text = format!("{}\n", log::redact(what));
     if std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&file, text).is_ok() {
         format!("\n\nThe details are in {} (the launcher's Open logs shows its folder).", log::redact(&file.display().to_string()))
@@ -2338,7 +2339,8 @@ This happens when other software takes that range. Restart the PC and try again.
         Ok(s) => s,
         Err(e) => {
             eprintln!("{e}");
-            player_error(&format!("The game could not set up its threads ({e})."));
+            let note = early_failure_note(&format!("setting up the threads' slot failed: {e}"));
+            player_error(&format!("The game could not set up its threads ({e}).{note}"));
             std::process::exit(EXIT_EARLY as i32);
         }
     };
