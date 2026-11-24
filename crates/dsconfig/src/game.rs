@@ -61,6 +61,9 @@ pub enum Problem {
     Encrypted,
     NoModule(String),
     EncryptedModule(String),
+    /// A SELF container the port cannot rebuild an ELF from: (its file, why), such as one cut
+    /// short by a copy or with compressed segments (`self_file`).
+    Unusable(String, String),
     MissingData(String),
 }
 
@@ -76,7 +79,8 @@ impl std::fmt::Display for Problem {
             Problem::NoExecutable => write!(f, "The game's eboot.bin is missing."),
             Problem::Encrypted => write!(f, "The game's eboot.bin is encrypted. The port needs the decrypted eboot.bin (a plain ELF, or a SELF with decrypted segments), in the game folder or in its decrypted folder."),
             Problem::NoModule(m) => write!(f, "{m} is missing. The port needs the game's decrypted libraries in sce_module."),
-            Problem::EncryptedModule(m) => write!(f, "{m} is encrypted. The port needs the game's decrypted libraries in sce_module."),
+            Problem::EncryptedModule(m) => write!(f, "{m} is encrypted. The port needs the game's decrypted libraries in sce_module (plain ELF files, or SELFs with decrypted segments)."),
+            Problem::Unusable(file, why) => write!(f, "The game's {file} could not be read ({why}). Copy it from your dump again, or convert it to an ELF file."),
             Problem::MissingData(d) => write!(f, "The game's {d} folder is missing. The game files are incomplete."),
         }
     }
@@ -100,19 +104,40 @@ pub fn locate(dir: &Path) -> Option<PathBuf> {
     subs.into_iter().find_map(|s| [s.clone(), s.join(APP_DIR)].into_iter().find(|d| has_param(d)))
 }
 
-/// Whether `rel` in the game's files starts as an ELF file (decrypted); None when it cannot be
-/// read.
-fn is_elf(src: &Source, rel: &str) -> Option<bool> {
-    let f = src.open_file(rel).ok()?;
+/// What one of the game's executables is (`exe_state`).
+#[derive(Debug, PartialEq, Eq)]
+enum Exe {
+    /// Not there, unreadable or shorter than a signature.
+    Missing,
+    /// A plain ELF, or a SELF container with its segments decrypted.
+    Usable,
+    Encrypted,
+    /// A SELF container that cannot be rebuilt into an ELF, and why.
+    Unusable(String),
+}
+
+/// What `rel` in the game's files is: a decrypted executable or not, and why not.
+fn exe_state(src: &Source, rel: &str) -> Exe {
+    let Ok(f) = src.open_file(rel) else { return Exe::Missing };
     let mut b = [0u8; 4];
-    if f.read_at(0, &mut b).ok()? != 4 {
-        return Some(false);
+    if !matches!(f.read_at(0, &mut b), Ok(4)) {
+        return Exe::Missing;
     }
     if b == *b"\x7fELF" {
-        return Some(true);
+        return Exe::Usable;
+    }
+    if !crate::self_file::is_self(&b) {
+        return Exe::Encrypted;
     }
     // (A SELF container whose segments are decrypted holds a usable ELF: `self_file`.)
-    Some(crate::self_file::is_self(&b) && executable_bytes(src, rel).is_ok())
+    match src.read(rel) {
+        Err(e) => Exe::Unusable(e.to_string()),
+        Ok(bytes) => match crate::self_file::decrypted_elf(&bytes) {
+            Ok(_) => Exe::Usable,
+            Err(e) if e == crate::self_file::ENCRYPTED => Exe::Encrypted,
+            Err(e) => Exe::Unusable(e),
+        },
+    }
 }
 
 /// A module's ELF: the file itself, or the ELF its decrypted SELF container holds (issue #8).
@@ -160,21 +185,23 @@ pub fn check(dir: &Path) -> Result<Game, Problem> {
     }
     // The decrypted executable: in `decrypted\` (as dumps keep it beside the encrypted one) or
     // the application folder's own.
-    let code_dir = if is_elf(&source, "decrypted/eboot.bin") == Some(true) {
+    let code_dir = if exe_state(&source, "decrypted/eboot.bin") == Exe::Usable {
         "decrypted"
     } else {
-        match is_elf(&source, "eboot.bin") {
-            Some(true) => "",
-            Some(false) => return Err(Problem::Encrypted),
-            None => return Err(Problem::NoExecutable),
+        match exe_state(&source, "eboot.bin") {
+            Exe::Usable => "",
+            Exe::Encrypted => return Err(Problem::Encrypted),
+            Exe::Unusable(why) => return Err(Problem::Unusable("eboot.bin".into(), why)),
+            Exe::Missing => return Err(Problem::NoExecutable),
         }
     };
     let under = |rel: &str| if code_dir.is_empty() { rel.to_string() } else { format!("{code_dir}/{rel}") };
     for m in MODULES {
-        match is_elf(&source, &under(&format!("sce_module/{m}"))) {
-            Some(true) => {}
-            Some(false) => return Err(Problem::EncryptedModule(m.into())),
-            None => return Err(Problem::NoModule(m.into())),
+        match exe_state(&source, &under(&format!("sce_module/{m}"))) {
+            Exe::Usable => {}
+            Exe::Encrypted => return Err(Problem::EncryptedModule(m.into())),
+            Exe::Unusable(why) => return Err(Problem::Unusable(format!("sce_module\\{m}"), why)),
+            Exe::Missing => return Err(Problem::NoModule(m.into())),
         }
     }
     if let Some(d) = DATA_DIRS.iter().find(|d| !source.is_dir(d)) {
@@ -231,7 +258,8 @@ mod tests {
         std::fs::create_dir_all(code.join("sce_module")).unwrap();
         std::fs::write(code.join("eboot.bin"), b"\x7fELF....").unwrap();
         if decrypted_dir {
-            std::fs::write(app.join("eboot.bin"), b"\x54\x14\xf5\xee....").unwrap();
+            // (The retail container beside it: a SELF whose segments are encrypted.)
+            std::fs::write(app.join("eboot.bin"), crate::self_file::tests::encrypted_sample()).unwrap();
         }
         for m in MODULES {
             std::fs::write(code.join("sce_module").join(m), b"\x7fELF....").unwrap();
@@ -255,6 +283,20 @@ mod tests {
         assert_eq!(check(&dump).unwrap_err(), Problem::NoModule("libc.prx".into()));
         std::fs::remove_dir_all(app.join("decrypted")).unwrap();
         assert_eq!(check(&dump).unwrap_err(), Problem::Encrypted);
+        // (A container cut short by a copy says why; an empty file is a missing one.)
+        let s = crate::self_file::tests::sample().1;
+        std::fs::write(app.join("eboot.bin"), &s[..s.len() - 0x40]).unwrap();
+        assert!(matches!(check(&dump).unwrap_err(), Problem::Unusable(f, why) if f == "eboot.bin" && why.contains("past its end")));
+        std::fs::write(app.join("eboot.bin"), b"").unwrap();
+        assert_eq!(check(&dump).unwrap_err(), Problem::NoExecutable);
+        // (The decrypted container itself is used as it is.)
+        std::fs::write(app.join("eboot.bin"), &s).unwrap();
+        std::fs::create_dir_all(app.join("sce_module")).unwrap();
+        for m in MODULES {
+            std::fs::write(app.join("sce_module").join(m), &s).unwrap();
+        }
+        assert_eq!(check(&dump).unwrap().code, app);
+        assert!(!Problem::Unusable("eboot.bin".into(), "x".into()).to_string().contains(';'));
         std::fs::remove_dir_all(&tmp).unwrap();
 
         let app = fake(&tmp, "01.006.000", false);
