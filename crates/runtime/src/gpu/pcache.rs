@@ -628,9 +628,11 @@ impl Crumb {
         static KEEP: OnceLock<bool> = OnceLock::new();
         let keep = *KEEP.get_or_init(|| std::env::var("DS_PIPELINE_CRUMBS").ok().as_deref() == Some("1"));
         let code = if keep { code() } else { Vec::new() };
+        let what = what();
+        inflight_mark(crumb_key(&what));
         CRUMB.with(|c| {
             if let Ok(mut g) = c.try_borrow_mut() {
-                *g = Some((what(), code));
+                *g = Some((what, code));
             }
         });
         Crumb
@@ -639,12 +641,95 @@ impl Crumb {
 
 impl Drop for Crumb {
     fn drop(&mut self) {
+        inflight_mark(None);
         CRUMB.with(|c| {
             if let Ok(mut g) = c.try_borrow_mut() {
                 *g = None;
             }
         });
     }
+}
+
+/// The compiles in flight, kept on disk (`inflight-<pid>.bin` in the store, 2026-11-24 night): a
+/// slot per compiling thread holds the pipeline it has the driver compile (`Crumb`), cleared when
+/// that compile ends; a clean shutdown removes the file (`clear_crash_suspects`). A session that
+/// ended otherwise, by an exit inside the driver no fault handler sees (a player's sessions on
+/// NVIDIA's 621.40 ended in their background compiles with nothing in their logs) or from
+/// outside, leaves it, and the next start lists those compiles as suspects
+/// (`confirm_left_suspects`): the same compile cannot end every session.
+struct Inflight {
+    file: std::fs::File,
+    next: std::sync::atomic::AtomicU32,
+}
+
+static INFLIGHT: OnceLock<Option<Inflight>> = OnceLock::new();
+/// The file: the driver's pipeline cache id (ASCII, zero-padded), then a slot a thread: the kind
+/// (a byte), seven bytes of padding, the key (little-endian).
+const INFLIGHT_HEADER: u64 = 128;
+const INFLIGHT_SLOT: u64 = 16;
+const INFLIGHT_SLOTS: u32 = 64;
+
+thread_local! {
+    static INFLIGHT_SLOT_OF: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+fn inflight_file(pid: u32) -> Option<PathBuf> {
+    DIR.get().map(|d| d.join(format!("inflight-{pid}.bin")))
+}
+
+fn inflight() -> Option<&'static Inflight> {
+    INFLIGHT
+        .get_or_init(|| {
+            use std::os::windows::fs::FileExt;
+            if READ_ONLY.load(Ordering::Relaxed) {
+                return None;
+            }
+            let (_, id) = IDENTITY.get()?;
+            let f = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(inflight_file(std::process::id())?).ok()?;
+            let mut header = [0u8; INFLIGHT_HEADER as usize];
+            let n = id.len().min(header.len());
+            header[..n].copy_from_slice(&id.as_bytes()[..n]);
+            f.seek_write(&header, 0).ok()?;
+            f.set_len(INFLIGHT_HEADER + INFLIGHT_SLOTS as u64 * INFLIGHT_SLOT).ok()?;
+            Some(Inflight { file: f, next: std::sync::atomic::AtomicU32::new(0) })
+        })
+        .as_ref()
+}
+
+/// This thread's compile in flight (`Crumb`): `Some` as it begins, `None` as it ends.
+fn inflight_mark(what: Option<(char, u64)>) {
+    use std::os::windows::fs::FileExt;
+    let Some(f) = inflight() else { return };
+    let slot = INFLIGHT_SLOT_OF.with(|s| {
+        s.get().unwrap_or_else(|| {
+            let n = f.next.fetch_add(1, Ordering::Relaxed);
+            s.set(Some(n));
+            n
+        })
+    });
+    if slot >= INFLIGHT_SLOTS {
+        return;
+    }
+    let mut b = [0u8; INFLIGHT_SLOT as usize];
+    if let Some((kind, key)) = what {
+        b[0] = kind as u8;
+        b[8..16].copy_from_slice(&key.to_le_bytes());
+    }
+    let _ = f.file.seek_write(&b, INFLIGHT_HEADER + slot as u64 * INFLIGHT_SLOT);
+}
+
+/// The compiles a dead session's `inflight-<pid>.bin` holds: its cache id and the pipelines.
+fn inflight_left(path: &Path) -> Option<(String, Vec<(char, u64)>)> {
+    let b = std::fs::read(path).ok()?;
+    let header = b.get(..INFLIGHT_HEADER as usize)?;
+    let id = String::from_utf8_lossy(&header[..header.iter().position(|&c| c == 0).unwrap_or(header.len())]).into_owned();
+    let mut v = Vec::new();
+    for s in b[INFLIGHT_HEADER as usize..].chunks_exact(INFLIGHT_SLOT as usize) {
+        if let (k @ (b'g' | b'c'), Ok(key)) = (s[0], <[u8; 8]>::try_from(&s[8..16])) {
+            v.push((k as char, u64::from_le_bytes(key)));
+        }
+    }
+    Some((id, v))
 }
 
 /// The driver faulted on this thread (`exception::veh_body`, at first chance): what it was
@@ -742,12 +827,19 @@ fn crashed_set() -> Option<&'static parking_lot::RwLock<Crashed>> {
         let mut s = Crashed::default();
         let mut suspects: std::collections::HashMap<(char, u64), u32> = std::collections::HashMap::new();
         if let Some(t) = crashed_file().and_then(|p| std::fs::read_to_string(p).ok()) {
+            let mut named = 0;
             for l in t.lines() {
                 let mut w = l.split_whitespace();
                 let (Some(k), Some(cid)) = (w.next(), w.next()) else { continue };
                 let suspect = w.next() == Some(SUSPECT_MARK);
                 let mut ch = k.chars();
                 if let (true, Some(kind @ ('g' | 'c')), Ok(key)) = (cid == id, ch.next(), u64::from_str_radix(ch.as_str(), 16)) {
+                    // (Each listed line in the log: which pipeline and shaders, for a player's
+                    // report.)
+                    if named < 16 {
+                        named += 1;
+                        crate::info!("pipeline cache: crashed.txt lists {}", l.chars().take(400).collect::<String>());
+                    }
                     s.background.insert((kind, key));
                     if suspect {
                         let n = suspects.entry((kind, key)).or_insert(0);
@@ -878,8 +970,14 @@ pub fn note_crash_suspect() {
     }
 }
 
-/// A clean shutdown: this process's suspects were handled by the driver, not fatal.
+/// A clean shutdown: this process's suspects were handled by the driver, not fatal; its compiles
+/// in flight (`Inflight`) ended with it.
 pub fn clear_crash_suspects() {
+    if INFLIGHT.get().is_some_and(|f| f.is_some())
+        && let Some(p) = inflight_file(std::process::id())
+    {
+        let _ = std::fs::remove_file(p);
+    }
     let Some(path) = suspect_file() else { return };
     let Ok(t) = std::fs::read_to_string(&path) else { return };
     let mine = format!("pid={} ", std::process::id());
@@ -895,23 +993,48 @@ fn confirm_left_suspects() {
     if READ_ONLY.load(Ordering::Relaxed) {
         return;
     }
-    let Ok(t) = std::fs::read_to_string(&path) else { return };
-    let mut kept = String::new();
-    for l in t.lines() {
-        let Some((pid, line)) = l.split_once(' ') else { continue };
-        let pid = pid.strip_prefix("pid=").and_then(|p| p.parse::<u32>().ok()).unwrap_or(0);
+    // (Pipelines a dead session's own first-chance note named: its compiles in flight below are
+    // not counted again for that session.)
+    let mut noted: std::collections::HashSet<(u32, String)> = std::collections::HashSet::new();
+    if let Ok(t) = std::fs::read_to_string(&path) {
+        let mut kept = String::new();
+        for l in t.lines() {
+            let Some((pid, line)) = l.split_once(' ') else { continue };
+            let pid = pid.strip_prefix("pid=").and_then(|p| p.parse::<u32>().ok()).unwrap_or(0);
+            if pid == std::process::id() || process_alive(pid) {
+                kept.push_str(l);
+                kept.push('\n');
+                continue;
+            }
+            // (`<kind><key> <cache id> suspect: <what>`.)
+            let mut w = line.splitn(3, ' ');
+            if let (Some(k), Some(cid)) = (w.next(), w.next()) {
+                append_line(&crashed, &format!("{k} {cid} {SUSPECT_MARK} {}", w.next().unwrap_or("")));
+                noted.insert((pid, k.to_string()));
+            }
+        }
+        let _ = if kept.is_empty() { std::fs::remove_file(&path) } else { std::fs::write(&path, kept) };
+    }
+    // Compiles in flight when a session ended without a clean exit (`Inflight`).
+    let Some(dir) = DIR.get() else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(pid) = name.strip_prefix("inflight-").and_then(|s| s.strip_suffix(".bin")).and_then(|s| s.parse::<u32>().ok()) else { continue };
         if pid == std::process::id() || process_alive(pid) {
-            kept.push_str(l);
-            kept.push('\n');
             continue;
         }
-        // (`<kind><key> <cache id> suspect: <what>`.)
-        let mut w = line.splitn(3, ' ');
-        if let (Some(k), Some(cid)) = (w.next(), w.next()) {
-            append_line(&crashed, &format!("{k} {cid} {SUSPECT_MARK} {}", w.next().unwrap_or("")));
+        if let Some((cid, pipelines)) = inflight_left(&e.path()) {
+            for (kind, key) in pipelines {
+                let k = format!("{kind}{key:016x}");
+                if !noted.contains(&(pid, k.clone())) {
+                    crate::warn!("pipeline cache: {k} was being compiled when an earlier session (process {pid}) ended without a clean exit: a suspect (crashed.txt)");
+                    append_line(&crashed, &format!("{k} {cid} {SUSPECT_MARK} in flight when session {pid} ended"));
+                }
+            }
         }
+        let _ = std::fs::remove_file(e.path());
     }
-    let _ = if kept.is_empty() { std::fs::remove_file(&path) } else { std::fs::write(&path, kept) };
 }
 
 /// Whether process `pid` still runs (a suspect's session beside this one).
@@ -953,6 +1076,11 @@ pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result
         if kind != 'q' && key % n == 0 {
             crate::warn!("pipeline cache: {kind}{key:016x} faults now in its compile (DS_SIM_COMPILER_CRASH={n})");
             crate::log::try_flush();
+            // (`DS_SIM_COMPILER_CRASH_MODE=abort`: a fail-fast exit no fault handler sees, as the
+            // sessions on NVIDIA's 621.40 ended: only the compiles in flight tell, `Inflight`.)
+            if std::env::var("DS_SIM_COMPILER_CRASH_MODE").ok().as_deref() == Some("abort") {
+                std::process::abort();
+            }
             SIM_CRASHING.with(|c| c.set(true));
             // SAFETY: none; a deliberate access violation, as the driver's own crash.
             unsafe { std::ptr::write_volatile(std::ptr::without_provenance_mut::<u64>(8), 0) };
