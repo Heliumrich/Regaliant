@@ -760,6 +760,9 @@ pub fn disasm(inst: &Inst) -> String {
             if inst.smem_soffset() != OP_NULL {
                 let _ = write!(s, " + {}", operand_name(inst.smem_soffset()));
             }
+            if inst.glc() {
+                s.push_str(" glc");
+            }
         }
         Enc::Vop1 | Enc::Vop2 | Enc::Vopc => {
             let mut parts = Vec::new();
@@ -853,6 +856,9 @@ pub fn disasm(inst: &Inst) -> String {
             if inst.enc == Enc::Mtbuf {
                 let _ = write!(s, " format:{}", inst.mtbuf_format());
             }
+            if inst.glc() {
+                s.push_str(" glc");
+            }
         }
         Enc::Mimg => {
             let mut addrs = vec![format!("v{}", bits(inst.w1, 0, 8))];
@@ -902,6 +908,9 @@ pub fn disasm(inst: &Inst) -> String {
                 operand_name(inst.flat_saddr()),
                 inst.flat_offset()
             );
+            if inst.glc() {
+                s.push_str(" glc");
+            }
         }
     }
     s
