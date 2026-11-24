@@ -74,7 +74,7 @@ impl std::fmt::Display for Problem {
             Problem::Version(v) => write!(f, "This is version {v} of the game. This port needs version {VERSION}."),
             Problem::Param(e) => write!(f, "The game's sce_sys\\param.json could not be read ({e})."),
             Problem::NoExecutable => write!(f, "The game's eboot.bin is missing."),
-            Problem::Encrypted => write!(f, "The game's eboot.bin is encrypted. The port needs the decrypted eboot.bin, in the game folder or in its decrypted folder."),
+            Problem::Encrypted => write!(f, "The game's eboot.bin is encrypted. The port needs the decrypted eboot.bin (a plain ELF, or a SELF with decrypted segments), in the game folder or in its decrypted folder."),
             Problem::NoModule(m) => write!(f, "{m} is missing. The port needs the game's decrypted libraries in sce_module."),
             Problem::EncryptedModule(m) => write!(f, "{m} is encrypted. The port needs the game's decrypted libraries in sce_module."),
             Problem::MissingData(d) => write!(f, "The game's {d} folder is missing. The game files are incomplete."),
@@ -105,7 +105,23 @@ pub fn locate(dir: &Path) -> Option<PathBuf> {
 fn is_elf(src: &Source, rel: &str) -> Option<bool> {
     let f = src.open_file(rel).ok()?;
     let mut b = [0u8; 4];
-    (f.read_at(0, &mut b).ok()? == 4).then_some(b == *b"\x7fELF")
+    if f.read_at(0, &mut b).ok()? != 4 {
+        return Some(false);
+    }
+    if b == *b"\x7fELF" {
+        return Some(true);
+    }
+    // (A SELF container whose segments are decrypted holds a usable ELF: `self_file`.)
+    Some(crate::self_file::is_self(&b) && executable_bytes(src, rel).is_ok())
+}
+
+/// A module's ELF: the file itself, or the ELF its decrypted SELF container holds (issue #8).
+pub fn executable_bytes(src: &Source, rel: &str) -> Result<Vec<u8>, String> {
+    let bytes = src.read(rel).map_err(|e| format!("{rel}: {e}"))?;
+    if crate::self_file::is_self(&bytes) {
+        return crate::self_file::decrypted_elf(&bytes).map_err(|e| format!("{rel}: {e}"));
+    }
+    Ok(bytes)
 }
 
 /// The title's id and content version from `sce_sys/param.json`.
@@ -173,11 +189,19 @@ pub fn check(dir: &Path) -> Result<Game, Problem> {
 
 /// Whether the executable is the one the port was tested with (its SHA-256).
 pub fn tested_executable(g: &Game) -> std::io::Result<bool> {
+    let rel = if g.code_dir.is_empty() { "eboot.bin".to_string() } else { format!("{}/eboot.bin", g.code_dir) };
+    // (A decrypted SELF container: the ELF it holds, rebuilt byte for byte, is what is compared.)
+    let f = g.source.open_file(&rel)?;
+    let mut head = [0u8; 4];
+    if f.read_at(0, &mut head)? == 4 && crate::self_file::is_self(&head) {
+        let elf = executable_bytes(&g.source, &rel).map_err(std::io::Error::other)?;
+        let mut sha = crate::sha::Sha256::new()?;
+        sha.update(&elf)?;
+        return Ok(crate::sha::hex(&sha.finish()?) == TESTED_EBOOT);
+    }
     if let Source::Dir(_) = &g.source {
         return Ok(crate::sha::file_sha256(&g.code.join("eboot.bin"))? == TESTED_EBOOT);
     }
-    let rel = if g.code_dir.is_empty() { "eboot.bin".to_string() } else { format!("{}/eboot.bin", g.code_dir) };
-    let f = g.source.open_file(&rel)?;
     let mut sha = crate::sha::Sha256::new()?;
     let mut buf = vec![0u8; 8 << 20];
     let mut off = 0u64;

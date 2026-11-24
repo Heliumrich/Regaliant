@@ -22,7 +22,7 @@ What you need
   a .zar archive of that folder. The folder holds sce_sys, the game's data folders and
   eboot.bin. The executable and its two libraries must be decrypted: a decrypted eboot.bin (in
   the folder or in its "decrypted" folder) and decrypted libc.prx and libSceNpCppWebApi.prx in
-  sce_module.
+  sce_module, as plain ELF files or in their SELF containers with the segments decrypted.
 - Windows 10 or 11, 64-bit.
 - A graphics card and driver with Vulkan 1.3.
 - A processor with AVX2 (Intel from 2013 on, AMD Ryzen).

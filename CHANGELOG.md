@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Game folders whose executable and libraries are decrypted but still in their SELF containers
+  (as some dumps keep them) now work as they are. Before, the launcher called them encrypted and
+  they had to be converted to ELF files first.
+
 ## 0.1.2
 
 - On RTX 50-series graphics cards (and AMD and Intel ones) the game's shaders now tell the driver

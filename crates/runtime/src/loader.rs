@@ -115,6 +115,15 @@ pub fn load(path: &Path, is_main: bool) -> Result<Arc<LoadedModule>, String> {
 
 /// `load` of a module's bytes read already (from the game's archive); `path` names it.
 pub fn load_bytes(bytes: Vec<u8>, path: &Path, is_main: bool) -> Result<Arc<LoadedModule>, String> {
+    // (A decrypted SELF container: the ELF it holds, rebuilt as `dsconfig::self_file` does;
+    // issue #8.)
+    let bytes = if dsconfig::self_file::is_self(&bytes) {
+        let elf = dsconfig::self_file::decrypted_elf(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+        crate::info!("{}: a SELF container with decrypted segments: its ELF rebuilt ({} bytes)", path.display(), elf.len());
+        elf
+    } else {
+        bytes
+    };
     let m = Module::parse(bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     let dynamic = m.dynamic().map_err(|e| format!("{}: {e}", path.display()))?;
     let image_size = m.image_span(PAGE);
