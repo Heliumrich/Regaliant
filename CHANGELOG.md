@@ -21,6 +21,11 @@
 - On PCs with integrated graphics beside the graphics card, other programs' video memory was
   counted on both, which could make the game drop textures early. Only the card the game uses
   counts now.
+- Playing on Linux through Wine or Proton (issue #14): the log now names Wine and how fast it
+  tracks memory writes, and the launcher says when that makes loading very slow. Wine before
+  10.10, Proton before 9 and any Linux before 6.7 track them without the kernel's help, which
+  made a load into Boletaria crawl for minutes. Proton 9+ or Wine 10.10+ on Linux 6.7+ track
+  them in the kernel.
 - The launcher has an Uninstall button (issue #19). It removes Regaliant's program files,
   prepared shaders, logs and settings, never your game files or add-ons, and asks before
   deleting your saves.

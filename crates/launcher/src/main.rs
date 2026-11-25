@@ -432,7 +432,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 /// The opening status line: a game still running, or a session that did not end normally.
 fn startup_status(app: &mut App) {
     let marker = app.paths.running_marker();
-    let Ok(t) = std::fs::read_to_string(&marker) else { return };
+    let Ok(t) = std::fs::read_to_string(&marker) else {
+        // (Under Wine without the kernel's write tracking the game runs many times slower than
+        // on Windows, loads above all: issue #14, 2026-11-25 night, `dsconfig::wine`.)
+        if let Some(n) = dsconfig::wine::detect().and_then(|w| dsconfig::wine::slow_notice(Some(&w), dsconfig::wine::write_watch_cost_ns())) {
+            app.set_status(n);
+        }
+        return;
+    };
     let pid = t.lines().find_map(|l| l.strip_prefix("pid ")).and_then(|p| p.trim().parse::<u32>().ok());
     if let Some(pid) = pid.filter(|&p| sys::process_alive(p)) {
         app.running = Some(pid);

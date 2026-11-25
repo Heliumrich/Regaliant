@@ -1944,6 +1944,28 @@ fn build_id() -> String {
 }
 
 /// The command line, the memory and Windows' build (the run's log, for a player's report).
+/// Under Wine (a Linux or macOS PC through Wine or Proton): its version and host, and what a
+/// write to a write-watched page costs after a reset (`dsconfig::wine`); on Windows the cost
+/// alone (about 0.5 us here). Issue #14, 2026-11-25 night: a player's first load into
+/// Boletaria under a Wine without the kernel's write tracking read the files a load here
+/// reads 7 to 27 times slower and had not finished after six minutes; nothing in the log
+/// said Wine.
+fn note_wine() {
+    let wine = dsconfig::wine::detect();
+    let cost = dsconfig::wine::write_watch_cost_ns();
+    let cost_text = cost.map_or("unknown (write watching missing or not reporting writes)".to_string(), |c| format!("{c:.0} ns"));
+    let Some(w) = &wine else {
+        info!("write watch: a write after a reset costs {cost_text} a page");
+        return;
+    };
+    let maps = dsconfig::wine::max_map_count().map_or(String::new(), |n| format!("; vm.max_map_count {n}"));
+    if dsconfig::wine::slow_notice(Some(w), cost).is_some() {
+        warn!("host: {}: a write after a reset costs {cost_text} a page{maps}: this Wine tracks writes without the kernel's help (a signal at each page's first write after a check, under one lock for the whole process), so the game runs many times slower than on Windows, loads above all; Proton 9+ or Wine 10.10+ on Linux 6.7+ track them in the kernel", w.describe());
+    } else {
+        info!("host: {}: a write after a reset costs {cost_text} a page{maps}", w.describe());
+    }
+}
+
 fn system_line() -> String {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mem = {
@@ -2418,6 +2440,8 @@ This happens when other software takes that range. Restart the PC and try again.
     hle::LENIENT_IMPORTS.store(cfg.lenient, std::sync::atomic::Ordering::Relaxed);
     info!("Regaliant {} (build {}) | run dir {} | TLS slot {} | host heap: {} | guest write watch: {}", env!("REGALIANT_VERSION"), build_id(), cfg.run_dir.display(), slot, heap::name(), mem::write_watch_state());
     info!("start: {}", system_line());
+    // (Under Wine, and what a write-watched page costs: issue #14.)
+    note_wine();
     // (Windows of the guest range other memory of the process held at its reservation, issue #15.)
     mem::note_host_holes();
     info!("files: {:?} layout, settings and saves in {}, logs and caches in {}", cfg.paths.layout, cfg.paths.user.display(), cfg.paths.cache.display());
