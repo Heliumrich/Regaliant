@@ -8,9 +8,12 @@
 - Fixed a crash inside the graphics driver a few seconds after DLSS started, seen here with the
   newest DLSS file (310.9.16). When the game combined two batches of graphics work, it gave the
   upscaler the wrong command buffer. DLSS, FSR and XeSS now draw into the right one.
-- The shader preparation no longer loads the upscalers. Its hidden sessions show nothing, so a
-  saved DLSS choice cannot get in its way.
+- The shader preparation now always uses the game's own TAA, even with an upscaler saved. Its
+  hidden sessions show nothing, so a saved DLSS choice cannot get in its way.
 - A crash inside the graphics driver now leaves a line in the log that names where it happened.
+- 'portable.txt' can now name a folder of your own (issue #19). Write the folder's path in the
+  file, and settings, saves, logs and prepared shaders go there. An empty file still uses the
+  'user' folder beside the game.
 
 ## 0.1.6
 
