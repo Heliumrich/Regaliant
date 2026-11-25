@@ -1028,6 +1028,7 @@ fn reserve_guest_range_once() {
     // status 10, naming the region.)
     if env_is("DS_SIM_OCCUPIED", "1") {
         unsafe { VirtualAlloc((GUEST_BASE + 0x1000_0000) as _, 0x1_0000, MEM_RESERVE, PAGE_NOACCESS) };
+        sim_module();
     }
     // Section-backed guest memory (no write watching: views have none).
     if env_is("DS_SECTIONS", "1") && crate::sections::reserve(GUEST_BASE, size as u64, DMEM_SIZE, ANON_SIZE).is_ok() {
@@ -1060,6 +1061,30 @@ fn reserve_guest_range_once() {
     let p = unsafe { VirtualAlloc(GUEST_BASE as _, size, MEM_RESERVE, PAGE_NOACCESS) };
     if !p.is_null() {
         RESERVED_EARLY.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// `DS_SIM_MODULE=<dll path>` (a test, with `DS_SIM_OCCUPIED=1`): that module loaded before the
+/// reservation, as a tool another program puts into every process would be, for the failed
+/// start's list of such modules (`foreign_modules`). Read without allocating (the heap may not be
+/// set up yet).
+fn sim_module() {
+    use windows_sys::Win32::System::Environment::GetEnvironmentVariableW;
+    use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
+    const NAME: [u16; 14] = {
+        let b = b"DS_SIM_MODULE\0";
+        let mut a = [0u16; 14];
+        let mut i = 0;
+        while i < a.len() {
+            a[i] = b[i] as u16;
+            i += 1;
+        }
+        a
+    };
+    let mut buf = [0u16; 520];
+    let len = unsafe { GetEnvironmentVariableW(NAME.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if len > 0 && len < buf.len() {
+        unsafe { LoadLibraryW(buf.as_ptr()) };
     }
 }
 
@@ -1926,9 +1951,52 @@ pub fn reserve_guest_range() -> Result<(), String> {
             }
             addr = info.BaseAddress as u64 + info.RegionSize as u64;
         }
-        return Err(format!("reserving guest range failed (error {err}); occupied: {}", busy.join("; ")));
+        // (Private memory names no owner: the modules other programs put into this process
+        // before it reserved the range are its likely owners, issue #15.)
+        let others = foreign_modules();
+        let others = if others.is_empty() { String::new() } else { format!("; other programs' modules loaded: {}", others.join(", ")) };
+        return Err(format!("reserving guest range failed (error {err}); occupied: {}{others}", busy.join("; ")));
     }
     Ok(())
+}
+
+/// The modules loaded in this process that are neither Windows' own (under its folder) nor this
+/// program's (its folder): on a failed start, the likely owners of private memory in the guest
+/// range, such as a tool another program puts into every process (issue #15). At most 16.
+fn foreign_modules() -> Vec<String> {
+    use windows_sys::Win32::Foundation::HMODULE;
+    use windows_sys::Win32::System::ProcessStatus::{K32EnumProcessModules, K32GetModuleFileNameExW};
+    use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let proc = unsafe { GetCurrentProcess() };
+    let mut mods: [HMODULE; 512] = [std::ptr::null_mut(); 512];
+    let mut needed = 0u32;
+    if unsafe { K32EnumProcessModules(proc, mods.as_mut_ptr(), std::mem::size_of_val(&mods) as u32, &mut needed) } == 0 {
+        return Vec::new();
+    }
+    let n = (needed as usize / std::mem::size_of::<HMODULE>()).min(mods.len());
+    let mut wdir = [0u16; 260];
+    let wl = unsafe { GetSystemWindowsDirectoryW(wdir.as_mut_ptr(), wdir.len() as u32) } as usize;
+    let windows = if wl > 0 && wl < wdir.len() { format!("{}\\", String::from_utf16_lossy(&wdir[..wl]).trim_end_matches('\\').to_ascii_lowercase()) } else { String::new() };
+    let own = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| format!("{}\\", d.to_string_lossy().trim_end_matches('\\').to_ascii_lowercase())));
+    let mut out = Vec::new();
+    for &m in &mods[..n] {
+        let mut name = [0u16; 512];
+        let len = unsafe { K32GetModuleFileNameExW(proc, m, name.as_mut_ptr(), name.len() as u32) } as usize;
+        if len == 0 || len >= name.len() {
+            continue;
+        }
+        let path = String::from_utf16_lossy(&name[..len]);
+        let low = path.to_ascii_lowercase();
+        if (!windows.is_empty() && low.starts_with(&windows)) || own.as_deref().is_some_and(|d| low.starts_with(d)) {
+            continue;
+        }
+        out.push(users_folder_hidden(&crate::log::redact(&path)));
+        if out.len() == 16 {
+            break;
+        }
+    }
+    out
 }
 
 /// `path` with the folder after `\Users\` shown as `<user>`: a mapped file's name comes as a

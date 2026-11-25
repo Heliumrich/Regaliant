@@ -172,8 +172,10 @@ pub fn items() -> Vec<Item> {
         Item {
             id: s("MouseMotionBlur"),
             label: s("Motion Blur Fix"),
-            tooltip: s("On keeps plants sharp while the camera moves. Off uses the game's Motion Blur."),
-            kind: ItemKind::Choice(vec![s("Off"), s("Reduced Blur"), s("On")], 2),
+            // (Named by what each gives: "Off" read as no blur and gave the game's full blur to a
+            // player who saw every camera move smear, issue #6, 2026-11-25. The values stay.)
+            tooltip: s("No Blur keeps plants sharp while the camera moves. Game's Blur uses the game's Motion Blur."),
+            kind: ItemKind::Choice(vec![s("Game's Blur"), s("Reduced Blur"), s("No Blur")], 2),
         },
         Item {
             id: s("MouseSensitivity"),

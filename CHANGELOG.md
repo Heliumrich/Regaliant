@@ -1,5 +1,15 @@
 # Changelog
 
+## Next version (not released yet)
+
+- Motion Blur Fix's choices are now named by what they give: No Blur (the default), Reduced
+  Blur and Game's Blur. They were On, Reduced Blur and Off, and "Off" read as no blur while it
+  turned on the game's full motion blur, which smears every camera move (issue #6). Your saved
+  choice stays as it was.
+- When another program holds part of the memory the game needs ("status 10"), the message and
+  `early-failure.txt` now also list the modules other programs put into the game at that
+  moment, so the program can be found (issue #15).
+
 ## 0.1.7
 
 - Fixed the crash with Aspect Ratio 21:9 or 32:9 and Visual Mode Cinematic, also at every
