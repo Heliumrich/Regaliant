@@ -283,8 +283,9 @@ pub extern "sysv64" fn hook_display(regs: *const u64, _arg: u32) {
     }
 }
 
-/// The render size for a window area of `w`x`h` at `pct` percent: 16:9, the height a multiple
-/// of 4 from 360 to 2160, the width the height's 16:9 rounded to a multiple of 4.
+/// The render size for a window area of `w`x`h` at `pct` percent: the output's shape, the height
+/// a multiple of 4 from 360 to `max_lines` (2160, or 1512 at shapes wider than 16:9), the width
+/// the height's at that shape rounded to a multiple of 4.
 pub fn scaled_size(w: u32, h: u32, pct: u32) -> (u32, u32) {
     let (ow, oh) = output_size();
     scaled_for(w, h, pct, ow, oh)
