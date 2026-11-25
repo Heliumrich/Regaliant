@@ -1373,30 +1373,30 @@ unsafe fn veh_body(info: *mut EXCEPTION_POINTERS) -> i32 {
                 if matches!(code, 0xC0000005 | 0xC0000094 | 0xC000001D | 0x80000003) {
                     if let Some(what) = crate::gpu::pcache::crumb_report() {
                         let module = module_offset(rip).map_or_else(|| format!("{rip:#x}"), |(m, o)| format!("{m}+{o:#x}"));
-                        crate::warn!("driver fault {code:#010x} at {module} while compiling {what}");
-                        crate::log::try_flush();
-                        // (A suspect: the driver's own handlers may still take it. The fatal
-                        // report confirms it, `pcache::note_crash_suspect`.)
-                        crate::gpu::pcache::note_crash_suspect();
                         // (Under the port's host the game has a debugger attached, so code that
                         // breaks only for a debugger breaks here, and the host passes every such
                         // exception on: the process ended with 0x80000003 where a game without a
-                        // debugger goes on, the review of 2026-11-25. Stepped over, as without a
-                        // debugger; the suspect line stays in case it was fatal after all.)
+                        // debugger goes on (the first review of 2026-11-25). Stepped over, as
+                        // without a debugger: a one-byte int3 (Windows reports a breakpoint at
+                        // the int3's own byte), not one in a run of 0xCC padding (a stray jump),
+                        // the first in the compile only, the compile's binaries then not kept;
+                        // no suspect line for it, the compile's in-flight record covers a death
+                        // after it (the second review).)
                         if code == 0x80000003 && crate::hosted::on() {
                             let at = rip as *const u8;
-                            let len = match (*at, *at.add(1)) {
-                                (0xCC, _) => 1,
-                                (0xCD, 0x03) => 2,
-                                _ => 0,
-                            };
-                            if len > 0 {
-                                (*(*info).ContextRecord).Rip += len;
+                            let padding = rip & 0xFFF != 0xFFF && *at.add(1) == 0xCC;
+                            if *at == 0xCC && !padding && crate::gpu::pcache::note_stepped_break() {
+                                (*(*info).ContextRecord).Rip += 1;
                                 crate::warn!("driver debug break at {module} while compiling {what}: stepped over, as a game without a debugger goes on (the port's host is one)");
                                 crate::log::try_flush();
                                 return -1; // EXCEPTION_CONTINUE_EXECUTION
                             }
                         }
+                        crate::warn!("driver fault {code:#010x} at {module} while compiling {what}");
+                        crate::log::try_flush();
+                        // (A suspect: the driver's own handlers may still take it. The fatal
+                        // report confirms it, `pcache::note_crash_suspect`.)
+                        crate::gpu::pcache::note_crash_suspect();
                     }
                 }
                 return EXCEPTION_CONTINUE_SEARCH;

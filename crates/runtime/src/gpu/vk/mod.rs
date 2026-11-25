@@ -418,13 +418,14 @@ fn init_inner() -> Result<(), String> {
             let _ = du.create_debug_utils_messenger(&mci, None);
         }
         // Pick a device the port can use: Vulkan 1.3, a graphics+compute queue and the extensions
-        // it always enables; a card's own driver before a translation layer's device of the same
-        // card (Microsoft's D3D12 one, installed with Windows' compatibility pack, lists every
-        // card again, without push descriptors), a discrete one before others, the last of
-        // equals. (Until 2026-11-25 the last discrete device was taken whatever it offered: a
-        // player's RTX 3060 Ti failed with "vkCreateDevice: Extension specified does not
-        // exist", likely such a device; the review of that night.) None usable: the old rule,
-        // and its error.
+        // it always enables; a native driver before a translation layer's device (Microsoft's
+        // D3D12 one, installed with Windows' compatibility pack, lists every card again, without
+        // push descriptors), then by kind: discrete, integrated, virtual, the CPU's; among
+        // equals the last discrete one, else the first (the old rule; a CPU driver such as
+        // lavapipe passes every check, the second review of 2026-11-25). (Until 2026-11-25 the
+        // last discrete device was taken whatever it offered: a player's RTX 3060 Ti failed with
+        // "vkCreateDevice: Extension specified does not exist", likely such a device.) None
+        // usable: the old rule, and its error.
         let pdevs = instance.enumerate_physical_devices().map_err(|e| format!("enumerate devices: {e}"))?;
         let mut chosen: Option<(vk::PhysicalDevice, u32, vk::PhysicalDeviceProperties)> = None;
         let mut chosen_rank = i32::MIN;
@@ -466,8 +467,14 @@ fn init_inner() -> Result<(), String> {
                     fallback = Some((pd, qf as u32, props));
                 }
                 if lacks.is_empty() {
-                    let rank = if layered { 0 } else { 4 } + if discrete { 2 } else { 0 };
-                    if rank >= chosen_rank {
+                    let kind = match props.device_type {
+                        vk::PhysicalDeviceType::DISCRETE_GPU => 3,
+                        vk::PhysicalDeviceType::INTEGRATED_GPU => 2,
+                        vk::PhysicalDeviceType::VIRTUAL_GPU => 1,
+                        _ => 0,
+                    };
+                    let rank = if layered { 0 } else { 10 } + kind;
+                    if rank > chosen_rank || (rank == chosen_rank && discrete) {
                         chosen_rank = rank;
                         chosen = Some((pd, qf as u32, props));
                     }
@@ -476,7 +483,7 @@ fn init_inner() -> Result<(), String> {
         }
         // (Every card Vulkan lists, for a player's report: a laptop with two graphics chips.)
         crate::info!(
-            "Vulkan devices: {} (taken: a usable one, a card's own driver before a translation layer, discrete before others, the last of equals; none usable: the last discrete one, else the first)",
+            "Vulkan devices: {} (taken: a usable one, a native driver before a translation layer, then discrete, integrated, virtual, the CPU's, among equals the last discrete one, else the first; none usable: the last discrete one, else the first)",
             seen.join(", ")
         );
         let (pdev, qf, props) = chosen.or(fallback).ok_or("no Vulkan device with graphics+compute")?;

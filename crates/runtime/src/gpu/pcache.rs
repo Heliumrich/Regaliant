@@ -618,6 +618,21 @@ thread_local! {
     /// mass rebuilds: FINDINGS.md 2026-11-15 evening), with its stages' SPIR-V saved into the
     /// run directory under `DS_PIPELINE_CRUMBS=1`.
     static CRUMB: std::cell::RefCell<Option<(String, Vec<(&'static str, Vec<u32>)>)>> = const { std::cell::RefCell::new(None) };
+    /// The driver stopped on a debug break in this thread's compile and it was stepped over
+    /// (`exception`, under the port's host): at most one a compile, and such a compile's
+    /// binaries are not kept for later sessions (the second review of 2026-11-25).
+    static STEPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The fault handler may step over a driver's debug break in this thread's compile: the first in
+/// a compile only (true, and noted), never a second one.
+pub fn note_stepped_break() -> bool {
+    STEPPED.with(|s| !s.replace(true))
+}
+
+/// This thread's compile had a debug break stepped over (`note_stepped_break`).
+pub fn stepped_in_compile() -> bool {
+    STEPPED.with(|s| s.get())
 }
 
 /// A pipeline compile's note (`CRUMB`) for as long as it lives.
@@ -630,6 +645,7 @@ impl Crumb {
         let code = if keep { code() } else { Vec::new() };
         let what = what();
         inflight_mark(crumb_key(&what));
+        STEPPED.with(|s| s.set(false));
         CRUMB.with(|c| {
             if let Ok(mut g) = c.try_borrow_mut() {
                 *g = Some((what, code));
@@ -1196,7 +1212,13 @@ pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result
     sim_compile_delay();
     let r = create(Via { cache: vk::PipelineCache::null(), capture: true, binaries: None });
     CREATING.fetch_sub(1, Ordering::Relaxed);
-    if let (Ok(pipe), Some(p)) = (&r, &path) {
+    // (A compile whose driver stopped on a debug break that was stepped over: made for this
+    // session, its binaries not kept, as the break may have been an assertion.)
+    let stepped = stepped_in_compile();
+    if stepped {
+        crate::warn!("pipeline cache: {kind}{key:016x}'s binaries not kept: its compile had a driver debug break stepped over");
+    }
+    if let (Ok(pipe), Some(p), false) = (&r, &path, stepped) {
         let t = std::time::Instant::now();
         match pb.capture(*pipe, &|k| shared_path(k).is_some_and(|p| p.exists())) {
             Ok(bins) => {
