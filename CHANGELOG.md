@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.6
 
 - Fixed the shader preparation and the game ending when the graphics driver stops on a debug
   break while it compiles a shader (seen with NVIDIA's driver 621.40 as "crashed (status
