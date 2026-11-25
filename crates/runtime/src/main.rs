@@ -423,7 +423,7 @@ pub fn keep_run(reason: &str) {
 ///   pcset <setting> <value>  a PC setting (`Setting_PC_...`) as if changed in the SETTINGS screen
 ///   convars                  the PC settings' title console variables and their values
 ///   convar <name> <value>    one of them set (`title`: the title's own again; tests)
-///   shot <name>              screenshot of the next presented flip -> shot_<name>.png
+///   shot <name>              screenshot of the next presented flip -> <name>.png (the run directory)
 ///   burst <name> <n> [x y w h] [half]  shots of the next n flips, each one (cropped, at half size) -> <name>_NNN.png
 ///   dump                     dump all GPU images at the next flip
 ///   trace                    log every draw/dispatch of an upcoming flip (FRAME lines)
@@ -1783,15 +1783,33 @@ fn host_thread_stacks() -> String {
     s
 }
 
-/// Ctrl+F10 in the window: the `stacks` report (each thread's wait and stack, the GPU queues,
-/// the audio) written to the log, for a player's report of a hang the game still draws through
-/// (issue #14: a loading screen that never ends, its fog moving at 60 fps). On a thread of its
-/// own, so the window's messages go on meanwhile.
+/// Ctrl+F10 in the window: what every thread waits on, then the stacks (the `stacks` report:
+/// ours and the title's, the GPU queues, the audio), written to the log, for a player's report
+/// of a hang the game still draws through (issue #14: a loading screen that never ends, its fog
+/// moving at 60 fps). On a thread of its own, so the window's messages go on meanwhile. The waits
+/// come first because they need no thread to answer; the stacks need each thread's context, and
+/// a thread stuck inside the driver may never give it (`stacks_bounded` waits 20 s). One report
+/// at a time; none after one whose stacks were not taken (its sampling thread may still wait).
 pub(crate) fn stacks_hotkey() {
-    let _ = std::thread::Builder::new().name("stacks-hotkey".into()).spawn(|| {
-        let flip = gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
-        info!("Ctrl+F10 at flip {flip}: every thread, what it waits on and its stack:\n{}", thread_summary_ex(true));
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static BUSY: AtomicBool = AtomicBool::new(false);
+    if BUSY.swap(true, Ordering::SeqCst) {
+        info!("Ctrl+F10: the previous report is not finished (or its stacks were not taken): none now");
+        return;
+    }
+    let spawned = std::thread::Builder::new().name("stacks-hotkey".into()).spawn(|| {
+        let flip = gpu::FRAMES.load(Ordering::Relaxed);
+        info!("Ctrl+F10 at flip {flip}: every thread and what it waits on:\n{}", thread_summary_ex(false));
+        let stacks = stacks_bounded();
+        let taken = !stacks.starts_with("the threads' stacks were not taken");
+        info!("Ctrl+F10 at flip {flip}: the stacks:\n{stacks}");
+        if taken {
+            BUSY.store(false, Ordering::SeqCst);
+        }
     });
+    if spawned.is_err() {
+        BUSY.store(false, Ordering::SeqCst);
+    }
 }
 
 fn thread_summary_ex(with_stacks: bool) -> String {

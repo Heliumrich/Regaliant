@@ -53,5 +53,3 @@ Unzip the new release over the old one or into a new folder, and start its 'rega
 Delete the folder. Settings and saves are in '%APPDATA%\Regaliant', logs and prepared shaders in '%LOCALAPPDATA%\Regaliant'.
 
 To keep everything in one place instead, put an empty file named 'portable.txt' next to 'regaliant.exe'. Settings, saves, logs and prepared shaders then go to a 'user' folder beside it, and deleting the game's folder removes them all. To keep your saves and settings, first copy what '%APPDATA%\Regaliant' holds into that 'user' folder.
-
-To use a folder of your own instead, write its path in 'portable.txt', for example 'D:\Games\Regaliant data'. Everything then goes there, and deleting the game's folder leaves it. A short path such as 'data' means a folder inside the game's folder.

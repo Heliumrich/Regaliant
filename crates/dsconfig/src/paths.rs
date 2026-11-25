@@ -7,7 +7,7 @@
 //!   install: 2026-11-15, one run from there took the development layout, whose GPU work is off
 //!   unless the run sets DS_GPU=1, and showed a black screen.
 //! - Portable (`portable.txt` beside the executable, or `DSPORT_HOME=<folder>`): everything in
-//!   `<exe folder>\user`, the folder the file names, or `DSPORT_HOME`.
+//!   `<exe folder>\user` (or that folder).
 //! - Installed (anything else): settings, key bindings, saves and their backups in
 //!   `%APPDATA%\Regaliant`; logs, prepared shaders and the game's own runtime folders in
 //!   `%LOCALAPPDATA%\Regaliant`.
@@ -70,27 +70,6 @@ fn dev_root(dir: &Path) -> Option<PathBuf> {
     None
 }
 
-/// The folder `portable.txt` names (issue #19: a folder of the player's own without links in the
-/// game's folder): its first line that is not blank, without quotes around it (UTF-8, with or
-/// without a byte-order mark, or UTF-16 as Notepad's "Unicode"; a relative path is taken from the
-/// executable's folder). An empty file, or a folder that cannot be made, gives `<exe folder>\user`
-/// as before 0.1.7.
-fn portable_folder(exe_dir: &Path) -> PathBuf {
-    let bytes = std::fs::read(exe_dir.join(PORTABLE_MARKER)).unwrap_or_default();
-    let text = if bytes.len() > 8192 {
-        String::new()
-    } else if let Some(b) = bytes.strip_prefix(&[0xff, 0xfe]) {
-        String::from_utf16_lossy(&b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>())
-    } else {
-        String::from_utf8_lossy(&bytes).into_owned()
-    };
-    let named = text.trim_start_matches('\u{feff}').lines().map(|l| l.trim().trim_matches('"').trim()).find(|l| !l.is_empty());
-    match named.map(|l| exe_dir.join(l)) {
-        Some(dir) if dir.is_dir() || std::fs::create_dir_all(&dir).is_ok() => dir,
-        _ => exe_dir.join("user"),
-    }
-}
-
 impl Paths {
     pub fn for_exe(exe: &Path) -> Paths {
         let exe_dir = exe.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -99,7 +78,7 @@ impl Paths {
             return portable(PathBuf::from(home));
         }
         if exe_dir.join(PORTABLE_MARKER).is_file() {
-            return portable(portable_folder(&exe_dir));
+            return portable(exe_dir.join("user"));
         }
         if let Some(root) = dev_root(&exe_dir) {
             let data = root.join("local-data");
@@ -331,23 +310,6 @@ mod tests {
             assert_eq!(p.user, rel.join("user"));
             assert_eq!(p.logs(), rel.join("user").join("logs"));
             assert_eq!(p.shaders(), rel.join("user").join("shaders"));
-
-            // (portable.txt naming a folder: absolute, quoted, after a blank line, with a BOM.)
-            let own = tmp.join("My data");
-            std::fs::write(rel.join(PORTABLE_MARKER), format!("\u{feff}\r\n  \"{}\"  \r\n", own.display())).unwrap();
-            let p = Paths::for_exe(&rel.join(GAME_EXE));
-            assert_eq!(p.layout, Layout::Portable);
-            assert_eq!(p.user, own);
-            assert_eq!(p.logs(), own.join("logs"));
-            assert!(own.is_dir());
-            // (Relative to the executable's folder; UTF-16 as Notepad's "Unicode".)
-            let utf16: Vec<u8> = [0xff, 0xfe].into_iter().chain("data\r\n".encode_utf16().flat_map(u16::to_le_bytes)).collect();
-            std::fs::write(rel.join(PORTABLE_MARKER), utf16).unwrap();
-            assert_eq!(Paths::for_exe(&rel.join(GAME_EXE)).user, rel.join("data"));
-            // (A folder that cannot be made: the user folder.)
-            std::fs::write(rel.join("blocker"), "").unwrap();
-            std::fs::write(rel.join(PORTABLE_MARKER), "blocker\\inside").unwrap();
-            assert_eq!(Paths::for_exe(&rel.join(GAME_EXE)).user, rel.join("user"));
         }
         let _ = std::fs::remove_dir_all(&tmp);
     }

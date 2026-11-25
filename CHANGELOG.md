@@ -7,16 +7,14 @@
   as soon as it is ready.
 - Fixed a crash inside the graphics driver a few seconds after DLSS started, seen here with the
   newest DLSS file (310.9.16). When the game combined two batches of graphics work, it gave the
-  upscaler the wrong command buffer. DLSS, FSR and XeSS now draw into the right one.
+  upscaler the wrong command buffer. DLSS, FSR and XeSS now draw into the right one. This likely
+  also fixes the game closing without a message with FSR on (issue #5).
 - The shader preparation now always uses the game's own TAA, even with an upscaler saved. Its
   hidden sessions show nothing, so a saved DLSS choice cannot get in its way.
 - A crash inside the graphics driver now leaves a line in the log that names where it happened.
 - Ctrl+F10 in the game's window writes what the game is waiting for into the log. If the game
-  hangs but keeps drawing, such as a loading screen that never ends (issue #14), press it
-  before closing the game and attach the log.
-- 'portable.txt' can now name a folder of your own (issue #19). Write the folder's path in the
-  file, and settings, saves, logs and prepared shaders go there. An empty file still uses the
-  'user' folder beside the game.
+  hangs but keeps drawing, such as a loading screen that never ends (issue #14), press it,
+  wait a few seconds before closing the game, then attach the log.
 
 ## 0.1.6
 
