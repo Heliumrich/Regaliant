@@ -670,6 +670,8 @@ pub extern "sysv64" fn changed_hook(regs: *const u64, _arg: u32) {
 }
 
 const START_MENU: &str = "/app0/ui/scripts/_cmn/uistartmenu.cgpr";
+/// The title menu (Continue, Load Game, New Game, Settings, Gallery): Exit Game added (`quit`).
+const FRONT_END: &str = "/app0/ui/scripts/_cmn/uifrontend.cgpr";
 const HUD: &str = "/app0/ui/scripts/_cmn/uihud.cgpr";
 const GLOBAL: &str = "/app0/ui/scripts/_cmn/uiglobal.cgpr";
 /// UI files whose directly drawn button icons get keyboard and Xbox copies (`prompts::variants`).
@@ -700,7 +702,7 @@ fn ui_file(guest: &str) -> bool {
 
 /// Whether the port extends this guest path (a cheap test: every file lookup asks).
 fn extends(guest: &str) -> bool {
-    guest == START_MENU || guest == HUD || guest == GLOBAL || ICON_FILES.contains(&guest) || (guest.starts_with(TEXT_DIR) && guest.ends_with(".ctxt")) || prompts::serves(guest) || (ui_file(guest) && wide_factor().is_some())
+    guest == START_MENU || guest == FRONT_END || guest == HUD || guest == GLOBAL || ICON_FILES.contains(&guest) || (guest.starts_with(TEXT_DIR) && guest.ends_with(".ctxt")) || prompts::serves(guest) || (ui_file(guest) && wide_factor().is_some())
 }
 
 static GENERATED: Mutex<Option<HashMap<String, Option<Arc<Vec<u8>>>>>> = Mutex::new(None);
@@ -723,6 +725,8 @@ pub fn generated(guest: &str) -> Option<Arc<Vec<u8>>> {
         let orig = crate::hle::kernel::fs::read_file(guest).map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { "not in the game tree" } else { "unreadable" })?;
         if guest == START_MENU {
             start_menu(&orig)
+        } else if guest == FRONT_END {
+            front_end(&orig)
         } else if guest == HUD {
             hud::build(&orig)
         } else if guest == GLOBAL {
@@ -1157,6 +1161,39 @@ fn bindings_browser(f: &mut cgpr::File, choice: &cgpr::Entity, names: &ListNames
     crate::info!("pc settings: {} list with {} rows (the HELP screen's layout)", names.screen, items.len());
     f.roots.push(screen);
     Ok(opener)
+}
+
+/// The title menu with Exit Game after Gallery (`quit`): a copy of its Settings item showing
+/// the game's own `SETTINGS_HEADING_EXITGAME` ("EXIT GAME", upper case as the title menu's own
+/// items, in every language: the in-game SETTINGS tab's heading), its choice `QuitGame`
+/// (`SetUIToGameValue 'FrontEnd_MainMenu_Selection'`), hidden where Settings is.
+fn front_end(orig: &[u8]) -> Result<Vec<u8>, String> {
+    let mut f = cgpr::parse(orig).ok_or("unexpected layout")?;
+    if cgpr::serialize(&f) != orig {
+        return Err("does not serialize back to the same bytes".into());
+    }
+    let ri = f.roots.iter().position(|r| r.name == b"FE_MainMenu_StartMenuChoose").ok_or("no FE_MainMenu_StartMenuChoose")?;
+    let mut path = f.roots[ri].path_to("MainMenu").ok_or("no MainMenu")?;
+    let li = f.roots[ri].at(&path).kids.iter().position(|k| k.name == b"ListProvider").ok_or("no ListProvider")?;
+    path.push(li);
+    let list = f.roots[ri].at(&path);
+    if list.kids.iter().any(|k| k.name == b"QuitGame") {
+        return Err("the title menu has a QuitGame item already".into());
+    }
+    let item = list.kids.iter().find(|k| k.name == b"Settings").ok_or("no Settings item")?.clone();
+    let repl = vec![(b"UI_FRONTEND_SETTINGS".to_vec(), b"SETTINGS_HEADING_EXITGAME".to_vec()), (b"Settings".to_vec(), b"QuitGame".to_vec())];
+    let mut copy = cgpr::clone_entity(&mut f.comps, &item, &repl, &cgpr::salt("QuitGame"));
+    copy.name = b"QuitGame".to_vec();
+    // (Both strings replaced, or no item: a copy still choosing Settings would open Settings.)
+    let mut idx = Vec::new();
+    cgpr::comp_indices(&copy, &mut idx);
+    let has = |s: &str| idx.iter().any(|&i| cgpr::contains(&f.comps[i as usize].payload, s.as_bytes()));
+    if !has("SETTINGS_HEADING_EXITGAME") || !has("QuitGame") || has("UI_FRONTEND_SETTINGS") {
+        return Err("the Settings item's copy kept its text or choice".into());
+    }
+    f.roots[ri].at_mut(&path).kids.push(copy);
+    crate::info!("pc settings: the title menu has Exit Game after Gallery (`quit`)");
+    Ok(cgpr::serialize(&f))
 }
 
 fn start_menu(orig: &[u8]) -> Result<Vec<u8>, String> {

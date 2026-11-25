@@ -403,6 +403,19 @@ const FIXES: &[Fix] = &[
         why: "the UI is laid out on a 3840x2160 canvas in modes 3-5",
         only_with: None,
     },
+    // The title menu's handler of a choice (eboot+0x7c9ae0): r12d the chosen item's hash, read
+    // from the game values and compared with its items' from eboot+0x7c9d70, `cmp r12d,imm32`
+    // (7 bytes; an unknown choice leaves the menu as it was). `quit::menu_hook` answers the
+    // port's Exit Game item (`QuitGame`, `pcsettings::front_end`).
+    Fix {
+        name: "title menu Exit Game",
+        offset: 0x7c9d70,
+        from: (7, 0xd918dc0def1635c6),
+        change: Change::Hook { at: 0, handler: crate::quit::menu_hook },
+        kind: "Quit Game (the title menu's Exit Game)",
+        why: "the port's Exit Game item on the title menu ends the session",
+        only_with: None,
+    },
     // The title's handler of a changed setting (eboot+0xb4700, an observer of
     // its settings registry; rsi the setting): `push rbp; mov rbp,rsp; push
     // rbx; push rax`. The PC settings learn every change there (`pcsettings`).

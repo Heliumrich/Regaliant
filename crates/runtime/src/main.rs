@@ -49,6 +49,7 @@ mod uistate;
 mod vrr;
 mod tls;
 mod prepplay;
+mod quit;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -2849,6 +2850,12 @@ This happens when other software takes that range. Restart the PC and try again.
         }
         if gpu::vk::window::CLOSED.load(std::sync::atomic::Ordering::SeqCst) {
             info!("window closed by user");
+            quit::wait_for_saves();
+            shutdown(0);
+        }
+        if quit::REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+            info!("quit: the session ends (Exit Game on the title menu)");
+            quit::wait_for_saves();
             shutdown(0);
         }
         if let Some(s) = cfg.seconds {
