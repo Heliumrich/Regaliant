@@ -35,6 +35,8 @@ use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, DPI_AWARENESS_CONT
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 pub const TITLE: &str = "Regaliant";
+/// The release version (the workspace's, this package's own).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const CLIENT: (i32, i32) = (780, 600);
 
 /// Posted when the game exits (WPARAM: its exit code).
@@ -482,7 +484,7 @@ fn main() {
         };
         RegisterClassExW(&wc);
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-        let title = wide(&format!("{TITLE} {}", dsconfig::VERSION));
+        let title = wide(&format!("{TITLE} {}", VERSION));
         let hwnd = CreateWindowExW(0, class.as_ptr(), title.as_ptr(), style, CW_USEDEFAULT, CW_USEDEFAULT, 800, 640, std::ptr::null_mut(), std::ptr::null_mut(), hinst, std::ptr::null());
         if hwnd.is_null() {
             return;

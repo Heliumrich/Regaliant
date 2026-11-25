@@ -8,8 +8,8 @@ pub mod self_file;
 pub mod sha;
 pub mod zar;
 
-/// The port's version (the workspace's).
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+// (The release version is each program's own: the launcher's package version, the runtime's
+// `REGALIANT_VERSION`. This crate's version stays 0.1.7, see its Cargo.toml.)
 
 /// The time now in UTC as `YYYYMMDD-HHMMSS` (run folders and backups are named by it).
 pub fn utc_stamp() -> String {

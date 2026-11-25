@@ -36,8 +36,12 @@ const PACKAGE_FILES: &[&str] = &[
     "upscalers\\fidelityfx.license.md",
 ];
 
-/// Names in the settings folder that hold saves (kept unless the player deletes the saves).
+/// Names in the settings folder kept with the saves (unless the player deletes them), as name
+/// prefixes: the PS5 import folder is renamed "PS5 Saves (imported <time>)" after an import and
+/// holds the player's own decrypted PS5 saves (the review of 2026-11-25 night).
 const SAVE_ENTRIES: &[&str] = &["saves", "save-backups", "PS5 Saves", "achievements.txt", "save-folder.txt"];
+/// Of those, the ones that hold saves (the question is asked only when one of them has any).
+const SAVE_HOLDERS: &[&str] = &["saves", "save-backups", "PS5 Saves"];
 /// Add-on packages: the player's own, always kept.
 const ADDONS: &str = "Add-ons";
 
@@ -95,13 +99,54 @@ fn remove(p: &Path, failed: &mut Vec<String>) {
     }
 }
 
-/// Removes the entries of `dir` except `keep` (by name), then `dir` itself when that left it
-/// empty.
-fn clear_folder(dir: &Path, keep: &[&str], failed: &mut Vec<String>) {
+/// Whether entry `name` starts with one of `keep` (case-insensitive).
+fn kept_name(name: &str, keep: &[&str]) -> bool {
+    keep.iter().any(|k| name.len() >= k.len() && name[..k.len()].eq_ignore_ascii_case(k))
+}
+
+/// Whether `p` must stay whatever folder it is in: a game archive (.zar), or the game folder the
+/// launcher uses or a folder holding it (a player may have put the game inside Regaliant's own
+/// folders; the review of 2026-11-25 night).
+fn protected(p: &Path, game: Option<&Path>) -> bool {
+    if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("zar")) {
+        return true;
+    }
+    // (Game files by what they hold, whatever the records say: game.txt may be gone already.)
+    if p.is_dir() && holds_game(p, 4) {
+        return true;
+    }
+    // (Compared lowercase with one separator: paths may mix / and \.)
+    let norm = |q: &Path| q.to_string_lossy().to_lowercase().replace('/', "\\").trim_end_matches('\\').to_string();
+    game.is_some_and(|g| {
+        let (g, p) = (norm(g), norm(p));
+        g == p || g.starts_with(&format!("{p}\\"))
+    })
+}
+
+/// Whether folder `dir` holds a game's files within `depth` levels: an `eboot.bin`, an `sce_sys`
+/// folder or a .zar archive.
+fn holds_game(dir: &Path, depth: u32) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else { return false };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_lowercase();
+        let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
+        if (!is_dir && (name == "eboot.bin" || name.ends_with(".zar"))) || (is_dir && name == "sce_sys") {
+            return true;
+        }
+        if is_dir && depth > 1 && holds_game(&e.path(), depth - 1) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Removes the entries of `dir` except those `keep` names (prefixes) and the protected ones, then
+/// `dir` itself when that left it empty.
+fn clear_folder(dir: &Path, keep: &[&str], game: Option<&Path>, failed: &mut Vec<String>) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        if keep.iter().any(|k| k.eq_ignore_ascii_case(&name)) {
+        if kept_name(&name, keep) || protected(&e.path(), game) {
             continue;
         }
         remove(&e.path(), failed);
@@ -109,9 +154,9 @@ fn clear_folder(dir: &Path, keep: &[&str], failed: &mut Vec<String>) {
     let _ = std::fs::remove_dir(dir);
 }
 
-/// Whether any save is in the places that hold them.
+/// Whether any of `places` (folders) holds anything.
 fn saves_found(places: &[PathBuf]) -> bool {
-    places.iter().any(|p| std::fs::read_dir(p).is_ok_and(|mut rd| rd.next().is_some()) || p.is_file())
+    places.iter().any(|p| std::fs::read_dir(p).is_ok_and(|mut rd| rd.next().is_some()))
 }
 
 /// Whether `p` is one of this layout's own folders: in the installed layout a folder named after
@@ -124,9 +169,18 @@ fn ours(paths: &Paths, p: &Path) -> bool {
     }
 }
 
-/// Where saves are kept: the settings folder's save entries and `others` (`other_save_folders`).
+/// The folders that hold saves: the settings folder's (the PS5 import folder by its prefix) and
+/// `others` (`other_save_folders`).
 fn save_places(paths: &Paths, others: &[PathBuf]) -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = SAVE_ENTRIES.iter().map(|n| paths.user.join(n)).collect();
+    let mut v: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&paths.user) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if kept_name(&name, SAVE_HOLDERS) && e.file_type().is_ok_and(|t| t.is_dir()) {
+                v.push(e.path());
+            }
+        }
+    }
     v.extend(others.iter().cloned());
     v
 }
@@ -177,9 +231,12 @@ pub fn run(app: &mut App) {
 fn perform(paths: &Paths, others: &[PathBuf], delete_saves: bool) -> (Vec<String>, Vec<String>) {
     let (user, cache) = (&paths.user, &paths.cache);
     let mut failed = Vec::new();
+    // (The game folder the launcher uses, read before its record goes: never removed.)
+    let game = paths.chosen_game();
+    let game = game.as_deref();
     // Prepared shaders, logs, the runtime folders (add-ons kept).
     if ours(paths, cache) && cache != user {
-        clear_folder(cache, &[ADDONS], &mut failed);
+        clear_folder(cache, &[ADDONS], game, &mut failed);
     }
     // Settings, and the saves when asked (add-ons kept).
     if ours(paths, user) {
@@ -187,14 +244,19 @@ fn perform(paths: &Paths, others: &[PathBuf], delete_saves: bool) -> (Vec<String
         if !delete_saves {
             keep.extend_from_slice(SAVE_ENTRIES);
         }
-        clear_folder(user, &keep, &mut failed);
+        clear_folder(user, &keep, game, &mut failed);
     }
     if delete_saves {
         for f in others {
-            if f.is_dir() {
+            if f.is_dir() && !protected(f, game) {
                 remove(f, &mut failed);
-                // (Its "Demon's Souls" folder when nothing else is in it.)
+                // (The backups the game keeps beside them, then their "Demon's Souls" folder
+                // when nothing else is in it.)
                 if let Some(parent) = f.parent() {
+                    let backups = parent.join("save-backups");
+                    if backups.is_dir() && !protected(&backups, game) {
+                        remove(&backups, &mut failed);
+                    }
                     let _ = std::fs::remove_dir(parent);
                 }
             }
@@ -210,8 +272,11 @@ fn perform(paths: &Paths, others: &[PathBuf], delete_saves: bool) -> (Vec<String
     let up = paths.exe_dir.join("upscalers");
     let _ = std::fs::remove_dir(&up);
     let mut kept = Vec::new();
-    if !delete_saves && saves_found(&save_places(paths, others)) {
-        kept.push(format!("Your saves are kept in {}.", user.display()));
+    if !delete_saves {
+        let places: Vec<PathBuf> = save_places(paths, others).into_iter().filter(|p| saves_found(std::slice::from_ref(p))).collect();
+        if let Some(p) = places.iter().find(|p| others.contains(p)).or(places.first()) {
+            kept.push(format!("Your saves are kept in {}.", p.display()));
+        }
     }
     if up.join("nvngx_dlss.dll").is_file() {
         kept.push(format!("Your own DLSS file is kept in {}.", up.display()));
@@ -252,32 +317,57 @@ mod tests {
             std::fs::write(f, b"x").unwrap();
         };
         let programs = ["regaliant.exe", "regaliant-launcher.exe", "README.txt", "portable.txt", "upscalers/libxess.dll", "upscalers/nvngx_dlss.dll", "upscalers/sl.dlss.dll"];
-        let data = ["user/pcsettings.txt", "user/shaders/a.bin", "user/logs/x/dsport.log", "user/saves/u/SAVEDATA0PlayerProfile0/USR-DATA", "user/save-backups/b", "user/Add-ons/pkg"];
+        // (Inside the settings folder too: the renamed PS5 import folder, an archive and the game
+        // folder the launcher uses, which a player may have put there.)
+        let data = [
+            "user/pcsettings.txt",
+            "user/shaders/a.bin",
+            "user/logs/x/dsport.log",
+            "user/saves/u/SAVEDATA0PlayerProfile0/USR-DATA",
+            "user/save-backups/b",
+            "user/Add-ons/pkg",
+            "user/PS5 Saves (imported 20261125-120000)/SAVEDATA0PlayerProfile0/USR-DATA",
+            "user/mygame.zar",
+            "user/games/PPSA01341-app0/eboot.bin",
+        ];
         let others = ["PPSA01341-app0/eboot.bin", "game.zar", "notes.txt"];
         for f in programs.iter().chain(&data).chain(&others) {
             put(f);
         }
+        std::fs::write(root.join("user/game.txt"), root.join("user/games/PPSA01341-app0").to_string_lossy().as_bytes()).unwrap();
         let paths = Paths::for_exe(&root.join("regaliant-launcher.exe"));
         assert_eq!(paths.layout, Layout::Portable);
         // (A Save Folder choice stands in for Documents' inside the test's own folder: the PC's own
-        // folders are never touched by a test.)
+        // folders are never touched by a test. Its backups beside it go with it.)
         put("docs/My Games/Demon's Souls/saves/u/SAVEDATA0PlayerProfile0/USR-DATA");
+        put("docs/My Games/Demon's Souls/save-backups/b");
         let others = vec![root.join("docs/My Games/Demon's Souls/saves")];
+        assert!(saves_found(&save_places(&paths, &others)));
         let (failed, kept) = perform(&paths, &others, false);
         assert!(failed.is_empty(), "{failed:?}");
-        for gone in ["regaliant.exe", "README.txt", "portable.txt", "upscalers/libxess.dll", "upscalers/sl.dlss.dll", "user/pcsettings.txt", "user/shaders", "user/logs"] {
+        for gone in ["regaliant.exe", "README.txt", "portable.txt", "upscalers/libxess.dll", "upscalers/sl.dlss.dll", "user/pcsettings.txt", "user/shaders", "user/logs", "user/game.txt"] {
             assert!(!root.join(gone).exists(), "{gone} left");
         }
-        for stays in ["upscalers/nvngx_dlss.dll", "user/saves/u/SAVEDATA0PlayerProfile0/USR-DATA", "user/save-backups/b", "user/Add-ons/pkg", "PPSA01341-app0/eboot.bin", "game.zar", "notes.txt", "regaliant-launcher.exe"] {
+        let always = ["upscalers/nvngx_dlss.dll", "user/Add-ons/pkg", "user/mygame.zar", "user/games/PPSA01341-app0/eboot.bin", "PPSA01341-app0/eboot.bin", "game.zar", "notes.txt", "regaliant-launcher.exe"];
+        for stays in always.iter().chain(&["user/saves/u/SAVEDATA0PlayerProfile0/USR-DATA", "user/save-backups/b", "user/PS5 Saves (imported 20261125-120000)/SAVEDATA0PlayerProfile0/USR-DATA"]) {
             assert!(root.join(stays).exists(), "{stays} removed");
         }
         assert_eq!(kept.len(), 2, "{kept:?}");
-        // Then the saves too; add-ons and the game's files still stay.
+        assert!(kept[0].contains("docs"), "the note names the Save Folder in use: {kept:?}");
+        // Then the saves too; add-ons, archives and the game's files still stay.
         assert!(root.join("docs/My Games/Demon's Souls/saves/u/SAVEDATA0PlayerProfile0/USR-DATA").exists());
         let (failed, _) = perform(&paths, &others, true);
         assert!(failed.is_empty(), "{failed:?}");
-        assert!(!root.join("user/saves").exists() && !root.join("user/save-backups").exists() && !root.join("docs/My Games/Demon's Souls").exists());
-        assert!(root.join("user/Add-ons/pkg").exists() && root.join("PPSA01341-app0/eboot.bin").exists() && root.join("game.zar").exists());
+        for gone in ["user/saves", "user/save-backups", "user/PS5 Saves (imported 20261125-120000)", "docs/My Games/Demon's Souls"] {
+            assert!(!root.join(gone).exists(), "{gone} left");
+        }
+        for stays in always {
+            assert!(root.join(stays).exists(), "{stays} removed");
+        }
+        // A settings folder with only its record of the save folder asks nothing.
+        std::fs::create_dir_all(root.join("user")).unwrap();
+        std::fs::write(root.join("user/save-folder.txt"), b"x").unwrap();
+        assert!(!saves_found(&save_places(&paths, &[])));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -157,11 +157,22 @@ fn now_ready(k: Kind) {
 /// Whether this session prepares `k`'s library: DS_UPSCALER names the one
 /// (development runs), else each that is installed.
 fn prepares(k: Kind) -> bool {
+    if k == Kind::Dlss && HELPER.load(Relaxed) {
+        return false;
+    }
     match std::env::var("DS_UPSCALER") {
         Ok(v) => Kind::parse(&v) == k,
         Err(_) => true,
     }
 }
+
+/// A helper process (the launcher's checks, the shader preparation's steps: `main`): Streamline is
+/// not loaded. They never present a frame of their own through it, end with their own exit codes
+/// before a clean shutdown, and use the game's own TAA; with Streamline on trial each left a
+/// marker that the next start counted as a death, two of them switching DLSS off (the review of
+/// 2026-11-25 night), and the preparation's steps were where a player's DLSS file crashed on
+/// 2026-11-24.
+pub static HELPER: AtomicBool = AtomicBool::new(false);
 
 static XESS_READY: AtomicBool = AtomicBool::new(false);
 static DLSS_READY: AtomicBool = AtomicBool::new(false);

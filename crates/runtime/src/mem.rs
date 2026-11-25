@@ -1140,6 +1140,11 @@ static HOLE_OCC: [std::sync::atomic::AtomicU64; 48] = [const { std::sync::atomic
 static HOLE_OCC_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// At most this many windows are left out (4 GiB of 64 MiB windows): more is no stray block.
 const MAX_HOLE_WINDOWS: usize = 64;
+/// The guest map's name for a window left out (`note_host_holes`; `map` never replaces one).
+const HOST_HOLE_NAME: &str = "held by the host at the start";
+/// The main module's fixed place (`MODULE_BASE`, its image and trampolines): a held window there
+/// fails the reservation as before (status 10 naming the region) instead of the module's load.
+const MODULE_SPAN: u64 = 256 << 20;
 
 /// Whether the window holding guest address `a` was left out (`MIXED_HOLES`).
 fn mixed_hole(a: u64) -> bool {
@@ -1175,6 +1180,10 @@ fn reserve_around_holes() -> bool {
                 HOLE_OCC[3 * occ + 1].store(end - start, Relaxed);
                 HOLE_OCC[3 * occ + 2].store(info.Type as u64, Relaxed);
                 occ += 1;
+            }
+            if start < MODULE_BASE + MODULE_SPAN && MODULE_BASE < end {
+                clear();
+                return false;
             }
             let mut w = start.max(GUEST_BASE) & !(win - 1);
             while w < end.min(GUEST_END) {
@@ -1269,7 +1278,7 @@ pub fn note_host_holes() {
     crate::info!("mem: the guest range is reserved around {n} window(s) of {} MiB that other memory of this process held at the start ({}); held there: {}", win >> 20, list.join(", "), occ.join("; "));
     let mut st = MEM.lock();
     for &(s, z) in &runs {
-        st.vmas.insert(s, Vma { start: s, size: z, kind: VmaKind::Reserved, prot: 0, phys: 0, mtype: 0, name: "held by the host at the start".to_string(), slots: 0, off: 0, born: 0 });
+        st.vmas.insert(s, Vma { start: s, size: z, kind: VmaKind::Reserved, prot: 0, phys: 0, mtype: 0, name: HOST_HOLE_NAME.to_string(), slots: 0, off: 0, born: 0 });
     }
 }
 
@@ -3103,6 +3112,11 @@ impl MemState {
             return Err(MemError::Invalid);
         }
         let existing = self.overlapping(addr, addr + size);
+        // (A window other memory of the process held at the start is never mapped over: its
+        // window cannot be made, `mixed_make`; the review of 2026-11-25 night.)
+        if existing.iter().any(|v| v.kind == VmaKind::Reserved && v.name == HOST_HOLE_NAME) {
+            return Err(MemError::Busy);
+        }
         if kind == VmaKind::Direct {
             // Diagnostics: contents the console would keep.
             let same = existing

@@ -133,7 +133,7 @@ static GAME_ID: std::sync::Mutex<Option<(String, String, String)>> = std::sync::
 fn version_mismatch() -> Option<String> {
     let g = GAME_ID.lock().unwrap_or_else(|e| e.into_inner());
     let (v, _, _) = g.as_ref()?;
-    (v != dsconfig::VERSION).then(|| format!("The game's program is version {v}, the launcher {}. Close the game, then unpack the whole new version again. Nothing is prepared until then.", dsconfig::VERSION))
+    (v != crate::VERSION).then(|| format!("The game's program is version {v}, the launcher {}. Close the game, then unpack the whole new version again. Nothing is prepared until then.", crate::VERSION))
 }
 static CHECK_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// When the check began (`check_pending`'s deadline).
@@ -410,7 +410,7 @@ fn log_check_line(app: &App, r: &Result<String, String>) {
         return;
     }
     let id = GAME_ID.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    log(app, &format!("launcher {} started; the game's check: translation {}; game {}", dsconfig::VERSION, r.as_deref().unwrap_or_else(|e| e), id.map_or("unknown".to_string(), |(v, d, r)| if d.is_empty() { format!("{v}, no graphics card reported") } else { format!("{v} on {d}, driver {r}") })));
+    log(app, &format!("launcher {} started; the game's check: translation {}; game {}", crate::VERSION, r.as_deref().unwrap_or_else(|e| e), id.map_or("unknown".to_string(), |(v, d, r)| if d.is_empty() { format!("{v}, no graphics card reported") } else { format!("{v} on {d}, driver {r}") })));
 }
 
 /// The check's answer once it has one.

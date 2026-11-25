@@ -2344,6 +2344,10 @@ fn main() {
                 SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
             }
         }
+        // (The helper processes load no Streamline: `upscale::HELPER`.)
+        if args.iter().any(|a| matches!(a.as_str(), "--prepare-play" | "--precompile-all" | "--pb-check" | "--translation-fingerprint" | "--compile-bench")) {
+            gpu::upscale::HELPER.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         if args.iter().any(|a| matches!(a.as_str(), "--prepare-play" | "--precompile-all")) {
             unsafe {
                 use windows_sys::Win32::System::Power::{SetThreadExecutionState, ES_CONTINUOUS, ES_SYSTEM_REQUIRED};
@@ -2486,7 +2490,7 @@ This happens when other software takes that range. Restart the PC and try again.
         // (This program's version first: the launcher compares it with its own, a new version's
         // files unpacked over a game still running would leave the old game beside the new
         // launcher.)
-        println!("version = {}", std::env::var("DS_SIM_VERSION").unwrap_or_else(|_| dsconfig::VERSION.to_string()));
+        println!("version = {}", std::env::var("DS_SIM_VERSION").unwrap_or_else(|_| env!("REGALIANT_VERSION").to_string()));
         // (`DS_SIM_CHECK_DELAY_S=<s>`, a test of a slow PC's check: the answer that many seconds
         // later, the process and its session lock held meanwhile, as the other PC's 50 s check
         // held them. Under the 60 s watch above.)
