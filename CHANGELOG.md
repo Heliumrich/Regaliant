@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.8
 
 - Fixed the washed-out, too bright picture with ghosting and black blotches at Render Scale
   100% on a 4K screen (issue #6). Above 2048 lines the game's lighting goes wrong when the
