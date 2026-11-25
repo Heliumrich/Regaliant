@@ -575,9 +575,14 @@ pub fn install() {
 /// code (one deep inside a driver) that no handler took.
 static UNHANDLED: AtomicBool = AtomicBool::new(false);
 
+/// Access violations inside NVIDIA's modules logged at first chance (`veh_body`: the first few).
+static DRIVER_FAULTS_LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// The last chance for a fault no handler took (the first sessions' access
 /// violations inside nvoglv64.dll ended the process with no report of
-/// ours): the fatal report, with the host frames down to our code.
+/// ours): the fatal report, with the host frames down to our code. (Under the port's host, a
+/// debugger, Windows does not call it: `veh_body` logs a driver's access violation at first
+/// chance instead.)
 unsafe extern "system" fn unhandled(info: *const EXCEPTION_POINTERS) -> i32 {
     UNHANDLED.store(true, Ordering::SeqCst);
     unsafe { veh_body(info as *mut EXCEPTION_POINTERS) };
@@ -1398,6 +1403,35 @@ unsafe fn veh_body(info: *mut EXCEPTION_POINTERS) -> i32 {
                         // report confirms it, `pcache::note_crash_suspect`.)
                         crate::gpu::pcache::note_crash_suspect();
                     }
+                }
+                // (An access violation deep inside NVIDIA's driver, left to its handlers: under
+                // the port's host, a debugger, no unhandled-exception filter runs, so when none
+                // takes it the game ends with no report of ours (DLSS's sessions of 2026-11-25:
+                // only Streamline's minidump). Logged at first chance with our frames, the first
+                // few of a session.)
+                if code == 0xC0000005
+                    && let Some((m, o)) = module_offset(rip).filter(|(m, _)| m.to_ascii_lowercase().starts_with("nv"))
+                    && DRIVER_FAULTS_LOGGED.fetch_add(1, Ordering::Relaxed) < 3
+                {
+                    let (access, target) = if rec.NumberParameters >= 2 {
+                        let a = match rec.ExceptionInformation[0] {
+                            0 => "read",
+                            1 => "write",
+                            8 => "execute",
+                            _ => "access",
+                        };
+                        (a, rec.ExceptionInformation[1] as u64)
+                    } else {
+                        ("access", 0)
+                    };
+                    let mut c: AlignedContext = std::mem::zeroed();
+                    c.0 = *ctx;
+                    let mut host = [0u64; 24];
+                    let mut guest = [0u64; 4];
+                    let (nh, _) = unwind(&mut c, &mut host, &mut guest);
+                    let frames: Vec<String> = host[..nh].iter().map(|&a| module_offset(a).map_or_else(|| format!("{a:#x}"), |(m, o)| format!("{m}+{o:#x}"))).collect();
+                    crate::warn!("access violation inside {m}+{o:#x} ({access} of {target:#x}), first chance, left to its handlers; frames: {}", frames.join(" <- "));
+                    crate::log::try_flush();
                 }
                 return EXCEPTION_CONTINUE_SEARCH;
             }

@@ -344,14 +344,19 @@ pub fn apply() {
     convar::want_capped("sunShadowMaxDistance", SHADOW_REACH.get(get("ShadowDistance").unwrap_or(0) as usize).copied().flatten());
     // Anti-Aliasing by its code: the title's TAA, Off (r_aaMethod: EAAMethods::Off 0, TAA 1), or
     // an upscaler in the TAA's place (the TAA stays on: its dispatch is what they replace, its
-    // jitter what they need). A code whose upscaler is not ready here falls back to the TAA.
+    // jitter what they need). The upscaler stays chosen while it is not ready yet: these settings
+    // are first applied at the start, before the device that readies XeSS and FSR, and DLSS on a
+    // thread of its own a second or so after it; the title's TAA runs until then, and for good if
+    // it never is (`upscale::active`). Until 0.1.6 a code whose upscaler was not ready fell back to
+    // the TAA here, which at the start it always was: a saved DLSS, FSR or XeSS never took effect
+    // after a restart, while the menu still showed it (players' "DLSS not working", 2026-11-25).
     let aa = store::raw_value("Setting_PC_AntiAliasing").unwrap_or(AA_TAA);
     convar::want("r_aaMethod", (aa == AA_OFF).then_some(0));
     // (`DS_UPSCALER` decides in development runs.)
     if std::env::var_os("DS_UPSCALER").is_none() { crate::gpu::upscale::set_choice(match aa {
-        AA_DLSS if crate::gpu::upscale::is_ready("dlss") => "dlss",
-        AA_FSR if crate::gpu::upscale::is_ready("fsr") => "fsr",
-        AA_XESS if crate::gpu::upscale::is_ready("xess") => "xess",
+        AA_DLSS => "dlss",
+        AA_FSR => "fsr",
+        AA_XESS => "xess",
         _ => "off",
     }); }
     convar::want("r_bloomEnable", (get("Bloom") == Some(0)).then_some(0));

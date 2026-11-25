@@ -97,12 +97,41 @@ pub fn choice() -> Kind {
     k
 }
 
-/// A new choice from the settings (applied from the next frame).
+/// A new choice from the settings (applied from the next frame). An upscaler that is not ready
+/// yet takes over once it is (`now_ready`); until then, and for good if it never is, the game's
+/// TAA runs (`active`). The switch starts a new history at the upscaler's first frame.
 pub fn set_choice(v: &str) {
     let k = Kind::parse(v);
     if CHOICE.swap(k as u8, Relaxed) != k as u8 {
         SWITCHED.store(true, Relaxed);
-        crate::info!("upscaler: {} chosen{}", k.name(), if k != Kind::Off && !ready(k) { " (not available here: the game's TAA stays)" } else { "" });
+        let note = if k == Kind::Off || ready(k) {
+            ""
+        } else if may_become_ready(k) {
+            " (the game's TAA until it is ready)"
+        } else {
+            " (not available here: the game's TAA stays)"
+        };
+        crate::info!("upscaler: {} chosen{note}", k.name());
+    }
+}
+
+/// The device is made (`device_created`): XeSS and FSR are ready by then or not at all.
+static DEVICE_MADE: AtomicBool = AtomicBool::new(false);
+
+/// Whether `k`, not ready now, may still become ready in this session: before the device is made
+/// any upscaler may; after it only DLSS, while it starts on its own thread.
+fn may_become_ready(k: Kind) -> bool {
+    if k == Kind::Off || failed_flag(k).load(Relaxed) {
+        return false;
+    }
+    !DEVICE_MADE.load(Relaxed) || (k == Kind::Dlss && DLSS_DEVICE_OK.load(Relaxed))
+}
+
+/// `k` just became ready: when it is the one chosen, it replaces the game's TAA from the next
+/// frame (the switch of `set_choice` is still pending, so its history starts new).
+fn now_ready(k: Kind) {
+    if choice() == k {
+        crate::info!("upscaler: {} in use from now (the chosen Anti-Aliasing)", k.name());
     }
 }
 
@@ -130,13 +159,29 @@ fn failed_flag(k: Kind) -> &'static AtomicBool {
     }
 }
 
-/// Whether `k` is ready to run in this session.
+/// Whether `k` is ready to run in this session (DLSS: once a frame's present went through
+/// Streamline, `SL_PRESENTED`).
 fn ready(k: Kind) -> bool {
     match k {
         Kind::Off => false,
         Kind::Xess => XESS_READY.load(Relaxed) && !XESS_FAILED.load(Relaxed),
-        Kind::Dlss => DLSS_READY.load(Relaxed) && !DLSS_FAILED.load(Relaxed),
+        Kind::Dlss => DLSS_READY.load(Relaxed) && !DLSS_FAILED.load(Relaxed) && SL_PRESENTED.load(Relaxed),
         Kind::Fsr => FSR_READY.load(Relaxed) && !FSR_FAILED.load(Relaxed),
+    }
+}
+
+/// A frame's present went through Streamline's vkQueuePresentKHR (`present_hook`): DLSS runs only
+/// after that. Streamline's per-frame bookkeeping (presentCommon) needs every frame's present; in
+/// runs that presented nothing through it (no window: the hidden present went to the driver
+/// directly until 2026-11-25), DLSS evaluated anyway warned "presentCommon() was not observed" and
+/// in three runs of four ended the process seconds later, an access violation inside the driver
+/// at a submission (NGX DLSS 310.9.16, driver 610.88; a window's session ran clean).
+static SL_PRESENTED: AtomicBool = AtomicBool::new(false);
+
+/// A present went through Streamline's vkQueuePresentKHR (`vk::present`).
+pub fn note_sl_present() {
+    if !SL_PRESENTED.swap(true, Relaxed) {
+        now_ready(Kind::Dlss);
     }
 }
 
@@ -181,11 +226,6 @@ static EVAL_OK: AtomicBool = AtomicBool::new(false);
 /// Whether the upscaler's evaluation just recorded into the command buffer succeeded.
 pub fn last_eval_ok() -> bool {
     EVAL_OK.load(Relaxed)
-}
-
-/// Whether `name` (dlss, fsr, xess) is ready in this session.
-pub fn is_ready(name: &str) -> bool {
-    ready(Kind::parse(name))
 }
 
 /// Whether `name` is ready or will be shortly (DLSS starts on a thread of its own after the
@@ -490,13 +530,20 @@ pub fn device_created(instance: &ash::Instance, pdev: vk::PhysicalDevice, device
     if XESS_DEVICE_OK.load(Relaxed) && xess().is_some() {
         XESS_READY.store(true, Relaxed);
         crate::info!("upscaler: XeSS ready");
+        now_ready(Kind::Xess);
     }
     if FSR_DEVICE_OK.load(Relaxed) && ffx().is_some() {
         FSR_READY.store(true, Relaxed);
         crate::info!("upscaler: FSR ready");
+        now_ready(Kind::Fsr);
     }
     if DLSS_DEVICE_OK.load(Relaxed) {
         dlss_device_created(instance, pdev, device, qf, queues);
+    }
+    DEVICE_MADE.store(true, Relaxed);
+    let k = choice();
+    if k != Kind::Off && !ready(k) && !may_become_ready(k) {
+        crate::info!("upscaler: {} (the chosen Anti-Aliasing) is not available here: the game's TAA stays", k.name());
     }
 }
 
@@ -907,9 +954,12 @@ fn xess_record(cmd: vk::CommandBuffer, inp: &Inputs, reset: bool) -> bool {
     let (h, exec) = (s.ctx as usize, x.execute);
     drop(st);
     unsafe {
-        super::vk::defer::external(cmd, Box::new(move |_| {
+        // (Into the command buffer the deferred list is played into, `cb`: a batch fused into an
+        // earlier one's buffer at submission plays there, its own buffer never begun; see
+        // `dlss_record`.)
+        super::vk::defer::external(cmd, Box::new(move |cb| {
             static N: AtomicU32 = AtomicU32::new(0);
-            let r = (exec)(h as Handle, cmd, &p);
+            let r = (exec)(h as Handle, cb, &p);
             EVAL_OK.store(r == 0, Relaxed);
             if r != 0 {
                 warn_some(&N, "xessVKExecute", r);
@@ -1681,7 +1731,7 @@ fn dlss_device_created(instance: &ash::Instance, pdev: vk::PhysicalDevice, devic
         ver.base = SlBase::new(SL_FEATURE_VERSION, 1);
         let ngx = if unsafe { (s.version)(SL_FEATURE_DLSS, &mut ver) } == SL_OK { format!(", NGX DLSS {}.{}.{}", ver.ngx[0], ver.ngx[1], ver.ngx[2]) } else { String::new() };
         DLSS_READY.store(true, Relaxed);
-        crate::info!("upscaler: DLSS ready in {:.2} s (Streamline {}.{}.{}{ngx})", t0.elapsed().as_secs_f32(), ver.sl[0], ver.sl[1], ver.sl[2]);
+        crate::info!("upscaler: DLSS ready in {:.2} s (Streamline {}.{}.{}{ngx}): in use from the first present through Streamline", t0.elapsed().as_secs_f32(), ver.sl[0], ver.sl[1], ver.sl[2]);
     });
     if let Err(e) = spawned {
         fail(Kind::Dlss, format!("no thread for its start ({e})"));
@@ -1814,8 +1864,15 @@ fn dlss_record(cmd: vk::CommandBuffer, inp: &Inputs, reset: bool) -> bool {
     let extent = SlExtent { top: 0, left: 0, width: inp.in_width, height: inp.in_height };
     let out_extent = SlExtent { top: 0, left: 0, width: inp.width, height: inp.height };
     let (frame_token, set_constants, evaluate) = (s.frame_token, s.set_constants, s.evaluate);
+    // Recorded into the command buffer the deferred list is played into (`cb`), not the one it was
+    // recorded for (`cmd`): a batch fused into an earlier one's buffer at submission plays there,
+    // and its own buffer is never begun. Until 2026-11-25 the upscalers recorded into `cmd`: with
+    // DLSS (NGX 310.9.16) on, runs whose batches were fused hit an access violation inside the
+    // driver (a write through a null object at 0x10) within seconds, from DLSS's own recording
+    // (the frames of `exception::veh_body`'s first-chance line); unfused, the commands were in
+    // the right buffer by chance.
     unsafe {
-        super::vk::defer::external(cmd, Box::new(move |_| {
+        super::vk::defer::external(cmd, Box::new(move |cb| {
             static N_TOKEN: AtomicU32 = AtomicU32::new(0);
             static N_CONST: AtomicU32 = AtomicU32::new(0);
             static N_OPT: AtomicU32 = AtomicU32::new(0);
@@ -1839,7 +1896,7 @@ fn dlss_record(cmd: vk::CommandBuffer, inp: &Inputs, reset: bool) -> bool {
             let tag = |i: usize, ty: u32| SlResourceTag { base: SlBase::new(SL_RESOURCE_TAG, 1), resource: &res[i], ty, lifecycle: SL_VALID_UNTIL_EVALUATE, extent: if i == 3 { out_extent } else { extent } };
             let tags = [tag(0, SL_DEPTH), tag(1, SL_MOTION_VECTORS), tag(2, SL_SCALING_INPUT_COLOR), tag(3, SL_SCALING_OUTPUT_COLOR)];
             let inputs: [*const SlBase; 5] = [&viewport.base, &tags[0].base, &tags[1].base, &tags[2].base, &tags[3].base];
-            let r = evaluate(SL_FEATURE_DLSS, token, inputs.as_ptr(), inputs.len() as u32, cmd);
+            let r = evaluate(SL_FEATURE_DLSS, token, inputs.as_ptr(), inputs.len() as u32, cb);
             EVAL_OK.store(r == SL_OK, Relaxed);
             if r != SL_OK {
                 warn_some(&N_EVAL, "slEvaluateFeature (DLSS)", r);
@@ -2248,11 +2305,14 @@ fn fsr_record(cmd: vk::CommandBuffer, inp: &Inputs, reset: bool) -> bool {
     let (ctx, dispatch) = (s.ctx, f.dispatch);
     drop(st);
     unsafe {
-        super::vk::defer::external(cmd, Box::new(move |_| {
+        // (Into the command buffer the deferred list is played into, `cb`: see `dlss_record`.)
+        super::vk::defer::external(cmd, Box::new(move |cb| {
             static N: AtomicU32 = AtomicU32::new(0);
             let mut c = ctx as FfxContext;
-            // (The whole description: a closure naming only `d.header`
-            // would capture just those 16 bytes.)
+            // (The whole description, its command buffer the one played into: a closure naming
+            // only `d.header` would capture just those 16 bytes.)
+            let mut d = d;
+            d.command_list = cb;
             let desc: *const FfxHeader = (&d as *const FfxDispatchUpscale).cast();
             let r = dispatch(&mut c, desc);
             EVAL_OK.store(r == FFX_OK, Relaxed);

@@ -336,7 +336,11 @@ pub fn setup(stage: Stage, cfg: &mut crate::Config) {
         // in the driver three times on 2026-11-20 and took every other driver call with them;
         // the GPU's clock may run lower, the self-play a little slower.)
         // (`set_unless_given`: a player's diagnostics.txt does not override them.)
-        for (k, v) in [("DS_FRAME_CAP", "0"), ("DS_UNCAPPED", "0"), ("DS_HEADLESS_PRESENT", "0")] {
+        // (No upscaler either, whatever the copied settings choose: DLSS's Streamline needs to
+        // see every frame's present, and a self-play run presents nothing. Until 2026-11-25 a
+        // saved upscaler never took effect at a start, so this did not come up; nor does
+        // Streamline's separate check run in every step now.)
+        for (k, v) in [("DS_FRAME_CAP", "0"), ("DS_UNCAPPED", "0"), ("DS_HEADLESS_PRESENT", "0"), ("DS_UPSCALER", "off")] {
             crate::set_unless_given(k, v);
         }
         if stage == Stage::NewGame {

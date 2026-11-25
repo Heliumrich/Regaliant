@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.7
+
+- Fixed DLSS, FSR and XeSS not working after a restart of the game. The Anti-Aliasing setting
+  still showed the upscaler, but the game used its own TAA. Now the chosen upscaler takes over
+  as soon as it is ready.
+- Fixed a crash inside the graphics driver a few seconds after DLSS started, seen here with the
+  newest DLSS file (310.9.16). When the game combined two batches of graphics work, it gave the
+  upscaler the wrong command buffer. DLSS, FSR and XeSS now draw into the right one.
+- The shader preparation no longer loads the upscalers. Its hidden sessions show nothing, so a
+  saved DLSS choice cannot get in its way.
+- A crash inside the graphics driver now leaves a line in the log that names where it happened.
+
 ## 0.1.6
 
 - Fixed the shader preparation and the game ending when the graphics driver stops on a debug

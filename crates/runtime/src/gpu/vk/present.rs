@@ -701,7 +701,17 @@ fn hidden_present_once() {
         let pi = vk::PresentInfoKHR::default().wait_semaphores(&signal).swapchains(&scs).image_indices(&idxs);
         let q = pq.lock();
         if c.device.queue_submit(*q, &[si], h.fences[f]).is_ok() {
-            let _ = c.swapchain_d.queue_present(*q, &pi);
+            // (Through Streamline's present once DLSS runs, as a window's: it needs to see every
+            // frame's present, `upscale::note_sl_present`.)
+            match crate::gpu::upscale::present_hook() {
+                Some(p) => {
+                    let _ = p(*q, &pi);
+                    crate::gpu::upscale::note_sl_present();
+                }
+                None => {
+                    let _ = c.swapchain_d.queue_present(*q, &pi);
+                }
+            }
             h.presented += 1;
             h.last = Some(std::time::Instant::now());
         }
@@ -1008,11 +1018,15 @@ pub fn present(src: Source) -> bool {
         let q = c.queue.lock();
         // (Through Streamline's present once DLSS runs: its per-frame bookkeeping.)
         let presented = match crate::gpu::upscale::present_hook() {
-            Some(f) => match f(*q, &pi) {
-                vk::Result::SUCCESS => Ok(false),
-                vk::Result::SUBOPTIMAL_KHR => Ok(true),
-                e => Err(e),
-            },
+            Some(f) => {
+                let r = f(*q, &pi);
+                crate::gpu::upscale::note_sl_present();
+                match r {
+                    vk::Result::SUCCESS => Ok(false),
+                    vk::Result::SUBOPTIMAL_KHR => Ok(true),
+                    e => Err(e),
+                }
+            }
             None => c.swapchain_d.queue_present(*q, &pi),
         };
         drop(q);
