@@ -575,8 +575,64 @@ pub fn install() {
 /// code (one deep inside a driver) that no handler took.
 static UNHANDLED: AtomicBool = AtomicBool::new(false);
 
-/// Access violations inside NVIDIA's modules logged at first chance (`veh_body`: the first few).
-static DRIVER_FAULTS_LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// The sites (rip) of access violations inside NVIDIA's modules logged at first chance
+/// (`veh_body`): each once, eight at most, so a site the driver's own handlers take again and
+/// again (a probe of memory, say) does not use up the lines a later fatal one needs.
+static DRIVER_FAULT_SITES: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// Whether `rip` is a driver fault site not logged yet (then it counts as logged).
+fn new_driver_fault_site(rip: u64) -> bool {
+    for s in &DRIVER_FAULT_SITES {
+        match s.compare_exchange(0, rip, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(v) if v == rip => return false,
+            Err(_) => {}
+        }
+    }
+    false
+}
+
+/// A fault's frames for its log line, unwound with the registered tables only while the stack
+/// pointer stays inside the faulting stack's committed region (one VirtualQuery: a corrupt chain
+/// must not fault inside the handler, whose own fault would end a process the driver's handlers
+/// may have saved), up to the first guest frame.
+unsafe fn stack_bounded_frames(ctx: &CONTEXT, out: &mut [u64]) -> usize {
+    use windows_sys::Win32::System::Diagnostics::Debug::{RtlLookupFunctionEntry, RtlVirtualUnwind};
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { VirtualQuery(ctx.Rsp as *const std::ffi::c_void, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+        return 0;
+    }
+    let (lo, hi) = (ctx.Rsp, mbi.BaseAddress as u64 + mbi.RegionSize as u64);
+    let mut c: AlignedContext = unsafe { std::mem::zeroed() };
+    c.0 = *ctx;
+    let mut n = 0;
+    while n < out.len() {
+        let pc = c.0.Rip;
+        if pc == 0 || in_guest(pc) {
+            break;
+        }
+        out[n] = pc;
+        n += 1;
+        if c.0.Rsp < lo || c.0.Rsp + 8 > hi {
+            break;
+        }
+        let mut base = 0u64;
+        let fe = unsafe { RtlLookupFunctionEntry(pc, &mut base, std::ptr::null_mut()) };
+        if fe.is_null() {
+            c.0.Rip = unsafe { *(c.0.Rsp as *const u64) };
+            c.0.Rsp += 8;
+        } else {
+            let mut handler_data = std::ptr::null_mut();
+            let mut establisher = 0u64;
+            unsafe { RtlVirtualUnwind(0, base, pc, fe, &mut c.0, &mut handler_data, &mut establisher, std::ptr::null_mut()) };
+        }
+        if c.0.Rsp < lo || c.0.Rsp >= hi {
+            break;
+        }
+    }
+    n
+}
 
 /// The last chance for a fault no handler took (the first sessions' access
 /// violations inside nvoglv64.dll ended the process with no report of
@@ -1407,11 +1463,11 @@ unsafe fn veh_body(info: *mut EXCEPTION_POINTERS) -> i32 {
                 // (An access violation deep inside NVIDIA's driver, left to its handlers: under
                 // the port's host, a debugger, no unhandled-exception filter runs, so when none
                 // takes it the game ends with no report of ours (DLSS's sessions of 2026-11-25:
-                // only Streamline's minidump). Logged at first chance with our frames, the first
-                // few of a session.)
+                // only Streamline's minidump). Logged at first chance with our frames, each site
+                // once, eight at most.)
                 if code == 0xC0000005
                     && let Some((m, o)) = module_offset(rip).filter(|(m, _)| m.to_ascii_lowercase().starts_with("nv"))
-                    && DRIVER_FAULTS_LOGGED.fetch_add(1, Ordering::Relaxed) < 3
+                    && new_driver_fault_site(rip)
                 {
                     let (access, target) = if rec.NumberParameters >= 2 {
                         let a = match rec.ExceptionInformation[0] {
@@ -1424,11 +1480,8 @@ unsafe fn veh_body(info: *mut EXCEPTION_POINTERS) -> i32 {
                     } else {
                         ("access", 0)
                     };
-                    let mut c: AlignedContext = std::mem::zeroed();
-                    c.0 = *ctx;
                     let mut host = [0u64; 24];
-                    let mut guest = [0u64; 4];
-                    let (nh, _) = unwind(&mut c, &mut host, &mut guest);
+                    let nh = stack_bounded_frames(ctx, &mut host);
                     let frames: Vec<String> = host[..nh].iter().map(|&a| module_offset(a).map_or_else(|| format!("{a:#x}"), |(m, o)| format!("{m}+{o:#x}"))).collect();
                     crate::warn!("access violation inside {m}+{o:#x} ({access} of {target:#x}), first chance, left to its handlers; frames: {}", frames.join(" <- "));
                     crate::log::try_flush();

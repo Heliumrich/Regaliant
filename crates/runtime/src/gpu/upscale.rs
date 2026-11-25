@@ -40,7 +40,7 @@ use ash::vk;
 use parking_lot::Mutex;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering::Relaxed, Ordering::SeqCst};
 use windows_sys::Win32::Foundation::HMODULE;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -88,13 +88,23 @@ static SWITCHED: AtomicBool = AtomicBool::new(false);
 
 /// The upscaler chosen now: the PC tab's Anti-Aliasing (DS_UPSCALER at start).
 pub fn choice() -> Kind {
-    let v = CHOICE.load(Relaxed);
+    let v = CHOICE.load(SeqCst);
     if v != u8::MAX {
         return Kind::from_u8(v);
     }
     let k = Kind::parse(&std::env::var("DS_UPSCALER").ok().unwrap_or_default());
-    CHOICE.store(k as u8, Relaxed);
+    CHOICE.store(k as u8, SeqCst);
     k
+}
+
+/// The game's TAA for the whole run, whatever the settings choose, and why: the shader
+/// preparation's self-play (`prepplay::setup`, before the log and the settings; `set_choice`
+/// logs it).
+static PINNED_TAA: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+pub fn pin_taa(why: &'static str) {
+    let _ = PINNED_TAA.set(why);
+    CHOICE.store(Kind::Off as u8, SeqCst);
 }
 
 /// A new choice from the settings (applied from the next frame). An upscaler that is not ready
@@ -102,7 +112,16 @@ pub fn choice() -> Kind {
 /// TAA runs (`active`). The switch starts a new history at the upscaler's first frame.
 pub fn set_choice(v: &str) {
     let k = Kind::parse(v);
-    if CHOICE.swap(k as u8, Relaxed) != k as u8 {
+    if let Some(why) = PINNED_TAA.get() {
+        static TOLD: AtomicBool = AtomicBool::new(false);
+        if k != Kind::Off && !TOLD.swap(true, Relaxed) {
+            crate::info!("upscaler: {} chosen in the settings, the game's TAA for this run ({why})", k.name());
+        }
+        return;
+    }
+    // (SeqCst with `note_sl_present`'s: one of the two sees the other's store, so the last line
+    // logged for a choice of DLSS is right.)
+    if CHOICE.swap(k as u8, SeqCst) != k as u8 {
         SWITCHED.store(true, Relaxed);
         let note = if k == Kind::Off || ready(k) {
             ""
@@ -130,7 +149,7 @@ fn may_become_ready(k: Kind) -> bool {
 /// `k` just became ready: when it is the one chosen, it replaces the game's TAA from the next
 /// frame (the switch of `set_choice` is still pending, so its history starts new).
 fn now_ready(k: Kind) {
-    if choice() == k {
+    if choice() == k && ready(k) {
         crate::info!("upscaler: {} in use from now (the chosen Anti-Aliasing)", k.name());
     }
 }
@@ -165,7 +184,7 @@ fn ready(k: Kind) -> bool {
     match k {
         Kind::Off => false,
         Kind::Xess => XESS_READY.load(Relaxed) && !XESS_FAILED.load(Relaxed),
-        Kind::Dlss => DLSS_READY.load(Relaxed) && !DLSS_FAILED.load(Relaxed) && SL_PRESENTED.load(Relaxed),
+        Kind::Dlss => DLSS_READY.load(SeqCst) && !DLSS_FAILED.load(Relaxed) && SL_PRESENTED.load(SeqCst),
         Kind::Fsr => FSR_READY.load(Relaxed) && !FSR_FAILED.load(Relaxed),
     }
 }
@@ -180,7 +199,7 @@ static SL_PRESENTED: AtomicBool = AtomicBool::new(false);
 
 /// A present went through Streamline's vkQueuePresentKHR (`vk::present`).
 pub fn note_sl_present() {
-    if !SL_PRESENTED.swap(true, Relaxed) {
+    if !SL_PRESENTED.swap(true, SeqCst) {
         now_ready(Kind::Dlss);
     }
 }
@@ -1726,12 +1745,14 @@ fn dlss_device_created(instance: &ash::Instance, pdev: vk::PhysicalDevice, devic
             fail(Kind::Dlss, "no vkQueuePresentKHR from Streamline");
             return;
         };
-        let _ = SL_PRESENT.set(present);
         let mut ver: SlFeatureVersion = unsafe { std::mem::zeroed() };
         ver.base = SlBase::new(SL_FEATURE_VERSION, 1);
         let ngx = if unsafe { (s.version)(SL_FEATURE_DLSS, &mut ver) } == SL_OK { format!(", NGX DLSS {}.{}.{}", ver.ngx[0], ver.ngx[1], ver.ngx[2]) } else { String::new() };
-        DLSS_READY.store(true, Relaxed);
+        // (Ready before its present is published: the first present through Streamline then
+        // finds DLSS ready, and `note_sl_present` logs it in use; the review of 2026-11-25.)
+        DLSS_READY.store(true, SeqCst);
         crate::info!("upscaler: DLSS ready in {:.2} s (Streamline {}.{}.{}{ngx}): in use from the first present through Streamline", t0.elapsed().as_secs_f32(), ver.sl[0], ver.sl[1], ver.sl[2]);
+        let _ = SL_PRESENT.set(present);
     });
     if let Err(e) = spawned {
         fail(Kind::Dlss, format!("no thread for its start ({e})"));
