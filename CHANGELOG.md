@@ -1,13 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.1.7
 
 - Fixed the crash with Aspect Ratio 21:9 or 32:9 and Visual Mode Cinematic, also at every
   start after it (issue #20). At shapes wider than 16:9 the game now renders at most 1512
   lines, which its render targets have room for.
-
-## 0.1.7
-
 - Fixed DLSS, FSR and XeSS not working after a restart of the game. The Anti-Aliasing setting
   still showed the upscaler, but the game used its own TAA. Now the chosen upscaler takes over
   as soon as it is ready.
