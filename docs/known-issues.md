@@ -9,7 +9,7 @@
 - Water outside the Nexus can show bands. Some other rare picture faults are known.
 - The sky in the opening cutscene is a little darker than on PS5. Some light shafts look softer too.
 - At 32:9 the character preview in the equipment menu stands at the right edge.
-- On some PCs Aspect Ratio 21:9 or 32:9 (or Automatic on an ultrawide screen) crashes the game a few seconds after it is chosen, and at every start after that ([issue #20](https://github.com/SulphurS16/Regaliant/issues/20)). Choose 16:9 in SETTINGS > PC. If the game no longer starts, set `Setting_PC_AspectRatio = 1` in `pcsettings.txt` in '%APPDATA%\Regaliant'.
+- Aspect Ratio 21:9 or 32:9 (or Automatic on an ultrawide screen) with Visual Mode Cinematic crashes the game, also at every start after that ([issue #20](https://github.com/SulphurS16/Regaliant/issues/20)). With those shapes, set Visual Mode to Performance and leave Render Scale at Visual Mode. If the game no longer starts, set `Setting_PC_AspectRatio = 1` in `pcsettings.txt` in '%APPDATA%\Regaliant', start it, then change Visual Mode.
 - In character creation the header can turn bright cyan after the button prompts change, for example when you switch between the controller and the keyboard. It is only cosmetic.
 - In character creation and in the equipment menu the character preview can fill only part of the screen, and look dark in the menu, when Render Scale is set to a percentage (seen at small render sizes such as 100% of a 1280x720 window). Visual Mode shows it right.
 - HDR has not been seen on an HDR screen yet.

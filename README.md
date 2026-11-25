@@ -44,7 +44,7 @@ Shader preparation happens once. The first time you press Play, the game plays i
 
 - In a window on a 144 or 165 Hz screen the game shows an even 48 or 55 fps. Borderless or fullscreen with G-SYNC or FreeSync, or a 120 Hz screen, gives 60 ([more](docs/settings.md#frame-rate-and-refresh-rate)).
 - Shaders the preparation did not meet (rare effects, spells) still compile on first sight, and a level's first arrival can pause briefly.
-- On some PCs Aspect Ratio 21:9 or 32:9 crashes the game, also at later starts. 16:9 works ([how to get back](docs/known-issues.md)).
+- Aspect Ratio 21:9 or 32:9 with Visual Mode Cinematic crashes the game. Visual Mode Performance works ([more](docs/known-issues.md)).
 - A full playthrough has not been tested.
 - AMD and Intel graphics cards, HDR screens and 16 GB of memory have not been tested.
 - Online features are not available. The game plays offline.
