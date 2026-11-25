@@ -678,10 +678,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 return 0;
             }
             if wp as u16 == VK_F10_CODE {
-                // F10: the next 60 frames saved (a glitch as it happens). (As a
-                // system key it would open the window's menu.)
+                // F10: the next 60 frames saved (a glitch as it happens); Ctrl+F10: every
+                // thread's wait and stack written to the log (a hang the game still draws
+                // through). (As a system key it would open the window's menu.)
                 if (lp >> 30) & 1 == 0 {
-                    crate::hle::libs::videoout::burst_hotkey();
+                    if unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x11) } < 0 {
+                        crate::stacks_hotkey();
+                    } else {
+                        crate::hle::libs::videoout::burst_hotkey();
+                    }
                 }
                 return 0;
             }

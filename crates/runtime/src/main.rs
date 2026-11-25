@@ -1783,6 +1783,17 @@ fn host_thread_stacks() -> String {
     s
 }
 
+/// Ctrl+F10 in the window: the `stacks` report (each thread's wait and stack, the GPU queues,
+/// the audio) written to the log, for a player's report of a hang the game still draws through
+/// (issue #14: a loading screen that never ends, its fog moving at 60 fps). On a thread of its
+/// own, so the window's messages go on meanwhile.
+pub(crate) fn stacks_hotkey() {
+    let _ = std::thread::Builder::new().name("stacks-hotkey".into()).spawn(|| {
+        let flip = gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+        info!("Ctrl+F10 at flip {flip}: every thread, what it waits on and its stack:\n{}", thread_summary_ex(true));
+    });
+}
+
 fn thread_summary_ex(with_stacks: bool) -> String {
     let mut s = String::new();
     let list: Vec<&'static thread::GuestThread> = match thread::THREADS.try_lock() {
