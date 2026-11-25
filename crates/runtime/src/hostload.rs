@@ -35,6 +35,22 @@ static WINDOW: Mutex<Option<Window>> = Mutex::new(None);
 /// (u64::MAX before the first).
 static OTHERS_VRAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
+/// The card in use as the GPU counters name it (`luid_0x<high>_0x<low>`, upper-case hex), set
+/// when the device is chosen (`gpu::vk`). Video memory is counted on that card only: a PC with
+/// an integrated GPU beside it lists both, and the sum over both read 40-68 GB of others' memory
+/// on a 12 GB card (a Discord report, 2026-11-25; issue #5 had 38 GB). Until it is known, no
+/// video memory is counted.
+static ADAPTER: Mutex<Option<String>> = Mutex::new(None);
+
+/// The card's adapter id (Vulkan's deviceLUID: the Windows LUID's low part, then its high part).
+pub fn set_adapter_luid(luid: [u8; 8]) {
+    let low = u32::from_le_bytes([luid[0], luid[1], luid[2], luid[3]]);
+    let high = u32::from_le_bytes([luid[4], luid[5], luid[6], luid[7]]);
+    let tag = format!("luid_0x{high:08X}_0x{low:08X}");
+    crate::info!("host load: video memory counted on the card in use only ({tag})");
+    *ADAPTER.lock() = Some(tag);
+}
+
 /// Other processes' dedicated video memory at the last sample (once a
 /// second), bytes; None while the sampler is off or has not sampled yet.
 pub fn others_vram() -> Option<u64> {
@@ -237,9 +253,15 @@ fn sampler() {
                 }
             }
         }
-        if let Some(c) = vram {
+        let adapter = ADAPTER.lock().clone();
+        if let (Some(c), Some(adapter)) = (vram, adapter.as_deref()) {
             let mut vram_by: HashMap<u32, f64> = HashMap::new();
+            let want = adapter.to_ascii_uppercase();
             for (inst, v) in unsafe { values(c, PDH_FMT_DOUBLE) } {
+                // (Only the card in use: `ADAPTER`.)
+                if !inst.to_ascii_uppercase().contains(&want) {
+                    continue;
+                }
                 match pid_of(&inst) {
                     Some(pid) if pid == me => vram_ours += v,
                     Some(pid) => {

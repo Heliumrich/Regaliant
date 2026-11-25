@@ -231,10 +231,54 @@ fn note_pad_buffer(data: *mut PadData, how: &str) {
     }
 }
 
+/// The touch data of a touch pad click (ScePadTouchData: touchNum, 3 reserved bytes, a reserved
+/// word, then two ScePadTouch of x: u16, y: u16, id: u8 and 3 reserved bytes): a finger in the
+/// middle of the half the click is on (`input::TOUCH_LEFT` / `TOUCH_RIGHT`; the touch surface is
+/// 1920x1080, each half 960 wide), both halves two fingers, each contact's id new with each press
+/// as the DualSense numbers them (0-127, wrapping). The game tells a click's half by the finger's
+/// place: with no finger reported the click did nothing (the Tool Belt, a Discord report on 0.1.7,
+/// 2026-11-25).
+fn touch_of(buttons: u32) -> [u8; 24] {
+    use crate::input::{BTN_TOUCHPAD, TOUCH_RIGHT, TOUCH_SIDES};
+    use std::sync::atomic::{AtomicU32, AtomicU8, Ordering::Relaxed};
+    // (The sides held at the last read, and the next contact id.)
+    static WAS: AtomicU32 = AtomicU32::new(0);
+    static NEXT_ID: AtomicU8 = AtomicU8::new(0);
+    static IDS: [AtomicU8; 2] = [AtomicU8::new(0), AtomicU8::new(0)];
+    let mut t = [0u8; 24];
+    if buttons & BTN_TOUCHPAD == 0 {
+        WAS.store(0, Relaxed);
+        return t;
+    }
+    // (A click without a side, from no binding of ours, is on the left half.)
+    let sides = match buttons & TOUCH_SIDES {
+        0 => crate::input::TOUCH_LEFT,
+        s => s,
+    };
+    let was = WAS.swap(sides, Relaxed);
+    let mut n = 0usize;
+    for (i, (side, x)) in [(crate::input::TOUCH_LEFT, 480u16), (TOUCH_RIGHT, 1440u16)].into_iter().enumerate() {
+        if sides & side == 0 {
+            continue;
+        }
+        if was & side == 0 {
+            IDS[i].store(NEXT_ID.fetch_add(1, Relaxed) & 0x7f, Relaxed);
+        }
+        let o = 8 + n * 8;
+        t[o..o + 2].copy_from_slice(&x.to_le_bytes());
+        t[o + 2..o + 4].copy_from_slice(&540u16.to_le_bytes());
+        t[o + 4] = IDS[i].load(Relaxed);
+        n += 1;
+    }
+    t[0] = n as u8;
+    t
+}
+
 fn read_pad() -> PadData {
     let mut d: PadData = unsafe { std::mem::zeroed() };
     let st = crate::input::pad_state();
-    d.buttons = st.buttons;
+    d.buttons = st.buttons & !crate::input::TOUCH_SIDES;
+    d.touch = touch_of(st.buttons);
     d.lx = st.lx;
     d.ly = st.ly;
     d.rx = st.rx;

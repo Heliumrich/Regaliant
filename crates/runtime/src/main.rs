@@ -2180,8 +2180,10 @@ pub fn shutdown(code: i32) -> ! {
     session_ended();
     hle::libs::videoout::wait_shots();
     gpu::shutdown();
-    // (A clean end: faults the driver took itself were not crashes, `pcache::note_crash_suspect`.)
+    // (A clean end: faults the driver took itself were not crashes, `pcache::note_crash_suspect`;
+    // nor did Streamline end the start, `upscale::streamline_settled`.)
     gpu::pcache::clear_crash_suspects();
+    gpu::upscale::streamline_settled("the start ended cleanly first");
     // (The exact key specs still queued: written, the session's last ones.)
     gpu::precompile::exact_flush();
     info!("shutdown with status {code}\n{}", thread_summary());
@@ -2410,8 +2412,10 @@ This happens when other software takes that range. Restart the PC and try again.
     }
     log::TRACE_HLE.store(cfg.trace, std::sync::atomic::Ordering::Relaxed);
     hle::LENIENT_IMPORTS.store(cfg.lenient, std::sync::atomic::Ordering::Relaxed);
-    info!("Regaliant {} (build {}) | run dir {} | TLS slot {} | host heap: {} | guest write watch: {}", env!("CARGO_PKG_VERSION"), build_id(), cfg.run_dir.display(), slot, heap::name(), mem::write_watch_state());
+    info!("Regaliant {} (build {}) | run dir {} | TLS slot {} | host heap: {} | guest write watch: {}", env!("REGALIANT_VERSION"), build_id(), cfg.run_dir.display(), slot, heap::name(), mem::write_watch_state());
     info!("start: {}", system_line());
+    // (Windows of the guest range other memory of the process held at its reservation, issue #15.)
+    mem::note_host_holes();
     info!("files: {:?} layout, settings and saves in {}, logs and caches in {}", cfg.paths.layout, cfg.paths.user.display(), cfg.paths.cache.display());
     if let Some(p) = &cfg.game_problem {
         error!("game files: {}", p.replace('\n', " "));

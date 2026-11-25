@@ -491,6 +491,17 @@ fn init_inner() -> Result<(), String> {
         // (The design decides the translation's subgroup modes: `shaders::plain_modes`.)
         let checked = modes_checked_on(props.vendor_id, props.device_id);
         SUBGROUP_MODES_CHECKED.store(checked, std::sync::atomic::Ordering::Relaxed);
+        // (The card's adapter id: other programs' video memory is counted on this card only,
+        // `hostload`; a PC with an integrated GPU beside it lists both, and their sum read 40-68 GB
+        // on a 12 GB card, issue #5 and a Discord report of 2026-11-25.)
+        {
+            let mut idp = vk::PhysicalDeviceIDProperties::default();
+            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut idp);
+            instance.get_physical_device_properties2(pdev, &mut p2);
+            if idp.device_luid_valid == vk::TRUE {
+                crate::hostload::set_adapter_luid(idp.device_luid);
+            }
+        }
         crate::info!(
             "Vulkan device ids: PCI {:04x}:{:04x}; the translation's subgroup modes {} (DS_PLAIN_MODES=1 or 0 overrides)",
             props.vendor_id,

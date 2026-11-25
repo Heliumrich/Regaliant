@@ -42,6 +42,19 @@ pub const BTN_CIRCLE: u32 = 0x2000;
 pub const BTN_CROSS: u32 = 0x4000;
 pub const BTN_SQUARE: u32 = 0x8000;
 pub const BTN_TOUCHPAD: u32 = 0x100000;
+/// The touch pad's halves: marks beside `BTN_TOUCHPAD` that never reach the game (`devices`
+/// takes them off and puts a finger on that half). The game gives each half a mode in its
+/// settings (Left / Right TouchPad Mode: the Tool Belt, gestures, messages, photo mode) and tells
+/// a click's half by the finger's place: a click with no finger did nothing (the Tool Belt from
+/// every device's binding, a Discord report on 0.1.7, 2026-11-25).
+pub const TOUCH_LEFT: u32 = 0x2000_0000;
+pub const TOUCH_RIGHT: u32 = 0x4000_0000;
+pub const TOUCH_SIDES: u32 = TOUCH_LEFT | TOUCH_RIGHT;
+/// A click on the touch pad's left half (`touchpad`, `touchpad_l`) and on its right (`touchpad_r`).
+pub const TOUCHPAD_L: u32 = BTN_TOUCHPAD | TOUCH_LEFT;
+pub const TOUCHPAD_R: u32 = BTN_TOUCHPAD | TOUCH_RIGHT;
+/// The View button's place in `PAD_BUTTONS` (a PlayStation controller's touch pad click).
+pub const PAD_VIEW: usize = 10;
 
 /// The pad's buttons as XInput reports them (an Xbox controller's names): the layout file's
 /// name (`PadA = cross`), the menu's, and the XInput button bit (0: a trigger).
@@ -66,7 +79,7 @@ pub const PAD_BUTTONS: &[(&str, &str, u16)] = &[
 pub const PAD_LT: usize = 6;
 pub const PAD_RT: usize = 7;
 /// Each pad button's target unless the layout remaps it: the PS5 pad's button in its place.
-pub const PAD_DEFAULT: [u32; 16] = [BTN_CROSS, BTN_CIRCLE, BTN_SQUARE, BTN_TRIANGLE, BTN_L1, BTN_R1, BTN_L2, BTN_R2, BTN_L3, BTN_R3, BTN_TOUCHPAD, BTN_OPTIONS, BTN_UP, BTN_DOWN, BTN_LEFT, BTN_RIGHT];
+pub const PAD_DEFAULT: [u32; 16] = [BTN_CROSS, BTN_CIRCLE, BTN_SQUARE, BTN_TRIANGLE, BTN_L1, BTN_R1, BTN_L2, BTN_R2, BTN_L3, BTN_R3, TOUCHPAD_L, BTN_OPTIONS, BTN_UP, BTN_DOWN, BTN_LEFT, BTN_RIGHT];
 
 /// A button target's bit (`cross`, `up`, ...; None for stick directions and unknown names).
 pub fn button_bit(target: &str) -> Option<u32> {
@@ -133,7 +146,8 @@ fn parse_name(n: &str) -> Option<Result<u32, Stick>> {
         "l3" => Ok(BTN_L3),
         "r3" => Ok(BTN_R3),
         "options" | "start" => Ok(BTN_OPTIONS),
-        "touchpad" => Ok(BTN_TOUCHPAD),
+        "touchpad" | "touchpad_l" => Ok(TOUCHPAD_L),
+        "touchpad_r" => Ok(TOUCHPAD_R),
         "ls_up" => Err(Stick::LUp),
         "ls_down" => Err(Stick::LDown),
         "ls_left" => Err(Stick::LLeft),
@@ -637,6 +651,13 @@ fn xinput(st: &mut PadState) -> (u32, i16, i16) {
             st.buttons |= t;
         }
     }
+    // A PlayStation controller's touch pad click (View here) on the touch pad: the half its
+    // finger is on, as the console reads it; an Xbox pad's View or a key keeps its binding's half.
+    if phys & (1 << PAD_VIEW) != 0 && l.pad[PAD_VIEW] & BTN_TOUCHPAD != 0
+        && let Some(right) = crate::pspad::finger_right()
+    {
+        st.buttons = (st.buttons & !TOUCH_SIDES) | if right { TOUCH_RIGHT } else { TOUCH_LEFT };
+    }
     if l.pad[PAD_LT] == BTN_L2 && swallowed & (1 << PAD_LT) == 0 {
         st.l2 = st.l2.max(g.bLeftTrigger);
     }
@@ -668,7 +689,9 @@ pub const DEFAULT_LAYOUT: &str = "\
 # middle, Mouse4 and Mouse5 the side buttons), WheelUp, WheelDown; each may
 # have Shift+, Ctrl+ or Alt+ in front (that binding then wins while the
 # modifier is held). Targets: cross circle square triangle l1 r1 l2 r2 l3 r3
-# options touchpad, up down left right (d-pad), ls_up ls_down ls_left
+# options touchpad (the touch pad's left half) touchpad_r (its right half; the
+# game's Left and Right TouchPad Mode settings choose what each half does),
+# up down left right (d-pad), ls_up ls_down ls_left
 # ls_right (left stick), rs_up rs_down rs_left rs_right (right stick, the
 # camera), walk (the left stick at walking tilt).
 # Controller buttons (an Xbox controller's names: PadA PadB PadX PadY PadLB
@@ -1059,7 +1082,7 @@ fn render(l: &Layout, text: &str) -> String {
         head.push(line.to_string());
     }
     let target_name = |d: Dst| -> String {
-        let names = ["cross", "circle", "square", "triangle", "up", "down", "left", "right", "l1", "r1", "l2", "r2", "l3", "r3", "options", "touchpad", "ls_up", "ls_down", "ls_left", "ls_right", "rs_up", "rs_down", "rs_left", "rs_right", "walk"];
+        let names = ["cross", "circle", "square", "triangle", "up", "down", "left", "right", "l1", "r1", "l2", "r2", "l3", "r3", "options", "touchpad", "touchpad_r", "ls_up", "ls_down", "ls_left", "ls_right", "rs_up", "rs_down", "rs_left", "rs_right", "walk"];
         names.into_iter().find(|n| parse_dst(n) == Some(d)).unwrap_or("?").to_string()
     };
     let mut out = head.join("\n");

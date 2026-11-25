@@ -5,6 +5,17 @@ fn main() {
     // A profile-instrumented build for PGO passes `--cfg dsport_pgo_gen` with
     // `-Cprofile-generate` (docs/WORKFLOW.md).
     println!("cargo::rustc-check-cfg=cfg(dsport_pgo_gen)");
+    // The release version (the workspace's, Cargo.toml at the root): `REGALIANT_VERSION`. The
+    // crate's own version stays fixed (its Cargo.toml says why).
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml");
+    println!("cargo:rerun-if-changed={}", root.display());
+    let text = std::fs::read_to_string(&root).expect("the workspace's Cargo.toml");
+    let version = text
+        .split("[workspace.package]")
+        .nth(1)
+        .and_then(|t| t.lines().find_map(|l| l.trim().strip_prefix("version = \"").and_then(|v| v.strip_suffix('"'))))
+        .expect("[workspace.package] version");
+    println!("cargo:rustc-env=REGALIANT_VERSION={version}");
     // Keep bottom-up allocations (heaps, stacks) in the low 4 GiB so the guest
     // address range (16 GiB .. 8 TiB) can be reserved at startup. Image ASLR stays on.
     println!("cargo:rustc-link-arg-bins=/HIGHENTROPYVA:NO");

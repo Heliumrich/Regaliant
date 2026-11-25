@@ -86,6 +86,9 @@ pub struct Gamepad {
     pub ly: i16,
     pub rx: i16,
     pub ry: i16,
+    /// The first finger on the touch pad: its X (0-1919 across the pad), where the report carries
+    /// it and a finger is on the pad. The game tells a touch pad click's half by it (`input`).
+    pub touch_x: Option<u16>,
 }
 
 /// A stick's X (0-255, 128 the centre) in XInput's range, so that the pad layer's scale (`v *
@@ -147,7 +150,19 @@ pub fn parse_report(model: Model, bluetooth: bool, r: &[u8]) -> Option<Gamepad> 
     if b2 & 0x02 != 0 {
         w |= BACK; // the touch pad's click
     }
-    Some(Gamepad { buttons: w, lt: l2, rt: r2, lx: axis_x(d[0]), ly: axis_y(d[1]), rx: axis_x(d[2]), ry: axis_y(d[3]) })
+    // The first touch point (contact byte: bit 7 set when no finger is on the pad; then X in 12
+    // bits: the low 8, then 4 in the next byte's low half): the DualSense's full layout at data
+    // bytes 32-34, the DUALSHOCK 4's at 34-36 (its USB report and Bluetooth 0x11; the short
+    // Bluetooth report carries none).
+    let at = if full { 32 } else { 34 };
+    let touch_x = (d.len() > at + 2 && (full || model == Model::DualShock4) && d[at] & 0x80 == 0).then(|| d[at + 1] as u16 | ((d[at + 2] as u16 & 0x0F) << 8));
+    Some(Gamepad { buttons: w, lt: l2, rt: r2, lx: axis_x(d[0]), ly: axis_y(d[1]), rx: axis_x(d[2]), ry: axis_y(d[3]), touch_x })
+}
+
+/// Whether a PlayStation controller's first finger is on the touch pad's right half (None: no
+/// finger on any, or none connected): a touch pad click is on that half (`input`).
+pub fn finger_right() -> Option<bool> {
+    states().into_iter().filter(|s| s.active).find_map(|s| s.pad.touch_x).map(|x| x >= 960)
 }
 
 // ---------------------------------------------------------------------------
@@ -771,6 +786,30 @@ mod tests {
         // Not a state report.
         assert_eq!(parse_report(Model::DualSense, false, &[0x05; 64]), None);
         assert_eq!(parse_report(Model::DualSense, false, &r[..9]), None);
+    }
+
+    #[test]
+    fn touch_pad_finger() {
+        // The DualSense over USB: no finger (the contact byte's bit 7), then one at X 1500 (the
+        // touch pad's right half: X in 12 bits, the low 8 then the next byte's low 4).
+        let mut r = ds_usb([128; 4], 0, 0, [0x08, 0, 0x02]);
+        r[33] = 0x80 | 3;
+        assert_eq!(parse_report(Model::DualSense, false, &r).unwrap().touch_x, None);
+        r[33] = 3;
+        r[34] = (1500 & 0xFF) as u8;
+        r[35] = 0x50 | (1500 >> 8) as u8;
+        assert_eq!(parse_report(Model::DualSense, false, &r).unwrap().touch_x, Some(1500));
+        // The DUALSHOCK 4 over USB: a finger at X 300 (the left half), two bytes further on.
+        let mut r4 = vec![0u8; 64];
+        r4[0] = 0x01;
+        r4[5] = 0x08;
+        r4[35] = 1;
+        r4[36] = (300 & 0xFF) as u8;
+        r4[37] = (300 >> 8) as u8;
+        assert_eq!(parse_report(Model::DualShock4, false, &r4).unwrap().touch_x, Some(300));
+        // The short Bluetooth report carries no touch data.
+        let simple = [0x01, 128, 128, 128, 128, 0x08, 0, 0x02, 0, 0];
+        assert_eq!(parse_report(Model::DualSense, true, &simple).unwrap().touch_x, None);
     }
 
     #[test]

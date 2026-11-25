@@ -1023,11 +1023,20 @@ pub fn guest_range_reserved() -> bool {
 /// One attempt at the whole range (`reserve_guest_range_early`).
 fn reserve_guest_range_once() {
     let size = (GUEST_END - GUEST_BASE) as usize;
-    // (`DS_SIM_OCCUPIED=1`, a test: 64 KiB of the range taken first, as another program's
-    // module or memory took part of it on a player's PC (issue #15): the start then ends with
-    // status 10, naming the region.)
-    if env_is("DS_SIM_OCCUPIED", "1") {
-        unsafe { VirtualAlloc((GUEST_BASE + 0x1000_0000) as _, 0x1_0000, MEM_RESERVE, PAGE_NOACCESS) };
+    // (`DS_SIM_OCCUPIED`, a test: part of the range taken first, as another program's module or
+    // Windows' own threads' stacks took part of it on players' PCs (issue #15): `1` 64 KiB at
+    // 16.25 GiB, `0x<address>` 64 KiB there, both left out since 2026-11-25 night
+    // (`reserve_around_holes`); `big` 8 GiB, more than is left out: the start ends with status
+    // 10, naming the region.)
+    let sim = if env_is("DS_SIM_OCCUPIED", "1") {
+        Some((GUEST_BASE + 0x1000_0000, 0x1_0000u64))
+    } else if env_is("DS_SIM_OCCUPIED", "big") {
+        Some((GUEST_BASE + 0x1000_0000, 8u64 << 30))
+    } else {
+        env_hex("DS_SIM_OCCUPIED").filter(|a| (GUEST_BASE..GUEST_END - 0x1_0000).contains(a)).map(|a| (a & !0xFFFF, 0x1_0000u64))
+    };
+    if let Some((a, n)) = sim {
+        unsafe { VirtualAlloc(a as _, n as usize, MEM_RESERVE, PAGE_NOACCESS) };
         sim_module();
     }
     // Section-backed guest memory (no write watching: views have none).
@@ -1037,17 +1046,19 @@ fn reserve_guest_range_once() {
     }
     // The mixed range (`mixed`): one placeholder, windows made at first use.
     if !env_is("DS_MIXED", "0") && !env_is("DS_WRITE_WATCH", "0") {
+        if let Some(s) = env_u32("DS_MIXED_SHIFT").filter(|s| (MIXED_MIN_SHIFT..=30).contains(s)) {
+            MIXED_SHIFT.store(s, std::sync::atomic::Ordering::Relaxed);
+        }
         let p = unsafe { VirtualAlloc2(std::ptr::null_mut(), GUEST_BASE as _, size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, std::ptr::null_mut(), 0) };
-        if !p.is_null() {
-            if let Some(s) = env_u32("DS_MIXED_SHIFT").filter(|s| (MIXED_MIN_SHIFT..=30).contains(s)) {
-                MIXED_SHIFT.store(s, std::sync::atomic::Ordering::Relaxed);
-            }
+        // (Part of the range held already: the rest reserved around the windows it touches.)
+        let err = if p.is_null() { last_error() } else { 0 };
+        if !p.is_null() || reserve_around_holes() {
             MIXED.store(true, std::sync::atomic::Ordering::Release);
             WRITE_WATCH.store(true, std::sync::atomic::Ordering::Release);
             RESERVED_EARLY.store(true, std::sync::atomic::Ordering::Release);
             return;
         }
-        WRITE_WATCH_ERROR.store(last_error(), std::sync::atomic::Ordering::Release);
+        WRITE_WATCH_ERROR.store(err, std::sync::atomic::Ordering::Release);
     }
     if !env_is("DS_WRITE_WATCH", "0") {
         let p = unsafe { VirtualAlloc(GUEST_BASE as _, size, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_NOACCESS) };
@@ -1117,6 +1128,151 @@ const MIXED_MIN_SHIFT: u32 = 21;
 const MIXED_MAX_WINDOWS: usize = ((GUEST_END - GUEST_BASE) >> MIXED_MIN_SHIFT) as usize;
 /// The windows made (their allocation in place), a bit each.
 static MIXED_MADE: [std::sync::atomic::AtomicU64; MIXED_MAX_WINDOWS.div_ceil(64)] = [const { std::sync::atomic::AtomicU64::new(0) }; MIXED_MAX_WINDOWS.div_ceil(64)];
+/// Windows of the mixed range left out at the reservation, a bit each: other memory of the
+/// process sat in them (issue #15, 2026-11-25: on a player's PC the stacks of Windows' own
+/// threads lay inside the range at every start, and the start ended with status 10). The guest
+/// map holds them as taken (`note_host_holes`) and none is made (`mixed_make`).
+static MIXED_HOLES: [std::sync::atomic::AtomicU64; MIXED_MAX_WINDOWS.div_ceil(64)] = [const { std::sync::atomic::AtomicU64::new(0) }; MIXED_MAX_WINDOWS.div_ceil(64)];
+/// Windows left out (`MIXED_HOLES`) and what sat in them: (base, size, type) of at most 16
+/// regions, kept without allocating for `note_host_holes`.
+static HOLE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static HOLE_OCC: [std::sync::atomic::AtomicU64; 48] = [const { std::sync::atomic::AtomicU64::new(0) }; 48];
+static HOLE_OCC_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// At most this many windows are left out (4 GiB of 64 MiB windows): more is no stray block.
+const MAX_HOLE_WINDOWS: usize = 64;
+
+/// Whether the window holding guest address `a` was left out (`MIXED_HOLES`).
+fn mixed_hole(a: u64) -> bool {
+    if !(GUEST_BASE..GUEST_END).contains(&a) {
+        return false;
+    }
+    let w = ((a - GUEST_BASE) >> mixed_shift()) as usize;
+    MIXED_HOLES[w / 64].load(std::sync::atomic::Ordering::Acquire) >> (w % 64) & 1 != 0
+}
+
+/// The mixed range reserved in pieces, one placeholder for each run of windows nothing holds
+/// yet, the windows other memory of the process holds left out (`MIXED_HOLES`). False, nothing
+/// kept: nothing held (the whole range failed for another reason), more than
+/// `MAX_HOLE_WINDOWS` windows held, or a piece failed. Allocates nothing (it may run inside the
+/// heap's first allocation).
+fn reserve_around_holes() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let win = mixed_window();
+    let shift = mixed_shift();
+    let clear = || MIXED_HOLES.iter().for_each(|b| b.store(0, Relaxed));
+    let (mut holes, mut occ) = (0usize, 0usize);
+    let mut addr = GUEST_BASE;
+    while addr < GUEST_END {
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { VirtualQuery(addr as _, &mut info, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+            clear();
+            return false;
+        }
+        let (start, end) = (info.BaseAddress as u64, info.BaseAddress as u64 + info.RegionSize as u64);
+        if info.State != MEM_FREE {
+            if occ < 16 {
+                HOLE_OCC[3 * occ].store(start, Relaxed);
+                HOLE_OCC[3 * occ + 1].store(end - start, Relaxed);
+                HOLE_OCC[3 * occ + 2].store(info.Type as u64, Relaxed);
+                occ += 1;
+            }
+            let mut w = start.max(GUEST_BASE) & !(win - 1);
+            while w < end.min(GUEST_END) {
+                let i = ((w - GUEST_BASE) >> shift) as usize;
+                if MIXED_HOLES[i / 64].fetch_or(1 << (i % 64), Relaxed) >> (i % 64) & 1 == 0 {
+                    holes += 1;
+                }
+                w += win;
+            }
+            if holes > MAX_HOLE_WINDOWS {
+                clear();
+                return false;
+            }
+        }
+        addr = end.max(addr + PAGE);
+    }
+    if holes == 0 {
+        return false;
+    }
+    let mut made = [(0u64, 0u64); MAX_HOLE_WINDOWS + 1];
+    let mut n = 0;
+    let mut w = GUEST_BASE;
+    while w < GUEST_END {
+        if mixed_hole(w) {
+            w += win;
+            continue;
+        }
+        let s = w;
+        while w < GUEST_END && !mixed_hole(w) {
+            w += win;
+        }
+        let p = unsafe { VirtualAlloc2(std::ptr::null_mut(), s as _, (w - s) as usize, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, std::ptr::null_mut(), 0) };
+        if p.is_null() || n == made.len() {
+            for &(a, _) in &made[..n] {
+                unsafe { VirtualFree(a as _, 0, MEM_RELEASE) };
+            }
+            if !p.is_null() {
+                unsafe { VirtualFree(p, 0, MEM_RELEASE) };
+            }
+            clear();
+            return false;
+        }
+        made[n] = (s, w - s);
+        n += 1;
+    }
+    HOLE_COUNT.store(holes, Relaxed);
+    HOLE_OCC_N.store(occ, Relaxed);
+    true
+}
+
+/// The windows the reservation left out (`reserve_around_holes`), once the log exists: logged
+/// with what sat in them, and entered in the guest map as taken, so no mapping is placed there.
+pub fn note_host_holes() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let n = HOLE_COUNT.load(Relaxed);
+    if n == 0 {
+        return;
+    }
+    let win = mixed_window();
+    let mut runs = Vec::new();
+    let mut w = GUEST_BASE;
+    while w < GUEST_END {
+        if !mixed_hole(w) {
+            w += win;
+            continue;
+        }
+        let s = w;
+        while w < GUEST_END && mixed_hole(w) {
+            w += win;
+        }
+        runs.push((s, w - s));
+    }
+    let occ: Vec<String> = (0..HOLE_OCC_N.load(Relaxed))
+        .map(|i| {
+            let (b, z, t) = (HOLE_OCC[3 * i].load(Relaxed), HOLE_OCC[3 * i + 1].load(Relaxed), HOLE_OCC[3 * i + 2].load(Relaxed) as u32);
+            let kind = match t {
+                MEM_IMAGE => "a module",
+                MEM_MAPPED => "a mapped file",
+                _ => "private memory",
+            };
+            let mut name = [0u16; 512];
+            let len = if t == MEM_IMAGE || t == MEM_MAPPED {
+                unsafe { windows_sys::Win32::System::ProcessStatus::K32GetMappedFileNameW(windows_sys::Win32::System::Threading::GetCurrentProcess(), b as _, name.as_mut_ptr(), name.len() as u32) as usize }
+            } else {
+                0
+            };
+            let file = if len > 0 { format!(" {}", users_folder_hidden(&crate::log::redact(&String::from_utf16_lossy(&name[..len.min(name.len())])))) } else { String::new() };
+            format!("{b:#x}+{z:#x} {kind}{file}")
+        })
+        .collect();
+    let list: Vec<String> = runs.iter().map(|&(s, z)| format!("{s:#x}+{z:#x}")).collect();
+    crate::info!("mem: the guest range is reserved around {n} window(s) of {} MiB that other memory of this process held at the start ({}); held there: {}", win >> 20, list.join(", "), occ.join("; "));
+    let mut st = MEM.lock();
+    for &(s, z) in &runs {
+        st.vmas.insert(s, Vma { start: s, size: z, kind: VmaKind::Reserved, prot: 0, phys: 0, mtype: 0, name: "held by the host at the start".to_string(), slots: 0, off: 0, born: 0 });
+    }
+}
+
 /// Serializes the making of windows.
 static MIXED_LOCK: Mutex<()> = Mutex::new(());
 /// [windows made, failures to make one, host calls split at a window
@@ -1162,6 +1318,30 @@ fn env_u32(name: &str) -> Option<u32> {
     Some(v)
 }
 
+/// Environment variable `name` (ASCII) as a hexadecimal number (`0x` first), read without
+/// allocating (`env_is`).
+fn env_hex(name: &str) -> Option<u64> {
+    use windows_sys::Win32::System::Environment::GetEnvironmentVariableW;
+    let mut n = [0u16; 64];
+    if name.len() >= n.len() {
+        return None;
+    }
+    for (d, c) in n.iter_mut().zip(name.bytes()) {
+        *d = c as u16;
+    }
+    let mut buf = [0u16; 24];
+    let len = unsafe { GetEnvironmentVariableW(n.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if len < 3 || len >= buf.len() || buf[0] != '0' as u16 || (buf[1] | 0x20) != 'x' as u16 {
+        return None;
+    }
+    let mut v = 0u64;
+    for &c in &buf[2..len] {
+        let d = (c as u8 as char).to_digit(16).filter(|_| c < 128)? as u64;
+        v = v.checked_mul(16)?.checked_add(d)?;
+    }
+    Some(v)
+}
+
 /// The mixed guest range is on (unless `DS_MIXED=0`; set at the reservation).
 pub fn mixed() -> bool {
     MIXED.load(std::sync::atomic::Ordering::Acquire)
@@ -1183,6 +1363,12 @@ fn mixed_make(a: u64, e: u64) -> Result<(), u32> {
     let win = mixed_window();
     let mut w = a & !(win - 1);
     while w < e {
+        // (Left out at the reservation: other memory of the process is in it.)
+        if mixed_hole(w) {
+            MIXED_STATS[1].fetch_add(1, Ordering::Relaxed);
+            crate::warn!("mem: the guest range's window {w:#x} was left out at the start (other memory of the process is in it): no mapping there");
+            return Err(487);
+        }
         if !mixed_made(w) && !view_window(w) {
             let _g = MIXED_LOCK.lock();
             if !mixed_made(w) {

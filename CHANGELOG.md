@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+- Fixed the washed-out, too bright picture with ghosting and black blotches at Render Scale
+  100% on a 4K screen (issue #6). Above 2048 lines the game's lighting goes wrong when the
+  render size is changed from the game's own, so Render Scale now renders at most 2048 lines
+  (3640x2048 at 16:9, 95% of 4K).
+- Fixed the game closing at every start with some DLSS files (`nvngx_dlss.dll`). The check
+  before DLSS loads now also asks DLSS whether it supports your card, the step that crashed,
+  and a start that ends before DLSS has drawn its first frame is counted. A DLSS file that
+  crashes is left out, and the game starts with its own TAA.
+- Fixed "status 10" at every start on PCs where Windows itself puts a few thread stacks into
+  the memory range the game needs (issue #15). The game now leaves those few megabytes out and
+  starts.
+- Fixed the Tool Belt not opening (the touch pad, or View on an Xbox controller), from any
+  controller, keyboard or mouse. The game asks which half of the touch pad was pressed, and no
+  finger was reported. The left half opens the Tool Belt by default, the new binding "Touch Pad
+  Right" presses the right half, and a PlayStation controller's own touch pad presses the half
+  you touch.
+- On PCs with integrated graphics beside the graphics card, other programs' video memory was
+  counted on both, which could make the game drop textures early. Only the card the game uses
+  counts now.
+- The launcher has an Uninstall button (issue #19). It removes Regaliant's program files,
+  prepared shaders, logs and settings, never your game files or add-ons, and asks before
+  deleting your saves.
+
 ## 0.1.7
 
 - Fixed the crash with Aspect Ratio 21:9 or 32:9 and Visual Mode Cinematic, also at every

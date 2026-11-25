@@ -36,7 +36,12 @@ pub const ACTIONS: &[(&str, &str)] = &[
     ("square", "Use Item"),
     ("cross", "Interact"),
     ("r3", "Lock On"),
+    // (The touch pad's left half, then its right: the game's Left and Right TouchPad Mode set
+    // what each opens, the Tool Belt for both by default; a key reaches the right half only here.
+    // The controller's list keeps one row: its 16 targets sit on 16 buttons, and a PlayStation
+    // controller's finger picks the half itself.)
     ("touchpad", "Tool Belt"),
+    ("touchpad_r", "Touch Pad Right"),
     ("options", "Menu"),
     ("up", "Next Spell"),
     ("down", "Next Item"),

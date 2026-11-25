@@ -1,6 +1,10 @@
 [package]
 name = "dsport"
-version.workspace = true
+# Fixed, not the workspace's: cargo derives the hash in every symbol of this crate from its
+# version, and a PGO profile names the functions by those symbols. With the release version
+# here each release needed the profile trained again (~40 minutes); the release version reaches
+# the program through `REGALIANT_VERSION` (build.rs) instead. Never change it with a release.
+version = "0.1.7"
 description = "Regaliant's runtime: Demon's Souls (PS5, PPSA01341) on Windows x86-64, PS5 HLE + native CPU execution (shipped as regaliant.exe)"
 edition.workspace = true
 license.workspace = true

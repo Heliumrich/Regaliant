@@ -201,6 +201,7 @@ static SL_PRESENTED: AtomicBool = AtomicBool::new(false);
 pub fn note_sl_present() {
     if !SL_PRESENTED.swap(true, SeqCst) {
         now_ready(Kind::Dlss);
+        streamline_settled("DLSS ready and a frame presented through Streamline");
     }
 }
 
@@ -286,6 +287,9 @@ pub fn mip_bias() -> f32 {
 fn fail(k: Kind, msg: impl std::fmt::Display) {
     if !failed_flag(k).swap(true, Relaxed) {
         crate::warn!("upscaler: {} unavailable: {msg}", k.name());
+    }
+    if k == Kind::Dlss {
+        streamline_settled("DLSS unavailable without a crash");
     }
 }
 
@@ -1337,7 +1341,7 @@ fn system_dir() -> Option<PathBuf> {
 /// (`streamline-ok.txt` and `streamline-crashed.txt` hold the line they were written for: a check
 /// is made again once it differs, a driver update included).
 fn streamline_files_line(dir: &Path) -> String {
-    let mut v = vec![format!("Regaliant {}", env!("CARGO_PKG_VERSION"))];
+    let mut v = vec![format!("Regaliant {}", env!("REGALIANT_VERSION"))];
     let files = ["nvngx_dlss.dll", "sl.interposer.dll", "sl.common.dll", "sl.dlss.dll"].map(|f| dir.join(f));
     for p in files.iter().cloned().chain(system_dir().map(|s| s.join("nvapi64.dll"))) {
         let m = std::fs::metadata(&p).ok();
@@ -1346,6 +1350,24 @@ fn streamline_files_line(dir: &Path) -> String {
         v.push(format!("{name} {} {t}", m.map_or(0, |m| m.len())));
     }
     v.join("; ")
+}
+
+/// When process `pid` was created (FILETIME ticks; None: not found). A marker's process is the
+/// one that left it only while this matches: Windows reuses the number of an ended process.
+fn process_created(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let z = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let (mut c, mut e, mut k, mut u) = (z, z, z, z);
+        let ok = GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u) != 0;
+        CloseHandle(h);
+        ok.then(|| ((c.dwHighDateTime as u64) << 32) | c.dwLowDateTime as u64)
+    }
 }
 
 /// Whether process `pid` still runs.
@@ -1407,15 +1429,28 @@ fn streamline_crashed_before(dir: &Path) -> Option<String> {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
             let Some(pid) = name.strip_prefix("streamline-loading-").and_then(|s| s.strip_suffix(".txt")).and_then(|s| s.parse::<u32>().ok()) else { continue };
-            let old = e.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|a| a.as_secs() > 300);
-            if pid == std::process::id() || !(old || !process_alive(pid)) {
+            if pid == std::process::id() {
+                continue;
+            }
+            // (The files' line, then the process's creation time: a live process with that
+            // number and time is still on trial, however long. A marker without the time, from
+            // 0.1.7 and before, counts as its process's after five minutes.)
+            let text = std::fs::read_to_string(e.path()).unwrap_or_default();
+            let (line, created) = text.split_once('\n').map_or((text.as_str(), 0), |(l, c)| (l, c.trim().parse::<u64>().unwrap_or(0)));
+            let gone = if created != 0 {
+                !process_alive(pid) || process_created(pid) != Some(created)
+            } else {
+                let old = e.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|a| a.as_secs() > 300);
+                old || !process_alive(pid)
+            };
+            if !gone {
                 continue;
             }
             let claimed = cache.join(format!("streamline-loading-{pid}.claimed-{}", std::process::id()));
             if std::fs::rename(e.path(), &claimed).is_err() {
                 continue;
             }
-            let line = std::fs::read_to_string(&claimed).unwrap_or_default();
+            let line = line.to_string();
             let _ = std::fs::remove_file(&claimed);
             note_streamline_death(&cache, &line, &format!("an earlier start (process {pid}) ended while it loaded Streamline (DLSS)"));
         }
@@ -1480,9 +1515,12 @@ fn load_sl() -> Result<SlLib, LoadError> {
             }
         }
     }
-    // (Removed whatever the load's outcome; left behind only if the process dies in it.)
+    // (Left behind only if the process dies while Streamline is on trial: from its load to
+    // DLSS's first frame presented through it, `streamline_settled`. Until 0.1.7 it covered the
+    // load alone, and a player's start that died in DLSS's support query right after it, with
+    // their own nvngx_dlss.dll, died the same way at every start: 2026-11-25.)
     let marker = cache.join(format!("streamline-loading-{}.txt", std::process::id()));
-    let _ = std::fs::write(&marker, &line);
+    let _ = std::fs::write(&marker, format!("{line}\n{}", process_created(std::process::id()).unwrap_or(0)));
     // (Diagnosis: `DS_SL_CRASH_TEST=2` ends the process here, as a crash in the load would; `1`
     // ends the separate check instead.)
     if std::env::var_os("DS_SL_CRASH_TEST").is_some_and(|v| v == "2") {
@@ -1490,12 +1528,25 @@ fn load_sl() -> Result<SlLib, LoadError> {
         std::process::abort();
     }
     let r = load_sl_from(&dir);
-    let _ = std::fs::remove_file(&marker);
-    // (Loaded: the deaths in a row end here.)
     if r.is_ok() {
-        let _ = std::fs::remove_file(cache.join("streamline-deaths.txt"));
+        *SL_MARKER.lock() = Some(marker);
+    } else {
+        let _ = std::fs::remove_file(&marker);
     }
     r
+}
+
+/// This start's marker while Streamline is on trial (`load_sl`).
+static SL_MARKER: parking_lot::Mutex<Option<PathBuf>> = parking_lot::Mutex::new(None);
+
+/// Streamline's trial in this start ended without a death (`why`: DLSS presented a frame through
+/// it, failed without a crash, or the start ended cleanly first): the marker goes and so do the
+/// deaths in a row.
+pub fn streamline_settled(why: &str) {
+    let Some(m) = SL_MARKER.lock().take() else { return };
+    let _ = std::fs::remove_file(&m);
+    let _ = std::fs::remove_file(crate::paths().cache.join("streamline-deaths.txt"));
+    crate::info!("upscaler: Streamline's start went through ({why})");
 }
 
 /// Exit codes of `dsport --probe-streamline`: loaded, refused without a fault, out of time (its
@@ -1573,9 +1624,41 @@ pub fn probe_streamline(dir: &Path) -> ! {
     if std::env::var_os("DS_SL_CRASH_TEST").is_some_and(|v| v == "1") {
         std::process::abort();
     }
-    let code = if load_sl_from(dir).is_ok() { PROBE_LOADED } else { PROBE_REFUSED };
+    let code = match load_sl_from(dir) {
+        Ok(lib) => {
+            probe_support(&lib);
+            PROBE_LOADED
+        }
+        Err(_) => PROBE_REFUSED,
+    };
     unsafe { TerminateProcess(GetCurrentProcess(), code) };
     std::process::exit(code as i32)
+}
+
+/// The separate check's second step: DLSS's support query (slIsFeatureSupported, where NGX loads
+/// the player's nvngx_dlss.dll) on each NVIDIA card of a Vulkan instance made with DLSS's
+/// instance extensions, as a start makes it before its device. A start of 0.1.7 died there right
+/// after a check that only loaded the files (2026-11-25). Its answer does not matter here, only
+/// that the process survives it.
+fn probe_support(lib: &SlLib) {
+    let Ok(entry) = (unsafe { ash::Entry::load() }) else { return };
+    let avail = unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default();
+    let has = |e: &CStr| avail.iter().any(|x| unsafe { CStr::from_ptr(x.extension_name.as_ptr()) } == e);
+    let exts: Vec<*const std::ffi::c_char> = lib.reqs.instance_ext.iter().filter(|e| has(e)).map(|e| e.as_ptr()).collect();
+    let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
+    let ici = vk::InstanceCreateInfo::default().application_info(&app).enabled_extension_names(&exts);
+    let Ok(instance) = (unsafe { entry.create_instance(&ici, None) }) else { return };
+    for pdev in unsafe { instance.enumerate_physical_devices() }.unwrap_or_default() {
+        if unsafe { instance.get_physical_device_properties(pdev) }.vendor_id != 0x10DE {
+            continue;
+        }
+        let info = SlAdapterInfo { base: SlBase::new(SL_ADAPTER_INFO, 1), luid: std::ptr::null(), luid_size: 0, vk_physical_device: pdev };
+        // (Diagnosis: `DS_SL_CRASH_TEST=4` ends the check here.)
+        if std::env::var_os("DS_SL_CRASH_TEST").is_some_and(|v| v == "4") {
+            std::process::abort();
+        }
+        let _ = unsafe { (lib.is_supported)(SL_FEATURE_DLSS, &info) };
+    }
 }
 
 fn load_sl_from(dir: &Path) -> Result<SlLib, LoadError> {
@@ -1674,6 +1757,13 @@ fn dlss_device_needs(instance: &ash::Instance, pdev: vk::PhysicalDevice) -> Opti
         return None;
     }
     let info = SlAdapterInfo { base: SlBase::new(SL_ADAPTER_INFO, 1), luid: std::ptr::null(), luid_size: 0, vk_physical_device: pdev };
+    // (Diagnosis: `DS_SL_CRASH_TEST=3` ends the process here, as the player's DLSS file did in
+    // 0.1.7, 2026-11-25.)
+    if std::env::var_os("DS_SL_CRASH_TEST").is_some_and(|v| v == "3") {
+        crate::warn!("upscaler: DS_SL_CRASH_TEST: ending the process at DLSS's support query");
+        crate::log::flush();
+        std::process::abort();
+    }
     let r = unsafe { (s.is_supported)(SL_FEATURE_DLSS, &info) };
     if r != SL_OK {
         fail(Kind::Dlss, format!("not supported on this GPU or driver (Streamline result {r})"));

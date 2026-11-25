@@ -1,6 +1,8 @@
 [package]
 name = "dsconfig"
-version.workspace = true
+# Fixed, as the runtime's (crates/runtime/Cargo.toml says why): cargo mixes this crate's version
+# into the runtime's symbol hashes. Never change it with a release.
+version = "0.1.7"
 description = "Shared by Regaliant's runtime and launcher: where its files are kept, the game folder's checks"
 edition.workspace = true
 license.workspace = true

@@ -21,6 +21,7 @@ mod shaders;
 mod shot;
 mod sys;
 mod ui;
+mod uninstall;
 
 use dsconfig::paths::{Launch, Paths};
 use std::cell::RefCell;
@@ -47,6 +48,7 @@ const ID_RESET: i32 = 903;
 const ID_LOGS: i32 = 904;
 const ID_DISCORD: i32 = 905;
 const ID_STATUS_BAR: i32 = 906;
+const ID_UNINSTALL: i32 = 907;
 
 /// The community's Discord invite (the button "Join the Discord").
 const DISCORD: &str = "https://discord.gg/rSr5JhxxtZ";
@@ -364,6 +366,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 ID_RESET => reset_settings(app),
                 ID_LOGS => open_logs(app),
                 ID_DISCORD => ui::open_url(DISCORD),
+                ID_UNINSTALL => uninstall::run(app),
                 100..=199 => game::command(app, id, code),
                 200..=299 => shaders::command(app, id, code),
                 300..=399 => saves::command(app, id, code),
@@ -531,6 +534,8 @@ fn main() {
         app.put(usize::MAX, b.button("Reset settings...", r, ID_RESET), r);
         let r = (282, 548, 110, 36);
         app.put(usize::MAX, b.button("Open logs", r, ID_LOGS), r);
+        let r = (400, 548, 110, 36);
+        app.put(usize::MAX, b.button("Uninstall...", r, ID_UNINSTALL), r);
         // (At the row's right end.)
         let r = (614, 548, 150, 36);
         app.put(usize::MAX, b.button("Join the Discord", r, ID_DISCORD), r);
