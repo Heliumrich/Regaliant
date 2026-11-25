@@ -22,9 +22,9 @@
   Blur and Game's Blur. They were On, Reduced Blur and Off, and "Off" read as no blur while it
   turned on the game's full motion blur, which smears every camera move (issue #6). Your saved
   choice stays as it was.
-- When another program holds part of the memory the game needs ("status 10"), the message and
-  `early-failure.txt` now also list the modules other programs put into the game at that
-  moment, so the program can be found (issue #15).
+- When another program holds part of the memory the game needs ("status 10") with memory that
+  names no owner, the message and `early-failure.txt` now also list the modules other programs
+  put into the game at that moment, to help find the program (issue #15).
 
 ## 0.1.6
 

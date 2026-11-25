@@ -398,8 +398,9 @@ pub fn apply() {
     }
 }
 
-/// Motion Blur Fix (`MouseMotionBlur`): 0 Off (the game's own Motion Blur), 1 Reduced Blur
-/// (MOUSE_BLUR_REDUCED of it), 2 On (no motion blur: the default; at the game's default a mouse
+/// Motion Blur Fix (`MouseMotionBlur`): 0 Game's Blur (the game's own Motion Blur; "Off" until
+/// 2026-11-25), 1 Reduced Blur (MOUSE_BLUR_REDUCED of it), 2 No Blur ("On" until then; no motion
+/// blur: the default; at the game's default a mouse
 /// turn of 1,500 counts a second kept 10% of a still frame's detail, a tenth of the blur 49%,
 /// none 54%; at 4,000 a second 9%, 16% and 63%: FINDINGS.md 2026-11-07). With every device since
 /// 2026-11-13 night (the user: on by default with a controller too; mouse and keyboard only before).

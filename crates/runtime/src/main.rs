@@ -2265,6 +2265,12 @@ fn apply_diagnostics() -> Vec<String> {
             notes.push(format!("'{k}' left (the port's own)"));
             continue;
         }
+        // (Test switches stay out of the players' file: `DS_SIM_*` make the game fail on purpose,
+        // and `DS_SIM_MODULE` loads the module it names; the review of 2026-11-25 evening.)
+        if k.starts_with("DS_SIM_") {
+            notes.push(format!("'{k}' left (a test switch)"));
+            continue;
+        }
         // (What the environment already holds wins: the launcher's settings, a developer's.)
         if std::env::var_os(k).is_some() {
             if inherited.iter().any(|n| n == k) {

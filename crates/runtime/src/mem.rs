@@ -1929,10 +1929,14 @@ pub fn reserve_guest_range() -> Result<(), String> {
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         let mut addr = GUEST_BASE;
         let mut busy = Vec::new();
+        let mut private = false;
         while addr < GUEST_END {
             let n = unsafe { VirtualQuery(addr as _, &mut info, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) };
             if n == 0 {
                 break;
+            }
+            if info.State != MEM_FREE && info.Type != MEM_IMAGE && info.Type != MEM_MAPPED {
+                private = true;
             }
             if info.State != MEM_FREE && busy.len() < 16 {
                 let kind = match info.Type {
@@ -1952,9 +1956,11 @@ pub fn reserve_guest_range() -> Result<(), String> {
             addr = info.BaseAddress as u64 + info.RegionSize as u64;
         }
         // (Private memory names no owner: the modules other programs put into this process
-        // before it reserved the range are its likely owners, issue #15.)
-        let others = foreign_modules();
-        let others = if others.is_empty() { String::new() } else { format!("; other programs' modules loaded: {}", others.join(", ")) };
+        // before it reserved the range are its likely owners, issue #15. Listed only then: a
+        // module or mapped file names its own, and a bystander listed beside it would be blamed;
+        // the review of 2026-11-25 evening.)
+        let others = if private { foreign_modules() } else { Vec::new() };
+        let others = if others.is_empty() { String::new() } else { format!("; private memory names no owner, other programs' modules loaded then: {}", others.join(", ")) };
         return Err(format!("reserving guest range failed (error {err}); occupied: {}{others}", busy.join("; ")));
     }
     Ok(())
@@ -1965,10 +1971,14 @@ pub fn reserve_guest_range() -> Result<(), String> {
 /// range, such as a tool another program puts into every process (issue #15). At most 16.
 fn foreign_modules() -> Vec<String> {
     use windows_sys::Win32::Foundation::HMODULE;
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::System::ProcessStatus::{K32EnumProcessModules, K32GetModuleFileNameExW};
     use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let proc = unsafe { GetCurrentProcess() };
+    // (The program itself, by its handle: its folder may be a drive's root, which the folder test
+    // below leaves out, or unknown.)
+    let exe = unsafe { GetModuleHandleW(std::ptr::null()) };
     let mut mods: [HMODULE; 512] = [std::ptr::null_mut(); 512];
     let mut needed = 0u32;
     if unsafe { K32EnumProcessModules(proc, mods.as_mut_ptr(), std::mem::size_of_val(&mods) as u32, &mut needed) } == 0 {
@@ -1978,9 +1988,14 @@ fn foreign_modules() -> Vec<String> {
     let mut wdir = [0u16; 260];
     let wl = unsafe { GetSystemWindowsDirectoryW(wdir.as_mut_ptr(), wdir.len() as u32) } as usize;
     let windows = if wl > 0 && wl < wdir.len() { format!("{}\\", String::from_utf16_lossy(&wdir[..wl]).trim_end_matches('\\').to_ascii_lowercase()) } else { String::new() };
-    let own = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| format!("{}\\", d.to_string_lossy().trim_end_matches('\\').to_ascii_lowercase())));
+    // (The program's folder, unless it is a drive's root: then every module on that drive would
+    // be left out; the review of 2026-11-25 evening.)
+    let own = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| format!("{}\\", d.to_string_lossy().trim_end_matches('\\').to_ascii_lowercase()))).filter(|d| d.len() > 3);
     let mut out = Vec::new();
     for &m in &mods[..n] {
+        if m == exe {
+            continue;
+        }
         let mut name = [0u16; 512];
         let len = unsafe { K32GetModuleFileNameExW(proc, m, name.as_mut_ptr(), name.len() as u32) } as usize;
         if len == 0 || len >= name.len() {
