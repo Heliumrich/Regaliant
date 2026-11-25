@@ -1163,6 +1163,52 @@ fn bindings_browser(f: &mut cgpr::File, choice: &cgpr::Entity, names: &ListNames
     Ok(opener)
 }
 
+/// Save and Quit to Desktop for the PC page's end (`quit`): a copy of the EXIT GAME page's Save
+/// and Exit Game button (the game's own save and exit to the title: its ExitGameToFrontEnd and
+/// decide handler, its look), its text and tooltip the port's, its Element `quit::BUTTON_HEIGHT`
+/// high (the original 50: how the port tells it from other items), hidden on the title screen as
+/// the game hides its EXIT GAME tab there (the game's own HideCondition on 'Dialog_IsInFrontEnd';
+/// the title menu has EXIT GAME). (On the EXIT GAME page beside the game's button it could not be
+/// reached: that page's lists take no cursor input, 2026-11-26's boots.)
+fn quit_button(f: &mut cgpr::File) -> Result<cgpr::Entity, String> {
+    let line = cgpr::lstr("SETTINGS_ENTRY_EXIT_GAME_LINE");
+    let mut button = None;
+    for r in &f.roots {
+        let Some(path) = r.path_to("ExitButton") else { continue };
+        if let Some(b) = r.at(&path).kids.iter().find(|k| k.name == b"ExitGameButton" && k.comps.iter().any(|(_, i)| cgpr::contains(&f.comps[*i as usize].payload, &line))) {
+            button = Some(b.clone());
+            break;
+        }
+    }
+    let button = button.ok_or("no EXIT GAME page button")?;
+    let front_end = cgpr::lstr("Dialog_IsInFrontEnd");
+    let hide = f
+        .comps
+        .iter()
+        .position(|c| cgpr::contains(&c.payload, &front_end) && Payload::parse(&c.payload).is_some_and(|p| p.value.hash == h("HideCondition")))
+        .ok_or("no HideCondition on Dialog_IsInFrontEnd")?;
+    let repl = vec![
+        (b"SETTINGS_ENTRY_EXIT_GAME_LINE".to_vec(), b"PC_QUIT_GAME_LINE".to_vec()),
+        (b"SETTINGS_TOOLTIP_EXIT_GAME_TAB".to_vec(), b"PC_QUIT_GAME_TIP".to_vec()),
+    ];
+    let salt = cgpr::salt("QuitGameButton");
+    let mut copy = cgpr::clone_entity(&mut f.comps, &button, &repl, &salt);
+    copy.name = b"QuitGameButton".to_vec();
+    edit_descendant(f, &mut copy, "QuitGameButton", h("Element"), |p| set_float(p, h("Height"), crate::quit::BUTTON_HEIGHT))?;
+    copy.comps.push((cgpr::salted(&copy.guid, &cgpr::salt("QuitGameHide")), hide as u32));
+    let mut idx = Vec::new();
+    cgpr::comp_indices(&copy, &mut idx);
+    let has = |s: &str| idx.iter().any(|&i| cgpr::contains(&f.comps[i as usize].payload, s.as_bytes()));
+    if !has("PC_QUIT_GAME_LINE") || has("SETTINGS_ENTRY_EXIT_GAME_LINE") {
+        return Err("the button's copy kept the game's text".into());
+    }
+    Ok(copy)
+}
+
+/// The PC page's list box as a share of its page's height (the DISPLAY page's own: 0.9, eleven
+/// rows): room for a twelfth, Save and Quit to Desktop.
+const PC_LIST_HEIGHT: f32 = 0.98;
+
 /// The title menu with Exit Game after Gallery (`quit`): a copy of its Settings item showing
 /// the game's own `SETTINGS_HEADING_EXITGAME` ("EXIT GAME", upper case as the title menu's own
 /// items, in every language: the in-game SETTINGS tab's heading), its choice `QuitGame`
@@ -1270,6 +1316,19 @@ fn start_menu(orig: &[u8]) -> Result<Vec<u8>, String> {
                     Err(e) => crate::warn!("pc settings: no {} list ({e})", names.screen),
                 }
             }
+            // Save and Quit to Desktop at the page's end (`quit`).
+            // (The DISPLAY page's list box, 0.9 of the page, holds eleven rows from y 68, 48
+            // apart; a twelfth is placed but clipped: the PC page's list gets 0.98.)
+            match quit_button(&mut f).and_then(|b| {
+                edit_descendant(&mut f, &mut page, "MenuContents", h("FitRelativeToParent"), |p| set_float(p, h("Height"), PC_LIST_HEIGHT))?;
+                Ok(b)
+            }) {
+                Ok(b) => {
+                    page.at_mut(&contents_rel).kids.push(b);
+                    crate::info!("pc settings: the PC page ends with Save and Quit to Desktop (`quit`)");
+                }
+                Err(e) => crate::warn!("pc settings: no Save and Quit to Desktop ({e})"),
+            }
         }
         if tab.id == "PCTrophies" {
             match trophy_browser(&mut f, &trophy_rows()) {
@@ -1352,6 +1411,8 @@ fn text(orig: &[u8]) -> Vec<u8> {
             lines.extend(item.options().into_iter().filter_map(|(k, t)| t.map(|t| (k, t))));
         }
     }
+    lines.push(("PC_QUIT_GAME_LINE".into(), "Save and Quit to Desktop".into()));
+    lines.push(("PC_QUIT_GAME_TIP".into(), "Saves the current game and quits to the desktop.".into()));
     lines.push(("PC_BINDINGS_OPEN".into(), "Key Bindings".into()));
     lines.push(("PC_BINDINGS_OPEN_TIP".into(), "The keys and mouse buttons for every action.".into()));
     lines.push(("PC_BINDINGS_HEADING".into(), "KEY BINDINGS".into()));

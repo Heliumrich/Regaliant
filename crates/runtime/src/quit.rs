@@ -10,8 +10,17 @@
 //! for the save being written, if any, before it ends (`wait_for_saves`; saves are committed by
 //! renames, `hle::libs::savedata`, so an end never breaks one, but a write still open would be
 //! lost).
+//!
+//! In game, the SETTINGS screen's PC page ends with Save and Quit to Desktop
+//! (`pcsettings::quit_button`): a copy of the game's own Save and Exit Game button from its EXIT
+//! GAME page (the game saves and returns to the title), 51 units high where the original is 50,
+//! which is how `tick` knows Cross was pressed on it (the UI nodes, `uistate`, as the key
+//! binding rows are found); hidden on the title screen, where the title menu has EXIT GAME. The
+//! session then ends when the title's own movies open again
+//! (`note_open`): the game has left the game world, its save written.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use parking_lot::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 /// Set when the player chose Exit Game: the main loop ends the session.
@@ -30,6 +39,56 @@ pub extern "sysv64" fn menu_hook(regs: *const u64, _arg: u32) {
     let choice = unsafe { *regs.add(12) } as u32;
     if choice == quit_choice() && !REQUESTED.swap(true, Ordering::SeqCst) {
         crate::info!("quit: Exit Game chosen on the title menu");
+    }
+}
+
+/// The design height of Save and Quit to Desktop (the game's Save and Exit Game: 50).
+pub const BUTTON_HEIGHT: f32 = 51.0;
+
+/// When Save and Quit to Desktop was pressed: the session ends at the title within two minutes.
+static PENDING: Mutex<Option<Instant>> = Mutex::new(None);
+static PENDING_ON: AtomicBool = AtomicBool::new(false);
+const PENDING_FOR: Duration = Duration::from_secs(120);
+
+/// Each vblank while a menu is open (`pointer::tick`, under the UI nodes' guard): Cross on Save
+/// and Quit to Desktop.
+pub fn tick(focused: &[u64]) {
+    static LAST_CROSS: AtomicU32 = AtomicU32::new(0);
+    static LAST_TICK: Mutex<Option<Instant>> = Mutex::new(None);
+    let presses = crate::input::cross_presses();
+    let pressed = LAST_CROSS.swap(presses, Ordering::Relaxed) != presses;
+    // (A press counted while no menu was open, the one that opened this one too, is not this
+    // menu's: the first tick after a pause only takes the count.)
+    let fresh = LAST_TICK.lock().replace(Instant::now()).is_some_and(|t| t.elapsed() < Duration::from_millis(200));
+    if !pressed || !fresh {
+        return;
+    }
+    if focused.iter().any(|&n| crate::uistate::definition_size(n).is_some_and(|(_, h)| h == BUTTON_HEIGHT)) {
+        *PENDING.lock() = Some(Instant::now());
+        PENDING_ON.store(true, Ordering::SeqCst);
+        crate::info!("quit: Save and Quit to Desktop chosen: the game saves and leaves for the title, then the session ends");
+    }
+}
+
+/// A file the title opened (`hle::kernel::fs`): with Save and Quit to Desktop pending, the
+/// title's own movies mean the game left the game world, its save written: the session ends.
+pub fn note_open(path: &str) {
+    if !PENDING_ON.load(Ordering::Relaxed) {
+        return;
+    }
+    if !["/movies/attract_movie.bk2", "/movies/logo_intro.bk2", "/movies/main_menu.bk2"].iter().any(|m| path.ends_with(m)) {
+        return;
+    }
+    let since = PENDING.lock().take();
+    PENDING_ON.store(false, Ordering::SeqCst);
+    match since {
+        Some(t) if t.elapsed() <= PENDING_FOR => {
+            if !REQUESTED.swap(true, Ordering::SeqCst) {
+                crate::info!("quit: the title is back {:.1} s after Save and Quit to Desktop ({path}): the session ends", t.elapsed().as_secs_f64());
+            }
+        }
+        Some(t) => crate::info!("quit: Save and Quit to Desktop lapsed (the title came back {:.0} s after it; the game goes on)", t.elapsed().as_secs_f64()),
+        None => {}
     }
 }
 

@@ -46,9 +46,10 @@ struct Mounted {
 static MOUNTS: Mutex<[Option<Mounted>; 16]> = Mutex::new([const { None }; 16]);
 
 /// How many saves the game has open for writing now (a write in progress: `quit` waits for them
-/// before the session ends at the player's word).
+/// before the session ends at the player's word): mounted writable, or prepared and not yet
+/// committed (the game mounts its saves read-only, then prepares a staging copy to write).
 pub fn writes_open() -> usize {
-    MOUNTS.lock().iter().flatten().filter(|m| m.writable).count()
+    MOUNTS.lock().iter().flatten().filter(|m| m.writable || m.staging.is_some()).count()
 }
 
 pub fn init(root: PathBuf) {

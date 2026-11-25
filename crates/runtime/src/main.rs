@@ -2854,7 +2854,7 @@ This happens when other software takes that range. Restart the PC and try again.
             shutdown(0);
         }
         if quit::REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
-            info!("quit: the session ends (Exit Game on the title menu)");
+            info!("quit: the session ends (the player's Exit Game)");
             quit::wait_for_saves();
             shutdown(0);
         }

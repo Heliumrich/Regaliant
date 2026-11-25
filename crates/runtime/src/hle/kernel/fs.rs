@@ -407,6 +407,7 @@ pub fn vfs_open(path: &str, flags: i32, _mode: u32) -> i32 {
         Ok(f) => {
             let pos = if flags & O_APPEND != 0 { f.metadata().map(|m| m.len()).unwrap_or(0) } else { 0 };
             let fd = alloc_fd(Fd { kind: Kind::File { file: f, writable: wants_write }, pos: Mutex::new(pos), path: path.to_string() });
+            crate::quit::note_open(path);
             if crate::hle::iostat::note("kernel", path, crate::hle::iostat::What::Open, 0) {
                 crate::info!("open '{path}' flags={flags:#x} -> fd {fd}");
             } else {

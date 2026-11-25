@@ -715,6 +715,7 @@ fn tick_nodes(tree: &std::sync::Arc<uistate::Tree>, want: bool, kbm: bool) -> bo
         s.focused = found.clone();
     }
     super::bindings::tick(tree, &found);
+    crate::quit::tick(&found);
     // A horizontal press that did not move its list: that list takes L1/R1.
     if let Some((group, before, when)) = s.tried {
         let now_sel = found.iter().copied().find(|&n| uistate::parent(n) == group);
