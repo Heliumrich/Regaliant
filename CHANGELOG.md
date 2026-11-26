@@ -3,9 +3,9 @@
 ## 0.1.8
 
 - Fixed the washed-out, too bright picture with ghosting and black blotches at Render Scale
-  100% on a 4K screen (issue #6). Above 2048 lines the game's lighting goes wrong when the
-  render size is changed from the game's own, so Render Scale now renders at most 2048 lines
-  (3640x2048 at 16:9, 95% of 4K).
+  100% on a 4K screen (issue #6). Above 2048 lines two of the game's render targets share one
+  compression block, and Regaliant sometimes cleared the wrong one. Render Scale now renders at
+  most 2048 lines (3640x2048 at 16:9, 95% of 4K).
 - Fixed the game closing at every start with some DLSS files (`nvngx_dlss.dll`). The check
   before DLSS loads now also asks DLSS whether it supports your card, the step that crashed,
   and a start that ends before DLSS has drawn its first frame is counted. A DLSS file that
