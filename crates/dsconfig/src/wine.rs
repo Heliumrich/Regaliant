@@ -2,10 +2,11 @@
 //! and what a write-watched page costs there (issue #14, 2026-11-25 night).
 //!
 //! The runtime write-watches the whole guest range (`mem::take_written` and the takes of its
-//! front ends). Windows notes a page's writes without stopping the writer. Wine does so only
-//! with the kernel's help (Linux 6.7 and newer, in Proton 9 and newer and Wine 10.10 and newer);
-//! otherwise it write-protects every watched page and handles a signal at the first write after
-//! each reset, under one lock for the whole process. A player's first load into Boletaria read
+//! front ends). Windows notes a page's first write after a reset in its kernel (about 0.5 us a
+//! page here). Wine does so in the kernel only with Linux 6.7 and newer (in Proton 9 and newer
+//! and Wine 10.10 and newer); otherwise it write-protects every watched page and handles a
+//! signal at the first write after each reset in the process itself, under one lock for the
+//! whole process (several microseconds a page and more). A player's first load into Boletaria read
 //! the same files as here 7 to 27 times slower that way and never finished in six minutes.
 
 use std::ffi::{c_char, c_void, CStr};

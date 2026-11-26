@@ -352,6 +352,11 @@ pub fn vfs_open(path: &str, flags: i32, _mode: u32) -> i32 {
         return sce(ENOENT);
     };
     let wants_write = flags & O_ACCMODE != 0 || flags & (O_CREAT | O_TRUNC | O_APPEND) != 0;
+    // (Save and Quit to Desktop's end at the title's movies: every open, a `.zar` game's too, the
+    // review of 2026-11-26 night.)
+    if !wants_write {
+        crate::quit::note_open(path);
+    }
     if path == DEVLOG_ARGS && !wants_write {
         if let Some(fd) = title_args().and_then(|extra| open_merged_args(&r, path, &extra)) {
             return fd;
@@ -407,7 +412,6 @@ pub fn vfs_open(path: &str, flags: i32, _mode: u32) -> i32 {
         Ok(f) => {
             let pos = if flags & O_APPEND != 0 { f.metadata().map(|m| m.len()).unwrap_or(0) } else { 0 };
             let fd = alloc_fd(Fd { kind: Kind::File { file: f, writable: wants_write }, pos: Mutex::new(pos), path: path.to_string() });
-            crate::quit::note_open(path);
             if crate::hle::iostat::note("kernel", path, crate::hle::iostat::What::Open, 0) {
                 crate::info!("open '{path}' flags={flags:#x} -> fd {fd}");
             } else {

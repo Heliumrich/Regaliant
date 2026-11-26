@@ -17,7 +17,8 @@
 //! which is how `tick` knows Cross was pressed on it (the UI nodes, `uistate`, as the key
 //! binding rows are found); hidden on the title screen, where the title menu has EXIT GAME. The
 //! session then ends when the title's own movies open again
-//! (`note_open`): the game has left the game world, its save written.
+//! (`note_open`): the game has left the game world, its save written (within a minute of the
+//! press; a press the game did not act on lapses then).
 
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -45,10 +46,11 @@ pub extern "sysv64" fn menu_hook(regs: *const u64, _arg: u32) {
 /// The design height of Save and Quit to Desktop (the game's Save and Exit Game: 50).
 pub const BUTTON_HEIGHT: f32 = 51.0;
 
-/// When Save and Quit to Desktop was pressed: the session ends at the title within two minutes.
+/// When Save and Quit to Desktop was pressed: the session ends at the title within a minute (the
+/// game's save and exit takes about a second here; a press the game did not act on lapses).
 static PENDING: Mutex<Option<Instant>> = Mutex::new(None);
 static PENDING_ON: AtomicBool = AtomicBool::new(false);
-const PENDING_FOR: Duration = Duration::from_secs(120);
+const PENDING_FOR: Duration = Duration::from_secs(60);
 
 /// Each vblank while a menu is open (`pointer::tick`, under the UI nodes' guard): Cross on Save
 /// and Quit to Desktop.
@@ -87,7 +89,7 @@ pub fn note_open(path: &str) {
                 crate::info!("quit: the title is back {:.1} s after Save and Quit to Desktop ({path}): the session ends", t.elapsed().as_secs_f64());
             }
         }
-        Some(t) => crate::info!("quit: Save and Quit to Desktop lapsed (the title came back {:.0} s after it; the game goes on)", t.elapsed().as_secs_f64()),
+        Some(t) => crate::info!("quit: Save and Quit to Desktop had lapsed (the title came back {:.0} s after it; the game goes on)", t.elapsed().as_secs_f64()),
         None => {}
     }
 }
@@ -111,7 +113,9 @@ pub fn wait_for_saves() {
             }
         }
         if start.elapsed() >= Duration::from_secs(10) {
-            crate::warn!("quit: a save was still open for writing after 10 s ({open}); ending anyway (the save committed last stays)");
+            if open > 0 {
+                crate::warn!("quit: {open} save(s) still open for writing after 10 s; the session ends anyway");
+            }
             return;
         }
         std::thread::sleep(Duration::from_millis(20));

@@ -726,7 +726,15 @@ pub fn generated(guest: &str) -> Option<Arc<Vec<u8>>> {
         if guest == START_MENU {
             start_menu(&orig)
         } else if guest == FRONT_END {
-            front_end(&orig)
+            // (The title menu as it is when Exit Game cannot be added: still adapted to a wide
+            // output below, the review of 2026-11-26 night.)
+            match front_end(&orig) {
+                Ok(d) => Ok(d),
+                Err(e) => {
+                    crate::warn!("pc settings: the title menu without Exit Game ({e})");
+                    Ok(orig)
+                }
+            }
         } else if guest == HUD {
             hud::build(&orig)
         } else if guest == GLOBAL {
@@ -1214,6 +1222,10 @@ const PC_LIST_HEIGHT: f32 = 0.98;
 /// items, in every language: the in-game SETTINGS tab's heading), its choice `QuitGame`
 /// (`SetUIToGameValue 'FrontEnd_MainMenu_Selection'`), hidden where Settings is.
 fn front_end(orig: &[u8]) -> Result<Vec<u8>, String> {
+    // (Without the hook that answers it, the item would do nothing.)
+    if !crate::titlefix::applied("title menu Exit Game") {
+        return Err("its hook is not applied (`titlefix`)".into());
+    }
     let mut f = cgpr::parse(orig).ok_or("unexpected layout")?;
     if cgpr::serialize(&f) != orig {
         return Err("does not serialize back to the same bytes".into());
