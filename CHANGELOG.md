@@ -21,8 +21,8 @@
 - On PCs with integrated graphics beside the graphics card, other programs' video memory was
   counted on both, which could make the game drop textures early. Only the card the game uses
   counts now.
-- Quit Game where a PC game has one. The title menu has EXIT GAME after Settings, in the game's
-  own words and look in every language. In game, the PC page of SETTINGS ends with Save and Quit
+- Quit Game where a PC game has one. The title menu has EXIT GAME after Settings and Gallery, in
+  the game's own words and look in every language. In game, the PC page of SETTINGS ends with Save and Quit
   to Desktop, a copy of the game's own Save and Exit Game button: the game saves and leaves for
   the title as its own button does, then Regaliant closes. Quitting, and closing the window,
   wait for a save the game is still writing.
