@@ -45,11 +45,17 @@ struct Mounted {
 
 static MOUNTS: Mutex<[Option<Mounted>; 16]> = Mutex::new([const { None }; 16]);
 
-/// How many saves the game has open for writing now (a write in progress: `quit` waits for them
-/// before the session ends at the player's word): mounted writable, or prepared and not yet
-/// committed (the game mounts its saves read-only, then prepares a staging copy to write).
-pub fn writes_open() -> usize {
-    MOUNTS.lock().iter().flatten().filter(|m| m.writable || m.staging.is_some()).count()
+/// How many saves the game has mounted now (`quit` waits for them before the session ends at the
+/// player's word). Each save is one transaction: mounted read-only at /savedata0, a staging copy
+/// prepared, written, committed and unmounted, so a mounted save is a save in progress, a read-only
+/// one included (its Prepare may come next: the review of 2026-11-26 night). The lock is waited for
+/// at most 50 ms: Prepare and Commit hold it across their file copies, and a save thread stuck in
+/// its file I/O then counts as a save in progress (the caller's cap ends the wait).
+pub fn saves_open() -> usize {
+    match MOUNTS.try_lock_for(std::time::Duration::from_millis(50)) {
+        Some(m) => m.iter().flatten().count(),
+        None => 1,
+    }
 }
 
 pub fn init(root: PathBuf) {

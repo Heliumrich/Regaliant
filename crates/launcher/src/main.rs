@@ -450,7 +450,12 @@ fn startup_status(app: &mut App) {
         sys::watch_process(pid, app.hwnd as usize, WM_GAME_EXIT);
     } else {
         let _ = std::fs::remove_file(&marker);
-        app.set_status("The last session did not end normally. Open logs shows its log.");
+        // (Under a slow Wine the last session was most likely closed while it crawled, issue
+        // #14's case: the Wine notice says why; the review of 2026-11-26 night.)
+        match dsconfig::wine::detect().and_then(|w| dsconfig::wine::slow_notice(Some(&w), dsconfig::wine::write_watch_cost_ns())) {
+            Some(n) => app.set_status(n),
+            None => app.set_status("The last session did not end normally. Open logs shows its log."),
+        }
     }
 }
 

@@ -97,14 +97,16 @@ pub fn note_open(path: &str) {
 }
 
 /// Before the session ends at the player's word (the title's Exit Game, or the window closed):
-/// waits while the game has a save open for writing, and until none has been for half a second
-/// (a save the game starts right after a settings screen closes), at most ten seconds.
+/// waits while the game has a save mounted (`savedata::saves_open`), and until none has been for
+/// half a second (a save the game starts right after a settings screen closes), at most ten
+/// seconds; a save still mounted then is an error line (its last change may be lost: the next
+/// start recovers the save before it).
 pub fn wait_for_saves() {
     let start = Instant::now();
     let mut quiet_since: Option<Instant> = None;
     let mut waited = false;
     loop {
-        let open = crate::hle::libs::savedata::writes_open();
+        let open = crate::hle::libs::savedata::saves_open();
         if open > 0 {
             quiet_since = None;
             waited = true;
@@ -116,7 +118,7 @@ pub fn wait_for_saves() {
         }
         if start.elapsed() >= Duration::from_secs(10) {
             if open > 0 {
-                crate::warn!("quit: {open} save(s) still open for writing after 10 s; the session ends anyway");
+                crate::error!("quit: {open} save(s) still open after 10 s; the session ends anyway (its last change may be lost)");
             }
             return;
         }
