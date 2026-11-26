@@ -1227,8 +1227,12 @@ pub fn device_needs(instance: &ash::Instance, pdev: vk::PhysicalDevice, queues_l
         supported |= bit(f);
     }
     SUPPORTED.store(supported, Relaxed);
+    SL_GRAPHICS_QUEUES.store(n.graphics_queues, Relaxed);
     n
 }
+
+/// The graphics queues Streamline asked for (`device_needs`): its compute queues follow them.
+static SL_GRAPHICS_QUEUES: AtomicU32 = AtomicU32::new(0);
 
 /// slSetVulkanInfo is done: Streamline's proxies and features are usable.
 static READY: AtomicBool = AtomicBool::new(false);
@@ -1271,7 +1275,10 @@ pub fn device_created(instance: &ash::Instance, pdev: vk::PhysicalDevice, device
         device: device.handle(),
         instance: instance.handle(),
         physical_device: pdev,
-        compute_queue_index: queues + extra_graphics,
+        // (Its graphics queues first, then its compute queues: until 2026-11-26 the compute ones
+        // were placed after all of its queues, past those the device has, and DLSS-G's pacer
+        // crashed in getDeviceQueue as frame generation turned on.)
+        compute_queue_index: queues + SL_GRAPHICS_QUEUES.load(Relaxed).min(extra_graphics),
         compute_queue_family: qf,
         graphics_queue_index: queues,
         graphics_queue_family: qf,
@@ -1282,6 +1289,11 @@ pub fn device_created(instance: &ash::Instance, pdev: vk::PhysicalDevice, device
         graphics_queue_create_flags: 0,
         optical_flow_queue_create_flags: 0,
     };
+    crate::info!(
+        "streamline: its queues in family {qf}: graphics from index {}, compute from index {} (the port's {queues} first, {extra_graphics} of Streamline's)",
+        info.graphics_queue_index,
+        info.compute_queue_index
+    );
     let spawned = std::thread::Builder::new().name("sl-init".into()).spawn(move || {
         let t0 = std::time::Instant::now();
         let r = unsafe { (l.set_vulkan_info)(&info) };
