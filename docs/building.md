@@ -17,7 +17,7 @@ What it shows:
 - A frame per game flip.
 - Zones on the port's threads: the command processors (`cp run`, `cp chunk`, `cp wait reg mem`), the image cache's lock (`images lock wait`), batches (`begin batch (slot)`, `submit batch`, `flush`, `vkQueueSubmit2`), their completion (`wait batch on GPU`, `batch completion (CP effects)`), the upscaler and the present.
 - With `DS_TRACY_FINE=1` only: a zone per draw and dispatch and their recording (`draw`, `draw record`, `dispatch`, `dispatch record`, `bind stage`), shader preparation (`prepare ps`, `prepare ngg`), `images (held)`, and every PS5 system-library call the game makes, named after the function. These are millions a second: with them the game runs several times slower while the profiler is connected, so their times show what is called, not how long a frame takes.
-- A GPU track per queue with every batch's time on the GPU, named by its queue, number and leading programs (from the batch timestamps; needs VK_EXT_calibrated_timestamps, which NVIDIA and AMD drivers offer).
+- A GPU track per queue with every batch's time on the GPU, named by its queue and its most frequent program (from the batch timestamps; needs VK_EXT_calibrated_timestamps, which NVIDIA and AMD drivers offer).
 
 Run Tracy as administrator for context switches and CPU sampling. The game runs in a second `dsport.exe` under the first (its host, which answers page faults): only the game's own process has Tracy's client, so the profiler lists one `dsport.exe`.
 

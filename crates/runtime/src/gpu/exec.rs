@@ -11518,6 +11518,20 @@ fn batch_contents(shaders: &[u64]) -> String {
     }
 }
 
+/// A batch's most frequent program (`: 100889c300`, `: d1008a27b00` for a pixel program's
+/// draws; empty for none): its name on Tracy's GPU track.
+fn batch_lead(shaders: &[u64]) -> String {
+    let mut counts: Vec<(u64, u32)> = Vec::new();
+    for &a in shaders {
+        match counts.iter_mut().find(|c| c.0 == a) {
+            Some(c) => c.1 += 1,
+            None => counts.push((a, 1)),
+        }
+    }
+    let Some(&(a, _)) = counts.iter().max_by(|x, y| x.1.cmp(&y.1).then(y.0.cmp(&x.0))) else { return String::new() };
+    if a & DRAW_KEY != 0 { format!(": d{:x}", a & !DRAW_KEY) } else { format!(": {a:x}") }
+}
+
 /// Reads a completed batch's timestamps: its span on the GPU (`bq`) for the
 /// hitch reports, and with DS_PROFILE_GPU its batch, prologue and dispatch
 /// times (`pool`) into the profile.
@@ -11534,7 +11548,9 @@ fn collect_timestamps(bq: vk::QueryPool, pool: vk::QueryPool, shaders: &[u64], q
         let start = if got_pre && pre[0] != 0 && pre[0] < be[0] { pre[0] } else { be[0] };
         // Tracy's GPU track (`prof`): the batch named by its leading programs.
         if crate::prof::ON {
-            crate::prof::gpu_batch(queue, &format!("{queue} batch {seq}{}", batch_contents(shaders)), start, be[1]);
+            // (Named by its queue and leading program only: Tracy keeps a source location per
+            // distinct name, at most 32K, so no batch number or counts in it.)
+            crate::prof::gpu_batch(queue, &format!("{queue}{}", batch_lead(shaders)), start, be[1]);
         }
         super::hitch::gpu_batch(queue, seq, start, be[1], shaders.len() as u32, batch_key(shaders), || {
             // Its leading commands and its other operations (copies, fills,

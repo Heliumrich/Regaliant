@@ -59,7 +59,16 @@ pub fn gpu_batch(_queue: &str, _name: &str, _start: u64, _end: u64) {
             client.new_gpu_context(Some(&format!("GPU {_queue}")), tracy_client::GpuContextType::Vulkan, gpu as i64, c.limits.timestamp_period).ok()
         });
         let Some(ctx) = ctx.as_ref() else { return };
-        if let Ok(mut span) = ctx.span_alloc(_name, "batch", file!(), line!()) {
+        // Each distinct name is a source location of Tracy's (32K at most in a capture, past
+        // which the profiler stops with "Too many source locations"): past 8192 names, the
+        // queue's name alone.
+        static NAMES: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+        let name = {
+            let mut n = NAMES.lock();
+            let set = n.get_or_insert_with(Default::default);
+            if set.contains(_name) || (set.len() < 8192 && set.insert(_name.to_string())) { _name } else { _queue }
+        };
+        if let Ok(mut span) = ctx.span_alloc(name, "batch", file!(), line!()) {
             span.end_zone();
             span.upload_timestamp_start(_start as i64);
             span.upload_timestamp_end(_end as i64);
