@@ -1258,8 +1258,9 @@ fn missed_write(addr: u64, wide: bool, func: u32, mask: u64, reference: u64, sin
 /// throughout; the title's frame counters count by 1 and by 2), and it rose
 /// by two steps or more (a frame counter; a flag set from 0 to 1 is not
 /// one). Run 20261011-103835: acb0x48 waited for 0x801 at 0x805 after cold
-/// pipeline compiles and every queue stopped.
-fn counter_passed(addr: u64, wide: bool, func: u32, mask: u64, reference: u64) -> bool {
+/// pipeline compiles and every queue stopped. `stalled`: the wait has gone on
+/// for `STALL_ONE_STEP` (its polling), which also lets one step on pass (below).
+fn counter_passed(addr: u64, wide: bool, func: u32, mask: u64, reference: u64, stalled: bool) -> bool {
     if func & 7 != 3 {
         return false;
     }
@@ -1290,14 +1291,22 @@ fn counter_passed(addr: u64, wide: bool, func: u32, mask: u64, reference: u64) -
         None if start == 0 && run.len() >= 3 && run[0] > r && (run[0] - r) % step == 0 && run[0] - r < 64 * step => (run, false),
         None => return false,
     };
-    // Two steps on, or one step on when the waited value is in the history and the run holds 8
-    // steps or more (a counter for sure, as after a reset above): a queue that reaches its wait a
-    // frame late (behind a long compile) waits for a value its writer has passed, while the
-    // writer waits on that queue through other labels (2026-11-26 -060518: acb0x48 waited for
-    // 0x140e with the counter at 0x1410, counting by 2 over 12 writes, and every queue stopped).
+    // Two steps on; one step on only for a wait that has stalled (`STALL_ONE_STEP`), when the
+    // waited value is in the history and the whole recorded window is one run of 8 steps or more:
+    // a queue that reaches its wait a frame late (behind a long compile) waits for a value its
+    // writer has passed, while the writer waits on that queue through other labels (2026-11-26
+    // -060518: acb0x48 waited for 0x140e with the counter at 0x1410, counting by 2 over 12
+    // writes, and every queue stopped). (Not at a wait's first check, and not after a break in
+    // the window: a label that cycles, reset each frame or a ring, would let a waiter of the next
+    // cycle pass at this cycle's next value, and one that cycles within 64 writes shows a break;
+    // the review of 2026-11-26, as first written one step on was the rule for every counter.)
     let steps = run.windows(2).filter(|w| w[1] != w[0]).count();
-    later.last().is_some_and(|&l| l >= r.wrapping_add(2 * step) || (written && steps >= 8 && l == r.wrapping_add(step)))
+    later.last().is_some_and(|&l| l >= r.wrapping_add(2 * step) || (stalled && written && start == 0 && steps >= 8 && l == r.wrapping_add(step)))
 }
+
+/// How long a label wait goes on before `counter_passed` lets one step on pass (a deadlock
+/// breaker: a wait of the next cycle on a fast writer is met well within it).
+const STALL_ONE_STEP: Duration = Duration::from_secs(1);
 
 /// The recorded writes of a waited-on label (wait reports).
 fn label_writes(addr: u64) -> String {
@@ -2584,7 +2593,7 @@ impl Cp {
             label_event(&self.name, b'p', a, read(), reference, at);
             return Flow::Next;
         }
-        if self.submitted_at.is_some_and(|since| missed_write(a, wide, func, mask, reference, since)) || counter_passed(a, wide, func, mask, reference) {
+        if self.submitted_at.is_some_and(|since| missed_write(a, wide, func, mask, reference, since)) || counter_passed(a, wide, func, mask, reference, false) {
             label_event(&self.name, b'm', a, read(), reference, at);
             return Flow::Next;
         }
@@ -7382,7 +7391,7 @@ impl Cp {
         // An equality wait on a counter that has moved past the value (its
         // command buffer came after the write: run 20261011-082829, acb0x48
         // waited for 0x706 at 0x70a while pipelines compiled).
-        if counter_passed(a, wide, func, mask, reference) {
+        if counter_passed(a, wide, func, mask, reference, false) {
             if COUNTER_PASSED.fetch_add(1, Ordering::Relaxed) < 20 {
                 crate::info!("gpu[{}]: WAIT_REG_MEM at {at:#x} for [{a:#x}] == {reference:#x} passed: the counter is at {v0:#x}", self.name);
             }
@@ -7504,6 +7513,9 @@ impl Cp {
         // game, 2026-11-23: compute queue 0x48 waited for 0xa20 with the counter at 0xa84).
         let counter_gen = std::cell::Cell::new(u64::MAX);
         let counter_moved = std::cell::Cell::new(false);
+        // (Checked again once the wait has stalled, when one step on may pass too.)
+        let waited_from = Instant::now();
+        let counter_stalled = std::cell::Cell::new(false);
         let r = self.poll_until_wake(
             at,
             &what,
@@ -7513,7 +7525,10 @@ impl Cp {
                     || (use_promise && promises_moved() && promised(a, wide, func, mask, reference).is_some())
                     || (func & 7 == 3 && {
                         let g = LABEL_WRITES_GEN.load(Ordering::Acquire);
-                        counter_gen.replace(g) != g && counter_passed(a, wide, func, mask, reference) && {
+                        let stalled = waited_from.elapsed() >= STALL_ONE_STEP;
+                        let new_writes = counter_gen.replace(g) != g;
+                        let newly_stalled = counter_stalled.replace(stalled) != stalled;
+                        (new_writes || newly_stalled) && counter_passed(a, wide, func, mask, reference, stalled) && {
                             counter_moved.set(true);
                             true
                         }
@@ -7869,47 +7884,54 @@ mod tests {
     fn counter_passed_rule() {
         let m = 0xFFFF_FFFF;
         history(0x1000, &[0x7fe, 0x7ff, 0x800, 0x801, 0x802, 0x803, 0x804, 0x805]);
-        assert!(counter_passed(0x1000, false, 3, m, 0x801));
-        assert!(!counter_passed(0x1000, false, 3, m, 0x804), "one step behind may still come");
-        assert!(!counter_passed(0x1000, false, 3, m, 0x806), "not reached yet");
-        assert!(!counter_passed(0x1000, false, 2, m, 0x801), "only equality waits");
+        assert!(counter_passed(0x1000, false, 3, m, 0x801, false));
+        assert!(!counter_passed(0x1000, false, 3, m, 0x804, false), "one step behind may still come");
+        assert!(!counter_passed(0x1000, false, 3, m, 0x806, false), "not reached yet");
+        assert!(!counter_passed(0x1000, false, 2, m, 0x801, false), "only equality waits");
         // Counting by 2 (run 20261011-105452: 0x82c 0x82e 0x830 0x832).
         history(0x1008, &[0x82c, 0x82e, 0x830, 0x832, 0x834]);
-        assert!(counter_passed(0x1008, false, 3, m, 0x82e));
-        assert!(!counter_passed(0x1008, false, 3, m, 0x832));
+        assert!(counter_passed(0x1008, false, 3, m, 0x82e, false));
+        assert!(!counter_passed(0x1008, false, 3, m, 0x832, false));
         // The waited value before the recorded window.
         history(0x1010, &[0x802, 0x803, 0x803, 0x804, 0x805]);
-        assert!(counter_passed(0x1010, false, 3, m, 0x801));
-        assert!(!counter_passed(0x1010, false, 3, m, 0x700), "too far behind the window");
+        assert!(counter_passed(0x1010, false, 3, m, 0x801, false));
+        assert!(!counter_passed(0x1010, false, 3, m, 0x700, false), "too far behind the window");
         // A flag (0 -> 1 -> 0) is not a counter.
         history(0x1018, &[0, 1, 0, 1]);
-        assert!(!counter_passed(0x1018, false, 3, m, 0));
+        assert!(!counter_passed(0x1018, false, 3, m, 0, false));
         // A counter that was reset is not trusted, while the reset is in the window (for the
         // values after it too).
         history(0x1020, &[0x10, 0x11, 0x0, 0x1, 0x2, 0x3]);
-        assert!(!counter_passed(0x1020, false, 3, m, 0x11));
-        assert!(!counter_passed(0x1020, false, 3, m, 0x1));
+        assert!(!counter_passed(0x1020, false, 3, m, 0x11, false));
+        assert!(!counter_passed(0x1020, false, 3, m, 0x1, false));
         // A ring (values counted modulo 4) is no counter: a queue waiting at 2 for its next 1 is
         // not passed at 3 (the review of 2026-11-24).
         history(0x1030, &[0, 1, 2, 3, 0, 1, 2, 3]);
-        assert!(!counter_passed(0x1030, false, 3, m, 1));
+        assert!(!counter_passed(0x1030, false, 3, m, 1, false));
         // A counter reset (at a load, say) is trusted again once it has counted 8 steps.
         history(0x1038, &[0x10, 0x11, 0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9]);
-        assert!(counter_passed(0x1038, false, 3, m, 0x2));
-        assert!(!counter_passed(0x1038, false, 3, m, 0x11), "before the reset");
+        assert!(counter_passed(0x1038, false, 3, m, 0x2, false));
+        assert!(!counter_passed(0x1038, false, 3, m, 0x11, false), "before the reset");
         // A queue that reaches its wait one step late is not passed then, but once the counter
         // moves on again, which the wait's polling now checks (2026-11-24: acb0x48 waited for
         // 0xa20 while the counter went on to 0xa84, and every queue stopped).
         history(0x1028, &[0xa1c, 0xa1e, 0xa20, 0xa22]);
-        assert!(!counter_passed(0x1028, false, 3, m, 0xa20), "one step on: may still be a flag");
+        assert!(!counter_passed(0x1028, false, 3, m, 0xa20, false), "one step on: may still be a flag");
         history(0x1028, &[0xa1c, 0xa1e, 0xa20, 0xa22, 0xa24]);
-        assert!(counter_passed(0x1028, false, 3, m, 0xa20));
-        // One step on is enough when the waited value was written and the run holds 8 steps or
-        // more (2026-11-26 -060518: the wait for 0x140e at 0x1410, counting by 2 over 12 writes).
+        assert!(counter_passed(0x1028, false, 3, m, 0xa20, false));
+        // One step on passes only a stalled wait, when the waited value was written and the whole
+        // window is one run of 8 steps or more (2026-11-26 -060518: the wait for 0x140e at 0x1410,
+        // counting by 2 over 12 writes).
         history(0x1040, &[0x13fa, 0x13fc, 0x13fe, 0x1400, 0x1402, 0x1404, 0x1406, 0x1408, 0x140a, 0x140c, 0x140e, 0x1410]);
-        assert!(counter_passed(0x1040, false, 3, m, 0x140e));
-        assert!(!counter_passed(0x1040, false, 3, m, 0x1410), "the value now");
-        assert!(!counter_passed(0x1040, false, 3, m, 0x1412), "not reached yet");
+        assert!(!counter_passed(0x1040, false, 3, m, 0x140e, false), "one step on: only once stalled");
+        assert!(counter_passed(0x1040, false, 3, m, 0x140e, true));
+        assert!(!counter_passed(0x1040, false, 3, m, 0x1410, true), "the value now");
+        assert!(!counter_passed(0x1040, false, 3, m, 0x1412, true), "not reached yet");
+        // Not after a break in the window, stalled or not (a label reset each cycle: a waiter of
+        // the next cycle must not pass at this cycle's next value; the review of 2026-11-26).
+        history(0x1048, &[0x10, 0x11, 0x0, 0x2, 0x4, 0x6, 0x8, 0xa, 0xc, 0xe, 0x10, 0x12]);
+        assert!(!counter_passed(0x1048, false, 3, m, 0x10, true), "one step on after a reset");
+        assert!(counter_passed(0x1048, false, 3, m, 0xe, true), "two steps on, as before");
     }
 
     #[test]
