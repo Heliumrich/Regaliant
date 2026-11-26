@@ -1818,31 +1818,37 @@ impl Exec {
         }
         let t_prog = super::prog_census().then(std::time::Instant::now);
         self.census_kind = 0;
-        // At the title's interface composite (SDR or HDR): Menu & HUD Size's layer scaled before
-        // the title composites it, and the Sharpening (RCAS) of the picture under it, recorded
-        // where the composite begins rendering (`rcas_want`, `gpu::vk::sharpen`).
-        let scale_ui = super::super::uiscale::scale() < 1.0;
-        let sharpen = super::super::vk::sharpen::amount() > 0.0;
-        if scale_ui || sharpen {
+        // Menu & HUD Size: the interface layer scaled before the title composites it (SDR or
+        // HDR composite).
+        if super::super::uiscale::scale() < 1.0 {
             let ps = ((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8;
             if super::super::uiscale::is_composite(ps) {
-                if scale_ui {
-                    self.scale_ui_layer(cp);
-                }
-                if sharpen {
-                    self.rcas_want = true;
-                    // (Rendering begins again at the composite: the pass goes in before it.)
-                    self.end_rendering();
-                }
+                self.scale_ui_layer(cp);
             }
         }
         // (The vertices a non-indexed draw of one instance reads: `snap_prog`'s snapshots.)
         set_snap_verts(if args.index.is_none() && args.instances == 1 { Some((args.base_vertex.unwrap_or_else(|| ctx_reg(cp, 0x28408) as i32).max(0) as u64, args.count as u64)) } else { None });
+        self.post_job = None;
         let r = self.draw_inner(cp, &args);
+        // The title's post-processing pass (`upscale::post_pass`): the Sharpening on its picture
+        // and, when it ran at the output size, its picture taken down into the title's target and
+        // given to the interface composite in that target's place.
+        if let Some((done, title_base, ps)) = self.post_job.take() {
+            if matches!(r, Ok(true)) {
+                self.end_rendering();
+                super::super::postscale::record_after(self.cmd(), done);
+                if let Some((_, _, _)) = done.ours {
+                    let (_, _, tw, th) = done.title;
+                    let views = super::super::images::with(|im| im.views_at(title_base, tw, th));
+                    if let Some(view) = self.post_view {
+                        super::super::upscale::set_post(super::super::FRAMES.load(Ordering::Relaxed), views, view, ps);
+                    }
+                }
+            }
+        }
         set_snap_verts(None);
         self.ui_sub = None;
         self.ui_job = None;
-        self.rcas_want = false;
         if let Some(t) = t_prog {
             let ps = ((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8;
             let ns = t.elapsed().as_nanos() as u64;
@@ -2962,7 +2968,44 @@ impl Exec {
                 (f, t_pipe)
             }
         };
-        let Fixed { colors, depth, area, scissor: (x0, y0, x1, y1), z_test, z_write, s_test, s_write, clear_z, clear_s, dctl, sctl, refm, refm_bf, pipe: Pipe { pipeline, layout, set_layout, push }, .. } = fixed;
+        let Fixed { mut colors, depth, mut area, scissor: (mut x0, mut y0, mut x1, mut y1), z_test, z_write, s_test, s_write, clear_z, clear_s, dctl, sctl, refm, refm_bf, pipe: Pipe { pipeline, layout, set_layout, push }, .. } = fixed;
+        // The title's post-processing pass (`upscale::post_pass`): at the output size into our
+        // target while an upscaler takes the picture up to it, its viewport and scissor scaled
+        // (its TAA input then the upscaled picture: `substitute_full` below).
+        let mut vp_scale: Option<(f32, f32)> = None;
+        if let (Some(t), Some(p)) = (colors[0], ps.as_ref()) {
+            if depth.is_none() && colors[1..].iter().all(Option::is_none) {
+                let reads = p.resources.iter().filter_map(|r| match r {
+                    super::Resolved::Image(x) => Some(x.base),
+                    _ => None,
+                });
+                if let Some(up) = super::super::upscale::post_pass(super::super::FRAMES.load(Ordering::Relaxed), (t.width, t.height), reads) {
+                    let mut ours = None;
+                    if let Some((ow, oh)) = up {
+                        match super::super::postscale::target(t.format, ow, oh) {
+                            Ok((image, view, fresh)) => {
+                                if fresh {
+                                    self.end_rendering();
+                                    super::super::postscale::init_layout(self.cmd(), image);
+                                }
+                                let (sx, sy) = (ow as f32 / t.width as f32, oh as f32 / t.height as f32);
+                                colors[0] = Some(Target { image, view, width: ow, height: oh, ..t });
+                                area = (ow, oh);
+                                (x0, y0, x1, y1) = ((x0 as f32 * sx).round() as i32, (y0 as f32 * sy).round() as i32, ((x1 as f32 * sx).round() as i32).min(ow as i32), ((y1 as f32 * sy).round() as i32).min(oh as i32));
+                                vp_scale = Some((sx, sy));
+                                self.post_view = Some(view);
+                                ours = Some((image, ow, oh));
+                            }
+                            Err(e) => {
+                                static ONCE: std::sync::Once = std::sync::Once::new();
+                                ONCE.call_once(|| crate::warn!("upscaler: no post-processing target ({e}): the title scales its picture up"));
+                            }
+                        }
+                    }
+                    self.post_job = Some((super::super::postscale::Done { title: (t.image, t.format, t.width, t.height), ours }, t.key.base, ps_addr));
+                }
+            }
+        }
         // Resources.
         match &ps {
             Some(p) => self.reserve(&[&vs, p], push),
@@ -3178,15 +3221,6 @@ impl Exec {
                 if let Some(job) = self.ui_job.take() {
                     super::super::uiscale::record(self.cmd(), job);
                 }
-                // Sharpening: RCAS over the picture in the composite's target before the
-                // interface goes over it.
-                if std::mem::take(&mut self.rcas_want) {
-                    if let Some(t) = colors[0].as_ref() {
-                        if let Some(job) = super::super::vk::sharpen::prepare(t.image, t.format, t.width, t.height) {
-                            super::super::vk::sharpen::record(self.cmd(), job);
-                        }
-                    }
-                }
                 self.begin_rendering(colors, depth, area);
             } else if super::super::tune::race_checks() && self.barrier_wanted {
                 super::UNORDERED[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3226,12 +3260,15 @@ impl Exec {
         // directly onto a Vulkan viewport (negative height for a flipped Y).
         let vte = reg(0x28818);
         let (xs, xo, ys, yo, zs, zo) = (f32r(reg(0x2843C)), f32r(reg(0x28440)), f32r(reg(0x28444)), f32r(reg(0x28448)), f32r(reg(0x2844C)), f32r(reg(0x28450)));
-        let vp = if vte & 0x3F == 0x3F && xs != 0.0 && ys != 0.0 {
+        let mut vp = if vte & 0x3F == 0x3F && xs != 0.0 && ys != 0.0 {
             vk::Viewport { x: xo - xs, y: yo - ys, width: 2.0 * xs, height: 2.0 * ys, min_depth: zo.clamp(0.0, 1.0), max_depth: (zo + zs).clamp(0.0, 1.0) }
         } else {
             self.report(format!("PA_CL_VTE_CNTL {vte:#x} (viewport transform disabled) approximated"));
             vk::Viewport { x: 0.0, y: 0.0, width: area.0 as f32, height: area.1 as f32, min_depth: 0.0, max_depth: 1.0 }
         };
+        if let Some((sx, sy)) = vp_scale {
+            (vp.x, vp.width, vp.y, vp.height) = (vp.x * sx, vp.width * sx, vp.y * sy, vp.height * sy);
+        }
         if draw_traces() && (trace_ps_addrs().contains(&vs.addr) || trace_bin_match(vs.addr)) {
             crate::info!(
                 "trace vs {:#x} viewport at flip {}: {:?} xs {xs} xo {xo} ys {ys} yo {yo} zs {zs} zo {zo} vte {vte:#x} clip {:#x} zmin/zmax {}/{} depth ctl {:#x}",

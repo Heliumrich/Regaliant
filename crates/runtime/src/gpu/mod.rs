@@ -2272,6 +2272,7 @@ pub mod shaders;
 pub mod swizzle_tables;
 pub mod tiling;
 pub mod upscale;
+pub mod postscale;
 pub mod upmerge;
 pub mod uiscale;
 pub mod verify;

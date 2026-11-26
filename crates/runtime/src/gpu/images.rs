@@ -663,8 +663,8 @@ pub fn sampler_hit(s: [u32; 4], compare: bool) -> Option<vk::Sampler> {
 /// The textures' level-of-detail bias while an upscaler takes the render up to the output size,
 /// in steps of -1/16 (0: none): log2 of the render size over the output size, NVIDIA's guidance
 /// for DLSS (-1 at 50%, about -0.58 at 67%; `upscale::set_full`). Applied to the title's
-/// mipmapped, linearly filtered samplers that do not compare (its surface textures), as the PC
-/// texture filtering is. `DS_LOD_BIAS=0` leaves them alone.
+/// mipmapped, linearly filtered samplers that do not compare and that it gives anisotropic
+/// filtering itself (its materials; not its particles'). `DS_LOD_BIAS=0` leaves them alone.
 pub static LOD_BIAS_Q: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Sets the textures' bias (`LOD_BIAS_Q`) for a render scale (render size over output size).
@@ -7878,8 +7878,17 @@ impl Images {
         // mipmapped, linearly filtered samplers that do not compare (its surface textures).
         let surface = !compare_use && mip == 2 && b(s[2], 22, 2) >= 1 && b(s[2], 20, 2) >= 1;
         let raise = aniso_pc > 1 && surface;
-        // The upscaling's bias (`LOD_BIAS_Q`) on those too, when they have mips to go to.
-        let lod_bias = if surface && bias_q > 0 && max_lod > min_lod { lod_bias - bias_q as f32 / 16.0 } else { lod_bias };
+        // The upscaling's bias (`LOD_BIAS_Q`) on the samplers the title itself gives anisotropic
+        // filtering (its materials), when they have mips to go to: not on its effects' textures
+        // (smoke and other particles flickered with it, 2026-11-26).
+        let lod_bias = if surface && aniso > 0 && bias_q > 0 && max_lod > min_lod { lod_bias - bias_q as f32 / 16.0 } else { lod_bias };
+        if surface && bias_q > 0 && max_lod > min_lod {
+            static BIASED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+            let k = (aniso > 0) as usize;
+            if BIASED[k].fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                crate::info!("images: first {} sampler at the upscaling's bias (S# {:08x} {:08x} {:08x} {:08x})", if k == 1 { "anisotropic (biased)" } else { "non-anisotropic (left alone)" }, s[0], s[1], s[2], s[3]);
+            }
+        }
         let ci = vk::SamplerCreateInfo::default()
             .mag_filter(filt(b(s[2], 20, 2)))
             .min_filter(filt(b(s[2], 22, 2)))

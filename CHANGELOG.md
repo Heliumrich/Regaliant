@@ -4,8 +4,9 @@
 
 - DLSS, FSR and XeSS now upscale to your screen's resolution. Until now they anti-aliased the
   picture at the render resolution, and the game then stretched it to the screen with a plain
-  scaling, which looked blurry below 100%. The upscaler's picture now replaces the game's
-  stretched one, pixel for pixel on a 16:9 4K screen.
+  scaling, which looked blurry below 100%. Now the game's post-processing (bloom, depth of field,
+  colour grading) runs on the upscaled picture at the screen's resolution, and the menus and HUD
+  go over it pixel for pixel. `DS_UPSCALE_POST=0` or `DS_UPSCALE_FULL=0` bring back the old way.
 - Render Scale is now Render Quality, named by the upscalers' modes: Ultra Performance (33%),
   Performance (50%), Balanced (58%), Quality (67%), Ultra Quality (77%) and DLAA / Native
   (100%), beside Visual Mode. Shares above 100% are gone. A saved Render Scale is carried over
@@ -20,6 +21,8 @@
   the 3840x2160 output.
 - While DLSS, FSR or XeSS upscale, textures get NVIDIA's recommended level-of-detail bias
   (log2 of the render share: -1 at 50%), so they stay as sharp as at the screen's resolution.
+  Only the textures the game filters anisotropically get it: smoke and other effects flickered
+  with it.
 - The window presents with Vulkan's MAILBOX mode where the driver offers it (FIFO before):
   lower latency, presents never wait for a refresh. `DS_PRESENT_MODE=fifo` brings back FIFO.
 

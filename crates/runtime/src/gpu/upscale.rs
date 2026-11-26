@@ -310,6 +310,9 @@ struct FullRes {
     full: vk::ImageView,
     size: (u32, u32),
     scale: f32,
+    /// The title's post-processing pass run at the output size (`post_pass`): the views of its
+    /// own render-size target, our output-size target's view in their place, the flip.
+    post: Option<(Vec<vk::ImageView>, vk::ImageView, u64)>,
 }
 
 // SAFETY: plain handles.
@@ -330,7 +333,10 @@ pub fn set_full(frame: u64, taa_views: Vec<vk::ImageView>, full: vk::ImageView, 
     if FULL_FRAMES.fetch_add(1, Relaxed) == 0 {
         crate::info!("upscaler: the picture goes up to the output size {}x{} (render scale {scale:.3}); the title's passes at that size read it in the TAA output's place", size.0, size.1);
     }
-    *FULL.lock() = Some(FullRes { frame, taa_views, full, size, scale });
+    let mut g = FULL.lock();
+    let post = g.as_mut().and_then(|f| f.post.take());
+    *g = Some(FullRes { frame, taa_views, full, size, scale, post });
+    drop(g);
     super::images::set_upscale_bias(scale);
     FULL_SIZE.store((size.0 as u64) << 32 | size.1 as u64, Relaxed);
 }
@@ -361,9 +367,16 @@ pub fn substitute_full(frame: u64, target: (u32, u32), imgs: &mut [(u32, vk::Des
         return 0;
     }
     let mut n = 0;
-    for e in imgs.iter_mut().filter(|e| f.taa_views.contains(&e.2.image_view)) {
-        e.2.image_view = f.full;
-        n += 1;
+    for e in imgs.iter_mut() {
+        if f.taa_views.contains(&e.2.image_view) {
+            e.2.image_view = f.full;
+            n += 1;
+        } else if let Some((views, view, at)) = &f.post {
+            if frame <= at + 2 && views.contains(&e.2.image_view) {
+                e.2.image_view = *view;
+                n += 1;
+            }
+        }
     }
     drop(g);
     if n > 0 {
@@ -457,6 +470,69 @@ pub fn trace_pass(frame: u64, kind: &str, addr: u64, reads: &[TraceImage], write
     }
     t.logged.push(key);
     crate::info!("upscale trace: {kind} {addr:#x} reads [{}] writes [{}]", fmt_images(reads), fmt_images(writes));
+}
+
+/// The title's TAA output of the flip being recorded (base, size; `note_taa`), for the
+/// post-processing pass that reads it (`post_pass`): base, then width << 32 | height, then flip.
+static TAA_OUT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// The title's TAA (cs 0x100893aa00) ran in flip `frame` with its output at `base`, `w`x`h`
+/// (with an upscaler or without).
+pub fn note_taa(frame: u64, base: u64, w: u32, h: u32) {
+    // (The scene's: the largest of a flip. The title also runs its TAA on smaller views, such as
+    // a menu's character preview, between the scene's TAA and its post-processing.)
+    let (nw, nh) = { let v = TAA_OUT[1].load(Relaxed); ((v >> 32) as u64, v & 0xFFFF_FFFF) };
+    if frame <= TAA_OUT[2].load(Relaxed) && (w as u64) * (h as u64) < nw * nh {
+        return;
+    }
+    TAA_OUT[0].store(base, Relaxed);
+    TAA_OUT[1].store((w as u64) << 32 | h as u64, Relaxed);
+    TAA_OUT[2].store(frame, Relaxed);
+}
+
+/// The title's post-processing pass (2026-11-26's trace: ps 0x1008895d00 with HDR output, which
+/// reads the TAA output with the bloom, the depth of field and the colour grading's table and
+/// writes the tone-mapped picture at the render size, which the interface composite then scales
+/// up to the output): a draw of flip `frame` that reads the TAA output (`reads`: its pixel
+/// stage's image bases) into one colour target of the TAA output's size. Returns the output size
+/// to run it at when an upscaler takes the picture up to it (`FULL`), else Some(None): the pass
+/// runs as it is (the Sharpening still goes after it). None: not the pass.
+pub fn post_pass(frame: u64, target: (u32, u32), reads: impl Iterator<Item = u64>) -> Option<Option<(u32, u32)>> {
+    let base = TAA_OUT[0].load(Relaxed);
+    if base == 0 || TAA_OUT[1].load(Relaxed) != (target.0 as u64) << 32 | target.1 as u64 || frame > TAA_OUT[2].load(Relaxed) + 2 {
+        return None;
+    }
+    let mut reads = reads;
+    if !reads.any(|b| b == base) {
+        return None;
+    }
+    let full = FULL_SIZE.load(Relaxed);
+    if full == 0 || !active() || !post_on() {
+        return Some(None);
+    }
+    let g = FULL.lock();
+    let f = g.as_ref()?;
+    if frame > f.frame + 2 {
+        return Some(None);
+    }
+    Some(Some(f.size))
+}
+
+/// Whether the post-processing pass runs at the output size (`DS_UPSCALE_POST=0`: at the render
+/// size, the title scaling its result up).
+fn post_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_UPSCALE_POST").ok().as_deref() != Some("0"))
+}
+
+/// The post-processing pass of flip `frame` ran at the output size into `view`: the passes at
+/// the output size read it in place of the title's render-size target (its views `views`).
+pub fn set_post(frame: u64, views: Vec<vk::ImageView>, view: vk::ImageView, ps: u64) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| crate::info!("upscaler: the post-processing pass (ps {ps:#x}) runs at the output size on the upscaled picture; the interface composite reads its result"));
+    if let Some(f) = FULL.lock().as_mut() {
+        f.post = Some((views, view, frame));
+    }
 }
 
 /// The status line's part (none while the picture was never made).

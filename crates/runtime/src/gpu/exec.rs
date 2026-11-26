@@ -12137,9 +12137,11 @@ pub struct Exec {
     /// Its copy, recorded where the composite begins rendering (its batch open then): the layer,
     /// our image, the size, the scale and the filter (`uiscale::record`).
     pub(super) ui_job: Option<super::uiscale::Job>,
-    /// Sharpening: the draw is the interface composite; RCAS over its target goes in where it
-    /// begins rendering (`gpu::vk::sharpen`).
-    pub(super) rcas_want: bool,
+    /// The draw being recorded is the title's post-processing pass (`upscale::post_pass`): what
+    /// follows it (`postscale::record_after`), its own target's base and its pixel program; and
+    /// our output-size target's view when it ran at the output size.
+    pub(super) post_job: Option<(super::postscale::Done, u64, u64)>,
+    pub(super) post_view: Option<vk::ImageView>,
     /// A parallel worker's chunk: the guest ranges CP writes of its run's
     /// earlier chunks write (`par::Run::cp_writes`); a CPU read of one stops
     /// the chunk (those batches are not submitted yet).
@@ -13945,7 +13947,8 @@ impl Exec {
                 par_worker: false,
                 ui_sub: None,
                 ui_job: None,
-                rcas_want: false,
+                post_job: None,
+                post_view: None,
                 run_writes: Vec::new(),
                 hs_seg: 0,
                 effect_writes: Default::default(),
@@ -22824,6 +22827,10 @@ impl Exec {
         }
         // The chosen upscaler after the title's TAA (`gpu::upscale`, `gpu::upmerge`).
         if !batched && p.addr == TAA_CS && indirect.is_none() {
+            // (Its output, for the post-processing pass that reads it: `upscale::post_pass`.)
+            if let Some(Resolved::Image(t)) = p.resources.get(TAA_RES[3]) {
+                super::upscale::note_taa(super::FRAMES.load(Ordering::Relaxed), t.base, t.width, t.height);
+            }
             self.taa_upscale(&p, &bound);
         } else if super::upscale::trace_on() {
             let imgs: Vec<super::upscale::TraceImage> = p.resources.iter().filter_map(|r| match r {

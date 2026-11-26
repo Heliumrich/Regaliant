@@ -1,11 +1,11 @@
 //! The PC settings' Sharpening: AMD's RCAS (FSR 1's robust contrast-adaptive sharpening, without
 //! FSR 1's upscaling; `rdna::kernels::rcas`) over the finished picture, after the upscaler (or
-//! the game's TAA) and the game's tone mapping, before the interface is composited over it. The
-//! title's last draw of a frame composites its interface layer over the picture in its display
-//! target (ps 0x100888d100, and 0x100888d900 with HDR output: `gpu::uiscale`); just before that
-//! draw the display target is blitted into an image of ours (RGBA16F), sharpened into a second
-//! one and blitted back (`Exec::draw`). The menus and the HUD are drawn after it and stay as
-//! they are.
+//! the game's TAA) and the game's tone mapping, before the interface is composited over it: on
+//! the target of the title's post-processing pass (bloom, depth of field, colour grading; at the
+//! output size while an upscaler takes the picture up to it: `gpu::postscale`), which the
+//! interface composite (ps 0x100888d100, 0x100888d900 with HDR output) then reads with the
+//! interface layer. The target is blitted into an image of ours (RGBA16F), sharpened into a
+//! second one and blitted back. The menus and the HUD stay as they are.
 //!
 //! Until 2026-11-26 the presenter sharpened the whole shown frame with a kernel of its own
 //! (interface included), and the game's own sharpening of its TAA's history ran as the title
