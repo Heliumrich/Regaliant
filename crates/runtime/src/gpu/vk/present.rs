@@ -613,8 +613,14 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
             }
             old = vk::SwapchainKHR::null();
         }
-        // DLSS-G loaded for the new swapchain, or unhooked (its resources freed).
+        // DLSS-G loaded for the new swapchain, or unhooked (its resources freed). (Logged and
+        // written out first when that changes: the steps where NVIDIA's libraries do the most.)
+        let fg_changes = fg != p.fg;
         if p.sl.is_some() {
+            if fg_changes {
+                crate::info!("present: a new swapchain {} DLSS Frame Generation ({mode:?})", if fg { "with" } else { "without" });
+                crate::log::flush();
+            }
             crate::gpu::framegen::dlssg::swapchain_loading(fg);
         }
         let mut fse_info = vk::SurfaceFullScreenExclusiveInfoEXT::default().full_screen_exclusive(if exclusive.is_some() {
@@ -644,6 +650,11 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
             }
         }
         let sc = sc_create(p, &sci).map_err(|e| format!("create swapchain: {e}"))?;
+        if p.sl.is_some() && fg_changes {
+            crate::exception::reclaim_unhandled_filter("Streamline's vkCreateSwapchainKHR");
+            crate::info!("present: the swapchain made through Streamline");
+            crate::log::flush();
+        }
         if old != vk::SwapchainKHR::null() {
             // The old swapchain's images are only the presenter's: its frames done and the queue
             // idle under the queue's lock (a device-wide idle wait touches the queue while the

@@ -547,7 +547,9 @@ sysv! {
             gamma: 1.0,
         });
         drop(g);
-        crate::thread::spawn_host("vblank", 1 << 20, Box::new(vblank_thread)).expect("vblank thread");
+        // (8 MiB: the presenter calls into Streamline, NGX and the driver on this thread, which
+        // make DLSS Frame Generation's swapchain and run its first frames there.)
+        crate::thread::spawn_host("vblank", 8 << 20, Box::new(vblank_thread)).expect("vblank thread");
         crate::info!("sceVideoOutOpen -> 1");
         1
     }

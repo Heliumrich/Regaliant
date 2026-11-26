@@ -2450,6 +2450,7 @@ This happens when other software takes that range. Restart the PC and try again.
     exception::install();
     heapsites::start();
     hosted::init();
+    hosted::note_run_dir(&cfg.run_dir);
     hosted::self_test_maybe();
     if cfg.dispatch_bench {
         let code = gpu::dispbench::run();

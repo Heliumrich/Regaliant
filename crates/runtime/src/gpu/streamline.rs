@@ -673,10 +673,21 @@ unsafe extern "C" fn sl_log(ty: u32, msg: *const c_char) {
     // without VK_NV_low_latency2: its absence is no fault.)
     let ty = if m.contains("NvLowLatencyVk.dll") { 0 } else { ty };
     match ty {
-        2 => crate::warn!("Streamline error: {m}"),
+        // (An error is written out at once: the next thing may be the end of the process.)
+        2 => {
+            crate::warn!("Streamline error: {m}");
+            crate::log::try_flush();
+        }
         1 => crate::warn!("Streamline: {m}"),
+        _ if verbose_log() => crate::info!("Streamline: {m}"),
         _ => crate::debug!("Streamline: {m}"),
     }
+}
+
+/// `DS_SL_LOG=verbose`: Streamline's own verbose log in the port's (diagnosis).
+fn verbose_log() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DS_SL_LOG").is_ok_and(|v| v.trim().eq_ignore_ascii_case("verbose")))
 }
 
 /// The system folder (nvapi64.dll, NVIDIA's driver library, is there with every NVIDIA driver).
@@ -995,7 +1006,7 @@ fn load_from(dir: &Path) -> Result<Lib, LoadError> {
         let prefs = SlPreferences {
             base: SlBase::new(SL_PREFERENCES, 1),
             show_console: false,
-            log_level: 1,
+            log_level: if verbose_log() { 2 } else { 1 },
             paths_to_plugins: paths.as_ptr(),
             num_paths_to_plugins: 1,
             path_to_logs_and_data: std::ptr::null(),
@@ -1012,6 +1023,7 @@ fn load_from(dir: &Path) -> Result<Lib, LoadError> {
             render_api: SL_VULKAN,
         };
         let r = init(&prefs, SL_SDK_VERSION);
+        crate::exception::reclaim_unhandled_filter("slInit");
         if r != SL_OK {
             return Err(format!("slInit failed ({r}: {})", result_name(r)).into());
         }
@@ -1273,6 +1285,7 @@ pub fn device_created(instance: &ash::Instance, pdev: vk::PhysicalDevice, device
     let spawned = std::thread::Builder::new().name("sl-init".into()).spawn(move || {
         let t0 = std::time::Instant::now();
         let r = unsafe { (l.set_vulkan_info)(&info) };
+        crate::exception::reclaim_unhandled_filter("slSetVulkanInfo");
         if r != SL_OK {
             crate::warn!("streamline: slSetVulkanInfo failed ({r}: {}): DLSS, DLSS Frame Generation and Reflex unavailable", result_name(r));
             for f in [FEATURE_DLSS, FEATURE_DLSS_G, FEATURE_REFLEX, FEATURE_PCL] {
