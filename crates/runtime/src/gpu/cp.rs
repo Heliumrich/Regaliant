@@ -1285,12 +1285,18 @@ fn counter_passed(addr: u64, wide: bool, func: u32, mask: u64, reference: u64) -
     if start > 0 && run.windows(2).filter(|w| w[1] != w[0]).count() < 8 {
         return false;
     }
-    let later = match run.iter().rposition(|&v| v == r) {
-        Some(i) => &run[i..],
-        None if start == 0 && run.len() >= 3 && run[0] > r && (run[0] - r) % step == 0 && run[0] - r < 64 * step => run,
+    let (later, written) = match run.iter().rposition(|&v| v == r) {
+        Some(i) => (&run[i..], true),
+        None if start == 0 && run.len() >= 3 && run[0] > r && (run[0] - r) % step == 0 && run[0] - r < 64 * step => (run, false),
         None => return false,
     };
-    later.last().is_some_and(|&l| l >= r.wrapping_add(2 * step))
+    // Two steps on, or one step on when the waited value is in the history and the run holds 8
+    // steps or more (a counter for sure, as after a reset above): a queue that reaches its wait a
+    // frame late (behind a long compile) waits for a value its writer has passed, while the
+    // writer waits on that queue through other labels (2026-11-26 -060518: acb0x48 waited for
+    // 0x140e with the counter at 0x1410, counting by 2 over 12 writes, and every queue stopped).
+    let steps = run.windows(2).filter(|w| w[1] != w[0]).count();
+    later.last().is_some_and(|&l| l >= r.wrapping_add(2 * step) || (written && steps >= 8 && l == r.wrapping_add(step)))
 }
 
 /// The recorded writes of a waited-on label (wait reports).
@@ -7898,6 +7904,12 @@ mod tests {
         assert!(!counter_passed(0x1028, false, 3, m, 0xa20), "one step on: may still be a flag");
         history(0x1028, &[0xa1c, 0xa1e, 0xa20, 0xa22, 0xa24]);
         assert!(counter_passed(0x1028, false, 3, m, 0xa20));
+        // One step on is enough when the waited value was written and the run holds 8 steps or
+        // more (2026-11-26 -060518: the wait for 0x140e at 0x1410, counting by 2 over 12 writes).
+        history(0x1040, &[0x13fa, 0x13fc, 0x13fe, 0x1400, 0x1402, 0x1404, 0x1406, 0x1408, 0x140a, 0x140c, 0x140e, 0x1410]);
+        assert!(counter_passed(0x1040, false, 3, m, 0x140e));
+        assert!(!counter_passed(0x1040, false, 3, m, 0x1410), "the value now");
+        assert!(!counter_passed(0x1040, false, 3, m, 0x1412), "not reached yet");
     }
 
     #[test]
