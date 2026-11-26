@@ -4927,6 +4927,33 @@ mod tests {
         assert!(Spec::from_words(&format!("{w} extra")).is_none());
     }
 
+    /// V_MED3_F32 with the fog's operands, med3(71.0, v0, 0) (assembled here: VOP3 0x157, a
+    /// literal, v0, the inline 0): translated with the hardware's NaN rule, bit tests and a
+    /// select, no `OpIsNan`. `RDNA_GS_DUMP=<dir>` writes the module there for spirv-val.
+    #[test]
+    fn med3_takes_the_hardware_nan_rule() {
+        let words = [0xd557_0000, 0x0202_00ff, 0x428e_0000, 0xbf81_0000];
+        let code = crate::decode_program(&words).unwrap();
+        let spec = cs_spec([64, 1, 1]);
+        let plan = crate::analysis::analyze(&code, 0, 0);
+        let out = translate(&code, &plan, &spec).unwrap();
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        let mut ops = Vec::new();
+        let mut i = 5;
+        while i < out.spirv.len() {
+            ops.push(out.spirv[i] & 0xFFFF);
+            i += ((out.spirv[i] >> 16) as usize).max(1);
+        }
+        let count = |op: u32| ops.iter().filter(|&&o| o == op).count();
+        assert_eq!(count(156), 0, "OpIsNan");
+        assert!(count(172) >= 3, "OpUGreaterThan: the three NaN tests");
+        assert!(count(169) >= 1, "OpSelect");
+        if let Some(dir) = std::env::var_os("RDNA_GS_DUMP") {
+            let dir = std::path::PathBuf::from(dir);
+            std::fs::write(dir.join("med3.spv"), out.spirv.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()).expect("written");
+        }
+    }
+
     fn cs_spec(local: [u32; 3]) -> Spec {
         Spec {
             stage: Stage::Compute,

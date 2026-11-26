@@ -1435,7 +1435,7 @@ impl<'a, E: Env> Group<'a, E> {
                 "v_max3_f32" => Self::fres(&v, fmax(fmax(fs(0)?, fs(1)?), fs(2)?)),
                 "v_med3_f32" => {
                     let (a, b, c) = (fs(0)?, fs(1)?, fs(2)?);
-                    Self::fres(&v, fmax(fmin(a, b), fmin(fmax(a, b), c)))
+                    Self::fres(&v, med3_f32(a, b, c))
                 }
                 "v_mul_i32_i24" => (sext(us(0)?, 24) as i32).wrapping_mul(sext(us(1)?, 24) as i32) as u32,
                 "v_mul_hi_i32_i24" => ((sext(us(0)?, 24) as i32 as i64 * sext(us(1)?, 24) as i32 as i64) >> 32) as u32,
@@ -2432,6 +2432,16 @@ fn fmax(a: f32, b: f32) -> f32 {
     }
 }
 
+/// V_MED3_F32 as the hardware does it (AMD's RDNA2 ISA reference): with a NaN among the inputs
+/// V_MIN3_F32 of them (the smallest of the others, NaN only when all three are), else the median.
+fn med3_f32(a: f32, b: f32, c: f32) -> f32 {
+    if a.is_nan() || b.is_nan() || c.is_nan() {
+        fmin(fmin(a, b), c)
+    } else {
+        fmax(fmin(a, b), fmin(fmax(a, b), c))
+    }
+}
+
 fn cube(name: &str, x: f32, y: f32, z: f32) -> f32 {
     let (ax, ay, az) = (x.abs(), y.abs(), z.abs());
     if az >= ax && az >= ay {
@@ -2455,5 +2465,26 @@ fn cube(name: &str, x: f32, y: f32, z: f32) -> f32 {
             "v_cubetc_f32" => -y,
             _ => 2.0 * x,
         }
+    }
+}
+
+#[cfg(test)]
+mod med3_tests {
+    use super::med3_f32;
+
+    /// V_MED3_F32's NaN rule (AMD's RDNA2 ISA reference): a NaN among the inputs gives the
+    /// smallest of the others, wherever it stands.
+    #[test]
+    fn med3_follows_the_hardware_with_nans() {
+        let n = f32::NAN;
+        assert_eq!(med3_f32(71.0, 5.0, 0.0), 5.0);
+        assert_eq!(med3_f32(71.0, -3.0, 0.0), 0.0);
+        assert_eq!(med3_f32(71.0, 90.0, 0.0), 71.0);
+        // The fog's slice clamp med3(71.0, x, 0): a NaN x gives slice 0, as on the console.
+        assert_eq!(med3_f32(71.0, n, 0.0), 0.0);
+        assert_eq!(med3_f32(n, 1.0, 0.0), 0.0);
+        assert_eq!(med3_f32(2.0, 1.0, n), 1.0);
+        assert_eq!(med3_f32(n, n, 2.0), 2.0);
+        assert!(med3_f32(n, n, n).is_nan());
     }
 }

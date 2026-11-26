@@ -206,13 +206,24 @@ pub fn max_reconvergence() -> bool {
 /// is made, with the widths the device allows (bit 0: 16, bit 1: 32, bit 2: 64).
 static NAN_PRESERVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// The widths the device lets a module declare SignedZeroInfNanPreserve for, whether or not the
+/// translated shaders declare it (the NaN rules check runs both ways: `reconv::nan_check`).
+static NAN_OFFERED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The widths the device offers for SignedZeroInfNanPreserve (bit 0: 16, bit 1: 32, bit 2: 64).
+pub fn nan_preserve_offered() -> u32 {
+    NAN_OFFERED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether every translated shader declares `SignedZeroInfNanPreserve` (SPV_KHR_float_controls).
 /// Without it Vulkan lets a compiler assume that no value is a NaN or an infinity and ignore the
-/// sign of zero, so it may fold an `OpIsNan` or `OpIsInf` to false. The translation relies on
-/// them where the console's hardware does: a vertex whose position has a NaN or infinite
-/// component is moved outside the clip volume so that its primitive is dropped, as the console's
-/// clipper drops it (the title's instancing gives unused instance slots NaN positions;
-/// `translate::mem`'s position export), and v_cmp_class tests classes. On the RTX 40 series the
+/// sign of zero, so it may fold an `OpIsNan` or `OpIsInf` to false. The translation tests NaNs
+/// where the console's hardware does: a vertex whose position has a NaN or infinite component is
+/// moved outside the clip volume so that its primitive is dropped, as the console's clipper drops
+/// it (the title's instancing gives unused instance slots NaN positions; `translate::mem`'s
+/// position export), v_cmp_class tests classes, v_cmp_u / v_cmp_o and v_med3 test their inputs;
+/// since 2026-11-26 those tests read the bits (`alu::nan_bits`), which no driver can fold, and the
+/// declaration still keeps the arithmetic's NaNs (`reconv::nan_check` logs both ways). On the RTX 40 series the
 /// tests held without the declaration; before that guard the RTX 4090 drew those primitives as
 /// streaks across the tutorial's opening tunnel, and on the RTX 50 series (driver 621.24 and
 /// 621.35) players see that tunnel black with "vertex explosions" (issues #4 and #6, 2026-11-24):
@@ -784,8 +795,8 @@ fn init_inner() -> Result<(), String> {
         };
         crate::info!("{sg_note}");
         // (What the driver lets a module declare about denormals, signed zeros, infinities, NaNs and
-        // rounding: translated modules declare none of it, so the driver's defaults decide; players'
-        // logs say what their design offers.)
+        // rounding: translated modules declare only the NaN preservation below, where it is on, so
+        // the driver's defaults decide the rest; players' logs say what their design offers.)
         {
             let mut p12 = vk::PhysicalDeviceVulkan12Properties::default();
             let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut p12);
@@ -799,6 +810,7 @@ fn init_inner() -> Result<(), String> {
             };
             let on = forced.unwrap_or(!checked) && widths & 2 != 0;
             NAN_PRESERVE.store(if on { widths } else { 0 }, std::sync::atomic::Ordering::Relaxed);
+            NAN_OFFERED.store(widths, std::sync::atomic::Ordering::Relaxed);
             crate::info!(
                 "Vulkan: NaN, infinity and signed-zero preservation {} ({}; DS_NAN_PRESERVE=1 or 0 overrides)",
                 if on { "declared by every translated shader" } else { "not declared" },

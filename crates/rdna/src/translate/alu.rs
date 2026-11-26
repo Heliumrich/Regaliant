@@ -43,6 +43,28 @@ fn nonzero64(tr: &mut T, lo: Word, hi: Word) -> R<Word> {
     nonzero(tr, o)
 }
 
+/// The f32 `x`'s bits without the sign, and the exponent field all ones, for the bit tests below.
+fn abs_bits(tr: &mut T, x: Word) -> R<(Word, Word)> {
+    let bits = tr.to_u(x)?;
+    let m = tr.u(0x7fff_ffff);
+    let abs = e(tr.b.bitwise_and(tr.t.u32, None, bits, m))?;
+    Ok((abs, tr.u(0x7f80_0000)))
+}
+
+/// Whether the f32 `x` is a NaN (exponent all ones, fraction nonzero), read from its bits: a
+/// driver free to assume no NaNs (a module without `SignedZeroInfNanPreserve`, the RTX 40
+/// series and older here) may fold `OpIsNan` to false, never an integer test.
+pub(crate) fn nan_bits(tr: &mut T, x: Word) -> R<Word> {
+    let (abs, inf) = abs_bits(tr, x)?;
+    e(tr.b.u_greater_than(tr.t.bool_, None, abs, inf))
+}
+
+/// Whether the f32 `x` is a NaN or an infinity (exponent all ones), from its bits as `nan_bits`.
+pub(crate) fn nonfinite_bits(tr: &mut T, x: Word) -> R<Word> {
+    let (abs, inf) = abs_bits(tr, x)?;
+    e(tr.b.u_greater_than_equal(tr.t.bool_, None, abs, inf))
+}
+
 /// Whole-quad mode: each 4-bit group becomes 0xF if any bit is set.
 fn wqm32(tr: &mut T, v: Word) -> R<Word> {
     let mut acc = tr.u(0);
@@ -1327,8 +1349,18 @@ fn fcmp(tr: &mut T, a: Word, b: Word, c: &str) -> R<Option<Word>> {
         "gt" => e(tr.b.f_ord_greater_than(bt, None, a, b))?,
         "lg" => e(tr.b.f_ord_not_equal(bt, None, a, b))?,
         "ge" => e(tr.b.f_ord_greater_than_equal(bt, None, a, b))?,
-        "o" => e(tr.b.ordered(bt, None, a, b))?,
-        "u" => e(tr.b.unordered(bt, None, a, b))?,
+        // (Ordered / unordered from the bits, `nan_bits`: v_cmp_u x, x is the title's NaN test,
+        // and `OpUnordered` may be folded as `OpIsNan` may.)
+        "o" | "u" => {
+            let na = nan_bits(tr, a)?;
+            let nb = nan_bits(tr, b)?;
+            let un = e(tr.b.logical_or(bt, None, na, nb))?;
+            if c == "u" {
+                un
+            } else {
+                e(tr.b.logical_not(bt, None, un))?
+            }
+        }
         "nge" => e(tr.b.f_unord_less_than(bt, None, a, b))?,
         "nlg" => e(tr.b.f_unord_equal(bt, None, a, b))?,
         "ngt" => e(tr.b.f_unord_less_than_equal(bt, None, a, b))?,
@@ -1345,16 +1377,26 @@ fn fclass(tr: &mut T, x: Word, mask: Word) -> R<Word> {
     let bt = tr.t.bool_;
     let u = tr.t.u32;
     let bits_ = tr.to_u(x)?;
-    let abs = tr.glsl1(tr.t.f32, GLOp::FAbs, x)?;
-    let inf = tr.f(f32::INFINITY);
-    let minn = tr.f(f32::MIN_POSITIVE);
-    let zero = tr.f(0.0);
     let s31 = tr.u(31);
     let sign_b = e(tr.b.shift_right_logical(u, None, bits_, s31))?;
     let one = tr.u(1);
     let neg = e(tr.b.i_equal(bt, None, sign_b, one))?;
     let pos = e(tr.b.logical_not(bt, None, neg))?;
-    let nan = e(tr.b.is_nan(bt, None, x))?;
+    // Every class from the bits, as the hardware reads them: the exponent field 0, 1-254 or 255
+    // and the fraction zero or not. Neither a driver free to assume no NaNs nor one that
+    // flushes denormals (an `FAbs` of one read as zero) changes the answer.
+    let s23 = tr.u(23);
+    let sh = e(tr.b.shift_right_logical(u, None, bits_, s23))?;
+    let kff = tr.u(0xff);
+    let ex = e(tr.b.bitwise_and(u, None, sh, kff))?;
+    let kfrac = tr.u(0x7f_ffff);
+    let fr = e(tr.b.bitwise_and(u, None, bits_, kfrac))?;
+    let z = tr.u(0);
+    let ex0 = e(tr.b.i_equal(bt, None, ex, z))?;
+    let exmax = e(tr.b.i_equal(bt, None, ex, kff))?;
+    let fr0 = e(tr.b.i_equal(bt, None, fr, z))?;
+    let frn = e(tr.b.logical_not(bt, None, fr0))?;
+    let nan = e(tr.b.logical_and(bt, None, exmax, frn))?;
     let qbit = tr.u(1 << 22);
     let qm = e(tr.b.bitwise_and(u, None, bits_, qbit))?;
     let quiet = nonzero(tr, qm)?;
@@ -1363,18 +1405,14 @@ fn fclass(tr: &mut T, x: Word, mask: Word) -> R<Word> {
         e(tr.b.logical_and(bt, None, nan, nq))?
     };
     let qnan = e(tr.b.logical_and(bt, None, nan, quiet))?;
-    let isinf = e(tr.b.f_ord_equal(bt, None, abs, inf))?;
-    let iszero = e(tr.b.f_ord_equal(bt, None, abs, zero))?;
+    let isinf = e(tr.b.logical_and(bt, None, exmax, fr0))?;
+    let iszero = e(tr.b.logical_and(bt, None, ex0, fr0))?;
     let normal = {
-        let ge = e(tr.b.f_ord_greater_than_equal(bt, None, abs, minn))?;
-        let ni = e(tr.b.logical_not(bt, None, isinf))?;
-        e(tr.b.logical_and(bt, None, ge, ni))?
+        let a = e(tr.b.logical_not(bt, None, ex0))?;
+        let b = e(tr.b.logical_not(bt, None, exmax))?;
+        e(tr.b.logical_and(bt, None, a, b))?
     };
-    let denorm = {
-        let lt = e(tr.b.f_ord_less_than(bt, None, abs, minn))?;
-        let nz = e(tr.b.logical_not(bt, None, iszero))?;
-        e(tr.b.logical_and(bt, None, lt, nz))?
-    };
+    let denorm = e(tr.b.logical_and(bt, None, ex0, frn))?;
     let classes = [
         snan,
         qnan,
@@ -1824,10 +1862,24 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
                     tr.glsl2(f, GLOp::NMax, m, c)?
                 }
                 _ => {
+                    // As the hardware does it (AMD's RDNA2 ISA reference, V_MED3_F32): with a
+                    // NaN among the inputs the result is V_MIN3_F32 of them, the smallest of
+                    // the others; else the median. The median of NMin/NMax alone gave the
+                    // first input's partner (a NaN first or second) or the larger of the first
+                    // two (a NaN third): the fog's slice clamp med3(71.0, x, 0) made a NaN x
+                    // slice 71 where the console makes it 0.
                     let mn = tr.glsl2(f, GLOp::NMin, a, b)?;
                     let mx = tr.glsl2(f, GLOp::NMax, a, b)?;
                     let m2 = tr.glsl2(f, GLOp::NMin, mx, c)?;
-                    tr.glsl2(f, GLOp::NMax, mn, m2)?
+                    let med = tr.glsl2(f, GLOp::NMax, mn, m2)?;
+                    let min3 = tr.glsl2(f, GLOp::NMin, mn, c)?;
+                    let bt = tr.t.bool_;
+                    let na = nan_bits(tr, a)?;
+                    let nb = nan_bits(tr, b)?;
+                    let nc = nan_bits(tr, c)?;
+                    let n1 = e(tr.b.logical_or(bt, None, na, nb))?;
+                    let n = e(tr.b.logical_or(bt, None, n1, nc))?;
+                    e(tr.b.select(f, None, n, min3, med))?
                 }
             };
             fout(tr, &v, r)?;
@@ -1907,7 +1959,17 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
                     let z = tr.f(0.0);
                     let mx = tr.f(4294967040.0);
                     let c = tr.glsl3(f, GLOp::NClamp, a, z, mx)?;
-                    e(tr.b.convert_f_to_u(u, None, c))?
+                    let cv = e(tr.b.convert_f_to_u(u, None, c))?;
+                    // Saturated as the hardware does it: 2^32 and above (infinity too) give
+                    // 0xffffffff (NClamp's bound gave 0xffffff00); a NaN gives 0, from the bits.
+                    let bt = tr.t.bool_;
+                    let top = tr.f(4294967296.0);
+                    let over = e(tr.b.f_ord_greater_than_equal(bt, None, a, top))?;
+                    let all = tr.u(u32::MAX);
+                    let cv = e(tr.b.select(u, None, over, all, cv))?;
+                    let n = nan_bits(tr, a)?;
+                    let zu = tr.u(0);
+                    e(tr.b.select(u, None, n, zu, cv))?
                 }
                 _ => {
                     let x = match name {
@@ -1922,8 +1984,20 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
                     let lo = tr.f(-2147483648.0);
                     let hi = tr.f(2147483520.0);
                     let c = tr.glsl3(f, GLOp::NClamp, x, lo, hi)?;
-                    let x = e(tr.b.convert_f_to_s(i, None, c))?;
-                    tr.to_u(x)?
+                    let cv = e(tr.b.convert_f_to_s(i, None, c))?;
+                    let cv = tr.to_u(cv)?;
+                    // Saturated as the hardware does it: 2^31 and above (infinity too) give
+                    // 0x7fffffff, where NClamp's bound gave 0x7fffff80; a NaN converts to 0 (the
+                    // D3D rule; NClamp made it -2147483648), tested on the source's bits (floor
+                    // and +0.5 keep a NaN, a driver free to assume none need not).
+                    let bt = tr.t.bool_;
+                    let top = tr.f(2147483648.0);
+                    let over = e(tr.b.f_ord_greater_than_equal(bt, None, x, top))?;
+                    let imax = tr.u(0x7fff_ffff);
+                    let cv = e(tr.b.select(u, None, over, imax, cv))?;
+                    let n = nan_bits(tr, a)?;
+                    let z = tr.u(0);
+                    e(tr.b.select(u, None, n, z, cv))?
                 }
             };
             uout(tr, &v, r)?;
@@ -1978,6 +2052,18 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
         "v_cvt_pkrtz_f16_f32" | "v_cvt_pknorm_i16_f32" | "v_cvt_pknorm_u16_f32" => {
             let a = fsrc(tr, ins, &v, 0)?;
             let b = fsrc(tr, ins, &v, 1)?;
+            // (The norm packs: a NaN packs as 0, as the hardware; GLSL's packs clamp with
+            // FClamp, undefined for a NaN.)
+            let (a, b) = if name == "v_cvt_pkrtz_f16_f32" {
+                (a, b)
+            } else {
+                let z = tr.f(0.0);
+                let na = nan_bits(tr, a)?;
+                let a = e(tr.b.select(f, None, na, z, a))?;
+                let nb = nan_bits(tr, b)?;
+                let b = e(tr.b.select(f, None, nb, z, b))?;
+                (a, b)
+            };
             let vv = e(tr.b.composite_construct(tr.t.v2f, None, [a, b]))?;
             let op = match name {
                 "v_cvt_pknorm_i16_f32" => GLOp::PackSnorm2x16,

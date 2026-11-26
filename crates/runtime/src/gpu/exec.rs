@@ -692,6 +692,7 @@ pub fn enabled() -> bool {
             Ok(()) => {
                 crate::info!("gpu: executing the GPU work on Vulkan");
                 super::reconv::check();
+                super::reconv::nan_check();
                 super::resident::init();
                 super::fe2::init();
                 super::resident::section_test_maybe();
@@ -4143,7 +4144,7 @@ pub(super) fn declare_max_reconvergence(spirv: &[u32]) -> Option<Vec<u32>> {
 }
 
 /// `SignedZeroInfNanPreserve` for 16-, 32- and 64-bit floats (`vk::nan_preserve`).
-const NAN_PRESERVE_MODES: &[(u32, u32)] = &[
+pub(super) const NAN_PRESERVE_MODES: &[(u32, u32)] = &[
     (rspirv::spirv::ExecutionMode::SignedZeroInfNanPreserve as u32, 16),
     (rspirv::spirv::ExecutionMode::SignedZeroInfNanPreserve as u32, 32),
     (rspirv::spirv::ExecutionMode::SignedZeroInfNanPreserve as u32, 64),

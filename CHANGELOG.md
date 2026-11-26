@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.9
+
+- Fixed white specks like stars in the sky on RTX 50-series cards. Regaliant handled one of the
+  game's shader rules for invalid numbers differently from the console, and those cards keep
+  such numbers where others drop them. After the update the launcher prepares the shaders once
+  more.
+
 ## 0.1.8
 
 - Fixed the washed-out, too bright picture with ghosting and black blotches at Render Scale

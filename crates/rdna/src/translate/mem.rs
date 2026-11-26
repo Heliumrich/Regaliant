@@ -1161,6 +1161,15 @@ fn pack_component(tr: &mut T, v: Word, bits_: u32, num: Num) -> R<Word> {
             let lo = tr.f(lo);
             let one = tr.f(1.0);
             let c = tr.glsl3(f, GLOp::NClamp, x, lo, one)?;
+            // A NaN converts to 0 on the hardware (the D3D rule); NClamp gives the lower
+            // bound, which is that 0 for UNORM but -1 for SNORM.
+            let c = if num == Num::Snorm {
+                let n = super::alu::nan_bits(tr, x)?;
+                let z = tr.f(0.0);
+                e(tr.b.select(f, None, n, z, c))?
+            } else {
+                c
+            };
             let kk = tr.f(k);
             let s = e(tr.b.f_mul(f, None, c, kk))?;
             let rn = tr.glsl1(f, GLOp::RoundEven, s)?;
@@ -1292,6 +1301,9 @@ fn store_formatted_rt(tr: &mut T, var: Word, addr: Word, vals: &[Word], r: usize
         let un = e(tr.b.convert_f_to_s(i32t, None, un))?;
         let un = tr.to_u(un)?;
         let sn = tr.glsl3(f, GLOp::NClamp, x, fm1, f1)?;
+        // (A NaN to 0, not NClamp's -1: the hardware's rule, as `pack_component`.)
+        let nx = super::alu::nan_bits(tr, x)?;
+        let sn = e(tr.b.select(f, None, nx, f0, sn))?;
         let sn = e(tr.b.f_mul(f, None, sn, smax))?;
         let sn = tr.glsl1(f, GLOp::RoundEven, sn)?;
         let sn = e(tr.b.convert_f_to_s(i32t, None, sn))?;
@@ -3487,12 +3499,13 @@ pub fn export(tr: &mut T, ins: &Inst) -> R<()> {
             // tunnel). Such a vertex goes to one point outside the clip
             // volume (z < 0) instead: a primitive with all three there is
             // dropped.
+            // The test reads the bits (`alu::nonfinite_bits`): `OpIsNan` / `OpIsInf` may be
+            // folded to false by a driver free to assume no NaNs, as the RTX 50 series did
+            // before the modules declared NaN preservation there (0.1.4).
             let bt = tr.t.bool_;
             let mut bad = tr.bool_c(false);
             for &c in &cs {
-                let n = e(tr.b.is_nan(bt, None, c))?;
-                let i = e(tr.b.is_inf(bt, None, c))?;
-                let ni = e(tr.b.logical_or(bt, None, n, i))?;
+                let ni = super::alu::nonfinite_bits(tr, c)?;
                 bad = e(tr.b.logical_or(bt, None, bad, ni))?;
             }
             // Diagnosis (`Spec::outlier`): finite positions counted in the program's census
