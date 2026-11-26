@@ -460,10 +460,39 @@ impl Drop for Present {
 }
 
 /// Status line.
+/// The composite's capture: `""` when it is tried (counted), else why it was not taken; each
+/// reason logged the first time and counted (status line).
+pub fn skipped(why: &str) {
+    if why.is_empty() {
+        TRIED.fetch_add(1, Relaxed);
+        return;
+    }
+    let mut g = SKIPS.lock();
+    let key: String = why.chars().take_while(|c| *c != '(').collect::<String>().trim().to_string();
+    match g.iter_mut().find(|(k, _)| *k == key) {
+        Some((_, n)) => *n += 1,
+        None => {
+            crate::warn!("frame generation: the HUD-less picture not taken: {why}");
+            g.push((key, 1));
+        }
+    }
+}
+
+/// Composite draws met while capturing, and why some were not taken (reason, count).
+static TRIED: AtomicU64 = AtomicU64::new(0);
+static SKIPS: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+
 pub fn status_line() -> String {
     let n = CAPTURED.load(Relaxed);
-    if n == 0 && MISSED.load(Relaxed) == 0 {
+    let tried = TRIED.load(Relaxed);
+    if n == 0 && MISSED.load(Relaxed) == 0 && tried == 0 && !super::super::streamline::loaded(super::super::streamline::FEATURE_DLSS_G) {
         return String::new();
     }
-    format!("    frame generation's HUD-less picture: {n} captured, {} presented with it, {} frames without\n", USED.load(Relaxed), MISSED.load(Relaxed))
+    let skips: Vec<String> = SKIPS.lock().iter().map(|(k, c)| format!("{k} {c}")).collect();
+    format!(
+        "    frame generation's HUD-less picture: {tried} composite draws met, {n} captured, {} presented with it, {} frames without{}\n",
+        USED.load(Relaxed),
+        MISSED.load(Relaxed),
+        if skips.is_empty() { String::new() } else { format!("; not taken: {}", skips.join(", ")) }
+    )
 }

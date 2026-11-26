@@ -317,8 +317,9 @@ fn parse_args() -> Config {
     }
     if safe_mode {
         // The GPU front end's cautious fallbacks (no arming of GPU-written pages, no held
-        // pages) and no upscaler library loaded: set before any thread starts or reads them.
-        for (k, v) in [("DS_FE2_ARM_GPU", "0"), ("DS_C4", "0"), ("DS_UPSCALER", "off")] {
+        // pages), no upscaler library loaded and no NVIDIA Streamline (no DLSS, Frame Generation
+        // or Reflex): set before any thread starts or reads them.
+        for (k, v) in [("DS_FE2_ARM_GPU", "0"), ("DS_C4", "0"), ("DS_UPSCALER", "off"), ("DS_STREAMLINE", "0")] {
             // SAFETY: still the only thread (parse_args runs before any is started).
             unsafe { set_unless_given(k, v) };
         }
@@ -2589,7 +2590,7 @@ This happens when other software takes that range. Restart the PC and try again.
     // Safe mode: the display choices and PC settings at their defaults for this session (a
     // scratch file for the display's, the player's files left as they are).
     if cfg.safe_mode {
-        info!("safe mode (the launcher's, for this start): default settings, a window, no upscaler, HDR off, arming and held pages off");
+        info!("safe mode (the launcher's, for this start): default settings, a window, no upscaler, no Frame Generation or Reflex, HDR off, arming and held pages off");
         let scratch = cfg.paths.cache.join("safe-mode-display.txt");
         let _ = std::fs::remove_file(&scratch);
         display::init(scratch);

@@ -230,7 +230,11 @@ fn vblank_thread() {
             crate::info!("vblank timer at {:.2} Hz ({})", 1.0 / period.as_secs_f64(), if period == uncapped_period { "the frame rate uncapped" } else { "the frame rate limited" });
         }
         let uncapped = period == uncapped_period;
-        let vrr = hz.is_none() && crate::vrr::active();
+        // (Frame generation counts as variable refresh: DLSS-G presents the frames on its own
+        // pacing, so the display's vblanks follow its presents and not the title's flips; a lock
+        // to them would feed back on itself.)
+        let fg = crate::gpu::framegen::dlssg::loaded();
+        let vrr = hz.is_none() && (crate::vrr::active() || fg);
         let lock = if hz.is_none() && !vrr { crate::displayclock::lock() } else { None };
         match lock {
             Some(s) => {
@@ -359,7 +363,7 @@ fn vblank_thread() {
                         let rhz = 1.0 / display.as_secs_f64();
                         crate::info!("pacing: the display's grid ({rhz:.3} Hz measured): the title's vblank at each of its vblanks, flips at least {interval} apart ({:.2} frames a second at most; {limit})", rhz / interval as f64);
                     }
-                    (3, _) => crate::info!("pacing: off the grid ({}): a ready frame is shown {}; the title's vblank on its own {:.2} Hz timer", if vrr { "variable refresh" } else { "`tune flip_grid` 0" }, if pace.is_zero() { "at once".to_string() } else { format!("{:.3} ms after the last at the earliest ({limit})", pace.as_secs_f64() * 1e3) }, 1.0 / period.as_secs_f64()),
+                    (3, _) => crate::info!("pacing: off the grid ({}): a ready frame is shown {}; the title's vblank on its own {:.2} Hz timer", if fg { "frame generation paces the display" } else if vrr { "variable refresh" } else { "`tune flip_grid` 0" }, if pace.is_zero() { "at once".to_string() } else { format!("{:.3} ms after the last at the earliest ({limit})", pace.as_secs_f64() * 1e3) }, 1.0 / period.as_secs_f64()),
                     _ => crate::info!("pacing: the vblank thread's own {:.2} Hz timer: flips at least {interval} vblank(s) apart ({limit}{})", 1.0 / period.as_secs_f64(), if cap > 0 { format!(", `tune frame_cap` {cap}") } else { String::new() }),
                 }
             }

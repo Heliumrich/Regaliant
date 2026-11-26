@@ -1897,11 +1897,19 @@ impl Exec {
     /// pixel or blends the layer over the picture already there, the first draw leaves the picture
     /// without the interface and the second the title's own.
     fn fg_capture_composite(&mut self, cp: &Cp, args: &DrawArgs) {
-        let Ok(p) = shaders::prepare_ps(cp) else { return };
-        let Some(super::Resolved::Image(t)) = p.resources.first() else { return };
+        use super::super::framegen::capture::skipped;
+        skipped("");
+        let p = match shaders::prepare_ps(cp) {
+            Ok(p) => p,
+            Err(e) => return skipped(&format!("its pixel stage not prepared ({e})")),
+        };
+        let Some(super::Resolved::Image(t)) = p.resources.first() else { return skipped("its resource 0 not an image") };
         let frame = super::super::FRAMES.load(Ordering::Relaxed);
-        let Ok(layer) = super::super::images::with(|im| im.upscale_tex(t, false, frame)) else { return };
-        let Some(zero) = super::super::framegen::capture::transparent_view() else { return };
+        let layer = match super::super::images::with(|im| im.upscale_tex(t, false, frame)) {
+            Ok(l) => l,
+            Err(e) => return skipped(&format!("the interface layer not resolved ({e})")),
+        };
+        let Some(zero) = super::super::framegen::capture::transparent_view() else { return skipped("no transparent image") };
         let id = super::super::streamline_frame();
         let saved = self.ui_sub;
         self.ui_sub = Some((layer.view, zero));
@@ -1910,10 +1918,12 @@ impl Exec {
         // (The title's own draw comes next: no buffer-delta or repeated draw of this one.)
         self.delta.at = None;
         self.repeat = None;
-        if !matches!(r, Ok(true)) {
-            return;
+        match r {
+            Ok(true) => {}
+            Ok(false) => return skipped("the hidden-interface draw drew nothing"),
+            Err(e) => return skipped(&format!("the hidden-interface draw failed ({e})")),
         }
-        let Some(rt) = self.rendering.as_ref().and_then(|r| r.colors[0]) else { return };
+        let Some(rt) = self.rendering.as_ref().and_then(|r| r.colors[0]) else { return skipped("no colour target after the draw") };
         self.end_rendering();
         // What the composite samples in the layer's place: the scaled copy under Menu & HUD Size.
         let ui = if saved.is_some() { super::super::uiscale::spare_image() } else { Some((layer.image, layer.size.0, layer.size.1)) };
