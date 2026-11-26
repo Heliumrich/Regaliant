@@ -290,24 +290,25 @@ pub extern "sysv64" fn hook_display(regs: *const u64, _arg: u32) {
 }
 
 /// The render size for a window area of `w`x`h` at `pct` percent: the output's shape, the height
-/// a multiple of 4 from 360 to `max_lines` (2160, or 1512 at shapes wider than 16:9), the width
+/// a multiple of 4 from 360 to `max_lines` (2048, or 1512 at shapes wider than 16:9), the width
 /// the height's at that shape rounded to a multiple of 4.
 pub fn scaled_size(w: u32, h: u32, pct: u32) -> (u32, u32) {
     let (ow, oh) = output_size();
     scaled_for(w, h, pct, ow, oh)
 }
 
-/// The most lines the port renders at the output's shape: the title's own 2160, and at shapes
-/// wider than 16:9 1512 (issue #20: the title's render-target pool, RTSharedAllocator, is one
-/// 687 MiB block made after the targets at the render and output sizes, from what they leave; at
-/// 21:9 and 32:9 a render of 1868 or 2160 lines left less than that and the title stopped on its
-/// out-of-memory assertion, eboot+0x7f9cab, while 1440 to 1524 lines played in: Visual Mode
-/// Cinematic's 2160 lines at those shapes now render as Performance's largest, 1512). 0.1.8's
-/// package of 2026-11-26 03:42 held 2048 lines (issue #6: above 2048 lines two of the title's
-/// targets share a compression block and the port's fast clear went to one of them by the binds'
-/// timing, washed out and ghosting); since the fix (`Images::meta_reach`: a fill reaches every
-/// image whose metadata starts at its address) the title's 2160 is right again.
-pub const MAX_LINES: u64 = 2160;
+/// The most lines the port renders at the output's shape: 2048, and at shapes wider than 16:9
+/// 1512 (issue #20: the title's render-target pool, RTSharedAllocator, is one 687 MiB block made
+/// after the targets at the render and output sizes, from what they leave; at 21:9 and 32:9 a
+/// render of 1868 or 2160 lines left less than that and the title stopped on its out-of-memory
+/// assertion, eboot+0x7f9cab, while 1440 to 1524 lines played in: Visual Mode Cinematic's 2160
+/// lines at those shapes now render as Performance's largest, 1512). Above 2048 lines a size the
+/// port sets makes the title's lighting wrong (issue #6, 2026-11-25 night: the same still view
+/// right at 3648x2048, washed out and too bright at 3664x2056 and up with every exposure method
+/// and with fog, ambient shadowing, IBL, TAA or the cascade shadows off; also Cinematic's 2160
+/// after a pulse to 2048 and back, while its own 2160 from the start is right; ghosting and black
+/// blotches in motion with it): until the title's part in it is found, the port stays at 2048.
+pub const MAX_LINES: u64 = 2048;
 fn max_lines(ow: u32, oh: u32) -> u64 {
     if ow as u64 * 9 > oh as u64 * 16 { 1512 } else { MAX_LINES }
 }
@@ -346,8 +347,8 @@ pub fn tick() {
             v => v,
         },
     };
-    // (Back to the title's own size by a pulse: in Cinematic, 2160 lines at 16:9 (`MAX_LINES`);
-    // at wider shapes the capped size.)
+    // (Back to the title's own size by a pulse: in Cinematic, 2160 lines, the capped size instead
+    // (`MAX_LINES`). Its own 2160 at the start, before any pulse, is right and stays.)
     let want = if want == 0 && RENDER.load(Ordering::Relaxed) != 0 && TITLE_MODE.load(Ordering::Relaxed) == 4 {
         let (ow, oh) = output_size();
         let (w, h) = shaped_lines(2160, ow, oh);
@@ -540,11 +541,11 @@ mod tests {
         // Visual Mode at the output's shape: 16:9 and 16:10 keep their lines, wider shapes take
         // at most 1512 (issue #20: 21:9 and 32:9 at 1440-1524 lines played in, 1868 and 2160
         // stopped the title on its render-target pool).
-        // (16:9 and 16:10 at most 2048 lines from 2026-11-25 night until issue #6's fix.)
-        assert_eq!(shaped_lines(2160, 3840, 2160), (3840, 2160));
+        // (16:9 and 16:10 at most 2048 lines since 2026-11-25 night, issue #6.)
+        assert_eq!(shaped_lines(2160, 3840, 2160), (3640, 2048));
         assert_eq!(shaped_lines(2048, 3840, 2160), (3640, 2048));
         assert_eq!(shaped_lines(1440, 3840, 2160), (2560, 1440));
-        assert_eq!(shaped_lines(2160, 3456, 2160), (3456, 2160));
+        assert_eq!(shaped_lines(2160, 3456, 2160), (3280, 2048));
         assert_eq!(shaped_lines(1440, 7680, 2160), (5120, 1440));
         assert_eq!(shaped_lines(1512, 5120, 2160), (3584, 1512));
         assert_eq!(shaped_lines(2160, 7680, 2160), (5376, 1512));
@@ -552,11 +553,11 @@ mod tests {
         // Render Scale: 150% of a 3440x1440 window at 21:9, and of a 5120x1440 one at 32:9.
         assert_eq!(scaled_for(3440, 1440, 150, 5120, 2160), (3584, 1512));
         assert_eq!(scaled_for(5120, 1440, 150, 7680, 2160), (5376, 1512));
-        // 100% of those windows as before; 16:9 at 150% of 2560x1440 and 100% of a 4K window
-        // the title's 2160 lines.
+        // 100% of those windows as before; 16:9 at 150% of 2560x1440 and 100% of a 4K window at
+        // most 2048 lines.
         assert_eq!(scaled_for(3440, 1440, 100, 5120, 2160), (3412, 1440));
-        assert_eq!(scaled_for(2560, 1440, 150, 3840, 2160), (3840, 2160));
-        assert_eq!(scaled_for(3840, 2160, 100, 3840, 2160), (3840, 2160));
+        assert_eq!(scaled_for(2560, 1440, 150, 3840, 2160), (3640, 2048));
+        assert_eq!(scaled_for(3840, 2160, 100, 3840, 2160), (3640, 2048));
         assert_eq!(scaled_for(3840, 2160, 90, 3840, 2160), (3456, 1944));
     }
 }
