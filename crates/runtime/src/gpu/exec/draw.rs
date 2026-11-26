@@ -1815,7 +1815,7 @@ impl Exec {
         }
         let t_prog = super::prog_census().then(std::time::Instant::now);
         self.census_kind = 0;
-        let composite = ((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8 == super::super::uiscale::COMPOSITE_PS;
+        let composite = super::super::uiscale::is_composite(((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8);
         // Menu & HUD Size: the interface layer scaled before the title composites it.
         if composite && super::super::uiscale::scale() < 1.0 {
             self.scale_ui_layer(cp);

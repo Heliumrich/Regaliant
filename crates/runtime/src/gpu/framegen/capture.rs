@@ -505,7 +505,7 @@ pub fn note_display_draw(base: u64, ps: u64, format: vk::Format, w: u32, h: u32)
         return;
     }
     g.push(ps);
-    crate::info!("frame generation: ps {ps:#x} draws into display buffer {base:#x} ({format:?} {w}x{h}); the composite captured is ps {:#x}", super::super::uiscale::COMPOSITE_PS);
+    crate::info!("frame generation: ps {ps:#x} draws into display buffer {base:#x} ({format:?} {w}x{h}); the composites captured are ps {:#x} and {:#x}", super::super::uiscale::COMPOSITE_PS, super::super::uiscale::COMPOSITE_PS_HDR);
 }
 
 /// Composite draws met while capturing, and why some were not taken (reason, count).
