@@ -6,6 +6,10 @@
   100% on a 4K screen (issue #6). Above 2048 lines two of the game's render targets share one
   compression block, and Regaliant sometimes cleared the wrong one. Render Scale now renders at
   most 2048 lines (3640x2048 at 16:9, 95% of 4K).
+- Changing Render Scale, resizing the window or switching between the window and fullscreen no
+  longer keeps the old size's render images in video memory until the game restarts (issue #1).
+  Each change kept another set, up to about 1 GB at 4K, and the game then had to load its
+  textures again and again, which made it stutter.
 - Fixed the game closing at every start with some DLSS files (`nvngx_dlss.dll`). The check
   before DLSS loads now also asks DLSS whether it supports your card, the step that crashed,
   and a start that ends before DLSS has drawn its first frame is counted. A DLSS file that
