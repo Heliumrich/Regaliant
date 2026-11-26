@@ -329,10 +329,35 @@ fn scaled_for(w: u32, h: u32, pct: u32, ow: u32, oh: u32) -> (u32, u32) {
 
 /// Each vblank: the render size the setting and the window ask for; a settled change is applied
 /// by a mode pulse (in the 4K-output modes; none in headless runs, which keep the title's size).
+/// The render size in effect at the last tick (`tick`): the port's (`RENDER`) or, when it holds
+/// none, the title's own for its Visual Mode; 0 before the title chose a mode.
+static EFFECTIVE: AtomicU64 = AtomicU64::new(0);
+
+fn effective_size() -> u64 {
+    let r = RENDER.load(Ordering::Relaxed);
+    if r != 0 {
+        return r;
+    }
+    let title = TITLE_MODE.load(Ordering::Relaxed);
+    if !(3..=5).contains(&title) {
+        return 0;
+    }
+    let (w, h) = sizes(title).0;
+    (w as u64) << 32 | h as u64
+}
+
 pub fn tick() {
     apply_aspect();
     if RENDER_FROM_ENV.load(Ordering::Relaxed) || PULSE_LEFT.load(Ordering::Relaxed) > 0 {
         return;
+    }
+    // (A size change the port did not make: the game's own Visual Mode changed in its menu while
+    // the port holds no size (Render Scale Automatic). That size's targets are left as a pulse's
+    // are, `images::note_left_size`; until 2026-11-26 only the port's own changes were noted.)
+    let eff = effective_size();
+    let last = EFFECTIVE.swap(eff, Ordering::Relaxed);
+    if last != 0 && eff != 0 && last != eff && RENDER.load(Ordering::Relaxed) == 0 {
+        crate::gpu::images::note_left_size((last >> 32) as u32, last as u32);
     }
     let pct = SCALE_PCT.load(Ordering::Relaxed);
     let want = match crate::gpu::vk::present::area() {
@@ -374,6 +399,9 @@ pub fn tick() {
         let (w, h) = size_of(old);
         crate::gpu::images::note_left_size(w, h);
     }
+    // (The size in effect is the new one: the check above must not note the old one again.)
+    let (nw, nh) = size_of(want);
+    EFFECTIVE.store((nw as u64) << 32 | nh as u64, Ordering::Relaxed);
     PULSE_MODE.store(if title == 4 { 3 } else { 4 }, Ordering::Relaxed);
     PULSE_LEFT.store(2, Ordering::Relaxed);
     let n = PULSES.fetch_add(1, Ordering::Relaxed);

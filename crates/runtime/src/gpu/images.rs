@@ -1355,10 +1355,11 @@ const EVICT_CHECK_MS: u64 = 500;
 /// resolution, and a twelfth rounded up, its fog volumes; seen idle after each change, 2026-11-26
 /// -011841) that were in use up to the change (within `LEFT_RECENT` frames before it) and no frame
 /// used after its pulse (`LEFT_PULSE` frames from its start) are freed (`free_left_targets`;
-/// `DS_LEFT_TARGETS=0`: kept, as before). The output size is never among them (the output's own
-/// images are not the render size's; Cinematic's own render size is the output's, so its full-size
-/// set stays: a review of 2026-11-26 night found the output's half excluded too kept a 1080p
-/// window's 100% set, 1920x1080), and an image idle before the change stays whatever its size
+/// `DS_LEFT_TARGETS=0`: kept, as before). The display buffers are never among them; other images of
+/// the output size are, when the idle test says so (since 2026-11-26 morning: Cinematic's own
+/// render size is the output's, and that size's set, ~1.1 GB at 4K, had stayed when a Visual Mode
+/// change left it; until then a review of 2026-11-26 night had the output's half excluded too,
+/// which kept a 1080p window's 100% set), and an image idle before the change stays whatever its size
 /// (data a level load wrote and draws much later: evicting idle GPU-written images lost 4-2's
 /// architecture, TRIED.md 2026-10-19). A later use makes the image anew: the title draws a target
 /// before it reads it.
@@ -1410,24 +1411,28 @@ fn free_left_targets(frame: u64) {
     if !left_targets_on() {
         return;
     }
+    // (The display buffers are the output's own and stay whatever their use; read before the
+    // images' lock, which the display's code never takes after its own.)
+    let displays: Vec<u64> = (0..16).filter_map(|i| crate::hle::libs::videoout::display_buffer(i).map(|(d, _)| d.addr)).collect();
     let Some(mut g) = IMAGES.try_lock() else {
         LEFT_SIZES.lock().extend(due);
         return;
     };
     let Some(im) = g.as_mut() else { return };
     let (cw, ch) = crate::dispmode::render_size();
-    let (ow, oh) = crate::dispmode::output_size();
-    let mut current = left_sizes(cw, ch).to_vec();
-    current.push((ow, oh));
     let mut out = Vec::new();
     for &(w, h, at) in &due {
-        // (Back at that size meanwhile: its targets are the title's again. A derived size the
-        // current one shares stays too.)
+        // (Back at that size meanwhile: its targets are the title's again.)
         if (cw, ch) == (w, h) {
             continue;
         }
-        let sizes: Vec<(u32, u32)> = left_sizes(w, h).into_iter().filter(|s| !current.contains(s)).collect();
-        let of_size = |k: &ImageKey, i: &Image| i.gpu_written && sizes.contains(&(k.width, k.height));
+        // (No size is kept for being the current set's or the output's: Cinematic's own render
+        // size is the output's, and the idle test below tells the left targets from those in use,
+        // a new size's being used after the change. The review of 2026-11-26 found the output
+        // size's set (~1.1 GB) kept when left, and a 1080p set left for 2160 kept for being
+        // 2160's half.)
+        let sizes: Vec<(u32, u32)> = left_sizes(w, h).to_vec();
+        let of_size = |k: &ImageKey, i: &Image| i.gpu_written && sizes.contains(&(k.width, k.height)) && !displays.contains(&k.base);
         let left = |i: &Image| i.used.get() + LEFT_RECENT >= at && i.used.get() <= at + LEFT_PULSE;
         let (mut keys, mut kept) = (Vec::new(), 0usize);
         for (k, i) in im.map.iter() {
@@ -5122,6 +5127,9 @@ impl Images {
                 v.0 = new_key;
             }
         }
+        if let Some(m) = self.meta_now.remove(&old) {
+            self.meta_now.insert(new_key, m);
+        }
         if let Some(n) = self.pending_clears.remove(&old) {
             self.pending_clears.insert(new_key, n);
             self.pending_change += 1;
@@ -6157,6 +6165,7 @@ impl Images {
         self.pending_change += 1;
         self.stencil_of.retain(|_, v| *v != *k);
         self.meta_of.retain(|_, v| v.0 != *k);
+        self.meta_now.remove(k);
         if img.gpu_written && !self.by_base.get(&k.base).is_some_and(|ks| ks.iter().any(|x| self.map.get(x).is_some_and(|i| i.gpu_written))) {
             self.gpu_bases.remove(&k.base);
         }

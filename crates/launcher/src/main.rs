@@ -433,11 +433,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 fn startup_status(app: &mut App) {
     let marker = app.paths.running_marker();
     let Ok(t) = std::fs::read_to_string(&marker) else {
-        // (Under Wine without the kernel's write tracking the game runs many times slower than
-        // on Windows, loads above all: issue #14, 2026-11-25 night, `dsconfig::wine`.)
-        if let Some(n) = dsconfig::wine::detect().and_then(|w| dsconfig::wine::slow_notice(Some(&w), dsconfig::wine::write_watch_cost_ns())) {
-            app.set_status(n);
-        }
         return;
     };
     let pid = t.lines().find_map(|l| l.strip_prefix("pid ")).and_then(|p| p.trim().parse::<u32>().ok());
@@ -450,12 +445,7 @@ fn startup_status(app: &mut App) {
         sys::watch_process(pid, app.hwnd as usize, WM_GAME_EXIT);
     } else {
         let _ = std::fs::remove_file(&marker);
-        // (Under a slow Wine the last session was most likely closed while it crawled, issue
-        // #14's case: the Wine notice says why; the review of 2026-11-26 night.)
-        match dsconfig::wine::detect().and_then(|w| dsconfig::wine::slow_notice(Some(&w), dsconfig::wine::write_watch_cost_ns())) {
-            Some(n) => app.set_status(n),
-            None => app.set_status("The last session did not end normally. Open logs shows its log."),
-        }
+        app.set_status("The last session did not end normally. Open logs shows its log.");
     }
 }
 

@@ -1,20 +1,17 @@
 # Changelog
 
-## 0.1.9
-
-- Fixed white specks like stars in the sky on RTX 50-series cards. Regaliant handled one of the
-  game's shader rules for invalid numbers differently from the console, and those cards keep
-  such numbers where others drop them. After the update the launcher prepares the shaders once
-  more.
-
 ## 0.1.8
 
 - Fixed the washed-out, too bright picture with ghosting and black blotches at Render Scale
   100% on a 4K screen (issue #6). Above 2048 lines two of the game's render targets share one
   compression block, and Regaliant sometimes cleared the wrong one. Render Scale now renders at
   most 2048 lines (3640x2048 at 16:9, 95% of 4K).
-- Changing Render Scale, resizing the window or switching between the window and fullscreen no
-  longer keeps the old size's render images in video memory until the game restarts (issue #1).
+- Fixed white specks like stars in the sky on RTX 50-series cards. Regaliant handled one of the
+  game's shader rules for invalid numbers differently from the console, and those cards keep
+  such numbers where others drop them. After the update the launcher prepares the shaders once
+  more.
+- Changing Render Scale or Visual Mode, resizing the window or switching between the window and
+  fullscreen no longer keeps the old size's render images in video memory until the game restarts (issue #1).
   Each change kept another set, up to about 1 GB at 4K, and the game then had to load its
   textures again and again, which made it stutter.
 - Fixed the game closing at every start with some DLSS files (`nvngx_dlss.dll`). The check
@@ -37,11 +34,6 @@
   to Desktop, a copy of the game's own Save and Exit Game button: the game saves and leaves for
   the title as its own button does, then Regaliant closes. Quitting, and closing the window,
   wait for a save the game is still writing.
-- Playing on Linux through Wine or Proton (issue #14): the log now names Wine and how fast it
-  tracks memory writes, and the launcher says when that makes loading very slow. Wine before
-  10.10, Proton before 9 and any Linux before 6.7 track them without the kernel's help, which
-  made a load into Boletaria crawl for minutes. Proton 9+ or Wine 10.10+ on Linux 6.7+ track
-  them in the kernel.
 - The launcher has an Uninstall button (issue #19). It removes Regaliant's program files,
   prepared shaders, logs and settings, never your game files or add-ons, and asks before
   deleting your saves.

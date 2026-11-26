@@ -6,7 +6,6 @@ pub mod game;
 pub mod paths;
 pub mod self_file;
 pub mod sha;
-pub mod wine;
 pub mod zar;
 
 // (The release version is each program's own: the launcher's package version, the runtime's
