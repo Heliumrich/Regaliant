@@ -20,7 +20,9 @@ path = "src/main.rs"
 tracy = ["dep:tracy-client"]
 
 [dependencies]
-tracy-client = { version = "0.19", optional = true, features = ["ondemand"] }
+# (Without Tracy's crash handler: its exception filter would take the access violations the port
+# answers itself, the guest pages it arms.)
+tracy-client = { version = "0.19", optional = true, default-features = false, features = ["enable", "ondemand", "system-tracing", "context-switch-tracing", "sampling", "code-transfer", "broadcast", "callstack-inlines"] }
 sce-elf = { path = "../sce-elf" }
 dsconfig = { path = "../dsconfig" }
 rdna = { path = "../rdna" }

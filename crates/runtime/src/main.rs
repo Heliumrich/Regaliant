@@ -2314,8 +2314,6 @@ pub(crate) unsafe fn set_unless_given(k: &str, v: &str) {
 }
 
 fn main() {
-    // Tracy (`prof`, the `tracy` feature): its client first, so every thread's zones are recorded.
-    prof::start();
     // `--probe-streamline <dir>`: a start's separate check that Streamline loads (`gpu::upscale::
     // probe_streamline`), before anything else: no log, no window, no error popups.
     {
@@ -2381,6 +2379,10 @@ fn main() {
 This happens when other software takes that range. Restart the PC and try again.{note}"));
         std::process::exit(EXIT_EARLY as i32);
     }
+    // Tracy (`prof`, the `tracy` feature): in the process that runs the game (not its host, which
+    // only answers page faults), after the guest range is reserved (its
+    // buffers stay out of it) and before the game's threads start.
+    prof::start();
     let slot = match tls::init_slot() {
         Ok(s) => s,
         Err(e) => {
@@ -2777,7 +2779,14 @@ This happens when other software takes that range. Restart the PC and try again.
     .expect("spawn main thread");
 
     let start = Instant::now();
-    let mut control = cfg.control.clone().map(|p| (p, 0u64));
+    // (`DS_CONTROL=<file>`: the same as `--control <file>`, for a game started by the launcher,
+    // which passes no such argument; only lines added after the start are run.)
+    let mut control = cfg.control.clone().map(|p| (p, 0u64)).or_else(|| {
+        let p = PathBuf::from(std::env::var_os("DS_CONTROL").filter(|v| !v.is_empty())?);
+        let at = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+        info!("control: lines added to {} are run (DS_CONTROL)", p.display());
+        Some((p, at))
+    });
     let mut ticks = 0u64;
     // Boot watch (`DS_BOOT_WATCH=<s>`, default 15, 0 off): a boot that has
     // flipped no frame by then dumps the guest thread stacks once (some

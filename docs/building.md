@@ -19,6 +19,14 @@ What it shows:
 - Every PS5 system-library call the game makes, named after the function, on the game's threads.
 - A GPU track per queue with every batch's time on the GPU, named by its queue, number and leading programs (from the batch timestamps; needs VK_EXT_calibrated_timestamps, which NVIDIA and AMD drivers offer).
 
-Run Tracy as administrator for context switches and CPU sampling.
+Run Tracy as administrator for context switches and CPU sampling. The game runs in a second `dsport.exe` under the first (its host, which answers page faults): only the game's own process has Tracy's client, so the profiler lists one `dsport.exe`.
 
-The GPU's own cost per shader comes from the existing profile: run with `DS_PROFILE_GPU=1` and `--control <file>`, append `profile reset` to the file, play a few seconds, then append `profile report`. The log then lists the GPU time by compute shader and by pixel program.
+A capture without the profiler's window: `tracy-capture.exe -o capture.tracy -s 15` (15 seconds, from the Tracy folder, while the game runs). `tracy-csvexport.exe capture.tracy > zones.csv` lists every zone's count and times.
+
+The GPU's own cost per shader comes from the existing profile:
+
+1. Set `DS_PROFILE_GPU=1` and `DS_CONTROL=<a text file>` before starting the launcher (PowerShell: `$env:DS_PROFILE_GPU = "1"`, `$env:DS_CONTROL = "F:\ctl.txt"`; the game started by the launcher inherits them).
+2. In game, add the line `profile reset` to that file and save it.
+3. Play 10 to 15 seconds, then add the line `profile report` and save.
+
+The game runs each line added to the file (and logs it); the report goes to the game's log (`dsport.log`), not to the file: the GPU time by compute shader and by pixel program.
