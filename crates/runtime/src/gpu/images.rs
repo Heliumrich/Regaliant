@@ -5453,31 +5453,6 @@ impl Images {
                 None => {}
             }
         }
-        // Every other image whose metadata starts at an address reached sees the write too
-        // (`meta_now`: each image's metadata as last bound). Above 2048 render lines the title
-        // gives its render-size lighting target and a 3840x2160 target one block (0x10ea7f8000,
-        // issue #6), and `meta_of` holds one image an address, the last bound, so a fill's clear
-        // went to one of them by the binds' timing (824 of 1,446 frames wrong at 3664x2056,
-        // -002116). At 2048 lines and below their blocks start apart, each is found by its own
-        // address and both see each fill: the same now when they share one.
-        if !out.is_empty() {
-            let mut more = Vec::new();
-            for (&k2, &(m2, _)) in self.meta_now.iter() {
-                if m2 == 0 || !out.iter().any(|o| o.0 == m2) || out.iter().any(|o| o.1 == k2) || !self.map.contains_key(&k2) {
-                    continue;
-                }
-                match meta_layer_bytes(&k2) {
-                    Some(per) => {
-                        let mask = layers_reached(m2, per, k2.layers, b, e, fill);
-                        if mask != 0 {
-                            more.push((m2, k2, mask));
-                        }
-                    }
-                    None => more.push((m2, k2, 0)),
-                }
-            }
-            out.extend(more);
-        }
         out
     }
 

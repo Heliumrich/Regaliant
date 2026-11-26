@@ -24,9 +24,6 @@ struct RcRun {
 
 thread_local! {
     static RC_RUN: std::cell::RefCell<Option<RcRun>> = const { std::cell::RefCell::new(None) };
-    /// Diagnosis (`DS_TRACE_CLEARS`): each colour target's metadata as last bound by a draw on this
-    /// thread (a change is logged: issue #6's render target never claiming on its block).
-    static BOUND_META: std::cell::RefCell<std::collections::HashMap<u64, u64>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// Draws without visible effect here (metadata passes, all writes disabled).
@@ -2668,28 +2665,6 @@ impl Exec {
                         masks[i as usize] = m as u8;
                     }
                 }
-                // (Diagnosis: a colour target bound with another metadata than this thread's
-                // draws last bound it with, `DS_TRACE_CLEARS`.)
-                if images::trace_clears() {
-                    for i in 0..MAX_RT {
-                        if let Some(t) = &colors[i] {
-                            let meta = color_metas[i].0;
-                            let changed = BOUND_META.with(|m| m.borrow_mut().insert(t.key.base, meta) != Some(meta));
-                            if changed {
-                                crate::info!(
-                                    "trace clears: draw binds {:#x} ({}x{}) as colour target {i} with metadata {meta:#x} (for flip {}, [{}] programs {:#x}/{:#x})",
-                                    t.key.base,
-                                    t.key.width,
-                                    t.key.height,
-                                    crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1,
-                                    self.name,
-                                    self.sync_readers[0],
-                                    self.sync_readers[1]
-                                );
-                            }
-                        }
-                    }
-                }
                 lap.mark(5);
                 // Depth/stencil.
                 let dctl = reg(0x28800);
@@ -2924,7 +2899,6 @@ impl Exec {
                     return Err(super::STOPPED.into());
                 }
                 if pending {
-                    super::RESOLVE_SITE.with(|s| s.set("draw"));
                     self.resolve_fast_clears(&used);
                     self.resolve_overwrites(&used);
                     self.sync_block_textures(&used);
