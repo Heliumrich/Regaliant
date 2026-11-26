@@ -328,8 +328,7 @@ pub static FULL_FRAMES: AtomicU64 = AtomicU64::new(0);
 
 /// The picture of flip `frame` at `size` stands for the TAA output (its views `taa_views`) in
 /// the passes at the output size from now on.
-pub fn set_full(frame: u64, taa_views: Vec<vk::ImageView>, full: vk::ImageView, size: (u32, u32), scale: f32, taa_base: u64, render: (u32, u32)) {
-    trace_start(frame, taa_base, render);
+pub fn set_full(frame: u64, taa_views: Vec<vk::ImageView>, full: vk::ImageView, size: (u32, u32), scale: f32) {
     if FULL_FRAMES.fetch_add(1, Relaxed) == 0 {
         crate::info!("upscaler: the picture goes up to the output size {}x{} (render scale {scale:.3}); the title's passes at that size read it in the TAA output's place", size.0, size.1);
     }
@@ -389,87 +388,6 @@ pub fn substitute_full(frame: u64, target: (u32, u32), imgs: &mut [(u32, vk::Des
         }
     }
     n
-}
-
-/// The trace of the title's passes from the TAA output to the output size (2026-11-26: no pass
-/// at the output size read the TAA output itself, so the passes between are to be found): for
-/// `TRACE_FLIPS` flips after the picture is first made at a render size, each draw or dispatch
-/// that reads an image the TAA output led to is logged once per program with its images and
-/// targets, and what it writes joins the set. `DS_UPSCALE_TRACE=0`: off.
-struct Trace {
-    frame: u64,
-    /// The flips left, the render size traced, the bases the TAA output led to this flip, the
-    /// programs logged.
-    left: u32,
-    render: (u32, u32),
-    bases: Vec<u64>,
-    logged: Vec<u64>,
-}
-
-static TRACE: Mutex<Option<Trace>> = Mutex::new(None);
-static TRACE_ON: AtomicBool = AtomicBool::new(false);
-
-/// Whether passes are being traced (`trace_pass`).
-pub fn trace_on() -> bool {
-    TRACE_ON.load(Relaxed)
-}
-const TRACE_FLIPS: u32 = 4;
-
-/// One image of a traced pass: base, width, height, format (the T#'s or the target's).
-pub type TraceImage = (u64, u32, u32, u32);
-
-fn trace_start(frame: u64, taa_base: u64, render: (u32, u32)) {
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *OFF.get_or_init(|| std::env::var("DS_UPSCALE_TRACE").ok().as_deref() == Some("0")) {
-        return;
-    }
-    let mut g = TRACE.lock();
-    let t = g.get_or_insert_with(|| Trace { frame: u64::MAX, left: 0, render: (0, 0), bases: Vec::new(), logged: Vec::new() });
-    if t.render != render {
-        // (A new render size: traced again.)
-        t.render = render;
-        t.left = TRACE_FLIPS;
-        t.logged.clear();
-        crate::info!("upscale trace: the passes from the TAA output ({taa_base:#x}, {}x{}) for {TRACE_FLIPS} flips", render.0, render.1);
-    }
-    if t.frame != frame && t.left > 0 {
-        t.left -= 1;
-        t.frame = frame;
-        t.bases = vec![taa_base];
-    }
-    TRACE_ON.store(t.left > 0 || t.frame == frame, Relaxed);
-}
-
-fn fmt_images(v: &[TraceImage]) -> String {
-    v.iter().map(|(b, w, h, f)| format!("{b:#x} {w}x{h} f{f}")).collect::<Vec<_>>().join(", ")
-}
-
-/// A draw (`kind` "ps") or dispatch ("cs") of program `addr` reading `reads` and writing
-/// `writes` (a dispatch's images are all in `reads`, its stored ones also in `writes`).
-pub fn trace_pass(frame: u64, kind: &str, addr: u64, reads: &[TraceImage], writes: &[TraceImage]) {
-    if !TRACE_ON.load(Relaxed) {
-        return;
-    }
-    let mut g = TRACE.lock();
-    let Some(t) = g.as_mut() else { return };
-    if frame > t.frame + 1 {
-        TRACE_ON.store(t.left > 0, Relaxed);
-        return;
-    }
-    if !reads.iter().any(|r| t.bases.contains(&r.0)) {
-        return;
-    }
-    for w in writes {
-        if !t.bases.contains(&w.0) {
-            t.bases.push(w.0);
-        }
-    }
-    let key = addr ^ (kind.len() as u64) << 60;
-    if t.logged.contains(&key) || t.logged.len() >= 48 {
-        return;
-    }
-    t.logged.push(key);
-    crate::info!("upscale trace: {kind} {addr:#x} reads [{}] writes [{}]", fmt_images(reads), fmt_images(writes));
 }
 
 /// The title's TAA output of the flip being recorded (base, size; `note_taa`), for the
