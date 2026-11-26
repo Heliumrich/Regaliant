@@ -160,6 +160,12 @@ unsafe fn scale_into(cb: vk::CommandBuffer, layer: vk::Image, tmp: vk::Image, w:
 }
 
 /// The scale now (1.0: the original's).
+/// Our scaled copy of the interface layer now (image, width, height; frame generation's
+/// interface coverage reads what the composite samples: `framegen::capture`).
+pub fn spare_image() -> Option<(vk::Image, u32, u32)> {
+    SPARE.lock().as_ref().map(|s| (s.image, s.w, s.h))
+}
+
 pub fn scale() -> f32 {
     crate::pcsettings::ui_size()
 }

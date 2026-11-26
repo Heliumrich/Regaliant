@@ -423,7 +423,7 @@ fn vblank_thread() {
             maybe_screenshot(&b, n);
             crate::gpu::vk::framewatch::SHOWN_FLIP.store(n as u64, std::sync::atomic::Ordering::Relaxed);
             crate::displayclock::note_present();
-            present_buffer(&b);
+            present_buffer(&b, n as u32);
         }
     }
 }
@@ -704,7 +704,8 @@ fn registered_size(b: &DisplayBuffer) -> Option<(u32, u32)> {
 /// Presents a flipped display buffer: the GPU image the title rendered at
 /// the buffer's address (`DS_GPU=1`), else a black frame of the buffer's size
 /// (never raw guest memory, which is tiled).
-fn present_buffer(b: &DisplayBuffer) {
+/// Shows display buffer `b` as flip `frame` (the frame's index: `gpu::streamline`).
+fn present_buffer(b: &DisplayBuffer, frame: u32) {
     if crate::gpu::vk::try_ctx().is_none() {
         return;
     }
@@ -735,7 +736,7 @@ fn present_buffer(b: &DisplayBuffer) {
             // HDR display buffers: the format's color space bits (0x0704: PQ-encoded BT.2020, what
             // the title registers while the output is reported as HDR; SDR has none).
             let hdr = PORT.lock().as_ref().and_then(|p| p.sets.get(b.set as usize).copied().flatten()).is_some_and(|a| is_hdr_format(a.pixel_format));
-            crate::gpu::vk::present::present(crate::gpu::vk::present::Source::Image { image, format, layout: ash::vk::ImageLayout::GENERAL, width, height, hdr });
+            crate::gpu::vk::present::present(crate::gpu::vk::present::Source::Image { image, format, layout: ash::vk::ImageLayout::GENERAL, width, height, hdr }, Some(frame));
             return;
         }
     }
@@ -746,7 +747,7 @@ fn present_buffer(b: &DisplayBuffer) {
         .map(|a| (a.width.clamp(1, 8192), a.height.clamp(1, 8192)))
         .unwrap_or((1920, 1080));
     let data = vec![0u8; (w * h * 4) as usize];
-    crate::gpu::vk::present::present(crate::gpu::vk::present::Source::Pixels { data, width: w, height: h });
+    crate::gpu::vk::present::present(crate::gpu::vk::present::Source::Pixels { data, width: w, height: h }, None);
 }
 
 /// Screenshot requested through the control channel (file name stem).
