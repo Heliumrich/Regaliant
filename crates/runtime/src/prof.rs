@@ -5,7 +5,8 @@
 //! * `zone!("name")`: a zone from here to the end of the enclosing block.
 //! * `zone_text!("name", text)`: the same with a text shown on the zone (a program's address).
 //! * `plot!("name", value)`: a value plotted over time.
-//! * Every HLE function (`hle::sysv!`): a zone named after it, on the game's threads.
+//! * `zone_fine!`: the same, only with `DS_TRACY_FINE=1` (draws, dispatches, HLE calls).
+//! * Every HLE function (`hle::sysv!`): a fine zone named after it, on the game's threads.
 //! * The GPU's batches: a track per queue (`gpu_batch`, from the batch timestamps).
 //! * `frame()`: the end of a frame (the game's flips, `hle::libs::videoout`).
 //! * `thread_name(name)`: the calling thread's name in the profile (`log::set_thread_name`).
@@ -69,6 +70,20 @@ pub fn gpu_batch(_queue: &str, _name: &str, _start: u64, _end: u64) {
 /// Whether zones are recorded (the feature).
 pub const ON: bool = cfg!(feature = "tracy");
 
+/// Whether the fine zones are recorded (`DS_TRACY_FINE=1`): one per draw, dispatch, stage
+/// preparation and HLE call. Millions a second: they slow the game several times over while the
+/// profiler is connected, so a capture without them is the one whose timing holds.
+#[inline]
+pub fn fine() -> bool {
+    #[cfg(feature = "tracy")]
+    {
+        static FINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *FINE.get_or_init(|| std::env::var("DS_TRACY_FINE").is_ok_and(|v| v == "1"))
+    }
+    #[cfg(not(feature = "tracy"))]
+    false
+}
+
 /// A zone to the end of the enclosing block.
 #[macro_export]
 macro_rules! zone {
@@ -80,6 +95,19 @@ macro_rules! zone {
     (@expr $name:expr) => {
         #[cfg(feature = "tracy")]
         let _tracy_zone = ::tracy_client::Client::running().map(|c| c.span(::tracy_client::span_location!($name), 0));
+    };
+}
+
+/// A fine zone (`fine`): recorded only with `DS_TRACY_FINE=1`.
+#[macro_export]
+macro_rules! zone_fine {
+    ($name:literal) => {
+        #[cfg(feature = "tracy")]
+        let _tracy_zone = if $crate::prof::fine() { ::tracy_client::Client::running().map(|c| c.span(::tracy_client::span_location!($name), 0)) } else { None };
+    };
+    (@expr $name:expr) => {
+        #[cfg(feature = "tracy")]
+        let _tracy_zone = if $crate::prof::fine() { ::tracy_client::Client::running().map(|c| c.span(::tracy_client::span_location!($name), 0)) } else { None };
     };
 }
 

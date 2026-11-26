@@ -20110,7 +20110,7 @@ impl Exec {
     /// Buffer, image and sampler bindings of a stage; fills the resource
     /// info blocks of its SGPR data.
     fn bind_stage(&mut self, p: &mut Prepared, allow_shadow: bool) -> Result<Bound, String> {
-        crate::zone!("bind stage");
+        crate::zone_fine!("bind stage");
         if replay_census_on() {
             replay_census(p, self.deferred);
         }
@@ -20923,7 +20923,7 @@ impl Exec {
 
     /// Executes a dispatch of `groups` thread groups with the compute state of `cp`.
     pub fn dispatch(&mut self, cp: &Cp, groups: [u32; 3], initiator: u32) {
-        crate::zone!("dispatch");
+        crate::zone_fine!("dispatch");
         self.join_ts[0] = tsc();
         self.join_fast_done = false;
         self.dispatch_in(cp, groups, initiator);
@@ -21748,7 +21748,7 @@ impl Exec {
     /// `indirect`: the arguments' guest address (the GPU reads the group
     /// counts; `groups` is unused).
     fn dispatch_inner(&mut self, cp: &Cp, mut groups: [u32; 3], initiator: u32, indirect: Option<u64>) -> Result<(), String> {
-        crate::zone!("dispatch record");
+        crate::zone_fine!("dispatch record");
         if ballast_progs().is_empty() || ballast_progs().contains(&cs_addr(cp)) {
             ballast_cp(self.ballast_kind, cp.ballast_part());
         }

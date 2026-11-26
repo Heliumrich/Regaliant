@@ -3522,7 +3522,7 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
         HOLDER.store(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }, std::sync::atomic::Ordering::Release);
     }
     drop(lock_wait);
-    crate::zone!("images (held)");
+    crate::zone_fine!("images (held)");
     let held_from = holds_on().then(std::time::Instant::now);
     if let (Some(a), Some(b)) = (asked, held_from) {
         let ns = (b - a).as_nanos() as u64;
