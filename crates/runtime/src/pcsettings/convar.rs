@@ -83,6 +83,11 @@ pub const VARS: &[Var] = &[
     v("sunShadowCascadeDistance1", 0x24a0710, 0x2f1d580, Kind::Float),
     v("sunShadowCascadeDistance2", 0x244a8d4, 0x2f1d680, Kind::Float),
     v("sunShadowCascadeDistance3", 0x248c595, 0x2f1d780, Kind::Float),
+    // The particle ribbons' tessellation, for diagnosis (the straight lines on souls' and
+    // sparks' trails players see; float density 10 and int limit 10, ConVars built at
+    // eboot+0x95ec9a and +0x95ed37).
+    v("particleRibbonTessDensity", 0x242dc91, 0x2f26fa8, Kind::Float),
+    v("particleRibbonTessLimit", 0x23ebafa, 0x2f270a8, Kind::Int),
 ];
 
 const VALUE: u64 = 0x68;

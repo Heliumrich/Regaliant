@@ -56,6 +56,9 @@ static MODE: AtomicU32 = AtomicU32::new(0);
 static RENDER: AtomicU64 = AtomicU64::new(0);
 /// Times the render size was set.
 static RENDER_SET: AtomicU64 = AtomicU64::new(0);
+/// Times the mode's size getter was given the port's render size (`hook_size_getter`), for its
+/// first log lines.
+static GETTER_SET: AtomicU64 = AtomicU64::new(0);
 /// Frames the mode was held.
 static HELD: AtomicU64 = AtomicU64::new(0);
 /// The PC tab's render scale (percent of the window's 16:9 area; 0: the title's own size).
@@ -497,6 +500,36 @@ pub extern "sysv64" fn hook_targets(regs: *const u64, _arg: u32) {
 pub extern "sysv64" fn hook_size_getter(regs: *const u64, _arg: u32) {
     let o = OUTPUT.load(Ordering::Relaxed);
     let (w, h) = unsafe { (*regs.add(9) as u32, *regs.add(10) as u32) };
+    // The mode's render size, stored already at [rsi+4] (width) and [rsi+8] (height) from the
+    // mode's table: the port's render size when it holds one, as the render resolution manager
+    // gets it (`hook_render_size`). Code that asks this getter (the menus' and character
+    // creation's 3D previews) had the mode's own size beside targets made at the port's: the
+    // preview drawn into a corner of its space and dark (the known issue of Render Scale
+    // percentages; issue #1's dark shop preview at a 4K render). Only for the 4K-output modes.
+    let r = RENDER.load(Ordering::Relaxed);
+    if r != 0 && ((w, h) == (3840, 2160) || (o != 0 && (w as u64, h as u64) == (o >> 32, o & 0xFFFF_FFFF))) {
+        let rsi = unsafe { *regs.add(6) };
+        let at = rsi.wrapping_add(4) as *mut u32;
+        let (rw, rh) = ((r >> 32) as u32, r as u32);
+        let old = unsafe { (at.read_volatile(), at.add(1).read_volatile()) };
+        if old != (rw, rh) {
+            unsafe {
+                at.write_volatile(rw);
+                at.add(1).write_volatile(rh);
+            }
+            if GETTER_SET.fetch_add(1, Ordering::Relaxed) < 8 {
+                // The caller: the getter has no frame, so the guest's [rsp] is its return
+                // address; the trampoline's saved rsp is 0x80 (red zone) and 11 pushes below it.
+                let ret = unsafe { ((*regs.add(4)).wrapping_add(0xd8) as *const u64).read_unaligned() };
+                crate::info!(
+                    "render size {rw}x{rh} given by the mode's size getter to {} (the mode's was {}x{})",
+                    crate::loader::describe_addr(ret.wrapping_sub(5)),
+                    old.0,
+                    old.1
+                );
+            }
+        }
+    }
     if o == 0 || (w, h) != (3840, 2160) {
         return;
     }

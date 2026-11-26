@@ -4,12 +4,16 @@
 
 - Fixed the washed-out, too bright picture with ghosting and black blotches at Render Scale
   100% on a 4K screen (issue #6). Above 2048 lines two of the game's render targets share one
-  compression block, and Regaliant sometimes cleared the wrong one. Render Scale now renders at
-  most 2048 lines (3640x2048 at 16:9, 95% of 4K).
+  compression block, and Regaliant sometimes cleared only one of them. A clear now reaches both,
+  so the full 2160 lines render right.
 - Fixed white specks like stars in the sky on RTX 50-series cards. Regaliant handled one of the
   game's shader rules for invalid numbers differently from the console, and those cards keep
   such numbers where others drop them. After the update the launcher prepares the shaders once
   more.
+- Fixed the character preview in character creation and the equipment menu showing in a corner
+  of the screen, at the screen's edge or dark when Render Scale is set to a percentage or the
+  screen is wider than 16:9 (issue #1). The menus took their render size from the game's own mode
+  table instead of the size Regaliant renders at.
 - Changing Render Scale or Visual Mode, resizing the window or switching between the window and
   fullscreen no longer keeps the old size's render images in video memory until the game restarts (issue #1).
   Each change kept another set, up to about 1 GB at 4K, and the game then had to load its
