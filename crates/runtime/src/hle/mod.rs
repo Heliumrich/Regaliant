@@ -28,6 +28,7 @@ macro_rules! sysv {
                 if $crate::log::TRACE_HLE.load(std::sync::atomic::Ordering::Relaxed) {
                     $crate::hle::trace_call(stringify!($name), &[ $( $crate::hle::ArgFmt::fmt_arg(&$arg) ),* ]);
                 }
+                $crate::zone!(@expr stringify!($name));
                 let __body = move || $( -> $ret )? { unsafe { $body } };
                 match $crate::hle::libs::fiber::on_fiber_stack() {
                     Some(fiber) => unsafe { $crate::hle::libs::fiber::on_host_stack(fiber, __body) },

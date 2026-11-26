@@ -2299,6 +2299,7 @@ impl Ctx {
     /// `submit_timeline`, on the compute family's queue when `on_compute`
     /// (ordered async compute).
     pub fn submit_timeline_on(&self, on_copy: bool, on_compute: bool, cmds: &[vk::CommandBuffer], waits: &[(vk::Semaphore, u64, vk::PipelineStageFlags2)], signals: &[(vk::Semaphore, u64)], fence: vk::Fence) -> Result<(), String> {
+        crate::zone!("vkQueueSubmit2");
         let cbs: Vec<vk::CommandBufferSubmitInfo> = cmds.iter().map(|&c| vk::CommandBufferSubmitInfo::default().command_buffer(c)).collect();
         let ws: Vec<vk::SemaphoreSubmitInfo> = waits.iter().map(|&(s, v, st)| vk::SemaphoreSubmitInfo::default().semaphore(s).value(v).stage_mask(st)).collect();
         let mut ss: Vec<vk::SemaphoreSubmitInfo> = signals.iter().map(|&(s, v)| vk::SemaphoreSubmitInfo::default().semaphore(s).value(v).stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)).collect();

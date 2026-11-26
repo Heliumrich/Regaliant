@@ -1784,6 +1784,7 @@ impl Exec {
     /// Executes a draw with the graphics state of `cp`; returns what
     /// happened (frame captures).
     pub fn draw(&mut self, cp: &Cp, args: DrawArgs) -> std::borrow::Cow<'static, str> {
+        crate::zone!("draw");
         if super::ballast_progs().is_empty() {
             super::ballast_cp(self.ballast_kind, cp.ballast_part());
         }
@@ -2188,6 +2189,7 @@ impl Exec {
 
     /// Records the draw; Ok(false) when it has no effect here.
     fn draw_inner(&mut self, cp: &Cp, a: &DrawArgs) -> Result<bool, String> {
+        crate::zone!("draw record");
         self.fe2_min_want = u32::MAX;
         let delta_at = self.delta.at.take();
         if a.count == 0 || a.instances == 0 {

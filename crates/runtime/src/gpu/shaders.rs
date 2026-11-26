@@ -2522,6 +2522,7 @@ fn mrtz_census() -> bool {
 }
 
 pub fn prepare_ps<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
+        crate::zone!("prepare ps");
     if super::tune::r2() && !PROBE_ON.load(std::sync::atomic::Ordering::Relaxed) && !super::exec::profiling_on() && !mrtz_census() && GPU_DRAW_MASKS.with(|c| c.get()).is_none() {
         return prepare_ps_r2(cp);
     }
@@ -2970,6 +2971,7 @@ const VGT_SHADER_STAGES_EN: u32 = 0x28B54;
 
 /// Resolves and translates the NGG (vertex) shader bound on `cp`.
 pub fn prepare_ngg<R: RegRead + ?Sized>(cp: &R) -> Result<Prepared, String> {
+        crate::zone!("prepare ngg");
     if super::tune::r2() && GPU_DRAW_MASKS.with(|c| c.get()).is_none() {
         let addr = ngg_addr_of(cp);
         if super::capture::vs_dump_for(addr).is_none() {

@@ -3504,6 +3504,7 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
         }
     });
     let asked = holds_on().then(std::time::Instant::now);
+    let lock_wait = crate::zone_guard!("images lock wait");
     let mut g = if holder_trace() {
         match IMAGES.try_lock_for(std::time::Duration::from_millis(1)) {
             Some(g) => g,
@@ -3520,6 +3521,8 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
         *HOLDER_AT.lock() = (crate::log::thread_name(), l.file(), l.line());
         HOLDER.store(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }, std::sync::atomic::Ordering::Release);
     }
+    drop(lock_wait);
+    crate::zone!("images (held)");
     let held_from = holds_on().then(std::time::Instant::now);
     if let (Some(a), Some(b)) = (asked, held_from) {
         let ns = (b - a).as_nanos() as u64;

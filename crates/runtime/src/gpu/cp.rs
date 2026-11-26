@@ -2620,6 +2620,7 @@ impl Cp {
     /// returns the address of the packet where the executor stopped (it
     /// and the rest are left to the main command processor), or None.
     pub fn run_chunk(&mut self, from: u64, to: u64) -> Option<u64> {
+        crate::zone!("cp chunk");
         let f = Fetched::new(from, 0);
         let mut cur = from;
         let mut commands = 0u64;
@@ -6107,6 +6108,7 @@ impl Cp {
     /// the GPU reaches the patched packets (copying them at submission broke
     /// rendering).
     pub fn run(&mut self, addr: u64, size: u32) {
+        crate::zone!("cp run");
         if self.depth > 8 {
             crate::error!("gpu[{}]: indirect buffer nesting too deep at {addr:#x}", self.name);
             return;
@@ -6904,6 +6906,7 @@ impl Cp {
             op::DMA_DATA => self.dma_data(p),
             op::RELEASE_MEM => self.release_mem(p),
             op::WAIT_REG_MEM => {
+                crate::zone!("cp wait reg mem");
                 if !super::tune::lazy_wait_submit() && self.held.is_none() {
                     self.submit_gpu("wait");
                 }

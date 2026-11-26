@@ -957,6 +957,7 @@ fn barrier(c: &super::Ctx, cmd: vk::CommandBuffer, img: vk::Image, old: vk::Imag
 
 /// Presents one frame. Returns false if presentation is not possible (minimized).
 pub fn present(src: Source) -> bool {
+        crate::zone!("present");
     let c = ctx();
     let mut g = PRESENTER.lock();
     let Some(p) = g.as_mut() else {

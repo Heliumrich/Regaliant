@@ -30,6 +30,7 @@ mod spatial;
 mod patch;
 mod pcsettings;
 mod perfhud;
+mod prof;
 mod jobidle;
 mod camhook;
 mod gamestep;
@@ -2313,6 +2314,8 @@ pub(crate) unsafe fn set_unless_given(k: &str, v: &str) {
 }
 
 fn main() {
+    // Tracy (`prof`, the `tracy` feature): its client first, so every thread's zones are recorded.
+    prof::start();
     // `--probe-streamline <dir>`: a start's separate check that Streamline loads (`gpu::upscale::
     // probe_streamline`), before anything else: no log, no window, no error popups.
     {

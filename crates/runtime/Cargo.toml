@@ -14,7 +14,13 @@ rust-version.workspace = true
 name = "dsport"
 path = "src/main.rs"
 
+[features]
+# Tracy instrumentation (`prof`): `cargo build --release --features tracy`, then connect the Tracy
+# profiler of the matching version (docs/building.md). Off by default: the zones compile to nothing.
+tracy = ["dep:tracy-client"]
+
 [dependencies]
+tracy-client = { version = "0.19", optional = true, features = ["ondemand"] }
 sce-elf = { path = "../sce-elf" }
 dsconfig = { path = "../dsconfig" }
 rdna = { path = "../rdna" }

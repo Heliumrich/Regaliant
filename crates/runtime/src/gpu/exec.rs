@@ -8979,12 +8979,14 @@ fn completion_thread() {
         if b.fence != vk::Fence::null() {
             // Its GPU work completed and its slot released (`releaser_thread`,
             // which marks it released after a device loss too).
+            crate::zone!("wait batch on GPU");
             let k = b.on_c as usize;
             let mut g = RELEASED_LOCK.lock();
             while RELEASED[k].load(Ordering::Acquire) < b.seq {
                 RELEASED_CV.wait_for(&mut g, std::time::Duration::from_millis(100));
             }
         }
+        crate::zone!("batch completion (CP effects)");
         // `tune host_census`: its written windows are armed before its CP
         // effects release anyone who reads them.
         crate::hostcensus::completed(b.seq);
@@ -11530,6 +11532,10 @@ fn collect_timestamps(bq: vk::QueryPool, pool: vk::QueryPool, shaders: &[u64], q
     let got_pre = unsafe { c.device.get_query_pool_results(bq, BQ_PRE, &mut pre, vk::QueryResultFlags::TYPE_64) }.is_ok();
     if got_be {
         let start = if got_pre && pre[0] != 0 && pre[0] < be[0] { pre[0] } else { be[0] };
+        // Tracy's GPU track (`prof`): the batch named by its leading programs.
+        if crate::prof::ON {
+            crate::prof::gpu_batch(queue, &format!("{queue} batch {seq}{}", batch_contents(shaders)), start, be[1]);
+        }
         super::hitch::gpu_batch(queue, seq, start, be[1], shaders.len() as u32, batch_key(shaders), || {
             // Its leading commands and its other operations (copies, fills,
             // merges and their sizes).
@@ -14190,6 +14196,7 @@ impl Exec {
     }
 
     fn begin_batch(&mut self) {
+        crate::zone!("begin batch (slot)");
         self.batch_count += 1;
         self.repeat = None;
         // (Its batch-start copy segment tried again in each batch: a refusal in the window after a
@@ -14474,6 +14481,7 @@ impl Exec {
     /// when it completes).
     /// Submits the recorded batch; `why` (profiling): what ended it.
     pub fn submit_for(&mut self, why: &'static str) {
+        crate::zone!("submit batch");
         self.label_close();
         if !self.recording {
             return;
@@ -17543,6 +17551,7 @@ impl Exec {
     /// deferred effects.
     #[track_caller]
     pub fn flush(&mut self) {
+        crate::zone!("flush");
         if self.deferred {
             let why = if self.flush_why.is_empty() { "flush" } else { self.flush_why };
             self.stop(why);
@@ -20101,6 +20110,7 @@ impl Exec {
     /// Buffer, image and sampler bindings of a stage; fills the resource
     /// info blocks of its SGPR data.
     fn bind_stage(&mut self, p: &mut Prepared, allow_shadow: bool) -> Result<Bound, String> {
+        crate::zone!("bind stage");
         if replay_census_on() {
             replay_census(p, self.deferred);
         }
@@ -20913,6 +20923,7 @@ impl Exec {
 
     /// Executes a dispatch of `groups` thread groups with the compute state of `cp`.
     pub fn dispatch(&mut self, cp: &Cp, groups: [u32; 3], initiator: u32) {
+        crate::zone!("dispatch");
         self.join_ts[0] = tsc();
         self.join_fast_done = false;
         self.dispatch_in(cp, groups, initiator);
@@ -20992,6 +21003,7 @@ impl Exec {
     /// to the output size, for the title's passes at that size (`upscale::substitute_full`). True when recorded (the executor's bound state
     /// is then unknown).
     fn taa_upscale(&mut self, p: &Prepared, bound: &Bound) -> bool {
+        crate::zone!("upscaler");
         if !super::upscale::active() {
             // (The game's TAA again: no picture to stand in, the textures' bias back to none.)
             super::upscale::clear_full();
@@ -21736,6 +21748,7 @@ impl Exec {
     /// `indirect`: the arguments' guest address (the GPU reads the group
     /// counts; `groups` is unused).
     fn dispatch_inner(&mut self, cp: &Cp, mut groups: [u32; 3], initiator: u32, indirect: Option<u64>) -> Result<(), String> {
+        crate::zone!("dispatch record");
         if ballast_progs().is_empty() || ballast_progs().contains(&cs_addr(cp)) {
             ballast_cp(self.ballast_kind, cp.ballast_part());
         }
