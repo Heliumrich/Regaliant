@@ -1355,11 +1355,13 @@ const EVICT_CHECK_MS: u64 = 500;
 /// resolution, and a twelfth rounded up, its fog volumes; seen idle after each change, 2026-11-26
 /// -011841) that were in use up to the change (within `LEFT_RECENT` frames before it) and no frame
 /// used after its pulse (`LEFT_PULSE` frames from its start) are freed (`free_left_targets`;
-/// `DS_LEFT_TARGETS=0`: kept, as before). The output size and its half are never among them (the
-/// output's own images are not the render size's, Cinematic's own render size is the output's),
-/// and an image idle before the change stays whatever its size (data a level load wrote and draws
-/// much later: evicting idle GPU-written images lost 4-2's architecture, TRIED.md 2026-10-19). A
-/// later use makes the image anew: the title draws a target before it reads it.
+/// `DS_LEFT_TARGETS=0`: kept, as before). The output size is never among them (the output's own
+/// images are not the render size's; Cinematic's own render size is the output's, so its full-size
+/// set stays: a review of 2026-11-26 night found the output's half excluded too kept a 1080p
+/// window's 100% set, 1920x1080), and an image idle before the change stays whatever its size
+/// (data a level load wrote and draws much later: evicting idle GPU-written images lost 4-2's
+/// architecture, TRIED.md 2026-10-19). A later use makes the image anew: the title draws a target
+/// before it reads it.
 static LEFT_SIZES: Mutex<Vec<(u32, u32, u64)>> = Mutex::new(Vec::new());
 const LEFT_SETTLE: u64 = 300;
 const LEFT_PULSE: u64 = 30;
@@ -1416,7 +1418,7 @@ fn free_left_targets(frame: u64) {
     let (cw, ch) = crate::dispmode::render_size();
     let (ow, oh) = crate::dispmode::output_size();
     let mut current = left_sizes(cw, ch).to_vec();
-    current.extend([(ow, oh), (ow / 2, oh / 2)]);
+    current.push((ow, oh));
     let mut out = Vec::new();
     for &(w, h, at) in &due {
         // (Back at that size meanwhile: its targets are the title's again. A derived size the
@@ -1468,7 +1470,7 @@ fn free_left_targets(frame: u64) {
             "images: the render size {w}x{h} the title left at frame {at}: {n} GPU-written images of its sizes ({}) freed ({} MiB), {kept} kept (used since, or idle before){}",
             sizes.iter().map(|(a, b)| format!("{a}x{b}")).collect::<Vec<_>>().join(", "),
             bytes >> 20,
-            if rest.is_empty() { String::new() } else { format!("; GPU-written images no frame used since, by size: {}", rest.join(", ")) }
+            if !left_census_on() { String::new() } else { format!("; GPU-written images no frame used since, by size: {}", if rest.is_empty() { "none".to_string() } else { rest.join(", ") }) }
         );
     }
     drop(g);
