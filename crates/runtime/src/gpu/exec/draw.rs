@@ -1903,7 +1903,6 @@ impl Exec {
         let Ok(layer) = super::super::images::with(|im| im.upscale_tex(t, false, frame)) else { return };
         let Some(zero) = super::super::framegen::capture::transparent_view() else { return };
         let id = super::super::streamline_frame();
-        super::super::framegen::capture::record_zero_init(self.cmd());
         let saved = self.ui_sub;
         self.ui_sub = Some((layer.view, zero));
         let r = self.draw_inner(cp, args);

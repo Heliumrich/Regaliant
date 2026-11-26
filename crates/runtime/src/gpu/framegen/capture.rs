@@ -156,8 +156,17 @@ fn with_cap<R>(f: impl FnOnce(&mut Capture) -> R) -> R {
 pub fn transparent_view() -> Option<vk::ImageView> {
     with_cap(|c| {
         if c.zero.is_none() {
-            match unsafe { Img::new(ZERO_FORMAT, 1, 1, vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST) } {
-                Ok(i) => c.zero = Some(i),
+            match unsafe { Img::new(ZERO_FORMAT, 1, 1, vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST) }.and_then(|i| match unsafe { clear_now(i.image) } {
+                Ok(()) => Ok(i),
+                Err(e) => {
+                    unsafe { i.destroy() };
+                    Err(e)
+                }
+            }) {
+                Ok(i) => {
+                    c.zero = Some(i);
+                    ZERO_READY.store(true, Relaxed);
+                }
                 Err(e) => {
                     static ONCE: std::sync::Once = std::sync::Once::new();
                     ONCE.call_once(|| crate::warn!("frame generation: no transparent image ({e}): no HUD-less picture"));
@@ -169,20 +178,50 @@ pub fn transparent_view() -> Option<vk::ImageView> {
     })
 }
 
-/// Records the transparent image's clear into `cmd` until one was played (GENERAL, as the
-/// title's images are bound).
-pub fn record_zero_init(cmd: vk::CommandBuffer) {
-    if ZERO_READY.load(Relaxed) {
-        return;
+/// Clears `image` (1x1) to transparent and leaves it GENERAL (as the title's images are bound),
+/// in a command buffer of its own, waited for: once, when the transparent image is made. (Not in
+/// the executor's batch: the composite's draw may be the first command of a batch not begun yet,
+/// whose command buffer is then still the GPU's. Recorded there, the first test of frame
+/// generation on 2026-11-26 crashed in the driver's vkCmdPipelineBarrier.)
+unsafe fn clear_now(image: vk::Image) -> Result<(), String> {
+    let c = ctx();
+    unsafe {
+        let pool = c.device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(c.queue_family).flags(vk::CommandPoolCreateFlags::TRANSIENT), None).map_err(|e| format!("pool: {e}"))?;
+        let r = (|| -> Result<(), String> {
+            let cb = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).map_err(|e| format!("command buffer: {e}"))?[0];
+            c.device.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).map_err(|e| e.to_string())?;
+            barrier(cb, image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL, ANY, XFER_W);
+            let zero = vk::ClearColorValue { float32: [0.0; 4] };
+            c.device.cmd_clear_color_image(cb, image, vk::ImageLayout::GENERAL, &zero, &[RANGE]);
+            barrier(cb, image, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL, XFER_W, ANY);
+            c.device.end_command_buffer(cb).map_err(|e| e.to_string())?;
+            let fence = c.device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(|e| e.to_string())?;
+            // (On the presenter's queue where there is one: the main queue's earlier batches may
+            // wait for work this thread has yet to submit.)
+            let cbs = [cb];
+            let si = vk::SubmitInfo::default().command_buffers(&cbs);
+            let submitted = match c.present_queue.as_ref() {
+                Some(q) => {
+                    let q = q.lock();
+                    c.device.queue_submit(*q, &[si], fence).map_err(|e| format!("submit: {e}"))
+                }
+                None => c.submit(cb, &[], &[], fence),
+            };
+            submitted?;
+            match c.device.wait_for_fences(&[fence], true, 5_000_000_000) {
+                Ok(()) => {
+                    c.device.destroy_fence(fence, None);
+                    Ok(())
+                }
+                // (Still the GPU's: its pool and fence are left, not freed under it.)
+                Err(e) => Err(format!("wait: {e}")),
+            }
+        })();
+        if !matches!(&r, Err(e) if e.starts_with("wait")) {
+            c.device.destroy_command_pool(pool, None);
+        }
+        r
     }
-    let Some(z) = with_cap(|c| c.zero.as_ref().map(|z| z.image)) else { return };
-    super::super::vk::defer::external(cmd, Box::new(move |cb| {
-        barrier(cb, z, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL, ANY, XFER_W);
-        let zero = vk::ClearColorValue { float32: [0.0; 4] };
-        unsafe { ctx().device.cmd_clear_color_image(cb, z, vk::ImageLayout::GENERAL, &zero, &[RANGE]) };
-        barrier(cb, z, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL, XFER_W, ANY);
-        ZERO_READY.store(true, Relaxed);
-    }));
 }
 
 /// Makes or keeps `slot`'s image of this format and size (an old one retired).
