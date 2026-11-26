@@ -600,6 +600,16 @@ fn headless_present() {
     if !crate::gpu::tune::headless_present() || HIDDEN_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    // Only with Streamline loaded: without it NVIDIA's present hangs in the driver
+    // (`NtDxgkSubmitPresentToHwQueue`), batches stop completing and the ended process stays,
+    // holding its video memory, until a restart (2026-11-20, 2026-11-24 night, and 2026-11-26
+    // morning: an FSR boot at a 3840x2160 render, -075115; the drivers' runs had to set
+    // `DS_HEADLESS_PRESENT=0` by hand, and one did not). Such a run's GPU clock may stay low.
+    if !crate::gpu::upscale::streamline_loaded() {
+        static NOTED: std::sync::Once = std::sync::Once::new();
+        NOTED.call_once(|| crate::info!("present: no window and Streamline not loaded: no hidden present (NVIDIA's present hangs without it; the GPU's clock may stay low)"));
+        return;
+    }
     HIDDEN_THREAD.call_once(|| {
         if ctx().present_queue.is_none() {
             crate::info!("present: no window and no second queue of the graphics family: nothing presented (the driver may keep the GPU's clock low)");

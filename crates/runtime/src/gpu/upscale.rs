@@ -1302,6 +1302,15 @@ struct SlLib {
 unsafe impl Send for SlLib {}
 unsafe impl Sync for SlLib {}
 
+/// Streamline loaded (`sl`): read without loading it (`streamline_loaded`).
+static SL_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether Streamline is loaded now, without loading it: a run without a window presents its
+/// hidden image only then (`present::headless_present`; NVIDIA's present hangs without it).
+pub fn streamline_loaded() -> bool {
+    SL_LOADED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Streamline, initialised with DLSS (None: not prepared, not installed or
 /// unusable).
 fn sl() -> Option<&'static SlLib> {
@@ -1311,7 +1320,10 @@ fn sl() -> Option<&'static SlLib> {
             return None;
         }
         match load_sl() {
-            Ok(l) => Some(l),
+            Ok(l) => {
+                SL_LOADED.store(true, std::sync::atomic::Ordering::Relaxed);
+                Some(l)
+            }
             Err(LoadError::Missing) => {
                 crate::info!("upscaler: DLSS not installed (nvngx_dlss.dll - the player's own - and Streamline in the upscalers folder)");
                 None
