@@ -139,6 +139,12 @@ pub fn sizes(mode: u32) -> ((u32, u32), (u32, u32)) {
 /// The Aspect Ratio setting's shapes (options 1-4): 16:9, 16:10, 21:9 (64:27), 32:9.
 const ASPECTS: [f32; 4] = [16.0 / 9.0, 16.0 / 10.0, 64.0 / 27.0, 32.0 / 9.0];
 
+/// The render size now: the one applied, or the title's own for its mode.
+pub fn render_size() -> (u32, u32) {
+    let r = RENDER.load(Ordering::Relaxed);
+    if r == 0 { sizes(TITLE_MODE.load(Ordering::Relaxed)).0 } else { ((r >> 32) as u32, r as u32) }
+}
+
 /// The output size (the title's 3840x2160 unless an aspect or `DS_OUTPUT_SIZE` changed it).
 pub fn output_size() -> (u32, u32) {
     let o = OUTPUT.load(Ordering::Relaxed);
@@ -361,7 +367,13 @@ pub fn tick() {
     if !(3..=5).contains(&title) || MODE.load(Ordering::Relaxed) != 0 {
         return;
     }
-    RENDER.store(want, Ordering::Relaxed);
+    let old = RENDER.swap(want, Ordering::Relaxed);
+    // (The size left: its render targets are freed once the change settled, `images::note_left_size`.)
+    let size_of = |r: u64| if r == 0 { sizes(title).0 } else { ((r >> 32) as u32, r as u32) };
+    if size_of(old) != size_of(want) {
+        let (w, h) = size_of(old);
+        crate::gpu::images::note_left_size(w, h);
+    }
     PULSE_MODE.store(if title == 4 { 3 } else { 4 }, Ordering::Relaxed);
     PULSE_LEFT.store(2, Ordering::Relaxed);
     let n = PULSES.fetch_add(1, Ordering::Relaxed);

@@ -1343,6 +1343,139 @@ const EVICT_AGE: u64 = 120;
 const EVICT_AGE_PRESSURE: u64 = 30;
 /// Video-memory budget checks at most this often.
 const EVICT_CHECK_MS: u64 = 500;
+
+/// Render sizes the title left (`note_left_size`, from `dispmode`'s mode pulses): (width, height,
+/// the frame the change began). The title makes its render targets anew at the new size, and the
+/// old size's stay: GPU-written images are never evicted, so each Render Scale change, window
+/// resize or switch to fullscreen at another size left one more set in video memory for the rest
+/// of the session (issue #1's 0.1.6 log: 7.3 GB of GPU-written images after nine Render Scale
+/// changes against 1.9 GB at one size; the textures evicted in 810 rounds against 7; FINDINGS.md
+/// 2026-11-26). Once a change settled (`LEFT_SETTLE` frames), the GPU-written images of the old
+/// size and of the sizes the title derives from it (`left_sizes`: half, its targets at half
+/// resolution, and a twelfth rounded up, its fog volumes; seen idle after each change, 2026-11-26
+/// -011841) that were in use up to the change (within `LEFT_RECENT` frames before it) and no frame
+/// used after its pulse (`LEFT_PULSE` frames from its start) are freed (`free_left_targets`;
+/// `DS_LEFT_TARGETS=0`: kept, as before). The output size and its half are never among them (the
+/// output's own images are not the render size's, Cinematic's own render size is the output's),
+/// and an image idle before the change stays whatever its size (data a level load wrote and draws
+/// much later: evicting idle GPU-written images lost 4-2's architecture, TRIED.md 2026-10-19). A
+/// later use makes the image anew: the title draws a target before it reads it.
+static LEFT_SIZES: Mutex<Vec<(u32, u32, u64)>> = Mutex::new(Vec::new());
+const LEFT_SETTLE: u64 = 300;
+const LEFT_PULSE: u64 = 30;
+const LEFT_RECENT: u64 = 60;
+/// Freed by `free_left_targets`: [images, bytes, sizes handled].
+static LEFT_FREED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+fn left_targets_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_LEFT_TARGETS").ok().as_deref() != Some("0"))
+}
+
+/// Diagnosis (`DS_LEFT_CENSUS=1`): each pass also logs the GPU-written images no frame used since
+/// the change, by size (a scan of the whole cache under its lock, so not by default: the review of
+/// 2026-11-26 night).
+fn left_census_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_LEFT_CENSUS").ok().as_deref() == Some("1"))
+}
+
+/// The sizes of a render size's targets: its own, half (rounded down: 2560x1440's 1280x720) and a
+/// twelfth rounded up (2560x1440's 214x120, the fog volumes).
+fn left_sizes(w: u32, h: u32) -> [(u32, u32); 3] {
+    [(w, h), (w / 2, h / 2), (w.div_ceil(12), h.div_ceil(12))]
+}
+
+/// A render size the title left (`dispmode::tick`, at the pulse that changes it).
+pub fn note_left_size(w: u32, h: u32) {
+    let frame = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+    LEFT_SIZES.lock().push((w, h, frame));
+}
+
+/// Frees the render targets of the sizes the title left, once each change settled (see
+/// `LEFT_SIZES`; the completion thread, from `maybe_evict`).
+fn free_left_targets(frame: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let due: Vec<(u32, u32, u64)> = {
+        let mut g = LEFT_SIZES.lock();
+        if !g.iter().any(|e| frame >= e.2 + LEFT_SETTLE) {
+            return;
+        }
+        let (due, keep): (Vec<_>, Vec<_>) = g.iter().copied().partition(|e| frame >= e.2 + LEFT_SETTLE);
+        *g = keep;
+        due
+    };
+    if !left_targets_on() {
+        return;
+    }
+    let Some(mut g) = IMAGES.try_lock() else {
+        LEFT_SIZES.lock().extend(due);
+        return;
+    };
+    let Some(im) = g.as_mut() else { return };
+    let (cw, ch) = crate::dispmode::render_size();
+    let (ow, oh) = crate::dispmode::output_size();
+    let mut current = left_sizes(cw, ch).to_vec();
+    current.extend([(ow, oh), (ow / 2, oh / 2)]);
+    let mut out = Vec::new();
+    for &(w, h, at) in &due {
+        // (Back at that size meanwhile: its targets are the title's again. A derived size the
+        // current one shares stays too.)
+        if (cw, ch) == (w, h) {
+            continue;
+        }
+        let sizes: Vec<(u32, u32)> = left_sizes(w, h).into_iter().filter(|s| !current.contains(s)).collect();
+        let of_size = |k: &ImageKey, i: &Image| i.gpu_written && sizes.contains(&(k.width, k.height));
+        let left = |i: &Image| i.used.get() + LEFT_RECENT >= at && i.used.get() <= at + LEFT_PULSE;
+        let (mut keys, mut kept) = (Vec::new(), 0usize);
+        for (k, i) in im.map.iter() {
+            if of_size(k, i) {
+                if left(i) {
+                    keys.push(*k);
+                } else {
+                    kept += 1;
+                }
+            }
+        }
+        let (mut n, mut bytes) = (0u64, 0u64);
+        for k in keys {
+            if let Some((e, b, _)) = im.drop_image(&k) {
+                out.push(e);
+                n += 1;
+                bytes += b;
+            }
+        }
+        // (Diagnosis, `DS_LEFT_CENSUS=1`: what else no frame used since the change, by size.)
+        let rest: Vec<String> = if left_census_on() {
+            let mut idle: HashMap<(u32, u32), (u64, u64)> = HashMap::default();
+            for (k, i) in im.map.iter() {
+                if i.gpu_written && i.used.get() <= at + LEFT_PULSE {
+                    let e = idle.entry((k.width, k.height)).or_insert((0, 0));
+                    e.0 += 1;
+                    e.1 += i.bytes;
+                }
+            }
+            let mut idle: Vec<((u32, u32), (u64, u64))> = idle.into_iter().collect();
+            idle.sort_unstable_by(|a, b| b.1 .1.cmp(&a.1 .1));
+            idle.iter().take(8).map(|((iw, ih), (c, b))| format!("{iw}x{ih} {c} ({} MiB)", b >> 20)).collect()
+        } else {
+            Vec::new()
+        };
+        LEFT_FREED[0].fetch_add(n, Relaxed);
+        LEFT_FREED[1].fetch_add(bytes, Relaxed);
+        LEFT_FREED[2].fetch_add(1, Relaxed);
+        crate::info!(
+            "images: the render size {w}x{h} the title left at frame {at}: {n} GPU-written images of its sizes ({}) freed ({} MiB), {kept} kept (used since, or idle before){}",
+            sizes.iter().map(|(a, b)| format!("{a}x{b}")).collect::<Vec<_>>().join(", "),
+            bytes >> 20,
+            if rest.is_empty() { String::new() } else { format!("; GPU-written images no frame used since, by size: {}", rest.join(", ")) }
+        );
+    }
+    drop(g);
+    if !out.is_empty() {
+        super::exec::bury_images(out);
+    }
+}
 /// Textures moved back from system memory a check at most (`promote`), bytes: each comes back at
 /// its next use as an upload.
 const PROMOTE_MAX: u64 = 128 << 20;
@@ -1517,6 +1650,7 @@ pub fn maybe_evict() {
     }
     LAST.store(ms, Relaxed);
     let frame = super::FRAMES.load(Relaxed);
+    free_left_targets(frame);
     let Some((raw_used, budget)) = ctx().device_budget() else { return };
     // (Slab memory no image uses is free for new images.)
     let used = raw_used.saturating_sub(super::slab::idle_bytes());
