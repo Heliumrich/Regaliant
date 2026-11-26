@@ -1364,6 +1364,9 @@ const EVICT_CHECK_MS: u64 = 500;
 /// architecture, TRIED.md 2026-10-19). A later use makes the image anew: the title draws a target
 /// before it reads it.
 static LEFT_SIZES: Mutex<Vec<(u32, u32, u64)>> = Mutex::new(Vec::new());
+/// Frames within which an image sharing a reached metadata address must have been used to take
+/// the write too (`Images::meta_reach`; issue #6's pair is used every frame).
+const META_SHARE_RECENT: u64 = 4;
 const LEFT_SETTLE: u64 = 300;
 const LEFT_PULSE: u64 = 30;
 const LEFT_RECENT: u64 = 60;
@@ -5468,10 +5471,25 @@ impl Images {
         // went to one of them by the binds' timing (824 of 1,446 frames wrong at 3664x2056,
         // -002116). At 2048 lines and below their blocks start apart, each is found by its own
         // address and both see each fill: the same now when they share one.
+        // Only images in use now (`META_SHARE_RECENT`) and of the reached image's own format: an
+        // image whose `meta_now` is stale (a block the title has since given to another target, or
+        // the targets a size change left) or of another kind (a colour image beside a depth
+        // surface: a fill's words mean other things) must not take the clear; and a whole-image
+        // clear only when the write covers its metadata's start, as above (the review of
+        // 2026-11-26).
         if !out.is_empty() {
+            let now = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
             let mut more = Vec::new();
             for (&k2, &(m2, _)) in self.meta_now.iter() {
-                if m2 == 0 || !out.iter().any(|o| o.0 == m2) || out.iter().any(|o| o.1 == k2) || !self.map.contains_key(&k2) {
+                if m2 == 0 || out.iter().any(|o| o.1 == k2) {
+                    continue;
+                }
+                let Some(holder) = out.iter().find(|o| o.0 == m2) else { continue };
+                if holder.1.format != k2.format {
+                    continue;
+                }
+                let Some(img) = self.map.get(&k2) else { continue };
+                if img.used.get() + META_SHARE_RECENT < now {
                     continue;
                 }
                 match meta_layer_bytes(&k2) {
@@ -5481,7 +5499,8 @@ impl Images {
                             more.push((m2, k2, mask));
                         }
                     }
-                    None => more.push((m2, k2, 0)),
+                    None if m2 >= b && m2 < e && (!fill || m2 + 4 <= e) => more.push((m2, k2, 0)),
+                    None => {}
                 }
             }
             out.extend(more);
