@@ -507,7 +507,7 @@ struct Tls {
     gpu_base: HashMap<u64, bool>,
     depth_feed: HashMap<u64, bool>,
     views: HashMap<[u32; 8], ViewMemo>,
-    samplers: HashMap<([u32; 4], bool, u8), vk::Sampler>,
+    samplers: HashMap<([u32; 4], bool, u16), vk::Sampler>,
 }
 
 /// The PC settings' texture filtering: 0 the title's own, otherwise the anisotropy (8, 16) its
@@ -656,8 +656,31 @@ pub fn tsharp_diff_line() -> String {
 
 /// `Images::sampler` from this thread's memo.
 pub fn sampler_hit(s: [u32; 4], compare: bool) -> Option<vk::Sampler> {
-    let aniso = ANISO.load(std::sync::atomic::Ordering::Relaxed);
-    tls(|m| m.samplers.get(&(s, compare, aniso)).copied())
+    let mode = sampler_mode();
+    tls(|m| m.samplers.get(&(s, compare, mode)).copied())
+}
+
+/// The textures' level-of-detail bias while an upscaler takes the render up to the output size,
+/// in steps of -1/16 (0: none): log2 of the render size over the output size, NVIDIA's guidance
+/// for DLSS (-1 at 50%, about -0.58 at 67%; `upscale::set_full`). Applied to the title's
+/// mipmapped, linearly filtered samplers that do not compare (its surface textures), as the PC
+/// texture filtering is. `DS_LOD_BIAS=0` leaves them alone.
+pub static LOD_BIAS_Q: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Sets the textures' bias (`LOD_BIAS_Q`) for a render scale (render size over output size).
+pub fn set_upscale_bias(scale: f32) {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let off = *OFF.get_or_init(|| std::env::var("DS_LOD_BIAS").ok().as_deref() == Some("0"));
+    let q = if off || !(scale > 0.0 && scale < 1.0) { 0 } else { (-scale.log2() * 16.0).round().clamp(0.0, 48.0) as u8 };
+    if LOD_BIAS_Q.swap(q, std::sync::atomic::Ordering::Relaxed) != q {
+        crate::info!("images: textures' level-of-detail bias {:.3} (render scale {scale:.3})", -(q as f32) / 16.0);
+    }
+}
+
+/// The samplers' key beyond the S#: the PC anisotropy and the upscaling's bias.
+fn sampler_mode() -> u16 {
+    use std::sync::atomic::Ordering::Relaxed;
+    ANISO.load(Relaxed) as u16 | (LOD_BIAS_Q.load(Relaxed) as u16) << 8
 }
 
 /// `Images::resolved_key` from this thread's memo (None: not memoized).
@@ -2314,7 +2337,7 @@ pub struct Images {
     /// Images whose fast-clear metadata was written: (metadata address, its
     /// first word when the writer's value is known: `note_meta_fill`).
     pending_clears: HashMap<ImageKey, PendingClear>,
-    samplers: HashMap<([u32; 4], bool, u8), vk::Sampler>,
+    samplers: HashMap<([u32; 4], bool, u16), vk::Sampler>,
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
@@ -7819,8 +7842,9 @@ impl Images {
     /// Sampler of an S#; `compare`: used by depth-compare instructions (the
     /// S# compare function applies only to those).
     pub fn sampler(&mut self, s: [u32; 4], compare_use: bool) -> Result<vk::Sampler, String> {
-        let aniso_pc = ANISO.load(std::sync::atomic::Ordering::Relaxed);
-        let key = (s, compare_use, aniso_pc);
+        let mode = sampler_mode();
+        let (aniso_pc, bias_q) = (mode as u8, (mode >> 8) as u8);
+        let key = (s, compare_use, mode);
         if let Some(&v) = self.samplers.get(&key) {
             tls(|m| {
                 m.samplers.insert(key, v);
@@ -7852,7 +7876,10 @@ impl Images {
         let max_lod = b(s[1], 12, 12) as f32 / 256.0;
         // The PC texture filtering (`ANISO`): anisotropic at that level for the title's
         // mipmapped, linearly filtered samplers that do not compare (its surface textures).
-        let raise = aniso_pc > 1 && !compare_use && mip == 2 && b(s[2], 22, 2) >= 1 && b(s[2], 20, 2) >= 1;
+        let surface = !compare_use && mip == 2 && b(s[2], 22, 2) >= 1 && b(s[2], 20, 2) >= 1;
+        let raise = aniso_pc > 1 && surface;
+        // The upscaling's bias (`LOD_BIAS_Q`) on those too, when they have mips to go to.
+        let lod_bias = if surface && bias_q > 0 && max_lod > min_lod { lod_bias - bias_q as f32 / 16.0 } else { lod_bias };
         let ci = vk::SamplerCreateInfo::default()
             .mag_filter(filt(b(s[2], 20, 2)))
             .min_filter(filt(b(s[2], 22, 2)))

@@ -42,6 +42,15 @@
 //! hand their projection: the view widens (Hor+). The display targets are made once, at the
 //! video-out constructor: a change applies at the next start.
 //!
+//! The display's resolution (2026-11-26): with a window, the title's display targets and the
+//! output size handed to its render resolution manager are the game's monitor's resolution at
+//! the start (its desktop mode; the output's shape fitted in, at most 2160 lines), so the
+//! picture reaches the screen pixel for pixel (a 2560x1440 screen gets 2560x1440, not 3840x2160
+//! taken down). The interface keeps its 2160-line canvas and layer (`ui_size`: its sprites are
+//! made for it), which the title's composite takes down onto the display target. Render sizes
+//! are shares of this size, and the upscalers take them up to it. `DS_OUTPUT_DISPLAY=0` keeps
+//! the title's 3840x2160 (or the Aspect Ratio's W x 2160) output.
+//!
 //! `DS_DISPLAY_MODE=<1-5>` holds the mode from the first frame: at all three
 //! the register holding the options' value (+0xD30, which has the last say)
 //! becomes the chosen mode just before its `test`/`cmovne` (`hook_rax` at
@@ -95,8 +104,11 @@ pub fn set_headless_size(w: u32, h: u32) -> Result<(), String> {
 }
 
 /// The chosen output size for modes 3-5 (width << 32 | height; 0: the
-/// title's 3840x2160).
+/// title's 3840x2160): the interface's canvas, and the display targets unless `DISPLAY` is set.
 static OUTPUT: AtomicU64 = AtomicU64::new(0);
+/// The display's resolution the picture is output at (width << 32 | height; 0: `OUTPUT`'s):
+/// the display targets and the render resolution manager's output (`start_display`).
+static DISPLAY: AtomicU64 = AtomicU64::new(0);
 /// Times the output size was set: mode change, constructor, targets, UI
 /// canvas, size getter.
 static OUTPUT_SET: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
@@ -148,10 +160,55 @@ pub fn render_size() -> (u32, u32) {
     if r == 0 { sizes(TITLE_MODE.load(Ordering::Relaxed)).0 } else { ((r >> 32) as u32, r as u32) }
 }
 
-/// The output size (the title's 3840x2160 unless an aspect or `DS_OUTPUT_SIZE` changed it).
+/// The output size: the display's resolution (`DISPLAY`), else the title's 3840x2160 unless an
+/// aspect or `DS_OUTPUT_SIZE` changed it. The picture, the upscalers' output and the display
+/// targets are this size.
 pub fn output_size() -> (u32, u32) {
+    let d = DISPLAY.load(Ordering::Relaxed);
+    if d != 0 {
+        return ((d >> 32) as u32, d as u32);
+    }
+    ui_size()
+}
+
+/// The interface's canvas and layer (the title's 3840x2160, or W x 2160 for another aspect):
+/// the same shape as `output_size`.
+pub fn ui_size() -> (u32, u32) {
     let o = OUTPUT.load(Ordering::Relaxed);
     if o == 0 { (3840, 2160) } else { ((o >> 32) as u32, o as u32) }
+}
+
+/// The display targets' and the render resolution manager's output size, packed (0: the
+/// title's own).
+fn display_packed() -> u64 {
+    match DISPLAY.load(Ordering::Relaxed) {
+        0 => OUTPUT.load(Ordering::Relaxed),
+        d => d,
+    }
+}
+
+/// The game's monitor's resolution at the start for the output (`DISPLAY`), with a window: the
+/// output's shape (`ui_size`) fitted into it, at most the title's 2160 lines; nothing when that
+/// is the title's own size, in runs without a window, or with `DS_OUTPUT_DISPLAY=0` or
+/// `DS_OUTPUT_SIZE`.
+fn start_display() {
+    if std::env::var("DS_OUTPUT_DISPLAY").ok().as_deref() == Some("0") || std::env::var_os("DS_OUTPUT_SIZE").is_some() || !crate::gpu::vk::present::active() {
+        return;
+    }
+    let Some(m) = crate::display::target() else { return };
+    let Some(mode) = crate::display::current_mode(&m.device) else { return };
+    let (uw, uh) = ui_size();
+    let shape = uw as f64 / uh as f64;
+    let h = (mode.h as f64).min(mode.w as f64 / shape).min(uh as f64).floor() as u32 & !1;
+    let w = ((h as f64 * shape).round() as u32).min(mode.w) & !1;
+    if (w, h) == (uw, uh) || h < 720 {
+        if h < 720 {
+            crate::warn!("output: the screen's {}x{} is too small; the title's {uw}x{uh} output stays", mode.w, mode.h);
+        }
+        return;
+    }
+    DISPLAY.store((w as u64) << 32 | h as u64, Ordering::Relaxed);
+    crate::info!("output {w}x{h}: the {}x{} screen of {} (the interface's canvas stays {uw}x{uh})", mode.w, mode.h, m.device);
 }
 
 /// The render size for the output's shape at the title's own size (no window, or the Render
@@ -166,13 +223,15 @@ fn headless_render() -> u64 {
         m @ 3..=5 => sizes(m).0 .1,
         _ => 1440,
     };
+    // (At most the output's lines: an upscaler cannot take a larger render down to it.)
+    let lines = lines.min(oh);
     let (w, h) = shaped_lines(lines, ow, oh);
     (w as u64) << 32 | h as u64
 }
 
 /// `lines` (at most `max_lines`) at the output's shape `ow`x`oh`, the width a multiple of 8.
 fn shaped_lines(lines: u32, ow: u32, oh: u32) -> (u32, u32) {
-    let lines = (lines as u64).min(max_lines(ow, oh));
+    let lines = (lines as u64).min(max_lines(ow, oh)).min(oh as u64);
     let w = ((lines as f32 * ow as f32 / oh as f32 / 8.0).round() as u64 * 8).min(7680);
     (w as u32, lines as u32)
 }
@@ -245,6 +304,7 @@ pub fn init() {
         }
     }
     start_aspect();
+    start_display();
     let Ok(v) = std::env::var("DS_DISPLAY_MODE") else { return };
     match v.trim().parse::<u32>() {
         Ok(m @ 1..=5) => {
@@ -423,8 +483,7 @@ pub extern "sysv64" fn hook_r15(regs: *const u64, _arg: u32) {
 
 /// The packed size at `at` (two u32) becomes the chosen output size where it
 /// is 3840x2160 (`site`: the OUTPUT_SET counter).
-fn swap_output(at: u64, site: usize) {
-    let o = OUTPUT.load(Ordering::Relaxed);
+fn swap_output(at: u64, site: usize, o: u64) {
     if o == 0 || at == 0 {
         return;
     }
@@ -446,7 +505,7 @@ fn swap_output(at: u64, site: usize) {
 /// output size ([rbp-0x3C]) the chosen one where it is 3840x2160.
 pub extern "sysv64" fn hook_render_size(regs: *const u64, _arg: u32) {
     let rbp = unsafe { *regs.add(5) };
-    swap_output(rbp.wrapping_sub(0x3C), 0);
+    swap_output(rbp.wrapping_sub(0x3C), 0, display_packed());
     let r = RENDER.load(Ordering::Relaxed);
     if r == 0 {
         return;
@@ -454,7 +513,7 @@ pub extern "sysv64" fn hook_render_size(regs: *const u64, _arg: u32) {
     // Only for the 4K-output modes (the boot's 1080p mode keeps its own).
     let out = rbp.wrapping_sub(0x3C);
     let (ow, oh) = unsafe { ((out as *const u32).read_volatile(), ((out + 4) as *const u32).read_volatile()) };
-    let o = OUTPUT.load(Ordering::Relaxed);
+    let o = display_packed();
     if (ow, oh) != (3840, 2160) && (o == 0 || (ow as u64, oh as u64) != (o >> 32, o & 0xFFFF_FFFF)) {
         return;
     }
@@ -475,13 +534,13 @@ pub extern "sysv64" fn hook_render_size(regs: *const u64, _arg: u32) {
 /// output size (+0x14).
 pub extern "sysv64" fn hook_ctor_sizes(regs: *const u64, _arg: u32) {
     let r15 = unsafe { *regs.add(15) };
-    swap_output(r15.wrapping_add(0x14), 1);
+    swap_output(r15.wrapping_add(0x14), 1, display_packed());
 }
 
 /// eboot+0x90af7e and eboot+0x90b06b, the constructor's display targets
 /// (edi width, esi height): the chosen output size.
 pub extern "sysv64" fn hook_targets(regs: *const u64, _arg: u32) {
-    let o = OUTPUT.load(Ordering::Relaxed);
+    let o = display_packed();
     let (w, h) = unsafe { (*regs.add(7) as u32, *regs.add(6) as u32) };
     if o == 0 || (w, h) != (3840, 2160) {
         return;
@@ -583,6 +642,10 @@ pub fn status() -> String {
     }
     if r != 0 {
         s += &format!("    render size {}x{} set {} times ({}; {} mode pulses)\n", r >> 32, r as u32, RENDER_SET.load(Ordering::Relaxed), if RENDER_FROM_ENV.load(Ordering::Relaxed) { "DS_RENDER_SIZE".to_string() } else { format!("Render Scale {}%", SCALE_PCT.load(Ordering::Relaxed)) }, PULSES.load(Ordering::Relaxed));
+    }
+    let d = DISPLAY.load(Ordering::Relaxed);
+    if d != 0 {
+        s += &format!("    output {}x{} (the screen's; the interface's canvas {:?})\n", d >> 32, d as u32, ui_size());
     }
     let o = OUTPUT.load(Ordering::Relaxed);
     if o != 0 {

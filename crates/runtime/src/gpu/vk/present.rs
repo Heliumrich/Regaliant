@@ -394,7 +394,14 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
                 crate::warn!("swapchain: the surface is {}x{}, the window's client {cw}x{ch} (Windows display scaling applied to this thread?)", extent.width, extent.height);
             }
         }
-        let count = (caps.min_image_count + 1).min(if caps.max_image_count == 0 { u32::MAX } else { caps.max_image_count });
+        // The present mode: MAILBOX where the driver offers it (the newest frame shown at the next
+        // refresh, a present never waits for one; with G-SYNC / FreeSync the refresh follows the
+        // frames as with FIFO), else FIFO. `DS_PRESENT_MODE=fifo|mailbox|immediate` chooses.
+        let modes = c.surface_i.get_physical_device_surface_present_modes(c.pdev, p.surface).unwrap_or_default();
+        let mode = window_present_mode(&modes);
+        // (MAILBOX needs an image beyond the one shown and the one queued.)
+        let want = caps.min_image_count + 1 + (mode == vk::PresentModeKHR::MAILBOX && caps.min_image_count < 3) as u32;
+        let count = want.min(if caps.max_image_count == 0 { u32::MAX } else { caps.max_image_count });
         let old = p.swapchain;
         // Exclusive fullscreen: held by the swapchain when the window asks for it (the PC tab's
         // Fullscreen), and never taken by the driver on its own for a window or borderless
@@ -417,7 +424,7 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(caps.current_transform)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-            .present_mode(vk::PresentModeKHR::FIFO)
+            .present_mode(mode)
             .clipped(true)
             .old_swapchain(old);
         if c.fse.is_some() {
@@ -1030,6 +1037,23 @@ pub fn present(src: Source) -> bool {
 static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// A window shows the frames.
+/// The window's present mode among `modes` (the surface's): `DS_PRESENT_MODE` where offered,
+/// else MAILBOX, else FIFO (always offered). Logged once per choice.
+fn window_present_mode(modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
+    let asked = match std::env::var("DS_PRESENT_MODE").ok().as_deref().map(str::trim) {
+        Some("fifo") => Some(vk::PresentModeKHR::FIFO),
+        Some("mailbox") => Some(vk::PresentModeKHR::MAILBOX),
+        Some("immediate") => Some(vk::PresentModeKHR::IMMEDIATE),
+        _ => None,
+    };
+    let mode = asked.filter(|m| modes.contains(m)).or_else(|| modes.contains(&vk::PresentModeKHR::MAILBOX).then_some(vk::PresentModeKHR::MAILBOX)).unwrap_or(vk::PresentModeKHR::FIFO);
+    static LOGGED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+    if LOGGED.swap(mode.as_raw(), std::sync::atomic::Ordering::Relaxed) != mode.as_raw() {
+        crate::info!("present: {mode:?} (offered {modes:?}{})", asked.map_or(String::new(), |a| format!("; DS_PRESENT_MODE asked {a:?}")));
+    }
+    mode
+}
+
 pub fn active() -> bool {
     ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
 }

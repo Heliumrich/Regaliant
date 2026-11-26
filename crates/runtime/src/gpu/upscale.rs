@@ -330,6 +330,7 @@ pub fn set_full(frame: u64, taa_views: Vec<vk::ImageView>, full: vk::ImageView, 
         crate::info!("upscaler: the picture goes up to the output size {}x{} (render scale {scale:.3}); the title's passes at that size read it in the TAA output's place", size.0, size.1);
     }
     *FULL.lock() = Some(FullRes { frame, taa_views, full, size, scale });
+    super::images::set_upscale_bias(scale);
     FULL_SIZE.store((size.0 as u64) << 32 | size.1 as u64, Relaxed);
 }
 
@@ -338,6 +339,7 @@ pub fn set_full(frame: u64, taa_views: Vec<vk::ImageView>, full: vk::ImageView, 
 pub fn clear_full() {
     if FULL_SIZE.swap(0, Relaxed) != 0 {
         FULL.lock().take();
+        super::images::set_upscale_bias(1.0);
     }
 }
 

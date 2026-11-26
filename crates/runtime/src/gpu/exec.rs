@@ -20990,6 +20990,8 @@ impl Exec {
     /// is then unknown).
     fn taa_upscale(&mut self, p: &Prepared, bound: &Bound) -> bool {
         if !super::upscale::active() {
+            // (The game's TAA again: no picture to stand in, the textures' bias back to none.)
+            super::upscale::clear_full();
             return false;
         }
         // The TAA's constant buffer (resource 0) as bound: its first float is the exposure the

@@ -14,6 +14,14 @@
   HUD, which are no longer sharpened. It handles HDR without clipping. The game's own TAA
   sharpening is always off.
 - Menu & HUD Size now also works with HDR output.
+- The game now outputs at your screen's resolution (read at the start), not always at
+  3840x2160: a 1440p or 1080p screen gets its own resolution pixel for pixel, and the render
+  quality shares are of it. The menus and HUD keep their size. `DS_OUTPUT_DISPLAY=0` brings back
+  the 3840x2160 output.
+- While DLSS, FSR or XeSS upscale, textures get NVIDIA's recommended level-of-detail bias
+  (log2 of the render share: -1 at 50%), so they stay as sharp as at the screen's resolution.
+- The window presents with Vulkan's MAILBOX mode where the driver offers it (FIFO before):
+  lower latency, presents never wait for a refresh. `DS_PRESENT_MODE=fifo` brings back FIFO.
 
 ## 0.1.8
 
