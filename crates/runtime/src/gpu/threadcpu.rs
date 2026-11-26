@@ -40,6 +40,11 @@ fn thread_cycles(tid: u32) -> Option<u64> {
     (unsafe { QueryThreadCycleTime(h as _, &mut c) } != 0).then_some(c)
 }
 
+/// Thread `tid`'s cycles so far (its handle kept open; the performance overlay).
+pub fn thread_cycles_of(tid: u32) -> Option<u64> {
+    thread_cycles(tid)
+}
+
 /// The calling thread's cycles so far (the timeline's recording spans: CPU
 /// time beside wall time).
 pub fn own_cycles() -> u64 {

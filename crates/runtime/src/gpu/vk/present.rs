@@ -52,6 +52,8 @@ struct Presenter {
     watch_failed: bool,
     /// The system text box drawn over the frame (`crate::textbox`), made on first use.
     text_box: Option<TextBox>,
+    /// The performance overlay's image (`perfhud`), made on first use.
+    perf_box: Option<TextBox>,
     /// The last present's id on this swapchain (`DS_PRESENT_STATS=1`: `waiter`).
     present_id: u64,
 }
@@ -307,6 +309,146 @@ unsafe fn draw_text_box(p: &mut Presenter, cmd: vk::CommandBuffer, slot: usize, 
     }
 }
 
+/// The swapchain's present mode (low 16 bits) and whether it holds exclusive fullscreen (bit 16):
+/// the performance overlay's presentation line.
+static SWAP_STATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// The performance overlay's presentation line: the present mode and how the frames likely reach
+/// the screen (Windows does not tell an application: an estimate from the window).
+pub fn presentation_line() -> String {
+    let st = SWAP_STATE.load(std::sync::atomic::Ordering::Relaxed);
+    if st == u32::MAX {
+        return "Present: no swapchain".into();
+    }
+    let mode = match (st & 0xFFFF) as i32 {
+        0 => "IMMEDIATE",
+        1 => "MAILBOX",
+        2 => "FIFO",
+        3 => "FIFO_RELAXED",
+        _ => "?",
+    };
+    let how = if st & 1 << 16 != 0 {
+        "exclusive fullscreen: direct flip"
+    } else {
+        match window::window_mode() {
+            1 => "borderless: independent flip when nothing covers it",
+            2 => "fullscreen (not held): DWM may compose",
+            _ => "windowed: composed by DWM (not optimal)",
+        }
+    };
+    format!("{mode}  {how}")
+}
+
+/// Draws the performance overlay (`perfhud`) in the top-right corner of the picture in `dst`
+/// (TRANSFER_DST_OPTIMAL), as `draw_text_box` its box.
+unsafe fn draw_perf(p: &mut Presenter, cmd: vk::CommandBuffer, slot: usize, dst: vk::Image, picture: (u32, u32, u32, u32)) {
+    let Some((generation, lines)) = crate::perfhud::lines() else {
+        if let Some(old) = p.perf_box.take() {
+            let c = ctx();
+            unsafe {
+                c.device.wait_for_fences(&p.fences, true, u64::MAX).ok();
+                old.destroy();
+            }
+        }
+        return;
+    };
+    let c = ctx();
+    let (rx, ry, rw, rh) = picture;
+    let hdr = p.hdr;
+    let key = (generation, rh, hdr);
+    unsafe {
+        // (Rendered when the text changes, four times a second at most; the image made at that
+        // size when the size changes.)
+        let fresh = p.perf_box.as_ref().is_none_or(|t| t.key != Some(key));
+        let mut px = Vec::new();
+        let (mut w, mut h) = p.perf_box.as_ref().map_or((0, 0), |t| (t.w, t.h));
+        if fresh {
+            let (v, pw, ph) = crate::perfhud::render(&lines, rh);
+            if pw == 0 || ph == 0 || pw > rw || ph > rh {
+                return;
+            }
+            px = v;
+            if hdr {
+                crate::textbox::to_pq(&mut px, 203.0);
+            }
+            if (pw, ph) != (w, h) {
+                let others: Vec<vk::Fence> = p.fences.iter().enumerate().filter(|&(i, _)| i != slot).map(|(_, &f)| f).collect();
+                c.device.wait_for_fences(&others, true, u64::MAX).ok();
+                if let Some(old) = p.perf_box.take() {
+                    old.destroy();
+                }
+                let ici = vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(vk::Format::B8G8R8A8_UNORM)
+                    .extent(vk::Extent3D { width: pw, height: ph, depth: 1 })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC);
+                let Ok(image) = c.device.create_image(&ici, None) else { return };
+                let Ok(memory) = c.alloc(c.device.get_image_memory_requirements(image), vk::MemoryPropertyFlags::DEVICE_LOCAL) else {
+                    c.device.destroy_image(image, None);
+                    return;
+                };
+                if c.device.bind_image_memory(image, memory, 0).is_err() {
+                    c.device.destroy_image(image, None);
+                    c.device.free_memory(memory, None);
+                    return;
+                }
+                let mut staging = Vec::new();
+                for _ in 0..FRAMES {
+                    match c.host_buffer((pw * ph * 4) as u64, vk::BufferUsageFlags::TRANSFER_SRC) {
+                        Ok(b) => staging.push(b),
+                        Err(_) => {
+                            TextBox { image, memory, w: pw, h: ph, staging, key: None }.destroy();
+                            return;
+                        }
+                    }
+                }
+                p.perf_box = Some(TextBox { image, memory, w: pw, h: ph, staging, key: None });
+            }
+            (w, h) = (pw, ph);
+        }
+        let Some(t) = p.perf_box.as_mut() else { return };
+        if fresh {
+            std::ptr::copy_nonoverlapping(px.as_ptr(), t.staging[slot].2, px.len());
+            let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+            let to_dst = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(t.image)
+                .subresource_range(range);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_dst]);
+            let copy = vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 })
+                .image_extent(vk::Extent3D { width: w, height: h, depth: 1 });
+            c.device.cmd_copy_buffer_to_image(cmd, t.staging[slot].0, t.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[copy]);
+            let to_src = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(t.image)
+                .subresource_range(range);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_src]);
+            t.key = Some(key);
+        }
+        // Over the frame just blitted to `dst`, a margin in from the picture's top-right corner.
+        let margin = (rh as f32 / 1080.0 * 16.0).round() as u32;
+        let x = (rx + rw).saturating_sub(t.w + margin);
+        let y = ry + margin;
+        barrier(c, cmd, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+        blit(c, cmd, t.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, (0, 0, t.w, t.h), dst, (x, y, t.w, t.h));
+    }
+}
+
 unsafe impl Send for Presenter {}
 
 static PRESENTER: Mutex<Option<Presenter>> = Mutex::new(None);
@@ -484,6 +626,7 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
                 Err(e) => crate::warn!("present: exclusive fullscreen not acquired ({e}): shown as borderless"),
             }
         }
+        SWAP_STATE.store((mode.as_raw() as u32 & 0xFFFF) | (p.exclusive.is_some() as u32) << 16, std::sync::atomic::Ordering::Relaxed);
         crate::info!(
             "swapchain {}x{} {:?} {:?} ({} images{})",
             extent.width,
@@ -783,6 +926,7 @@ pub fn init(title: &str) -> Result<(), String> {
             watch: None,
             watch_failed: false,
             text_box: None,
+            perf_box: None,
             present_id: 0,
         };
         super::framewatch::init_from_env();
@@ -929,6 +1073,8 @@ pub fn present(src: Source) -> bool {
         }
         // The system text box (the character's name) over the frame.
         draw_text_box(p, cmd, f, dst, (rx, ry, rw, rh));
+        // The performance overlay, in the frame itself (no window or plane of its own).
+        draw_perf(p, cmd, f, dst, (rx, ry, rw, rh));
         if p.logged != (sw, sh, p.extent.width, p.extent.height) {
             p.logged = (sw, sh, p.extent.width, p.extent.height);
             crate::info!("present: {sw}x{sh} frame into a {}x{} window at {rw}x{rh}+{rx}+{ry}: {level} halving(s), then {fw}x{fh} -> {rw}x{rh}", p.extent.width, p.extent.height);

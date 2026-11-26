@@ -239,6 +239,12 @@ pub fn graphics_items() -> Vec<Item> {
             kind: ItemKind::Choice(vec![s("Automatic"), s("Off")], 0),
         },
         Item {
+            id: s("PerfOverlay"),
+            label: s("Performance Overlay"),
+            tooltip: s("Frame rate in the top-right corner. Full adds lows, CPU, GPU and memory."),
+            kind: ItemKind::Choice(vec![s("Off"), s("Simple"), s("Full")], 0),
+        },
+        Item {
             id: s("AspectRatio"),
             label: s("Aspect Ratio"),
             tooltip: s("The picture's shape, from the next start."),
@@ -334,6 +340,7 @@ pub fn apply() {
     let sharpen = SHARPNESS.get(get("Sharpness").unwrap_or(0) as usize).copied().unwrap_or(0.0);
     crate::gpu::vk::sharpen::AMOUNT.store(sharpen.to_bits(), std::sync::atomic::Ordering::Relaxed);
     convar::want("r_aaHistorySharpeningStrength", Some(convar::float(0.0)));
+    crate::perfhud::MODE.store(get("PerfOverlay").unwrap_or(0).min(2) as u8, std::sync::atomic::Ordering::Relaxed);
     let sens = get("MouseSensitivity").map(f32::from_bits).filter(|v| v.is_finite() && *v > 0.0).unwrap_or(1.0);
     crate::input::PC_SENSITIVITY.store(sens.to_bits(), std::sync::atomic::Ordering::Relaxed);
     crate::input::PC_INVERT_Y.store(get("InvertMouseY") == Some(1), std::sync::atomic::Ordering::Relaxed);
@@ -510,6 +517,7 @@ pub fn state_report() {
         format!("TextureFiltering {} (anisotropy {})", v("TextureFiltering"), crate::gpu::images::ANISO.load(Relaxed)),
         format!("AntiAliasing {:?} (upscaler {up:?})", store::raw_value("Setting_PC_AntiAliasing")),
         format!("Bloom {} / Vignette {}", v("Bloom"), v("Vignette")),
+        format!("PerfOverlay {} (in effect {})", v("PerfOverlay"), crate::perfhud::mode()),
         format!("FrameRateLimit {} (frame cap {}, uncapped {})", v("FrameRateLimit"), crate::gpu::tune::frame_cap(), crate::gpu::tune::uncapped()),
         format!("MouseMotionBlur {} (in effect {})", v("MouseMotionBlur"), MOUSE_BLUR.load(Relaxed)),
         format!("UiSize {} (scale {:.2})", v("UiSize"), ui_size()),

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Performance Overlay in SETTINGS > PC > Graphics & Display: Simple (frame rate and frame time)
+  or Full (also 1% and 0.1% lows, the main and render threads' CPU use, GPU use and clock on
+  NVIDIA cards, video memory, memory and the presentation). It is drawn into the picture itself,
+  so it needs no extra display plane.
 - DLSS, FSR and XeSS now upscale to your screen's resolution. Until now they anti-aliased the
   picture at the render resolution, and the game then stretched it to the screen with a plain
   scaling, which looked blurry below 100%. Now the game's post-processing (bloom, depth of field,
