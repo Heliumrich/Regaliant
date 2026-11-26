@@ -13,7 +13,7 @@
 //!
 //! In game, the SETTINGS screen's PC page ends with Save and Quit to Desktop
 //! (`pcsettings::quit_button`): a copy of the game's own Save and Exit Game button from its EXIT
-//! GAME page (the game saves and returns to the title), 51 units high where the original is 50,
+//! GAME page (the game saves and returns to the title), 51.25 units high where the original is 50,
 //! which is how `tick` knows Cross was pressed on it (the UI nodes, `uistate`, as the key
 //! binding rows are found); hidden on the title screen, where the title menu has EXIT GAME. The
 //! session then ends when the title's own movies open again
@@ -43,8 +43,10 @@ pub extern "sysv64" fn menu_hook(regs: *const u64, _arg: u32) {
     }
 }
 
-/// The design height of Save and Quit to Desktop (the game's Save and Exit Game: 50).
-pub const BUTTON_HEIGHT: f32 = 51.0;
+/// The design height of Save and Quit to Desktop (the game's Save and Exit Game: 50): a
+/// fraction no element of the game's own has (some of its list slots are 51 high, 2026-11-26's
+/// UI dump), so a Cross on any other focused item never arms the quit.
+pub const BUTTON_HEIGHT: f32 = 51.25;
 
 /// When Save and Quit to Desktop was pressed: the session ends at the title within a minute (the
 /// game's save and exit takes about a second here; a press the game did not act on lapses).
