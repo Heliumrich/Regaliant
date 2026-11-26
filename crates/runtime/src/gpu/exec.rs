@@ -5598,6 +5598,13 @@ static TAP_LAST: Mutex<Option<HashMap<(u64, usize), (u64, Vec<u32>, u64, String)
 /// Rechecks made, and those that found words changed.
 static TAP_RECHECKS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
+thread_local! {
+    /// Diagnosis (`DS_TRACE_CLEARS`): the path that last applied fast clears on this thread.
+    static CLEAR_VIA: std::cell::Cell<&'static str> = const { std::cell::Cell::new("?") };
+    /// Diagnosis: the caller of the coming `resolve_fast_clears` (a draw or a dispatch).
+    pub(crate) static RESOLVE_SITE: std::cell::Cell<&'static str> = const { std::cell::Cell::new("?") };
+}
+
 impl Exec {
     fn tap_cs(&mut self, p: &Prepared, bound: &Bound) {
         let list = tap_list();
@@ -17052,6 +17059,7 @@ impl Exec {
     /// never compressed, so the metadata is read back and the image cleared.
     /// Runs before a draw or dispatch reserves its slot (it flushes).
     pub(crate) fn resolve_fast_clears(&mut self, keys: &[super::images::ImageKey]) {
+        // (Diagnosis, `DS_TRACE_CLEARS`: which path resolves; the draw's and the dispatch's set it.)
         if self.held && !keys.is_empty() {
             // Clears of the work before the stretch are not its to take; its
             // own are, once their values are known (else they wait for its
@@ -17089,6 +17097,7 @@ impl Exec {
             });
             note_clear_resolve(self.rendering.is_some());
             self.end_rendering();
+            CLEAR_VIA.with(|v| v.set("held resolve"));
             self.record_fast_clears(clears, false);
             return;
         }
@@ -17109,6 +17118,7 @@ impl Exec {
             }
         }
         let clears = super::images::with(|im| im.take_clears(keys));
+        CLEAR_VIA.with(|v| v.set(RESOLVE_SITE.with(|s| s.get())));
         self.record_fast_clears(clears, check);
     }
 
@@ -17143,10 +17153,17 @@ impl Exec {
             }
             return;
         }
-        if super::images::pending_meta_hit(meta) {
-            super::images::with(|im| im.claim_meta(key, meta, clear));
+        let hit = super::images::pending_meta_hit(meta);
+        if hit {
+            let moved = super::images::with(|im| im.claim_meta(key, meta, clear));
+            if super::images::trace_clears() {
+                crate::info!("trace clears: {:#x} ({}x{}) bound with metadata {meta:#x}: claim {} (for flip {}, [{}])", key.base, key.width, key.height, if moved { "took another image's clear" } else { "found none elsewhere" }, crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1, self.name);
+            }
+        } else if super::images::trace_clears() && super::images::with(|im| im.meta_pending_elsewhere(key, meta)) {
+            crate::info!("trace clears: {:#x} ({}x{}) bound with metadata {meta:#x}: a clear pends there under another image, but the published set missed it (for flip {}, [{}])", key.base, key.width, key.height, crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1, self.name);
         }
     }
+
 
     /// Records `clears` (`resolve_fast_clears`): each image cleared to the
     /// value its metadata gives (known, else read now); `check`: known
@@ -17256,7 +17273,7 @@ impl Exec {
             };
             let k = c.key;
             if super::images::trace_clears() {
-                crate::info!("trace clears: {:#x} ({:?} {}x{}) applied, metadata {:#x} = {v:#x}{} (for flip {}, [{}] before programs {:#x}/{:#x})", k.base, k.format, k.width, k.height, c.meta, if c.known.is_some() { " (from the fill)" } else { " (read)" }, crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1, self.name, self.sync_readers[0], self.sync_readers[1]);
+                crate::info!("trace clears: {:#x} ({:?} {}x{}) applied, metadata {:#x} = {v:#x}{} (for flip {}, [{}] before programs {:#x}/{:#x}; held {}, via {})", k.base, k.format, k.width, k.height, c.meta, if c.known.is_some() { " (from the fill)" } else { " (read)" }, crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1, self.name, self.sync_readers[0], self.sync_readers[1], self.held, CLEAR_VIA.with(|v| v.get()));
             }
             let (first, count) = run.unwrap_or((0, vk::REMAINING_ARRAY_LAYERS));
             if run.is_some() {
@@ -22067,6 +22084,7 @@ impl Exec {
         keys.clear();
         let hz = image_hazards(&[&p], &mut keys);
         if self.held_hit(&keys) || hz {
+            RESOLVE_SITE.with(|s| s.set("dispatch"));
             self.resolve_fast_clears(&keys);
             self.resolve_overwrites(&keys);
             self.sync_block_textures(&keys);
