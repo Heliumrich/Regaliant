@@ -4,8 +4,10 @@
 
 ## Settings
 
-- In the game: SETTINGS > PC. The tab has window mode, resolution, render scale, Anti-Aliasing / Upscaler, the frame rate limit, the Motion Blur Fix and mouse sensitivity. Its lists hold the rest: Graphics & Display, Controls, Sound & Saves, and the key and controller bindings. Most settings take effect at once.
-- In the launcher: the **Display** page sets the window mode, monitor, resolution, refresh rate, render scale and frame rate limit before the game starts.
+- In the game: SETTINGS > PC. The tab has window mode, resolution, render quality, Anti-Aliasing / Upscaler, the frame rate limit, the Motion Blur Fix and mouse sensitivity. Its lists hold the rest: Graphics & Display, Controls, Sound & Saves, and the key and controller bindings. Most settings take effect at once.
+- In the launcher: the **Display** page sets the window mode, monitor, resolution, refresh rate, render quality and frame rate limit before the game starts.
+- Render Quality sets the resolution the game renders at, as a share of your screen's: Ultra Performance (33%), Performance (50%), Balanced (58%), Quality (67%), Ultra Quality (77%) and DLAA / Native (100%). Visual Mode keeps the game's own. The picture is always shown at your screen's resolution: DLSS, FSR or XeSS (or the game's TAA) take the render up to it. At 100% DLSS runs as DLAA.
+- Sharpening runs AMD's RCAS over the picture after the upscaler, before the menus and HUD are drawn: they are never sharpened. It works the same with HDR. The game's own sharpening is always off.
 - Motion Blur Fix is No Blur by default: the game's motion blur is off, so plants and detail stay sharp while the camera moves. Game's Blur uses the game's own Motion Blur setting, which smears every camera move. Reduced Blur keeps a tenth of it.
 - Shadow Distance (Graphics & Display) shortens how far the sun's shadows reach. A shorter distance raises the frame rate in busy places.
 

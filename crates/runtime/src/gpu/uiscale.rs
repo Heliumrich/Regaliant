@@ -1,6 +1,6 @@
 //! Menu and HUD size (the PC tab's): the title draws its interface into a layer of its own
 //! (3840x2160 RGBA16F, mostly transparent) that its last draw of a frame composites over the
-//! scaled-up scene (ps 0x100888d100, the layer its resource 0). Before that draw the layer is
+//! scaled-up scene (ps 0x100888d100; 0x100888d900 with HDR output; the layer its resource 0). Before that draw the layer is
 //! blitted smaller around its centre into an image of ours, and the composite samples that image
 //! in the layer's place (`Exec::scale_ui_layer`), so the whole interface (menus and HUD alike)
 //! shrinks toward the middle. The layer itself is left as the title drew it: recording this twice
@@ -13,6 +13,13 @@ use parking_lot::Mutex;
 
 /// The title's interface composite (01.007.000).
 pub const COMPOSITE_PS: u64 = 0x100888d100;
+/// Its HDR output variant (the HDR10 display target), the same layer its resource 0.
+pub const COMPOSITE_PS_HDR: u64 = 0x100888d900;
+
+/// Whether pixel program `ps` is the interface composite (SDR or HDR).
+pub fn is_composite(ps: u64) -> bool {
+    ps == COMPOSITE_PS || ps == COMPOSITE_PS_HDR
+}
 
 struct Spare {
     image: vk::Image,

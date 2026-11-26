@@ -1,12 +1,16 @@
 //! Temporal upscalers in place of the title's TAA: NVIDIA DLSS, Intel XeSS and AMD FSR. The
 //! title's TAA (cs 0x100893aa00 on the graphics queue, `gpu::exec`) reads the scene colour
 //! (HDR, at the render size), depth, a stencil, its motion vectors (R16G16), its history and a
-//! mask, and writes the anti-aliased picture at the output size (it also upscales: 2560x1440 to
-//! 3840x2160 in the title's Performance mode). With an upscaler chosen (PC tab, Graphics:
-//! Anti-Aliasing), that dispatch is replaced by the upscaler's evaluation with the same colour,
-//! depth and motion vectors in and the same image out; the title's history goes unused. The
-//! title jitters its projection itself (Halton (2, 3), eight phases): each frame's offset is
-//! taken from its jitter function (`crate::jitter`) and handed to the upscaler.
+//! mask, and writes the anti-aliased picture at the render size too: the title's last pass at the
+//! output size (3840x2160) scales it up with the rest of its post-processing (a 50% render on a
+//! 4K screen, 2026-11-26: the TAA's output 1920x1080, then a plain scaling to 3840x2160). With an
+//! upscaler chosen (PC tab: Anti-Aliasing / Upscaler), the upscaler evaluates after the TAA with
+//! its colour, depth and motion vectors: at the render size when that is the output's (native
+//! anti-aliasing: DLAA), else up to the output size, its picture then read by the passes at the
+//! output size in the TAA output's place and, taken down, by those at the render size
+//! (`gpu::upmerge`, `substitute_full`). The title's history goes unused. The title jitters its
+//! projection itself (Halton (2, 3), eight phases): each frame's offset is taken from its jitter
+//! function (`crate::jitter`) and handed to the upscaler.
 //!
 //! The choice is live: every upscaler whose library is installed is prepared when the Vulkan
 //! device is made (its extensions and features), its context made at its first use, and a
@@ -34,7 +38,9 @@
 //!
 //! Debug: `DS_UPSCALER=off|xess|dlss|fsr` chooses at start and prepares only that library;
 //! `DS_UPSCALE_MV=<x>,<y>` multiplies the motion vectors' scale, `DS_UPSCALE_JITTER=<x>,<y>`
-//! the jitter passed to the upscaler, `DS_UP_JITTER=<0-3>` flips its signs.
+//! the jitter passed to the upscaler, `DS_UP_JITTER=<0-3>` flips its signs; `DS_UPSCALE_FULL=0`
+//! keeps the upscaler at the render size (its picture scaled up by the title, as before
+//! 2026-11-26).
 
 use ash::vk;
 use parking_lot::Mutex;
@@ -266,25 +272,118 @@ pub fn offered(name: &str) -> bool {
     ready(k) || (k == Kind::Dlss && DLSS_DEVICE_OK.load(Relaxed) && !DLSS_FAILED.load(Relaxed))
 }
 
-/// The choices the settings offer: the TAA and the upscalers ready here.
+/// The choices the settings offer: the TAA and the upscalers ready here (each upscales the
+/// Render Quality's size to the screen's, native anti-aliasing at 100%).
 pub fn choices() -> Vec<(String, String)> {
     let mut v = vec![("off".to_string(), "TAA (the game's)".to_string())];
     if ready(Kind::Dlss) {
-        v.push(("dlss".into(), "DLSS (DLAA)".into()));
+        v.push(("dlss".into(), "DLSS".into()));
     }
     if ready(Kind::Xess) {
-        v.push(("xess".into(), "XeSS Native AA".into()));
+        v.push(("xess".into(), "XeSS".into()));
     }
     if ready(Kind::Fsr) {
-        v.push(("fsr".into(), "FSR Native AA".into()));
+        v.push(("fsr".into(), "FSR".into()));
     }
     v
 }
 
-/// The render scale of upscaling done by the port: none (the title's TAA, which the upscalers
-/// replace, already scales its render size up to the output).
+/// The render scale of the upscaling done by the port: the render size over the output size
+/// while an upscaler takes the picture up to the output size (`FULL`), else 1.
 pub fn render_scale() -> f32 {
-    1.0
+    FULL.lock().as_ref().map_or(1.0, |f| f.scale)
+}
+
+/// Whether the upscaler goes up to the output size when the render size is below it
+/// (`DS_UPSCALE_FULL=0`: never, the title scales its picture up as before 2026-11-26).
+pub fn full_res_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_UPSCALE_FULL").ok().as_deref() != Some("0"))
+}
+
+/// The upscaler's full-resolution picture of the frame being recorded: the views of the title's
+/// TAA output (every view of its image and its aliases), the picture's view in their place, its
+/// size, and the flip it was recorded in (`Exec::taa_upscale`, `set_full`).
+struct FullRes {
+    frame: u64,
+    taa_views: Vec<vk::ImageView>,
+    full: vk::ImageView,
+    size: (u32, u32),
+    scale: f32,
+}
+
+// SAFETY: plain handles.
+unsafe impl Send for FullRes {}
+
+static FULL: Mutex<Option<FullRes>> = Mutex::new(None);
+/// The picture's size (width << 32 | height; 0: none): draws of other sizes skip the lock.
+static FULL_SIZE: AtomicU64 = AtomicU64::new(0);
+/// Draws given the picture in the TAA output's place (the status line), and flips the picture
+/// was made in.
+pub static FULL_SUBS: AtomicU64 = AtomicU64::new(0);
+pub static FULL_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// The picture of flip `frame` at `size` stands for the TAA output (its views `taa_views`) in
+/// the passes at the output size from now on.
+pub fn set_full(frame: u64, taa_views: Vec<vk::ImageView>, full: vk::ImageView, size: (u32, u32), scale: f32) {
+    if FULL_FRAMES.fetch_add(1, Relaxed) == 0 {
+        crate::info!("upscaler: the picture goes up to the output size {}x{} (render scale {scale:.3}); the title's passes at that size read it in the TAA output's place", size.0, size.1);
+    }
+    *FULL.lock() = Some(FullRes { frame, taa_views, full, size, scale });
+    FULL_SIZE.store((size.0 as u64) << 32 | size.1 as u64, Relaxed);
+}
+
+/// The render size is the output size again (native anti-aliasing, or no upscaler): nothing is
+/// substituted.
+pub fn clear_full() {
+    if FULL_SIZE.swap(0, Relaxed) != 0 {
+        FULL.lock().take();
+    }
+}
+
+/// A draw into a target of `target` size, recorded in flip `frame`, with its pixel stage's image
+/// bindings `imgs`: the TAA output's views among them become the full-resolution picture's when
+/// the target has the picture's size (the title's scaling of its picture to the output, and
+/// whatever else at that size reads it). Returns how many were replaced.
+pub fn substitute_full(frame: u64, target: (u32, u32), imgs: &mut [(u32, vk::DescriptorType, vk::DescriptorImageInfo)], ps: u64) -> usize {
+    if FULL_SIZE.load(Relaxed) != (target.0 as u64) << 32 | target.1 as u64 || imgs.is_empty() || !active() {
+        return 0;
+    }
+    let g = FULL.lock();
+    let Some(f) = g.as_ref() else { return 0 };
+    // (The picture of this flip, or of one just before it: the flip count moves at the CP's
+    // flips and the display's, and a draw may be recorded around one. An older picture is not
+    // used: the upscaler stopped evaluating.)
+    if target != f.size || frame > f.frame + 2 {
+        return 0;
+    }
+    let mut n = 0;
+    for e in imgs.iter_mut().filter(|e| f.taa_views.contains(&e.2.image_view)) {
+        e.2.image_view = f.full;
+        n += 1;
+    }
+    drop(g);
+    if n > 0 {
+        static SEEN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+        FULL_SUBS.fetch_add(1, Relaxed);
+        let mut seen = SEEN.lock();
+        if !seen.contains(&ps) && seen.len() < 16 {
+            seen.push(ps);
+            crate::info!("upscaler: ps {ps:#x} at {}x{} reads the upscaled picture in the TAA output's place ({n} binding(s))", target.0, target.1);
+        }
+    }
+    n
+}
+
+/// The status line's part (none while the picture was never made).
+pub fn full_status() -> String {
+    let frames = FULL_FRAMES.load(Relaxed);
+    if frames == 0 {
+        return String::new();
+    }
+    let subs = FULL_SUBS.load(Relaxed);
+    let note = if subs == 0 { " (no pass at the output size read the TAA output: the title scaled the render-size picture up)" } else { "" };
+    format!("    upscaler to the output size: {frames} flips, {subs} draws given the picture{note}\n")
 }
 
 /// The textures' level-of-detail bias while the game renders below the
@@ -606,9 +705,9 @@ pub struct Tex {
     pub layout: vk::ImageLayout,
 }
 
-/// The inputs of one replacement: the scene colour, depth and motion vectors
-/// sampled (at the render size), the output written (at the output size:
-/// the same in the native anti-aliasing modes).
+/// The inputs of one evaluation: the scene colour, depth and motion vectors
+/// sampled (at the render size), the output written (at the output size when
+/// the render size is below it, else at the render size: native anti-aliasing).
 pub struct Inputs {
     pub color: Tex,
     pub depth: Tex,
@@ -959,7 +1058,7 @@ fn xess_record(cmd: vk::CommandBuffer, inp: &Inputs, reset: bool) -> bool {
         // XeSS's: pixels, current -> previous.
         let (mx, my) = mv_scale();
         unsafe { (x.velocity_scale)(h, -(inp.in_width as f32) * mx, -(inp.in_height as f32) * my) };
-        if inp.ldr {
+        if (inp.in_width, inp.in_height) != (inp.width, inp.height) {
             crate::info!("upscaler: XeSS upscaling {}x{} to {}x{} (preset {quality}) after the game's TAA", inp.in_width, inp.in_height, inp.width, inp.height);
         } else {
             crate::info!("upscaler: XeSS native anti-aliasing at {}x{} after the game's TAA", inp.width, inp.height);
@@ -1060,15 +1159,27 @@ const SL_VALID_UNTIL_EVALUATE: u32 = 2;
 /// DLSSMode::eDLAA.
 const SL_DLSS_DLAA: u32 = 6;
 
-/// DLSS's mode for an output/render ratio (DLAA 1, quality 1.5, balanced
-/// 1.72, performance 2, ultra performance 3).
+/// DLSS's mode for an output/render ratio (DLAA 1, quality 1.5 (from 77%: ultra quality's
+/// share, run as quality), balanced 1.72, performance 2, ultra performance 3).
 fn dlss_mode(ratio: f32) -> u32 {
     match ratio {
-        r if r < 1.2 => SL_DLSS_DLAA,
+        r if r < 1.05 => SL_DLSS_DLAA,
         r if r < 1.6 => 3,
         r if r < 1.9 => 2,
         r if r < 2.6 => 1,
         _ => 4,
+    }
+}
+
+/// The name of a DLSS mode (`dlss_mode`'s values).
+fn dlss_mode_name(mode: u32) -> &'static str {
+    match mode {
+        SL_DLSS_DLAA => "DLAA",
+        1 => "Performance",
+        2 => "Balanced",
+        3 => "Quality",
+        4 => "Ultra Performance",
+        _ => "?",
     }
 }
 /// RenderAPI::eVulkan.
@@ -1924,10 +2035,10 @@ fn dlss_record(cmd: vk::CommandBuffer, inp: &Inputs, reset: bool) -> bool {
     let new_size = d.key != key;
     let mode = dlss_mode(inp.ratio());
     if new_size {
-        if inp.ldr {
-            crate::info!("upscaler: DLSS upscaling {}x{} to {}x{} (mode {mode}) after the game's TAA", inp.in_width, inp.in_height, inp.width, inp.height);
+        if mode == SL_DLSS_DLAA {
+            crate::info!("upscaler: DLSS native anti-aliasing (DLAA) at {}x{} (render {}x{}) after the game's TAA, HDR colour {}", inp.width, inp.height, inp.in_width, inp.in_height, !inp.ldr);
         } else {
-            crate::info!("upscaler: DLSS native anti-aliasing (DLAA) at {}x{} after the game's TAA", inp.width, inp.height);
+            crate::info!("upscaler: DLSS upscaling {}x{} to {}x{} ({}, ratio {:.2}) after the game's TAA, HDR colour {}", inp.in_width, inp.in_height, inp.width, inp.height, dlss_mode_name(mode), inp.ratio(), !inp.ldr);
         }
         d.key = key;
     }
@@ -2382,7 +2493,7 @@ fn fsr_record(cmd: vk::CommandBuffer, inp: &Inputs, reset: bool) -> bool {
         } else {
             "?".into()
         };
-        if inp.ldr {
+        if (inp.in_width, inp.in_height) != (inp.width, inp.height) {
             crate::info!("upscaler: FSR upscaling {}x{} to {}x{} after the game's TAA (provider {name})", inp.in_width, inp.in_height, inp.width, inp.height);
         } else {
             crate::info!("upscaler: FSR native anti-aliasing at {}x{} after the game's TAA (provider {name})", inp.width, inp.height);
@@ -2547,6 +2658,14 @@ mod tests {
         assert_eq!(dlss_mode(1.0 / 0.58), 2);
         assert_eq!(dlss_mode(2.0), 1);
         assert_eq!(dlss_mode(3.0), 4);
+        // The Render Quality's shares at 4K (`dispmode::scaled_size`'s rounding): 77% (1664
+        // lines) as quality, 33% (712 lines) as ultra performance, 100% DLAA.
+        assert_eq!(dlss_mode(2160.0 / 1664.0), 3);
+        assert_eq!(dlss_mode(2160.0 / 1448.0), 3);
+        assert_eq!(dlss_mode(2160.0 / 1252.0), 2);
+        assert_eq!(dlss_mode(2160.0 / 1080.0), 1);
+        assert_eq!(dlss_mode(2160.0 / 712.0), 4);
+        assert_eq!(dlss_mode(2160.0 / 2160.0), SL_DLSS_DLAA);
     }
 
     #[test]

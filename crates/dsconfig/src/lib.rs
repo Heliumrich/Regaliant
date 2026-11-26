@@ -4,6 +4,7 @@
 pub mod display;
 pub mod game;
 pub mod paths;
+pub mod quality;
 pub mod self_file;
 pub mod sha;
 pub mod zar;

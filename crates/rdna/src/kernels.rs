@@ -1687,13 +1687,27 @@ fn build_timestamp_many() -> Result<Vec<u32>, rspirv::dr::Error> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn sharpen_kernel_assembles() {
-        let w = super::sharpen();
+    fn rcas_kernel_is_spirv() {
+        let w = super::rcas();
         assert_eq!(w[0], 0x0723_0203);
-        if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
-            let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
-            std::fs::write(std::path::Path::new(&dir).join("sharpen.spv"), bytes).unwrap();
+        // SPIR-V 1.0, a compute entry point of 8x8, and no capability beyond Shader (naga's
+        // Image1D and StorageImageExtendedFormats dropped: neither is used, and the device does
+        // not enable the latter's feature).
+        assert_eq!(w[1], 0x0001_0000);
+        let (mut i, mut caps, mut size) = (5, Vec::new(), None);
+        while i < w.len() {
+            let (op, n) = (w[i] & 0xffff, (w[i] >> 16) as usize);
+            assert!(n > 0);
+            if op == 17 {
+                caps.push(w[i + 1]);
+            }
+            if op == 16 && w[i + 2] == 17 {
+                size = Some([w[i + 3], w[i + 4], w[i + 5]]);
+            }
+            i += n;
         }
+        assert_eq!(caps, vec![1]);
+        assert_eq!(size, Some([super::RCAS_LOCAL, super::RCAS_LOCAL, 1]));
     }
 
     #[test]
@@ -2151,13 +2165,18 @@ fn build_latency(salt: u32) -> Result<Vec<u32>, rspirv::dr::Error> {
     Ok(b.module().assemble())
 }
 
-/// Workgroup size (each axis) of `sharpen`.
-pub const SHARPEN_LOCAL: u32 = 8;
+/// Workgroup size (each axis) of `rcas`.
+pub const RCAS_LOCAL: u32 = 8;
 
-/// The PC settings' sharpening of the presented image: binding 0 the image to sharpen, binding
-/// 1 the result (storage images, rgba16f), push constants {width, height, amount}. Each pixel
-/// moves away from the mean of its four neighbours by `amount` times the difference, kept within
-/// the range of its 3x3 neighbourhood (so edges get no halo); alpha 1.
+/// The PC settings' Sharpening: AMD's RCAS (FSR 1's sharpening, without its upscaling) over the
+/// picture before the interface is composited (`kernels/rcas.comp`, its source; MIT, AMD's
+/// FidelityFX). Binding 0 the picture, binding 1 the result (storage images, rgba16f); push
+/// constants {width, height, strength, encoding} (see the source). Compiled with naga.
+pub fn rcas() -> Vec<u32> {
+    let bytes: &[u8] = include_bytes!("kernels/rcas.spv");
+    bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+}
+
 /// The upscalers' merge (`gpu::upscale`): each pixel of the title's TAA output (binding 1,
 /// RGBA16F storage image) takes the upscaler's colour (binding 0) times the exposure the TAA
 /// applies to its input (the first float of binding 2, a storage buffer: the TAA's output is
@@ -2257,130 +2276,5 @@ fn build_rgb_merge() -> Result<Vec<u32>, rspirv::dr::Error> {
     b.end_function()?;
     b.entry_point(ExecutionModel::GLCompute, f, "main", [gid]);
     b.execution_mode(f, ExecutionMode::LocalSize, [RGB_MERGE_LOCAL, RGB_MERGE_LOCAL, 1]);
-    Ok(b.module().assemble())
-}
-
-pub fn sharpen() -> Vec<u32> {
-    build_sharpen().expect("sharpen kernel")
-}
-
-fn build_sharpen() -> Result<Vec<u32>, rspirv::dr::Error> {
-    use rspirv::spirv::{Dim, GlslStd450Op as G, ImageFormat};
-    let lit = Operand::LiteralBit32;
-    let mut b = Builder::new();
-    b.set_version(1, 3);
-    b.capability(Capability::Shader);
-    let glsl = b.ext_inst_import("GLSL.std.450");
-    b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
-    let void = b.type_void();
-    let bool_ = b.type_bool();
-    let u32t = b.type_int(32, 0);
-    let i32t = b.type_int(32, 1);
-    let f32t = b.type_float(32, None);
-    let v3u = b.type_vector(u32t, 3);
-    let v2i = b.type_vector(i32t, 2);
-    let v4f = b.type_vector(f32t, 4);
-    let img = b.type_image(f32t, Dim::Dim2D, 0, 0, 0, 2, ImageFormat::Rgba16f, None);
-    let p_img = b.type_pointer(None, StorageClass::UniformConstant, img);
-    let pc = b.type_struct([u32t, u32t, f32t]);
-    b.decorate(pc, Decoration::Block, []);
-    b.member_decorate(pc, 0, Decoration::Offset, [lit(0)]);
-    b.member_decorate(pc, 1, Decoration::Offset, [lit(4)]);
-    b.member_decorate(pc, 2, Decoration::Offset, [lit(8)]);
-    let p_pc = b.type_pointer(None, StorageClass::PushConstant, pc);
-    let p_pcu = b.type_pointer(None, StorageClass::PushConstant, u32t);
-    let p_pcf = b.type_pointer(None, StorageClass::PushConstant, f32t);
-    let p_in = b.type_pointer(None, StorageClass::Input, v3u);
-    let gid = global(&mut b, p_in, StorageClass::Input);
-    b.decorate(gid, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
-    let src = global(&mut b, p_img, StorageClass::UniformConstant);
-    b.decorate(src, Decoration::DescriptorSet, [lit(0)]);
-    b.decorate(src, Decoration::Binding, [lit(0)]);
-    b.decorate(src, Decoration::NonWritable, []);
-    let dst = global(&mut b, p_img, StorageClass::UniformConstant);
-    b.decorate(dst, Decoration::DescriptorSet, [lit(0)]);
-    b.decorate(dst, Decoration::Binding, [lit(1)]);
-    b.decorate(dst, Decoration::NonReadable, []);
-    let pcv = global(&mut b, p_pc, StorageClass::PushConstant);
-    let (u0, u1, u2) = (b.constant_bit32(u32t, 0), b.constant_bit32(u32t, 1), b.constant_bit32(u32t, 2));
-    let (i0, i1) = (b.constant_bit32(i32t, 0), b.constant_bit32(i32t, 1));
-    let f_quarter = b.constant_bit32(f32t, 0.25f32.to_bits());
-    let f_one = b.constant_bit32(f32t, 1.0f32.to_bits());
-    let fty = b.type_function(void, []);
-    let f = b.begin_function(void, None, FunctionControl::NONE, fty)?;
-    b.begin_block(None)?;
-    let g = b.load(v3u, None, gid, None, [])?;
-    let gx = b.composite_extract(u32t, None, g, [0])?;
-    let gy = b.composite_extract(u32t, None, g, [1])?;
-    let p_w = b.access_chain(p_pcu, None, pcv, [u0])?;
-    let w = b.load(u32t, None, p_w, None, [])?;
-    let p_h = b.access_chain(p_pcu, None, pcv, [u1])?;
-    let h = b.load(u32t, None, p_h, None, [])?;
-    let p_k = b.access_chain(p_pcf, None, pcv, [u2])?;
-    let k = b.load(f32t, None, p_k, None, [])?;
-    let in_x = b.u_less_than(bool_, None, gx, w)?;
-    let in_y = b.u_less_than(bool_, None, gy, h)?;
-    let inside = b.logical_and(bool_, None, in_x, in_y)?;
-    let (l_body, l_end) = (b.id(), b.id());
-    b.selection_merge(l_end, SelectionControl::NONE)?;
-    b.branch_conditional(inside, l_body, l_end, [])?;
-    b.begin_block(Some(l_body))?;
-    let x = b.bitcast(i32t, None, gx)?;
-    let y = b.bitcast(i32t, None, gy)?;
-    let wi = b.bitcast(i32t, None, w)?;
-    let hi = b.bitcast(i32t, None, h)?;
-    let xmax = b.i_sub(i32t, None, wi, i1)?;
-    let ymax = b.i_sub(i32t, None, hi, i1)?;
-    let xm = b.i_sub(i32t, None, x, i1)?;
-    let xm = b.ext_inst(i32t, None, glsl, G::SMax as u32, [Operand::IdRef(xm), Operand::IdRef(i0)])?;
-    let xp = b.i_add(i32t, None, x, i1)?;
-    let xp = b.ext_inst(i32t, None, glsl, G::SMin as u32, [Operand::IdRef(xp), Operand::IdRef(xmax)])?;
-    let ym = b.i_sub(i32t, None, y, i1)?;
-    let ym = b.ext_inst(i32t, None, glsl, G::SMax as u32, [Operand::IdRef(ym), Operand::IdRef(i0)])?;
-    let yp = b.i_add(i32t, None, y, i1)?;
-    let yp = b.ext_inst(i32t, None, glsl, G::SMin as u32, [Operand::IdRef(yp), Operand::IdRef(ymax)])?;
-    let simg = b.load(img, None, src, None, [])?;
-    let mut fetch = |b: &mut Builder, px: Word, py: Word| -> Result<Word, rspirv::dr::Error> {
-        let at = b.composite_construct(v2i, None, [px, py])?;
-        b.image_read(v4f, None, simg, at, None, [])
-    };
-    let c = fetch(&mut b, x, y)?;
-    let n = fetch(&mut b, x, ym)?;
-    let s = fetch(&mut b, x, yp)?;
-    let e = fetch(&mut b, xp, y)?;
-    let wv = fetch(&mut b, xm, y)?;
-    let nw = fetch(&mut b, xm, ym)?;
-    let ne = fetch(&mut b, xp, ym)?;
-    let sw = fetch(&mut b, xm, yp)?;
-    let se = fetch(&mut b, xp, yp)?;
-    let mut lo = c;
-    let mut hi4 = c;
-    for v in [n, s, e, wv, nw, ne, sw, se] {
-        lo = b.ext_inst(v4f, None, glsl, G::FMin as u32, [Operand::IdRef(lo), Operand::IdRef(v)])?;
-        hi4 = b.ext_inst(v4f, None, glsl, G::FMax as u32, [Operand::IdRef(hi4), Operand::IdRef(v)])?;
-    }
-    let sum = b.f_add(v4f, None, n, s)?;
-    let sum = b.f_add(v4f, None, sum, e)?;
-    let sum = b.f_add(v4f, None, sum, wv)?;
-    let quarter = b.composite_construct(v4f, None, [f_quarter, f_quarter, f_quarter, f_quarter])?;
-    let mean = b.f_mul(v4f, None, sum, quarter)?;
-    let detail = b.f_sub(v4f, None, c, mean)?;
-    let kv = b.composite_construct(v4f, None, [k, k, k, k])?;
-    let add = b.f_mul(v4f, None, detail, kv)?;
-    let out = b.f_add(v4f, None, c, add)?;
-    let out = b.ext_inst(v4f, None, glsl, G::FClamp as u32, [Operand::IdRef(out), Operand::IdRef(lo), Operand::IdRef(hi4)])?;
-    let r = b.composite_extract(f32t, None, out, [0])?;
-    let gg = b.composite_extract(f32t, None, out, [1])?;
-    let bb = b.composite_extract(f32t, None, out, [2])?;
-    let out = b.composite_construct(v4f, None, [r, gg, bb, f_one])?;
-    let at = b.composite_construct(v2i, None, [x, y])?;
-    let dimg = b.load(img, None, dst, None, [])?;
-    b.image_write(dimg, at, out, None, [])?;
-    b.branch(l_end)?;
-    b.begin_block(Some(l_end))?;
-    b.ret()?;
-    b.end_function()?;
-    b.entry_point(ExecutionModel::GLCompute, f, "main", [gid]);
-    b.execution_mode(f, ExecutionMode::LocalSize, [SHARPEN_LOCAL, SHARPEN_LOCAL, 1]);
     Ok(b.module().assemble())
 }

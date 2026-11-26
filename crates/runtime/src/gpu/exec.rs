@@ -12137,6 +12137,9 @@ pub struct Exec {
     /// Its copy, recorded where the composite begins rendering (its batch open then): the layer,
     /// our image, the size, the scale and the filter (`uiscale::record`).
     pub(super) ui_job: Option<super::uiscale::Job>,
+    /// Sharpening: the draw is the interface composite; RCAS over its target goes in where it
+    /// begins rendering (`gpu::vk::sharpen`).
+    pub(super) rcas_want: bool,
     /// A parallel worker's chunk: the guest ranges CP writes of its run's
     /// earlier chunks write (`par::Run::cp_writes`); a CPU read of one stops
     /// the chunk (those batches are not submitted yet).
@@ -13942,6 +13945,7 @@ impl Exec {
                 par_worker: false,
                 ui_sub: None,
                 ui_job: None,
+                rcas_want: false,
                 run_writes: Vec::new(),
                 hs_seg: 0,
                 effect_writes: Default::default(),
@@ -20981,7 +20985,8 @@ impl Exec {
     /// The chosen upscaler after the title's TAA dispatch (`gpu::upscale`): the TAA's colour,
     /// depth and motion vectors in, the frame's jitter from the title's jitter function
     /// (`crate::jitter`), its own output image out, whose colour then replaces the TAA output's
-    /// (`gpu::upmerge`: the TAA's alpha stays). True when recorded (the executor's bound state
+    /// (`gpu::upmerge`: the TAA's alpha stays); when the render size is below the output size, up
+    /// to the output size, for the title's passes at that size (`upscale::substitute_full`). True when recorded (the executor's bound state
     /// is then unknown).
     fn taa_upscale(&mut self, p: &Prepared, bound: &Bound) -> bool {
         if !super::upscale::active() {
@@ -21021,7 +21026,27 @@ impl Exec {
                 return false;
             }
         };
-        let output = match super::upmerge::target(to.width, to.height) {
+        // Up to the output size when the TAA writes at a render size below it (the title then
+        // scales its picture up in its last pass: the upscaler does it instead, `upmerge`); at
+        // the TAA's own size otherwise (native anti-aliasing: DLAA).
+        let (ow, oh) = crate::dispmode::output_size();
+        let mut up = super::upscale::full_res_on() && (to.width, to.height) == (tc.width, tc.height) && ow >= to.width && oh >= to.height && (ow, oh) != (to.width, to.height);
+        let mut full = None;
+        if up {
+            let r = super::upmerge::target_slot(super::upmerge::SLOT_FULL, ow, oh).and_then(|f| Ok((f, super::upmerge::target_slot(super::upmerge::SLOT_DOWN, to.width, to.height)?)));
+            match r {
+                Ok(v) => full = Some(v),
+                Err(e) => {
+                    static N: AtomicU64 = AtomicU64::new(0);
+                    if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                        crate::warn!("upscaler: no {ow}x{oh} picture ({e}): native anti-aliasing, the title scales it up");
+                    }
+                    up = false;
+                }
+            }
+        }
+        let (out_w, out_h) = if up { (ow, oh) } else { (to.width, to.height) };
+        let output = match super::upmerge::target(out_w, out_h) {
             Ok(t) => t,
             Err(e) => {
                 static N: AtomicU64 = AtomicU64::new(0);
@@ -21033,8 +21058,12 @@ impl Exec {
         };
         let j = crate::jitter::for_flip(frame);
         let cmd = self.cmd();
-        let target = output.image;
-        super::vk::defer::external(cmd, Box::new(move |cb| super::upmerge::begin(cb, target)));
+        let targets: Vec<vk::Image> = std::iter::once(output.image).chain(full.iter().flat_map(|(f, d)| [f.image, d.image])).collect();
+        super::vk::defer::external(cmd, Box::new(move |cb| {
+            for t in targets {
+                super::upmerge::begin(cb, t);
+            }
+        }));
         let inp = super::upscale::Inputs {
             color,
             depth,
@@ -21042,8 +21071,8 @@ impl Exec {
             output,
             in_width: tc.width,
             in_height: tc.height,
-            width: to.width,
-            height: to.height,
+            width: out_w,
+            height: out_h,
             ldr: false,
             jitter_x: j.map_or(0.0, |j| j.x),
             jitter_y: j.map_or(0.0, |j| j.y),
@@ -21051,8 +21080,28 @@ impl Exec {
         if !super::upscale::record(cmd, &inp) {
             return false;
         }
-        let (src, view, w, h) = (inp.output.view, taa_out.view, to.width, to.height);
-        super::vk::defer::external(cmd, Box::new(move |cb| super::upmerge::record(cb, src, view, w, h, exposure)));
+        match full {
+            Some((f, d)) if up => {
+                let parts = super::upmerge::Full {
+                    out: (inp.output.image, inp.output.view),
+                    full: (f.image, f.view),
+                    down: (d.image, d.view),
+                    taa: (taa_out.image, taa_out.view),
+                    render: (to.width, to.height),
+                    output: (ow, oh),
+                };
+                super::vk::defer::external(cmd, Box::new(move |cb| super::upmerge::record_full(cb, parts, exposure)));
+                // (Every view of the TAA output and its aliases: the passes at the output size may
+                // sample it through any of them.)
+                let views = super::images::with(|im| im.views_at(to.base, to.width, to.height));
+                super::upscale::set_full(frame, views, f.view, (ow, oh), to.height as f32 / oh as f32);
+            }
+            _ => {
+                super::upscale::clear_full();
+                let (src, view, w, h) = (inp.output.view, taa_out.view, to.width, to.height);
+                super::vk::defer::external(cmd, Box::new(move |cb| super::upmerge::record(cb, src, view, w, h, exposure)));
+            }
+        }
         // (The upscaler and the merge bound pipelines and descriptors of their own.)
         self.dyncache = Default::default();
         true
@@ -23055,6 +23104,8 @@ pub fn status() -> String {
         + &clear_pass_line()
         + &super::images::pressure_line()
         + &super::upmerge::status_line()
+        + &super::vk::sharpen::status_line()
+        + &super::upscale::full_status()
         + &super::vk::gate_line()
         + &super::fe2::unimported_line()
         + &super::vk::system_line()

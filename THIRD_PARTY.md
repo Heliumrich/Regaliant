@@ -30,6 +30,7 @@ Their dependencies are MIT and/or Apache-2.0, except libloading (ISC, used by as
 | LibAtrac9 (Alex Barney), C implementation | `third_party/libatrac9` | ATRAC9 audio decoding | MIT (`third_party/libatrac9/LICENSE`) |
 | minimp3 (lieff) | `third_party/minimp3/minimp3.h` | MP3 audio decoding | CC0-1.0 (`third_party/minimp3/LICENSE`) |
 | Mesa addrlib's gfx10 swizzle patterns and layout logic (Advanced Micro Devices, Inc.) | `crates/runtime/src/gpu/swizzle_tables.rs` (tables generated from `gfx10SwizzlePattern.h`), `crates/runtime/src/gpu/tiling.rs` (a re-implementation) | the GPU's texture and surface layouts | MIT |
+| AMD FidelityFX RCAS, FSR 1's sharpening (Advanced Micro Devices, Inc.), with the HDR approach of EndlesslyFlowering's ReShade HDR shaders (no code taken) | `crates/rdna/src/kernels/rcas.comp` (a re-implementation; `rcas.spv` compiled from it) | the Sharpening setting | MIT |
 | The earlier native port by the same author | much of `crates/runtime`, `crates/sce-elf` and `crates/rdna` derives from it | the loader, system library layers and shader translator | MIT ("Copyright (c) 2026 SulphurS16 and the Bloodborne native port contributors") |
 | License texts of crates that ship none | `third_party/licenses` | read by `scripts/notices.py` | iced-x86: MIT (its repository's text), rspirv and spirv: Apache-2.0 (the license text) |
 

@@ -1,9 +1,17 @@
 //! The upscalers' output beside the title's TAA (`gpu::upscale`, `Exec::taa_upscale`). The
 //! title's TAA runs as before: its output's alpha packs per-pixel data (from the depth and
 //! stencil) that later passes read, which no upscaler writes. The upscaler writes an image of its
-//! own at the output's size, and a kernel then copies its colour into the TAA's output, keeping
-//! that alpha and applying the exposure the TAA applies to its input (its output is pre-exposed:
-//! the first float of the TAA's own constant buffer; `rdna::kernels::rgb_merge`).
+//! own, and a kernel then copies its colour into the TAA's output, keeping that alpha and
+//! applying the exposure the TAA applies to its input (its output is pre-exposed: the first float
+//! of the TAA's own constant buffer; `rdna::kernels::rgb_merge`).
+//!
+//! The title's TAA writes at the render size, and its last pass at the output size scales that up
+//! (2026-11-26: the log of a 50% render on a 4K screen, the TAA's output 1920x1080). When the
+//! render size is below the output size the upscaler writes at the output size instead
+//! (`record_full`): its picture with the TAA output's alpha (nearest) and the exposure goes to an
+//! image at the output size that the passes at the output size read in the TAA output's place
+//! (`upscale::substitute_full`), and the same picture taken down to the render size (linear)
+//! goes into the TAA output for the passes at the render size (bloom and the like).
 
 use super::vk::ctx;
 use ash::vk;
@@ -29,10 +37,16 @@ struct Retired {
     seq: Option<u64>,
 }
 
+/// The images in use: the upscaler's output (`SLOT_OUT`), the full-resolution picture
+/// (`SLOT_FULL`) and its copy at the render size (`SLOT_DOWN`).
+pub const SLOT_OUT: usize = 0;
+pub const SLOT_FULL: usize = 1;
+pub const SLOT_DOWN: usize = 2;
+
 struct Merge {
     layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
-    target: Option<Img>,
+    targets: [Option<Img>; 3],
     /// Images of other sizes. Until 2026-11-24 they were kept for good: the title's small views'
     /// TAA (the equipment menu's character preview at 640x360) changed the size every frame or
     /// two, and each change made a new image (30 MiB at 2560x1440) that was never freed: a
@@ -74,7 +88,7 @@ unsafe fn new_merge() -> Result<Merge, String> {
         let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
         let pipeline = d.create_compute_pipelines(vk::PipelineCache::null(), &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout)], None).map_err(|(_, e)| format!("merge pipeline: {e}"))?[0];
         d.destroy_shader_module(module, None);
-        Ok(Merge { layout, pipeline, target: None, retired: Vec::new() })
+        Ok(Merge { layout, pipeline, targets: [None, None, None], retired: Vec::new() })
     }
 }
 
@@ -133,6 +147,11 @@ unsafe fn destroy(img: Img) {
 /// The upscaler's output image at `w`x`h` (made, or taken back from the images of other sizes;
 /// GENERAL layout once `record` ran).
 pub fn target(w: u32, h: u32) -> Result<super::upscale::Tex, String> {
+    target_slot(SLOT_OUT, w, h)
+}
+
+/// The image of `slot` at `w`x`h` (as `target`; GENERAL once `begin` ran).
+pub fn target_slot(slot: usize, w: u32, h: u32) -> Result<super::upscale::Tex, String> {
     let mut g = MERGE.lock();
     if g.is_none() {
         *g = Some(unsafe { new_merge() }?);
@@ -154,7 +173,7 @@ pub fn target(w: u32, h: u32) -> Result<super::upscale::Tex, String> {
         }
     }
     m.retired = keep;
-    if m.target.as_ref().is_none_or(|t| (t.w, t.h) != (w, h)) {
+    if m.targets[slot].as_ref().is_none_or(|t| (t.w, t.h) != (w, h)) {
         let img = match m.retired.iter().position(|r| (r.img.w, r.img.h) == (w, h)) {
             Some(i) => m.retired.swap_remove(i).img,
             None => {
@@ -164,11 +183,11 @@ pub fn target(w: u32, h: u32) -> Result<super::upscale::Tex, String> {
                 img
             }
         };
-        if let Some(old) = m.target.replace(img) {
+        if let Some(old) = m.targets[slot].replace(img) {
             m.retired.push(Retired { img: old, frame, seq: None });
         }
     }
-    let t = m.target.as_ref().unwrap();
+    let t = m.targets[slot].as_ref().unwrap();
     Ok(super::upscale::Tex {
         image: t.image,
         view: t.view,
@@ -213,10 +232,19 @@ pub fn record(cb: vk::CommandBuffer, src_view: vk::ImageView, out_view: vk::Imag
     let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
     unsafe {
         c.device.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+        dispatch(cb, m, src_view, out_view, w, h, exposure);
+        c.device.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+    }
+}
+
+/// One merge: `src`'s colour times the exposure into `dst` (`w`x`h`), `dst`'s alpha kept.
+unsafe fn dispatch(cb: vk::CommandBuffer, m: &Merge, src_view: vk::ImageView, dst_view: vk::ImageView, w: u32, h: u32, exposure: vk::DescriptorBufferInfo) {
+    let c = ctx();
+    unsafe {
         c.device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, m.pipeline);
         let infos = [
             [vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: src_view, image_layout: vk::ImageLayout::GENERAL }],
-            [vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: out_view, image_layout: vk::ImageLayout::GENERAL }],
+            [vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: dst_view, image_layout: vk::ImageLayout::GENERAL }],
         ];
         let ebuf = [exposure];
         let writes = [
@@ -229,6 +257,62 @@ pub fn record(cb: vk::CommandBuffer, src_view: vk::ImageView, out_view: vk::Imag
         c.device.cmd_push_constants(cb, m.layout, vk::ShaderStageFlags::COMPUTE, 0, std::slice::from_raw_parts(pc.as_ptr().cast::<u8>(), 8));
         let local = rdna::kernels::RGB_MERGE_LOCAL;
         c.device.cmd_dispatch(cb, w.div_ceil(local), h.div_ceil(local), 1);
-        c.device.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+    }
+}
+
+/// The images of an upscaling to the output size (`record_full`): each its image and a storage
+/// view (GENERAL).
+#[derive(Clone, Copy)]
+pub struct Full {
+    /// The upscaler's output at the output size.
+    pub out: (vk::Image, vk::ImageView),
+    /// The full-resolution picture the passes at the output size read.
+    pub full: (vk::Image, vk::ImageView),
+    /// Its copy at the render size, merged into the TAA output.
+    pub down: (vk::Image, vk::ImageView),
+    /// The title's TAA output (the render size).
+    pub taa: (vk::Image, vk::ImageView),
+    /// The render size and the output size.
+    pub render: (u32, u32),
+    pub output: (u32, u32),
+}
+
+fn whole(from: (u32, u32), to: (u32, u32)) -> vk::ImageBlit {
+    let layers = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 };
+    vk::ImageBlit {
+        src_subresource: layers,
+        src_offsets: [vk::Offset3D { x: 0, y: 0, z: 0 }, vk::Offset3D { x: from.0 as i32, y: from.1 as i32, z: 1 }],
+        dst_subresource: layers,
+        dst_offsets: [vk::Offset3D { x: 0, y: 0, z: 0 }, vk::Offset3D { x: to.0 as i32, y: to.1 as i32, z: 1 }],
+    }
+}
+
+/// Records into `cb`, after the upscaler's evaluation to the output size: the full-resolution
+/// picture (the TAA output's alpha taken up by nearest texels, then the upscaler's colour times
+/// the exposure) and the TAA output's colour (the upscaler's taken down to the render size).
+/// When the evaluation failed the picture is the TAA output taken up (linear) and the TAA output
+/// stays.
+pub fn record_full(cb: vk::CommandBuffer, f: Full, exposure: vk::DescriptorBufferInfo) {
+    let c = ctx();
+    let g = MERGE.lock();
+    let Some(m) = g.as_ref() else { return };
+    let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+    let d = &c.device;
+    let gl = vk::ImageLayout::GENERAL;
+    unsafe {
+        // The upscaler's and the TAA's writes done.
+        d.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+        if !super::upscale::last_eval_ok() {
+            d.cmd_blit_image(cb, f.taa.0, gl, f.full.0, gl, &[whole(f.render, f.output)], vk::Filter::LINEAR);
+            d.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+            return;
+        }
+        // (The alpha packs per-pixel data: nearest texels, never blends of them.)
+        d.cmd_blit_image(cb, f.taa.0, gl, f.full.0, gl, &[whole(f.render, f.output)], vk::Filter::NEAREST);
+        d.cmd_blit_image(cb, f.out.0, gl, f.down.0, gl, &[whole(f.output, f.render)], vk::Filter::LINEAR);
+        d.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+        dispatch(cb, m, f.out.1, f.full.1, f.output.0, f.output.1, exposure);
+        dispatch(cb, m, f.down.1, f.taa.1, f.render.0, f.render.1, exposure);
+        d.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
     }
 }

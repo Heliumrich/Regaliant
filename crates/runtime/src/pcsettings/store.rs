@@ -115,6 +115,16 @@ pub fn init(path: PathBuf, defs: Vec<Def>) {
                 }
                 continue;
             }
+            // Render Scale (until 2026-11-26): the Render Quality option nearest to it.
+            let (old_key, new_key) = (format!("Setting_PC_{}", dsconfig::quality::OLD_ID), format!("Setting_PC_{}", dsconfig::quality::ID));
+            if k.trim() == old_key && by_name.contains_key(&new_key) {
+                if let Ok(old) = v.trim().parse::<u32>() {
+                    let i = dsconfig::quality::from_render_scale(old);
+                    carried.push((super::setting_hash(&new_key), i));
+                    crate::info!("pc settings: Render Scale option {old} carried over as Render Quality {}", dsconfig::quality::LABELS[i as usize]);
+                }
+                continue;
+            }
             match by_name.get(k.trim()) {
                 Some(&(h, kind)) => match parse(kind, v.trim()) {
                     Some(bits) => {

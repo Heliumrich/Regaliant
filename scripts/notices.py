@@ -8,7 +8,7 @@ with Cargo.lock: normal dependencies, without proc-macros and build-time crates)
 license file it ships; where a crate offers a choice, MIT is used. Then the vendored C code
 (LibAtrac9, minimp3, the mimalloc allocator libmimalloc-sys builds, the zstd library zstd-sys
 builds), Mesa addrlib's notice for
-the surface layout tables, the MIT notice of the earlier native port much of the runtime derives
+the surface layout tables, AMD's FidelityFX notice for the RCAS sharpening kernel, the MIT notice of the earlier native port much of the runtime derives
 from, and the Rust standard library's notices (the toolchain's COPYRIGHT-library.html), each
 distinct notice text once. The Microsoft C runtime linked statically needs no notice.
 """
@@ -269,6 +269,8 @@ def main():
         ('minimp3 (third_party/minimp3): MP3 decoding (CC0, no notice required)', read(ROOT / 'third_party/minimp3/LICENSE')),
         ('Mesa addrlib: the gfx10 surface layout tables and logic (crates/runtime/src/gpu/swizzle_tables.rs, tiling.rs)',
          'Copyright (C) 2007-2024 Advanced Micro Devices, Inc. All rights reserved.\n\n' + MIT_TEXT),
+        ('AMD FidelityFX RCAS, FSR 1\'s sharpening: the Sharpening kernel (crates/rdna/src/kernels/rcas.comp)',
+         'Copyright (c) 2021 Advanced Micro Devices, Inc. All rights reserved.\n\n' + MIT_TEXT),
         ('The earlier native port much of crates/runtime, crates/sce-elf and crates/rdna derives from',
          'Copyright (c) 2026 SulphurS16 and the Bloodborne native port contributors\n\n' + MIT_TEXT),
         ('The Rust standard library', rust_std_section()),

@@ -1818,11 +1818,22 @@ impl Exec {
         }
         let t_prog = super::prog_census().then(std::time::Instant::now);
         self.census_kind = 0;
-        // Menu & HUD Size: the interface layer scaled before the title composites it.
-        if super::super::uiscale::scale() < 1.0 {
+        // At the title's interface composite (SDR or HDR): Menu & HUD Size's layer scaled before
+        // the title composites it, and the Sharpening (RCAS) of the picture under it, recorded
+        // where the composite begins rendering (`rcas_want`, `gpu::vk::sharpen`).
+        let scale_ui = super::super::uiscale::scale() < 1.0;
+        let sharpen = super::super::vk::sharpen::amount() > 0.0;
+        if scale_ui || sharpen {
             let ps = ((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8;
-            if ps == super::super::uiscale::COMPOSITE_PS {
-                self.scale_ui_layer(cp);
+            if super::super::uiscale::is_composite(ps) {
+                if scale_ui {
+                    self.scale_ui_layer(cp);
+                }
+                if sharpen {
+                    self.rcas_want = true;
+                    // (Rendering begins again at the composite: the pass goes in before it.)
+                    self.end_rendering();
+                }
             }
         }
         // (The vertices a non-indexed draw of one instance reads: `snap_prog`'s snapshots.)
@@ -1831,6 +1842,7 @@ impl Exec {
         set_snap_verts(None);
         self.ui_sub = None;
         self.ui_job = None;
+        self.rcas_want = false;
         if let Some(t) = t_prog {
             let ps = ((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8;
             let ns = t.elapsed().as_nanos() as u64;
@@ -3015,6 +3027,14 @@ impl Exec {
             if k == 1 && decal_check() != 0 {
                 note_decal_bufs(p, &b);
             }
+            // The upscaler's picture at the output size in the TAA output's place, for the
+            // title's passes at that size (its scaling of the picture to the output:
+            // `upscale::substitute_full`).
+            if k == 1 {
+                if let Some(t) = colors.iter().flatten().next() {
+                    super::super::upscale::substitute_full(super::super::FRAMES.load(Ordering::Relaxed), (t.width, t.height), &mut b.imgs, ps_addr);
+                }
+            }
             // Menu & HUD Size: the composite samples our scaled copy of the interface layer.
             if k == 1 {
                 if let Some((from, to)) = self.ui_sub {
@@ -3149,6 +3169,15 @@ impl Exec {
                 // Menu & HUD Size: the interface layer's scaled copy before the composite.
                 if let Some(job) = self.ui_job.take() {
                     super::super::uiscale::record(self.cmd(), job);
+                }
+                // Sharpening: RCAS over the picture in the composite's target before the
+                // interface goes over it.
+                if std::mem::take(&mut self.rcas_want) {
+                    if let Some(t) = colors[0].as_ref() {
+                        if let Some(job) = super::super::vk::sharpen::prepare(t.image, t.format, t.width, t.height) {
+                            super::super::vk::sharpen::record(self.cmd(), job);
+                        }
+                    }
                 }
                 self.begin_rendering(colors, depth, area);
             } else if super::super::tune::race_checks() && self.barrier_wanted {

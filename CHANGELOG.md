@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- DLSS, FSR and XeSS now upscale to your screen's resolution. Until now they anti-aliased the
+  picture at the render resolution, and the game then stretched it to the screen with a plain
+  scaling, which looked blurry below 100%. The upscaler's picture now replaces the game's
+  stretched one, pixel for pixel on a 16:9 4K screen.
+- Render Scale is now Render Quality, named by the upscalers' modes: Ultra Performance (33%),
+  Performance (50%), Balanced (58%), Quality (67%), Ultra Quality (77%) and DLAA / Native
+  (100%), beside Visual Mode. Shares above 100% are gone. A saved Render Scale is carried over
+  to the nearest choice.
+- Sharpening is now AMD's RCAS, run on the picture after the upscaler and before the menus and
+  HUD, which are no longer sharpened. It handles HDR without clipping. The game's own TAA
+  sharpening is always off.
+- Menu & HUD Size now also works with HDR output.
+
 ## 0.1.8
 
 - Fixed the washed-out, too bright picture with ghosting and black blotches at Render Scale

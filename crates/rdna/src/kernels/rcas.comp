@@ -1,0 +1,146 @@
+#version 450
+// AMD FidelityFX RCAS (Robust Contrast-Adaptive Sharpening) on its own: FSR 1's sharpening pass
+// without FSR 1's upscaling (EASU), after the algorithm of ffx_fsr1.h (FidelityFX FSR 1.0.2,
+// MIT, Copyright (c) 2021 Advanced Micro Devices, Inc.; THIRD_PARTY.md), with the HDR handling
+// of the ReShade HDR shaders' RCAS (EndlesslyFlowering/ReShade_HDR_shaders, lilium__rcas.fx):
+// the sharpening works on perceptually encoded values in [0, 1].
+//
+// The PC settings' Sharpening (`gpu::vk::sharpen`): binding 0 the picture (rgba16f, blitted from
+// the title's display target before the interface is composited over it), binding 1 the result,
+// blitted back. Push constants: width, height, strength (RCAS's con.x: 1 its full strength) and
+// the encoding of the values in binding 0:
+//   0 already perceptual in [0, 1] (UNORM targets: gamma-encoded SDR, or ST 2084 PQ for HDR10),
+//   1 linear sRGB from an sRGB target (encoded to sRGB here, decoded after),
+//   2 linear float (scRGB, 1.0 = 80 nits): encoded to PQ here (no clipping of highlights),
+//     decoded after.
+// Regenerate the SPIR-V (rcas.spv) with naga (naga-cli 30) and drop the capabilities it adds
+// that the kernel does not use:
+//   naga --input-kind glsl --shader-stage compute rcas.comp rcas.spv
+//   python scripts/spv_strip_caps.py crates/rdna/src/kernels/rcas.spv
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D src;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D dst;
+
+layout(push_constant) uniform Params {
+    uint width;
+    uint height;
+    float strength;
+    uint encoding;
+} pc;
+
+// RCAS's limit of the lobe (FSR_RCAS_LIMIT): a ring of four neighbours at most -0.1875 each.
+const float RCAS_LIMIT = 0.25 - (1.0 / 16.0);
+
+vec3 srgb_encode(vec3 c) {
+    c = clamp(c, vec3(0.0), vec3(1.0));
+    vec3 lo = c * 12.92;
+    vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
+    return mix(hi, lo, vec3(lessThanEqual(c, vec3(0.0031308))));
+}
+
+vec3 srgb_decode(vec3 c) {
+    vec3 lo = c / 12.92;
+    vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));
+    return mix(hi, lo, vec3(lessThanEqual(c, vec3(0.04045))));
+}
+
+const float PQ_M1 = 0.1593017578125;
+const float PQ_M2 = 78.84375;
+const float PQ_C1 = 0.8359375;
+const float PQ_C2 = 18.8515625;
+const float PQ_C3 = 18.6875;
+
+// scRGB (1.0 = 80 nits) to PQ in [0, 1] (10,000 nits = 1). Negative values (outside BT.709)
+// are kept by their sign, so their colour comes back after decoding.
+vec3 pq_encode(vec3 c) {
+    vec3 s = sign(c);
+    vec3 y = clamp(abs(c) * (80.0 / 10000.0), vec3(0.0), vec3(1.0));
+    vec3 p = pow(y, vec3(PQ_M1));
+    return s * pow((PQ_C1 + PQ_C2 * p) / (1.0 + PQ_C3 * p), vec3(PQ_M2));
+}
+
+vec3 pq_decode(vec3 e) {
+    vec3 s = sign(e);
+    vec3 p = pow(abs(e), vec3(1.0 / PQ_M2));
+    vec3 y = pow(max(p - PQ_C1, vec3(0.0)) / (PQ_C2 - PQ_C3 * p), vec3(1.0 / PQ_M1));
+    return s * y * (10000.0 / 80.0);
+}
+
+vec3 encode(vec3 c) {
+    if (pc.encoding == 1u) {
+        return srgb_encode(c);
+    }
+    if (pc.encoding == 2u) {
+        return pq_encode(c);
+    }
+    return c;
+}
+
+vec3 decode(vec3 c) {
+    if (pc.encoding == 1u) {
+        return srgb_decode(c);
+    }
+    if (pc.encoding == 2u) {
+        return pq_decode(c);
+    }
+    return c;
+}
+
+vec3 fetch(ivec2 p) {
+    ivec2 q = clamp(p, ivec2(0), ivec2(int(pc.width) - 1, int(pc.height) - 1));
+    return encode(imageLoad(src, q).rgb);
+}
+
+void main() {
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    if (gid.x >= pc.width || gid.y >= pc.height) {
+        return;
+    }
+    ivec2 sp = ivec2(gid);
+    vec4 centre = imageLoad(src, sp);
+    //    b
+    //  d e f
+    //    h
+    vec3 b = fetch(sp + ivec2(0, -1));
+    vec3 d = fetch(sp + ivec2(-1, 0));
+    vec3 e = encode(centre.rgb);
+    vec3 f = fetch(sp + ivec2(1, 0));
+    vec3 h = fetch(sp + ivec2(0, 1));
+    // (Values outside [0, 1] would break the limiters: the PQ encoding's signed values of wide
+    // gamut colours are sharpened as their clamp, then given back their own part beyond it.)
+    vec3 eo = e;
+    b = clamp(b, 0.0, 1.0);
+    d = clamp(d, 0.0, 1.0);
+    e = clamp(e, 0.0, 1.0);
+    f = clamp(f, 0.0, 1.0);
+    h = clamp(h, 0.0, 1.0);
+    // Luma times 2.
+    float bL = b.b * 0.5 + (b.r * 0.5 + b.g);
+    float dL = d.b * 0.5 + (d.r * 0.5 + d.g);
+    float eL = e.b * 0.5 + (e.r * 0.5 + e.g);
+    float fL = f.b * 0.5 + (f.r * 0.5 + f.g);
+    float hL = h.b * 0.5 + (h.r * 0.5 + h.g);
+    // Noise detection (FSR_RCAS_DENOISE): less sharpening where the centre stands out alone.
+    float nz = 0.25 * bL + 0.25 * dL + 0.25 * fL + 0.25 * hL - eL;
+    float range = max(max(max(bL, dL), max(eL, fL)), hL) - min(min(min(bL, dL), min(eL, fL)), hL);
+    nz = clamp(abs(nz) / max(range, 1.0 / 65536.0), 0.0, 1.0);
+    nz = -0.5 * nz + 1.0;
+    // The ring's minimum and maximum.
+    vec3 mn4 = min(min(min(b, d), f), h);
+    vec3 mx4 = max(max(max(b, d), f), h);
+    // Limiters: the lobe that keeps the result within [0, 1] and the ring's range.
+    const vec2 peakC = vec2(1.0, -1.0 * 4.0);
+    vec3 hitMin = min(mn4, e) / max(4.0 * mx4, vec3(1.0 / 65536.0));
+    vec3 hitMaxDen = 4.0 * mn4 + peakC.y;
+    vec3 hitMax = (peakC.x - max(mx4, e)) / min(hitMaxDen, vec3(-1.0 / 65536.0));
+    vec3 lobeRGB = max(-hitMin, hitMax);
+    float lobe = max(-RCAS_LIMIT, min(max(max(lobeRGB.r, lobeRGB.g), lobeRGB.b), 0.0)) * pc.strength;
+    lobe *= nz;
+    float rcpL = 1.0 / (4.0 * lobe + 1.0);
+    vec3 pix = (lobe * b + lobe * d + lobe * h + lobe * f + e) * rcpL;
+    // (The centre's own part beyond [0, 1], if any, given back.)
+    pix += eo - e;
+    imageStore(dst, sp, vec4(decode(pix), centre.a));
+}

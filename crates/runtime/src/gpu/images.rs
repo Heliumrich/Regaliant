@@ -7365,6 +7365,13 @@ impl Images {
         })
     }
 
+    /// Every view made of the images at `base` of `w`x`h` (any format: aliases of one surface).
+    /// The upscalers' full-resolution picture takes the TAA output's place under these in the
+    /// passes at the output size (`upscale::substitute_full`).
+    pub fn views_at(&self, base: u64, w: u32, h: u32) -> Vec<vk::ImageView> {
+        self.map.values().filter(|i| i.key.base == base && (i.key.width, i.key.height) == (w, h)).flat_map(|i| i.views.values().copied()).collect()
+    }
+
     /// Diagnosis (`imgpng <address> <name>`): the largest GPU-written color image at `base`
     /// (mip 0, layer 0) to `<dir>/<name>.png`; its description.
     pub fn dump_one(&mut self, base: u64, dir: &std::path::Path, name: &str) -> Result<String, String> {

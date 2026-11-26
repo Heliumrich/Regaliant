@@ -1,5 +1,5 @@
 //! The Display page: the game's window mode, monitor, fullscreen resolution and refresh rate,
-//! render scale and frame rate limit for the next start (the user's request, 2026-11-13). The
+//! render quality and frame rate limit for the next start (the user's request, 2026-11-13). The
 //! same settings as the game's SETTINGS > PC tab: kept in the files the game reads at its start
 //! (pcsettings.txt and display.txt), written as soon as a choice changes. While the game runs it
 //! owns those files: the page waits, and reads them again when the game ends.
@@ -21,8 +21,6 @@ const ID_LIMIT: i32 = 406;
 pub const PAGE: usize = 1;
 
 const MODES: [&str; 3] = ["Windowed", "Borderless fullscreen", "Fullscreen"];
-/// The game's Render Scale options (the PC tab's: option 0 the Visual Mode's own size).
-const SCALES: [&str; 10] = ["Visual Mode (the game's own)", "50%", "60%", "67%", "75%", "85%", "100%", "125%", "150%", "200%"];
 const LIMITS: [&str; 3] = ["30 FPS", "60 FPS (the original)", "Uncapped"];
 
 #[derive(Default)]
@@ -94,7 +92,7 @@ pub fn build(app: &mut App) {
     unsafe {
         let r = (16, 58, 748, 40);
         app.put(PAGE, b.label("How the game shows for the next start. The game's SETTINGS > PC tab changes the same settings while you play.", r, -1), r);
-        let rows = [("Window mode:", ID_MODE), ("Monitor:", ID_MONITOR), ("Fullscreen resolution:", ID_RES), ("Fullscreen refresh rate:", ID_RATE), ("Render scale:", ID_SCALE), ("Frame rate limit:", ID_LIMIT)];
+        let rows = [("Window mode:", ID_MODE), ("Monitor:", ID_MONITOR), ("Fullscreen resolution:", ID_RES), ("Fullscreen refresh rate:", ID_RATE), ("Render quality:", ID_SCALE), ("Frame rate limit:", ID_LIMIT)];
         let mut hs = Vec::new();
         for (i, (label, id)) in rows.iter().enumerate() {
             let y = 108 + 40 * i as i32;
@@ -123,7 +121,11 @@ pub fn refresh(app: &mut App) {
     unsafe {
         fill(h(app.display.mode), &MODES.iter().map(|s| s.to_string()).collect::<Vec<_>>(), setting(app, "WindowMode").unwrap_or(0) as usize);
         fill(h(app.display.monitor), &mons, mon_i);
-        fill(h(app.display.scale), &SCALES.iter().map(|s| s.to_string()).collect::<Vec<_>>(), setting(app, "RenderScale").unwrap_or(0) as usize);
+        // The game's Render Quality options (option 0 the Visual Mode's own size; a Render Scale
+        // saved before it shown as the option the game carries it over to).
+        let quality = setting(app, dsconfig::quality::ID).or_else(|| setting(app, dsconfig::quality::OLD_ID).map(dsconfig::quality::from_render_scale)).unwrap_or(0);
+        let labels: Vec<String> = dsconfig::quality::LABELS.iter().enumerate().map(|(i, l)| if i == 0 { format!("{l} (the game's own)") } else { l.to_string() }).collect();
+        fill(h(app.display.scale), &labels, quality as usize);
         fill(h(app.display.limit), &LIMITS.iter().map(|s| s.to_string()).collect::<Vec<_>>(), setting(app, "FrameRateLimit").unwrap_or(1) as usize);
     }
     modes_for(app, mon_i, &choice);
@@ -187,7 +189,7 @@ fn save(app: &mut App) {
         res: res_i.checked_sub(1).and_then(|i| app.display.resolutions.get(i).copied()),
         hz: rate_i.checked_sub(1).and_then(|i| app.display.rates.get(i).copied()).unwrap_or(0),
     };
-    let r = set_settings(app, &[("WindowMode", mode as u32), ("RenderScale", scale as u32), ("FrameRateLimit", limit as u32)]).and_then(|_| disp::write_choice(&app.paths.display_file(), &choice));
+    let r = set_settings(app, &[("WindowMode", mode as u32), (dsconfig::quality::ID, scale as u32), ("FrameRateLimit", limit as u32)]).and_then(|_| disp::write_choice(&app.paths.display_file(), &choice));
     match r {
         Ok(()) => app.set_status("Display settings saved for the next start."),
         Err(e) => app.set_status(&format!("Could not save the display settings: {e}")),

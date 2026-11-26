@@ -1,4 +1,4 @@
-//! Quality presets: the Graphics list's Quality Preset sets the render scale and the graphics
+//! Quality presets: the Graphics list's Quality Preset sets the Render Quality and the graphics
 //! settings together and shows Custom once one of them differs from every preset. The defaults
 //! are the original's (High); no preset is chosen for the player (the user, 2026-11-06 night: a
 //! launcher may offer one later).
@@ -9,19 +9,20 @@ pub const NAMES: [&str; 5] = ["Custom", "Low", "Medium", "High", "Ultra"];
 /// Each preset's settings: (PC setting id, option index). High is the PS5's own quality (the
 /// settings' defaults: the Visual Mode's render size, tessellation and texture filtering);
 /// Ultra goes beyond it (the screen's own resolution, the finest tessellation, 16x filtering),
-/// Medium and Low trade detail for speed on modest GPUs (a lower render scale first: the largest
+/// Medium and Low trade detail for speed on modest GPUs (a lower Render Quality first: the largest
 /// saving on the GPU) and on the CPU side (a shorter reach of the sun's shadows: fewer draws
 /// into its cascades). Shadows stay on: the title's own switches turn them off altogether (the
 /// torches then light through walls).
 const PRESETS: [&[(&str, u32)]; 4] = [
-    // Low: 67% render scale, the title's PS4 Pro tessellation, the sun's shadows to 25 m.
-    &[("RenderScale", 3), ("GeometryDetail", 1), ("ShadowDistance", 3), ("TextureFiltering", 0)],
-    // Medium: 85%, the Performance mode's tessellation, the sun's shadows to 40 m.
-    &[("RenderScale", 5), ("GeometryDetail", 2), ("ShadowDistance", 2), ("TextureFiltering", 0)],
+    // Low: Quality (67%), the title's PS4 Pro tessellation, the sun's shadows to 25 m.
+    &[(dsconfig::quality::ID, 4), ("GeometryDetail", 1), ("ShadowDistance", 3), ("TextureFiltering", 0)],
+    // Medium: Ultra Quality (77%), the Performance mode's tessellation, the sun's shadows to 40 m.
+    &[(dsconfig::quality::ID, 5), ("GeometryDetail", 2), ("ShadowDistance", 2), ("TextureFiltering", 0)],
     // High: as the PS5.
-    &[("RenderScale", 0), ("GeometryDetail", 0), ("ShadowDistance", 0), ("TextureFiltering", 0)],
-    // Ultra: 100% (the screen's resolution), the finest tessellation, 16x anisotropic filtering.
-    &[("RenderScale", 6), ("GeometryDetail", 5), ("ShadowDistance", 0), ("TextureFiltering", 2)],
+    &[(dsconfig::quality::ID, 0), ("GeometryDetail", 0), ("ShadowDistance", 0), ("TextureFiltering", 0)],
+    // Ultra: DLAA / Native (100%: the screen's resolution), the finest tessellation, 16x
+    // anisotropic filtering.
+    &[(dsconfig::quality::ID, 6), ("GeometryDetail", 5), ("ShadowDistance", 0), ("TextureFiltering", 2)],
 ];
 
 fn key(id: &str) -> String {

@@ -128,10 +128,6 @@ impl Item {
     }
 }
 
-/// The Render Scale choice's percentages (of the window's or screen's resolution), its options
-/// 1-9; option 0, the default, is the title's own render size (the Visual Mode's).
-pub const RENDER_SCALES: [u32; 9] = [50, 60, 67, 75, 85, 100, 125, 150, 200];
-
 /// The PC tab's items, in order (each one works: what it changes is in `apply`). The tab shows
 /// 11 rows (rows past them are reached but never drawn: the four list openers were, 2026-11-13):
 /// these 7, then the openers of the Graphics & Display, Controls, Sound & Saves, Key Bindings
@@ -151,11 +147,12 @@ pub fn items() -> Vec<Item> {
             tooltip: s("The screen's resolution in Fullscreen mode."),
             kind: ItemKind::Display(1),
         },
+        // (Render Scale until 2026-11-26: `dsconfig::quality`.)
         Item {
-            id: s("RenderScale"),
-            label: s("Render Scale"),
-            tooltip: s("Lower runs faster, higher looks sharper."),
-            kind: ItemKind::Choice(std::iter::once(s("Visual Mode")).chain(RENDER_SCALES.iter().map(|p| format!("{p}%"))).collect(), 0),
+            id: s(dsconfig::quality::ID),
+            label: s("Render Quality"),
+            tooltip: s("The render resolution, upscaled to the screen's. Lower runs faster."),
+            kind: ItemKind::Choice(dsconfig::quality::LABELS.iter().map(|l| s(l)).collect(), 0),
         },
         Item {
             id: s("AntiAliasing"),
@@ -186,7 +183,9 @@ pub fn items() -> Vec<Item> {
     ]
 }
 
-/// Sharpness's amounts per option (the presenter's pass; 0 off, as the original).
+/// Sharpness's amounts per option: AMD's RCAS after the upscaler and the tone mapping, before
+/// the interface is drawn over the picture (`gpu::vk::sharpen`; 0 off). The game's own
+/// sharpening (its TAA's history sharpening) is always off.
 pub const SHARPNESS: [f32; 5] = [0.0, 0.25, 0.5, 0.75, 1.0];
 
 /// Shadow Distance's caps per option on the sun shadows' reach (`sunShadowMaxDistance`, in the
@@ -228,7 +227,7 @@ pub fn graphics_items() -> Vec<Item> {
         Item {
             id: s("Sharpness"),
             label: s("Sharpening"),
-            tooltip: s("Sharpens the image. Off is the original."),
+            tooltip: s("Sharpens the picture (AMD RCAS), not the menus and HUD."),
             kind: ItemKind::Choice(vec![s("Off"), s("25%"), s("50%"), s("75%"), s("100%")], 0),
         },
         toggle("Bloom", "Bloom", "The glow around bright lights.", true),
@@ -330,10 +329,11 @@ pub fn apply() {
         _ => 0,
     };
     crate::gpu::images::ANISO.store(aniso, std::sync::atomic::Ordering::Relaxed);
-    // Sharpening: the presenter's pass (amount x2: 1.00 moves a pixel twice its difference
-    // from its neighbours' mean, within their range).
+    // Sharpening: RCAS over the picture before the interface (its strength, 1.0 RCAS's full
+    // strength); the game's own sharpening of its TAA's history always off (0).
     let sharpen = SHARPNESS.get(get("Sharpness").unwrap_or(0) as usize).copied().unwrap_or(0.0);
-    crate::gpu::vk::sharpen::AMOUNT.store((sharpen * 2.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
+    crate::gpu::vk::sharpen::AMOUNT.store(sharpen.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    convar::want("r_aaHistorySharpeningStrength", Some(convar::float(0.0)));
     let sens = get("MouseSensitivity").map(f32::from_bits).filter(|v| v.is_finite() && *v > 0.0).unwrap_or(1.0);
     crate::input::PC_SENSITIVITY.store(sens.to_bits(), std::sync::atomic::Ordering::Relaxed);
     crate::input::PC_INVERT_Y.store(get("InvertMouseY") == Some(1), std::sync::atomic::Ordering::Relaxed);
@@ -386,8 +386,8 @@ pub fn apply() {
         }
     }
     UI_SIZE.store(UI_SIZES.get(get("UiSize").unwrap_or(0) as usize).copied().unwrap_or(100), std::sync::atomic::Ordering::Relaxed);
-    // Option 0: the title's own render size (0); 1-9 the percentages.
-    let scale = get("RenderScale").unwrap_or(0).checked_sub(1).and_then(|i| RENDER_SCALES.get(i as usize).copied()).unwrap_or(0);
+    // Option 0: the title's own render size (0); 1-6 the shares of the screen's resolution.
+    let scale = dsconfig::quality::percent(get(dsconfig::quality::ID).unwrap_or(0));
     crate::dispmode::SCALE_PCT.store(scale, std::sync::atomic::Ordering::Relaxed);
     // The window: applied when it changes (the window opens with it, `window_mode`).
     static WINDOW_MODE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
@@ -499,8 +499,8 @@ pub fn state_report() {
         format!("WindowMode {} (window in mode {})", v("WindowMode"), crate::gpu::vk::window::window_mode()),
         format!("HdrOutput {} (HDR allowed {}, output range {})", v("HdrOutput"), hdr_allowed(), crate::hle::libs::videoout::dynamic_range()),
         format!("AspectRatio {} (output {:?})", v("AspectRatio"), crate::dispmode::output_size()),
-        format!("RenderScale {} (scale {}%)", v("RenderScale"), crate::dispmode::SCALE_PCT.load(Relaxed)),
-        format!("Sharpness {} (amount {:.2})", v("Sharpness"), f32::from_bits(crate::gpu::vk::sharpen::AMOUNT.load(Relaxed))),
+        format!("RenderQuality {} (scale {}%)", v(dsconfig::quality::ID), crate::dispmode::SCALE_PCT.load(Relaxed)),
+        format!("Sharpness {} (RCAS strength {:.2})", v("Sharpness"), f32::from_bits(crate::gpu::vk::sharpen::AMOUNT.load(Relaxed))),
         format!("MouseSensitivity {} (in effect {:.2})", f("MouseSensitivity"), f32::from_bits(crate::input::PC_SENSITIVITY.load(Relaxed))),
         format!("InvertMouseY {} (in effect {})", v("InvertMouseY"), crate::input::PC_INVERT_Y.load(Relaxed)),
         format!("AudioOutput {} (in effect {})", v("AudioOutput"), crate::hle::libs::audio2::OUTPUT_CHOICE.load(Relaxed)),

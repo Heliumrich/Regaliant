@@ -40,9 +40,6 @@ struct Presenter {
     halves: Vec<Half>,
     /// The last (frame size, window size) logged.
     logged: (u32, u32, u32, u32),
-    /// The PC settings' sharpening pass (made on first use; `sharpen_failed` after an error).
-    sharpen: Option<super::sharpen::Sharpen>,
-    sharpen_failed: bool,
     /// The swapchain holds exclusive fullscreen (VK_EXT_full_screen_exclusive, application
     /// controlled), on this monitor.
     exclusive: Option<isize>,
@@ -773,8 +770,6 @@ pub fn init(title: &str) -> Result<(), String> {
             upload: None,
             halves: Vec::new(),
             logged: (0, 0, 0, 0),
-            sharpen: None,
-            sharpen_failed: false,
             exclusive: None,
             hdr: false,
             want_hdr: false,
@@ -907,42 +902,9 @@ pub fn present(src: Source) -> bool {
             (from, from_layout, fw, fh) = (half, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, hw, hh);
             level += 1;
         }
-        // The PC settings' sharpening: the frame blitted at its shown size, sharpened, blitted
-        // to the window.
-        let amount = super::sharpen::amount();
-        let mut sharpened = false;
-        if amount > 0.0 && !p.sharpen_failed {
-            if p.sharpen.is_none() {
-                match super::sharpen::Sharpen::new() {
-                    Ok(s) => p.sharpen = Some(s),
-                    Err(e) => {
-                        crate::warn!("present: no sharpening ({e})");
-                        p.sharpen_failed = true;
-                    }
-                }
-            }
-            let fences: Vec<vk::Fence> = p.fences.iter().enumerate().filter(|&(i, _)| i != f).map(|(_, &x)| x).collect();
-            if let Some(s) = p.sharpen.as_mut() {
-                match s.ensure(rw, rh, || {
-                    c.device.wait_for_fences(&fences, true, u64::MAX).ok();
-                }) {
-                    Ok((a, b, fresh)) => {
-                        s.begin(cmd, fresh);
-                        blit_to(c, cmd, from, from_layout, (0, 0, fw, fh), a, vk::ImageLayout::GENERAL, (0, 0, rw, rh));
-                        s.record(cmd, amount);
-                        blit(c, cmd, b, vk::ImageLayout::GENERAL, (0, 0, rw, rh), dst, (rx, ry, rw, rh));
-                        sharpened = true;
-                    }
-                    Err(e) => {
-                        crate::warn!("present: no sharpening images ({e})");
-                        p.sharpen_failed = true;
-                    }
-                }
-            }
-        }
-        if !sharpened {
-            blit(c, cmd, from, from_layout, (0, 0, fw, fh), dst, (rx, ry, rw, rh));
-        }
+        // (The PC settings' Sharpening is RCAS over the picture before the interface, in the
+        // game's own frame: `sharpen`. The shown frame goes to the window as it is.)
+        blit(c, cmd, from, from_layout, (0, 0, fw, fh), dst, (rx, ry, rw, rh));
         // The frame watch's copy of the frame as shown (before the window's scaling).
         if super::framewatch::ON.load(std::sync::atomic::Ordering::Relaxed) && !p.watch_failed {
             if p.watch.is_none() {
