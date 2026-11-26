@@ -21,8 +21,10 @@ tracy = ["dep:tracy-client"]
 
 [dependencies]
 # (Without Tracy's crash handler: its exception filter would take the access violations the port
-# answers itself, the guest pages it arms.)
-tracy-client = { version = "0.19", optional = true, default-features = false, features = ["enable", "ondemand", "system-tracing", "context-switch-tracing", "sampling", "code-transfer", "broadcast", "callstack-inlines"] }
+# answers itself, the guest pages it arms. With manual-lifetime: Tracy's client otherwise starts
+# before main in every process, the game's host too, which then holds Tracy's port 8086, so a
+# capture of 127.0.0.1 got the host; `prof::start` starts it in the game's process only.)
+tracy-client = { version = "0.19", optional = true, default-features = false, features = ["enable", "manual-lifetime", "ondemand", "system-tracing", "context-switch-tracing", "sampling", "code-transfer", "broadcast", "callstack-inlines"] }
 sce-elf = { path = "../sce-elf" }
 dsconfig = { path = "../dsconfig" }
 rdna = { path = "../rdna" }

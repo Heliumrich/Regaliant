@@ -455,6 +455,12 @@ fn poll_control(path: &Path, offset: &mut u64) {
             if let Some(end) = file.rfind('\n') {
                 *offset += end as u64 + 1;
                 buf.push_str(&file[..=end]);
+            } else if f.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|e| e.as_secs() >= 1) {
+                // (A last line without its line break, saved by an editor a second ago or more:
+                // complete. The profile report of 2026-11-27 was never run for want of one.)
+                *offset += file.len() as u64;
+                buf.push_str(&file);
+                buf.push('\n');
             }
         }
     }
