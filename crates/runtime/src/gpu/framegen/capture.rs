@@ -478,6 +478,36 @@ pub fn skipped(why: &str) {
     }
 }
 
+/// The display buffers' addresses as presented (`note_display_buffer`).
+static DISPLAY: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Pixel stages logged drawing into a display buffer (`note_display_draw`).
+static DISPLAY_PS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// A display buffer the presenter shows (its address).
+pub fn note_display_buffer(addr: u64) {
+    if DISPLAY.iter().any(|a| a.load(Relaxed) == addr) {
+        return;
+    }
+    if let Some(a) = DISPLAY.iter().find(|a| a.load(Relaxed) == 0) {
+        a.store(addr, Relaxed);
+    }
+}
+
+/// A draw other than the composite drew into an image at `base`: when that is a display buffer,
+/// its pixel stage is logged (once each, eight at most): what draws the final picture when the
+/// composite is not met (HDR's, another version of the title's).
+pub fn note_display_draw(base: u64, ps: u64, format: vk::Format, w: u32, h: u32) {
+    if base == 0 || !DISPLAY.iter().any(|a| a.load(Relaxed) == base) {
+        return;
+    }
+    let mut g = DISPLAY_PS.lock();
+    if g.len() >= 8 || g.contains(&ps) {
+        return;
+    }
+    g.push(ps);
+    crate::info!("frame generation: ps {ps:#x} draws into display buffer {base:#x} ({format:?} {w}x{h}); the composite captured is ps {:#x}", super::super::uiscale::COMPOSITE_PS);
+}
+
 /// Composite draws met while capturing, and why some were not taken (reason, count).
 static TRIED: AtomicU64 = AtomicU64::new(0);
 static SKIPS: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());

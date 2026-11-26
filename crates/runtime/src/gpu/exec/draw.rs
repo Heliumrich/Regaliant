@@ -1827,6 +1827,14 @@ impl Exec {
         // (The vertices a non-indexed draw of one instance reads: `snap_prog`'s snapshots.)
         set_snap_verts(if args.index.is_none() && args.instances == 1 { Some((args.base_vertex.unwrap_or_else(|| ctx_reg(cp, 0x28408) as i32).max(0) as u64, args.count as u64)) } else { None });
         let r = self.draw_inner(cp, &args);
+        // (Frame generation's diagnosis: the pixel stages that draw into a display buffer, when
+        // they are not the composite it captures: `capture::note_display_draw`.)
+        if !composite && super::super::framegen::capture::wanted() && matches!(r, Ok(true)) {
+            if let Some(rt) = self.rendering.as_ref().and_then(|r| r.colors[0]) {
+                let ps = ((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8;
+                super::super::framegen::capture::note_display_draw(rt.key.base, ps, rt.key.format, rt.width, rt.height);
+            }
+        }
         set_snap_verts(None);
         self.ui_sub = None;
         self.ui_job = None;

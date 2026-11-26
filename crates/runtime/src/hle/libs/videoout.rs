@@ -716,6 +716,7 @@ fn present_buffer(b: &DisplayBuffer, frame: u32) {
         return;
     }
     if crate::gpu::exec::enabled() {
+        crate::gpu::framegen::capture::note_display_buffer(b.addr);
         let size = registered_size(b);
         if let Some((image, format, width, height)) = crate::gpu::images::with(|im| im.rendered_at(b.addr, size)) {
             // Diagnosis: the image each buffer presents, logged when it changes.
