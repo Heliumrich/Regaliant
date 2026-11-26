@@ -3030,6 +3030,14 @@ impl Exec {
             // The upscaler's picture at the output size in the TAA output's place, for the
             // title's passes at that size (its scaling of the picture to the output:
             // `upscale::substitute_full`).
+            if k == 1 && super::super::upscale::trace_on() {
+                let reads: Vec<super::super::upscale::TraceImage> = p.resources.iter().filter_map(|r| match r {
+                    super::Resolved::Image(t) => Some((t.base, t.width, t.height, t.format as u32)),
+                    _ => None,
+                }).collect();
+                let writes: Vec<super::super::upscale::TraceImage> = colors.iter().flatten().map(|t| (t.key.base, t.width, t.height, t.format.as_raw() as u32)).collect();
+                super::super::upscale::trace_pass(super::super::FRAMES.load(Ordering::Relaxed), "ps", ps_addr, &reads, &writes);
+            }
             if k == 1 {
                 if let Some(t) = colors.iter().flatten().next() {
                     super::super::upscale::substitute_full(super::super::FRAMES.load(Ordering::Relaxed), (t.width, t.height), &mut b.imgs, ps_addr);

@@ -21096,7 +21096,7 @@ impl Exec {
                 // (Every view of the TAA output and its aliases: the passes at the output size may
                 // sample it through any of them.)
                 let views = super::images::with(|im| im.views_at(to.base, to.width, to.height));
-                super::upscale::set_full(frame, views, f.view, (ow, oh), to.height as f32 / oh as f32);
+                super::upscale::set_full(frame, views, f.view, (ow, oh), to.height as f32 / oh as f32, to.base, (to.width, to.height));
             }
             _ => {
                 super::upscale::clear_full();
@@ -22825,6 +22825,12 @@ impl Exec {
         // The chosen upscaler after the title's TAA (`gpu::upscale`, `gpu::upmerge`).
         if !batched && p.addr == TAA_CS && indirect.is_none() {
             self.taa_upscale(&p, &bound);
+        } else if super::upscale::trace_on() {
+            let imgs: Vec<super::upscale::TraceImage> = p.resources.iter().filter_map(|r| match r {
+                Resolved::Image(t) => Some((t.base, t.width, t.height, t.format as u32)),
+                _ => None,
+            }).collect();
+            super::upscale::trace_pass(super::FRAMES.load(Ordering::Relaxed), "cs", p.addr, &imgs, &imgs);
         }
         trace_cs_images(&self.name, &p, &bound);
         self.tap_cs(&p, &bound);
