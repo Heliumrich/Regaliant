@@ -344,9 +344,12 @@ pub fn presentation_line() -> String {
 unsafe fn draw_perf(p: &mut Presenter, cmd: vk::CommandBuffer, slot: usize, dst: vk::Image, picture: (u32, u32, u32, u32)) {
     let Some((generation, lines)) = crate::perfhud::lines() else {
         if let Some(old) = p.perf_box.take() {
+            // (The other slot's frame may still read it; this slot's fence is not submitted yet:
+            // waiting on it hung the presenter when the overlay was turned off, 2026-11-26.)
             let c = ctx();
+            let others: Vec<vk::Fence> = p.fences.iter().enumerate().filter(|&(i, _)| i != slot).map(|(_, &f)| f).collect();
             unsafe {
-                c.device.wait_for_fences(&p.fences, true, u64::MAX).ok();
+                c.device.wait_for_fences(&others, true, u64::MAX).ok();
                 old.destroy();
             }
         }
