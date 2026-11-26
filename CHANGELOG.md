@@ -21,7 +21,7 @@
   the 3840x2160 output.
 - While DLSS, FSR or XeSS upscale, textures get NVIDIA's recommended level-of-detail bias
   (log2 of the render share: -1 at 50%), so they stay as sharp as at the screen's resolution.
-  Only the game's tiled material textures get it: smoke and fog flickered with it.
+  Only opaque surfaces get it, not blended effects: smoke and fog flickered with it.
 - The window presents with Vulkan's MAILBOX mode where the driver offers it (FIFO before):
   lower latency, presents never wait for a refresh. `DS_PRESENT_MODE=fifo` brings back FIFO.
 

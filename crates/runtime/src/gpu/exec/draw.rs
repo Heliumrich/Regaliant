@@ -3044,6 +3044,11 @@ impl Exec {
         // while their memos' generations and the frame hold.
         let gens_hold = (delta.is_some() || expect.is_some()) && self.delta.bind_gens.is_some_and(|g| g == super::bind_gens());
         let mut reused = 0;
+        // The upscaling's texture bias for this draw's samplers: opaque draws only (colour target 0
+        // without blending: the materials). Smoke, fog and other effects blend, and flickered
+        // with the bias at 50% (2026-11-26); their samplers are the same as the materials'.
+        let bias_draw = super::super::images::LOD_BIAS_Q.load(Ordering::Relaxed) != 0 && colors[0].is_some() && (ctx_reg(cp, 0x28780) >> 30) & 1 == 0;
+        super::super::images::set_draw_bias(bias_draw);
         for k in 0..2 {
             let p: &mut Prepared = match k {
                 0 => &mut vs,
@@ -3106,6 +3111,7 @@ impl Exec {
             bounds.push(b);
             lap.mark(10 + k.min(1));
         }
+        super::super::images::set_draw_bias(false);
         if profiling() {
             // Buffer placements of the draw's stages (vertex stage first), under
             // the draw's profile key.

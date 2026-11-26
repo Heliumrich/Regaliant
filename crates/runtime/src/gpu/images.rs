@@ -663,8 +663,8 @@ pub fn sampler_hit(s: [u32; 4], compare: bool) -> Option<vk::Sampler> {
 /// The textures' level-of-detail bias while an upscaler takes the render up to the output size,
 /// in steps of -1/16 (0: none): log2 of the render size over the output size, NVIDIA's guidance
 /// for DLSS (-1 at 50%, about -0.58 at 67%; `upscale::set_full`). Applied to the title's
-/// mipmapped, linearly filtered samplers that do not compare, that it gives anisotropic
-/// filtering itself and that repeat (its materials; not its effects' clamped flipbooks). `DS_LOD_BIAS=0` leaves them alone.
+/// mipmapped, linearly filtered samplers that do not compare and that it gives anisotropic
+/// filtering itself, in opaque draws only (its materials; not its blended effects). `DS_LOD_BIAS=0` leaves them alone.
 pub static LOD_BIAS_Q: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Sets the textures' bias (`LOD_BIAS_Q`) for a render scale (render size over output size).
@@ -678,10 +678,23 @@ pub fn set_upscale_bias(scale: f32) {
     }
 }
 
-/// The samplers' key beyond the S#: the PC anisotropy and the upscaling's bias.
+thread_local! {
+    /// The draw being bound takes the upscaling's bias (`set_draw_bias`).
+    static DRAW_BIAS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the samplers this thread binds next take the upscaling's bias: an opaque draw's
+/// (`Exec::draw_inner`); dispatches and blended draws never.
+pub fn set_draw_bias(on: bool) {
+    DRAW_BIAS.with(|c| c.set(on));
+}
+
+/// The samplers' key beyond the S#: the PC anisotropy and the upscaling's bias (only while an
+/// opaque draw binds: `set_draw_bias`).
 fn sampler_mode() -> u16 {
     use std::sync::atomic::Ordering::Relaxed;
-    ANISO.load(Relaxed) as u16 | (LOD_BIAS_Q.load(Relaxed) as u16) << 8
+    let bias = if DRAW_BIAS.with(|c| c.get()) { LOD_BIAS_Q.load(Relaxed) as u16 } else { 0 };
+    ANISO.load(Relaxed) as u16 | bias << 8
 }
 
 /// `Images::resolved_key` from this thread's memo (None: not memoized).
@@ -7879,20 +7892,15 @@ impl Images {
         // mipmapped, linearly filtered samplers that do not compare (its surface textures).
         let surface = !compare_use && mip == 2 && b(s[2], 22, 2) >= 1 && b(s[2], 20, 2) >= 1;
         let raise = aniso_pc > 1 && surface;
-        // The upscaling's bias (`LOD_BIAS_Q`) on the samplers of the title's materials, when they
-        // have mips to go to: anisotropic and repeating in both directions (tiled surfaces). Not
-        // on its effects' textures: smoke and fog flickered with it at 50% (2026-11-26), their
-        // samplers anisotropic too, but their flipbook sheets clamped to their edges (an S#
-        // address mode other than wrap or mirror).
-        let wraps = |m: u32| m == 0 || m == 1;
-        let material = surface && aniso > 0 && wraps(b(s[0], 0, 3)) && wraps(b(s[0], 3, 3));
+        // The upscaling's bias (`LOD_BIAS_Q`, in the key only while an opaque draw binds:
+        // `set_draw_bias`) on its mipmapped, linearly filtered samplers that it filters
+        // anisotropically itself, when they have mips to go to.
+        let material = surface && aniso > 0;
         let lod_bias = if material && bias_q > 0 && max_lod > min_lod { lod_bias - bias_q as f32 / 16.0 } else { lod_bias };
-        if surface && bias_q > 0 && max_lod > min_lod {
-            static SEEN: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
-            let k = material as usize;
-            let n = SEEN[k].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 4 {
-                crate::info!("images: sampler {} the upscaling's bias (S# {:08x} {:08x} {:08x} {:08x}: anisotropy {aniso}, address {}/{})", if material { "at" } else { "left out of" }, s[0], s[1], s[2], s[3], b(s[0], 0, 3), b(s[0], 3, 3));
+        if material && bias_q > 0 && max_lod > min_lod {
+            static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2 {
+                crate::info!("images: an opaque draw's sampler at the upscaling's bias (S# {:08x} {:08x} {:08x} {:08x})", s[0], s[1], s[2], s[3]);
             }
         }
         let ci = vk::SamplerCreateInfo::default()
