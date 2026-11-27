@@ -7554,7 +7554,10 @@ const OP_FE2_SCATTERS: usize = 12;
 /// GPU-performed CP writes of labels a command processor of ours waits on
 /// (`cp::cp_waited`; `seg_stamps` names their segments apart).
 const OP_CP_WRITES_WAITED: usize = 13;
-const OPS: usize = 14;
+/// The chosen upscaler's evaluation and its merge (`Exec::taa_upscale`; `seg_stamps` names
+/// their segment apart, which the TAA's otherwise held).
+const OP_UPSCALES: usize = 14;
+const OPS: usize = 15;
 
 fn ops_line(ops: &[u64; OPS]) -> String {
     let kib = |b: u64| b.div_ceil(1024);
@@ -8159,6 +8162,16 @@ const XS_PRE_C_UNDO: usize = 8 + XR_N;
 /// those writes in the mirror).
 static XC_UPLOADS: RangeLog = RangeLog::new(&XC_UPLOADS_SPAN);
 static XC_UPLOADS_SPAN: SpanMarks = SpanMarks::new();
+
+/// Ordered async compute is on: `tune async_compute` at 2, or `tune async_compute_at`'s flip
+/// reached (the compute family's queue set up at boot either way: `vk::async_compute_boot`).
+fn xq_on() -> bool {
+    if super::tune::async_compute() >= 2 {
+        return true;
+    }
+    let at = super::tune::async_compute_at();
+    at != 0 && super::FRAMES.load(Ordering::Relaxed) >= at
+}
 
 /// Ordered async compute's dependencies are tracked: its census, or the
 /// compute family's queue set up (its batches may still run after the
@@ -9634,7 +9647,8 @@ static WB_SIZES: Mutex<([[u64; 4]; 7], [f64; 9])> = Mutex::new(([[0; 4]; 7], [0.
 
 /// What a segment without commands recorded (its operation counts' change).
 fn seg_kind(a: &[u64; OPS], b: &[u64; OPS]) -> &'static str {
-    const KINDS: [(usize, &str); 10] = [
+    const KINDS: [(usize, &str); 11] = [
+        (OP_UPSCALES, "upscaler (evaluation and merge)"),
         (OP_FE2_SCATTERS, "front end 2 write-backs"),
         (OP_MERGES, "shadow merges"),
         (OP_SHADOWS_IN, "shadow copies in"),
@@ -14361,7 +14375,7 @@ impl Exec {
         // of that family.
         // (Front end 2 only: the old one's shadows, homes and shared copies
         // assume one queue.)
-        let to_c = self.cfamily.is_some() && super::tune::async_compute() >= 2 && super::fe2::on();
+        let to_c = self.cfamily.is_some() && xq_on() && super::fe2::on();
         self.batch_c = to_c && !std::mem::take(&mut self.xq_main_once);
         {
             let s = &mut self.slots[self.cur];
@@ -17825,7 +17839,7 @@ impl Exec {
             XQ_STATS[XS_IMAGE_CLOSES].fetch_add(1, Ordering::Relaxed);
             self.xq_main_once = true;
             self.submit_for("image-cache work");
-        } else if !self.recording && self.cfamily.is_some() && super::tune::async_compute() >= 2 {
+        } else if !self.recording && self.cfamily.is_some() && xq_on() {
             self.xq_main_once = true;
         }
     }
@@ -22860,7 +22874,18 @@ impl Exec {
             if let Some(Resolved::Image(t)) = p.resources.get(TAA_RES[3]) {
                 super::upscale::note_taa(super::FRAMES.load(Ordering::Relaxed), t.base, t.width, t.height);
             }
-            self.taa_upscale(&p, &bound);
+            // (`seg_stamps`: the TAA's segment ends before the upscaler, whose work gets a segment
+            // of its own, `OP_UPSCALES`.)
+            let seg = seg_stamps() && super::upscale::active();
+            if seg {
+                self.barrier();
+            }
+            if self.taa_upscale(&p, &bound) {
+                self.ops[OP_UPSCALES] += 1;
+            }
+            if seg {
+                self.barrier();
+            }
         }
         trace_cs_images(&self.name, &p, &bound);
         self.tap_cs(&p, &bound);

@@ -351,6 +351,12 @@ fn program_checked(addr: u64) -> Result<(Arc<Vec<rdna::Inst>>, u64), String> {
     let hash = hash_words(&code[..words.min(code.len())]);
     note_per_lane(addr, &code[..words.min(code.len())], hash);
     note_append(addr, &insts, hash);
+    // (`DS_PROGRAM_IDS=1`, diagnosis: each program's address with its code hash and
+    // PER_LANE_PROGRAMS' id, to name a profile's addresses by the title's files.)
+    static IDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *IDS.get_or_init(|| std::env::var("DS_PROGRAM_IDS").ok().as_deref() == Some("1")) {
+        crate::info!("program {addr:#x}: code hash {hash:016x}, id {:016x}, {words} words", program_id(&code[..words.min(code.len())]));
+    }
     let insts = Arc::new(insts);
     map.insert(addr, Program { words, hash, insts: insts.clone() });
     Ok((insts, hash))
@@ -2228,6 +2234,57 @@ const PER_LANE_PROGRAMS: &[(u64, &str, bool)] = &[
     (0xa91a_ab21_188b_3a2a, "tiled pass cs 0x1008a0f200", false),
 ];
 
+/// The other variants of the tiled lighting pass (the title's
+/// `runtimelightingcompute/cs_run_*`, of which the first two tiled passes
+/// above are two; one 8x8 wave64 workgroup per screen tile), translated per
+/// lane while `tune per_lane_lit` is on, by FNV-1a as PER_LANE_PROGRAMS. They
+/// ran in lockstep: the heaviest writes the lit HDR picture (cs 0x100893aa00,
+/// 2.7 ms a frame at 1920x1080 and 6.5 ms at 3840x2160 on an RTX 4080, the
+/// largest single GPU cost of a frame; 2026-11-27 profile). Each checked by
+/// reading its code (`rdnadis --masks`, the code from the title's files):
+/// every cross-lane operation in code its invocations may not all run is of
+/// a kind the two verified passes have (the cluster light masks OR-reduced
+/// by DPP row shifts, v_permlanex16 and v_readlane of lanes 31 and 63 and
+/// walked with s_ff1 under per-lane tests; quad and row reads by DPP
+/// quad_perm and row_ror for screen-space differences) or a v_readlane of a
+/// constant lane a v_writelane wrote (an SGPR spill: a variable of the
+/// invocation's, `lane_slots`); the LDS some use is ds_write_addtid /
+/// ds_read_addtid with M0 0 (VGPR spills, a slot per lane, as the froxel
+/// fog's). EXEC branches per invocation, as the verified tiled passes.
+const LIT_PER_LANE_PROGRAMS: &[(u64, &str)] = &[
+    (0xa314_fb12_a1d6_3dbd, "tiled lighting cs_run_16210782"),
+    (0x8925_dcd0_d51f_cd2d, "tiled lighting cs_run_1c831930"),
+    (0x5a25_fd86_36d8_bcb7, "tiled lighting cs_run_2de1bad1"),
+    (0x8ef3_c2ca_a214_20a3, "tiled lighting cs_run_2fad93ad"),
+    (0x8a29_5ad9_17ac_d06d, "tiled lighting cs_run_340ce8cc"),
+    (0x8844_fc6f_2c27_29ad, "tiled lighting cs_run_35b8673b"),
+    (0x4f73_c915_2c4c_9461, "tiled lighting cs_run_48363bc8"),
+    (0x442b_d1c8_d773_1080, "tiled lighting cs_run_507f2d79"),
+    (0x55fc_8ffc_ac11_a370, "tiled lighting cs_run_5081a1e2"),
+    (0xf820_955b_ea13_3c34, "tiled lighting cs_run_55951af8"),
+    (0xbbc2_fdeb_211c_4156, "tiled lighting cs_run_5b1bdff9"),
+    (0xc7ce_dd70_69d0_a80a, "tiled lighting cs_run_5b1e5462"),
+    (0x085a_dcff_114a_b306, "tiled lighting cs_run_616e8276"),
+    (0xf22f_a56d_c59a_3bfe, "tiled lighting cs_run_62d2fe44"),
+    (0xc079_054f_73db_58b5, "tiled lighting cs_run_6d96b7df"),
+    (0x5a09_d0bc_d1f9_c2ca, "tiled lighting cs_run_73c6b257"),
+    (0x51eb_7a01_a7c5_a459, "tiled lighting cs_run_7a6aafef"),
+    (0x63d7_f222_4b42_a0e5, "tiled lighting cs_run_83ae0019"),
+    (0x721e_8588_7105_d82a, "tiled lighting cs_run_9376bc07"),
+    (0x2dd1_191c_5385_6895, "tiled lighting cs_run_9e948599"),
+    (0x5abb_e265_8e60_ecbc, "tiled lighting cs_run_a0492786"),
+    (0xa8d4_58ca_fdf0_f1d6, "tiled lighting cs_run_a662a82d"),
+    (0x74ff_b081_6517_495b, "tiled lighting cs_run_c4a6489d"),
+    (0xc9bd_d47e_60e3_1e8f, "tiled lighting cs_run_c8104f03"),
+    (0x46a9_f4f3_49ea_0ba6, "tiled lighting cs_run_cfc75c20"),
+    (0x8352_ab36_e6b8_0c00, "tiled lighting cs_run_d82396f6"),
+    (0x2a1b_301a_b87a_403d, "tiled lighting cs_run_e750c9eb"),
+    (0x1467_20a7_c3b3_e2f0, "tiled lighting cs_run_ed1b7554"),
+    (0x663e_e480_1253_6f10, "tiled lighting cs_run_f22de9d3"),
+    (0x63b6_f1d1_3787_7290, "tiled lighting cs_run_f53a44bc"),
+    (0x8fa7_843e_fbb8_8e5d, "tiled lighting cs_run_fb3a8202"),
+];
+
 
 /// Compute programs translated without lockstep mode (`Spec::lockstep_off`),
 /// by FNV-1a of their words up to the first s_endpgm (as PER_LANE_PROGRAMS),
@@ -2323,8 +2380,15 @@ fn no_lockstep_program(code_hash: u64) -> bool {
 static PER_LANE_HASHES: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 
 fn per_lane_program(code_hash: u64) -> bool {
-    code_hash != 0 && PER_LANE_HASHES.iter().any(|h| h.load(std::sync::atomic::Ordering::Relaxed) == code_hash)
+    use std::sync::atomic::Ordering::Relaxed;
+    code_hash != 0
+        && (PER_LANE_HASHES.iter().any(|h| h.load(Relaxed) == code_hash)
+            || (super::tune::per_lane_lit() && LIT_PER_LANE_HASHES.iter().take_while(|h| h.load(Relaxed) != 0).any(|h| h.load(Relaxed) == code_hash)))
 }
+
+/// Program hashes (`hash_words`) found in LIT_PER_LANE_PROGRAMS (taken in
+/// order, so a lookup stops at the first empty slot).
+static LIT_PER_LANE_HASHES: [std::sync::atomic::AtomicU64; 48] = [const { std::sync::atomic::AtomicU64::new(0) }; 48];
 
 /// Program hashes of PER_LANE_PROGRAMS entries with subgroup-decided EXEC
 /// branches.
@@ -2418,6 +2482,23 @@ fn note_per_lane(addr: u64, words: &[u32], hash: u64) {
                 }
             }
         }
+    }
+    if let Some(&(_, what)) = LIT_PER_LANE_PROGRAMS.iter().find(|p| p.0 == id) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !LIT_PER_LANE_HASHES.iter().any(|h| h.load(Relaxed) == hash) {
+            for slot in &LIT_PER_LANE_HASHES {
+                match slot.compare_exchange(0, hash, Relaxed, Relaxed) {
+                    Ok(_) => {
+                        crate::info!("shader {addr:#x}: translated per lane while `tune per_lane_lit` is on ({what})");
+                        break;
+                    }
+                    // (Another thread noted it meanwhile.)
+                    Err(h) if h == hash => break,
+                    Err(_) => {}
+                }
+            }
+        }
+        return;
     }
     let Some(&(_, what, votes)) = PER_LANE_PROGRAMS.iter().find(|p| p.0 == id) else { return };
     if per_lane_program(hash) {

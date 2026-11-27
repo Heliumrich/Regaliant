@@ -321,6 +321,9 @@ pub fn setup(stage: Stage, cfg: &mut crate::Config) {
     // SAFETY: still the only thread (`main` calls this right after `parse_args`).
     unsafe {
         crate::set_unless_given("DS_TEXT_HOOK", TEXT_HOOK);
+        // (The main queue alone, as before 2026-11-27: a run without prepared shaders is what
+        // lost the device with the compute queue on, `tune async_compute_at`.)
+        crate::set_unless_given("DS_ASYNC_COMPUTE_AT", "0");
         std::env::set_var("DS_IME_TEXT", NAME);
     }
     crate::audio::SILENT.store(true, Relaxed);

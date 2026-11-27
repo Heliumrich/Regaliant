@@ -155,7 +155,11 @@ pub struct ComputeQueue {
 /// written-bit map, images shared between the families.
 pub fn async_compute_boot() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| super::tune::async_compute() >= 2)
+    // (`tune async_compute_at` or `DS_ASYNC_COMPUTE_BOOT=1`: set up with the switch at 0, so that a boot
+    // runs every batch on the main queue and the compute queue comes on in play: boots
+    // without prepared shaders lost the device with it on from the start, FINDINGS.md
+    // 2026-11-18 night.)
+    *ON.get_or_init(|| super::tune::async_compute() >= 2 || super::tune::async_compute_at() != 0 || std::env::var("DS_ASYNC_COMPUTE_BOOT").ok().as_deref() == Some("1"))
 }
 
 /// A transfer-only queue for batch-start copies, and its timeline.

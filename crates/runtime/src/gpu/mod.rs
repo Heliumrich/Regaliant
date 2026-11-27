@@ -32,7 +32,7 @@ pub mod tune {
 
     const UNSET: u64 = u64::MAX;
 
-    static ALL: [Tunable; 190] = [
+    static ALL: [Tunable; 192] = [
         Tunable { name: "promises", env: "DS_PROMISES", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "lazy", env: "DS_LAZY_BARRIERS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "shadow_min", env: "DS_GPU_SHADOW_MIN", default: 64 << 10, value: AtomicU64::new(UNSET) },
@@ -107,7 +107,7 @@ pub mod tune {
         Tunable { name: "prep_pool", env: "DS_PREP_POOL", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "ww_probe", env: "DS_WW_PROBE", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "cmdbuf_merge", env: "DS_CMDBUF_MERGE", default: 2, value: AtomicU64::new(UNSET) },
-        Tunable { name: "par_spins", env: "DS_PAR_SPINS", default: 512, value: AtomicU64::new(UNSET) },
+        Tunable { name: "par_spins", env: "DS_PAR_SPINS", default: 4096, value: AtomicU64::new(UNSET) },
         Tunable { name: "slots_gfx", env: "DS_GPU_SLOTS_GFX", default: 8, value: AtomicU64::new(UNSET) },
         Tunable { name: "split_every", env: "DS_SPLIT_EVERY", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "plan_check", env: "DS_PLAN_CHECK", default: 0, value: AtomicU64::new(UNSET) },
@@ -223,6 +223,8 @@ pub mod tune {
         Tunable { name: "tick_lead", env: "DS_TICK_LEAD", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "layer_clears", env: "DS_LAYER_CLEARS", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "arm_inline_max", env: "DS_ARM_INLINE_MAX", default: 1024, value: AtomicU64::new(UNSET) },
+        Tunable { name: "per_lane_lit", env: "DS_PER_LANE_LIT", default: 1, value: AtomicU64::new(UNSET) },
+        Tunable { name: "async_compute_at", env: "DS_ASYNC_COMPUTE_AT", default: 1800, value: AtomicU64::new(UNSET) },
     ];
 
     /// A switch's value: one relaxed load once set (inlined into every
@@ -936,8 +938,9 @@ pub mod tune {
 
     /// Spins (`pause`) of a parallel run's waits (a worker for its chunk's
     /// turn, the main command processor for a chunk) before they block on
-    /// the run's condition variable (512 since 2026-10-16, 4,096 before:
-    /// -5% CPU per command with the front end on one CCD).
+    /// the run's condition variable (4,096 until 2026-10-16, then 512: -5% CPU per command
+    /// with the front end on one CCD of a 5900X; 4,096 again since 2026-11-27: a 7800X3D and
+    /// RTX 4080 at the Nexus, 51.6 against 50.0 flips/s in three alternating in-run rounds).
     #[inline]
     pub fn par_spins() -> u64 {
         get(74)
@@ -1439,6 +1442,28 @@ pub mod tune {
     pub fn arm_inline_max() -> u64 {
         get(189)
     }
+
+    /// The tiled lighting pass's other variants (`shaders::LIT_PER_LANE_PROGRAMS`, the title's
+    /// `cs_run_*`) are translated per lane, as the two in `PER_LANE_PROGRAMS` (1, the default
+    /// since 2026-11-27); 0: in lockstep, as before. Within `tune per_lane` (0 there turns them
+    /// off too). Live: switching translates them anew (their pipelines compile at their next
+    /// dispatch).
+    #[inline]
+    pub fn per_lane_lit() -> bool {
+        get(190) != 0
+    }
+
+    /// Ordered async compute (`async_compute` 2) from this flip on, with the compute family's
+    /// queue set up at boot (`vk::async_compute_boot`): the boot, its menus and first scenes on
+    /// the main queue alone (a boot without prepared shaders lost the device with the compute
+    /// queue on from the start, FINDINGS.md 2026-11-18 night), the compute queue beside it after
+    /// (an RTX 4080 at 4K with DLSS Performance: 49-52 -> 53-55 fps, 2026-11-27). 1800 the
+    /// default since 2026-11-27; 0: only `async_compute` 2 turns it on. Live.
+    #[inline]
+    pub fn async_compute_at() -> u64 {
+        get(191)
+    }
+
 
     /// A stretch past a label wait whose check at its label (`Exec::past_current_for`) finds
     /// pages written since its own checks uploads them in a batch of their own, submitted before
